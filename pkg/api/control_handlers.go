@@ -1711,7 +1711,7 @@ func (s *Service) executeCancelForApply(ctx context.Context, client tern.Client,
 		metrics.RecordControlOperation(ctx, "cancel", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, 0, controlConflictf("schema change is already terminal (current state: %s)", apply.State)
 	}
-	resp, responseStatus, err := s.queueCancelForApplyOwner(ctx, apply, caller)
+	resp, responseStatus, revision, err := s.queueCancelForApplyOwner(ctx, apply, caller)
 	if err != nil {
 		metrics.RecordControlOperation(ctx, "cancel", apply.Database, apply.Deployment, apply.Environment, controlMetricStatus(err))
 		return nil, 0, err
@@ -1730,6 +1730,9 @@ func (s *Service) executeCancelForApply(ctx context.Context, client tern.Client,
 		SkippedCount:   resp.SkippedCount,
 		Status:         responseStatus,
 	}
+	if resp.Accepted {
+		httpResp.ControlRequestRevision = &revision
+	}
 	httpStatus := http.StatusOK
 	if responseStatus == cancelResponseStatusAlreadyRequested {
 		httpStatus = http.StatusAccepted
@@ -1737,13 +1740,26 @@ func (s *Service) executeCancelForApply(ctx context.Context, client tern.Client,
 	return httpResp, httpStatus, nil
 }
 
-func (s *Service) queueCancelForApplyOwner(ctx context.Context, apply *storage.Apply, caller string) (*ternv1.CancelResponse, string, error) {
-	if resp, responseStatus, found, err := s.pendingCancelResponseIfPresent(ctx, apply); err != nil || found {
-		return resp, responseStatus, err
+// queueCancelForApplyOwner records the cancel, or joins the one already
+// pending, and returns the revision of that request alongside the response, so
+// a caller waiting on the outcome reads this request's settlement and not a
+// later one recorded on the same row.
+func (s *Service) queueCancelForApplyOwner(ctx context.Context, apply *storage.Apply, caller string) (*ternv1.CancelResponse, string, int64, error) {
+	var pendingRevision int64
+	resp, responseStatus, found, err := pendingControlResponseIfPresent(ctx, s, apply, storage.ControlOperationCancel, cancelResponseStatusAlreadyRequested,
+		func(controlReq *storage.ApplyControlRequest) (*ternv1.CancelResponse, error) {
+			pendingRevision = controlReq.Revision
+			return cancelResponseFromControlRequest(controlReq)
+		})
+	if err != nil {
+		return nil, "", 0, err
+	}
+	if found {
+		return resp, responseStatus, pendingRevision, nil
 	}
 	tasks, err := s.storage.Tasks().GetByApplyID(ctx, apply.ID)
 	if err != nil {
-		return nil, "", fmt.Errorf("get tasks for apply %s: %w", apply.ApplyIdentifier, err)
+		return nil, "", 0, fmt.Errorf("get tasks for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	cancelledCount, skippedCount := stopRequestCounts(tasks)
 	if cancelledCount == 0 && skippedCount == 0 {
@@ -1758,16 +1774,16 @@ func (s *Service) queueCancelForApplyOwner(ctx context.Context, apply *storage.A
 	}
 	controlReq, alreadyPending, err := s.createCancelControlRequest(ctx, apply, caller, cancelledCount, skippedCount)
 	if err != nil {
-		return nil, "", err
+		return nil, "", 0, err
 	}
 	if alreadyPending {
 		resp, err := cancelResponseFromControlRequest(controlReq)
 		if err != nil {
-			return nil, "", err
+			return nil, "", 0, err
 		}
-		return resp, cancelResponseStatusAlreadyRequested, nil
+		return resp, cancelResponseStatusAlreadyRequested, controlReq.Revision, nil
 	}
-	return &ternv1.CancelResponse{Accepted: true, CancelledCount: cancelledCount, SkippedCount: skippedCount}, "", nil
+	return &ternv1.CancelResponse{Accepted: true, CancelledCount: cancelledCount, SkippedCount: skippedCount}, "", controlReq.Revision, nil
 }
 
 func (s *Service) createCancelControlRequest(ctx context.Context, apply *storage.Apply, caller string, cancelledCount, skippedCount int64) (*storage.ApplyControlRequest, bool, error) {
@@ -1775,10 +1791,6 @@ func (s *Service) createCancelControlRequest(ctx context.Context, apply *storage
 		CancelledCount: cancelledCount,
 		SkippedCount:   skippedCount,
 	})
-}
-
-func (s *Service) pendingCancelResponseIfPresent(ctx context.Context, apply *storage.Apply) (*ternv1.CancelResponse, string, bool, error) {
-	return pendingControlResponseIfPresent(ctx, s, apply, storage.ControlOperationCancel, cancelResponseStatusAlreadyRequested, cancelResponseFromControlRequest)
 }
 
 func cancelResponseFromControlRequest(controlReq *storage.ApplyControlRequest) (*ternv1.CancelResponse, error) {
@@ -2008,15 +2020,34 @@ func (s *Service) stopQueuedStart(ctx context.Context, apply *storage.Apply, cal
 	}
 }
 
+// stopRequestCounts counts the tables a stop or cancel acts on and the tables
+// it leaves alone because they already finished. It counts tables, not tasks:
+// one table can carry several tasks, such as the steps of a staged change or
+// one task per shard, and the operator reads the count as tables. A table is
+// acted on while any of its tasks is still active. A task that names no table
+// covers several tables at once and counts as one.
 func stopRequestCounts(tasks []*storage.Task) (int64, int64) {
+	type tableKey struct {
+		namespace string
+		table     string
+		taskID    int64
+	}
+	active := make(map[tableKey]bool)
+	for _, task := range tasks {
+		key := tableKey{namespace: task.Namespace, table: task.TableName}
+		if task.TableName == "" {
+			key.taskID = task.ID
+		}
+		active[key] = active[key] || !state.IsTerminalTaskState(task.State)
+	}
 	var stoppedCount int64
 	var skippedCount int64
-	for _, task := range tasks {
-		if state.IsTerminalTaskState(task.State) {
-			skippedCount++
+	for _, isActive := range active {
+		if isActive {
+			stoppedCount++
 			continue
 		}
-		stoppedCount++
+		skippedCount++
 	}
 	return stoppedCount, skippedCount
 }

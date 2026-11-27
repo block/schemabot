@@ -179,6 +179,20 @@ func (e *RemoteDeploymentUnavailableError) Unwrap() error {
 	return e.Err
 }
 
+// RemotePlanRefusalError is a remote data plane declining to plan the declared
+// schema, answered as FailedPrecondition, which the data plane sends only for
+// an engine's plan refusal. Its text is the refusal's own, without the gRPC
+// framing, so the pull request reads the same explanation a local refusal
+// gives. It wraps the status, so the status code and the statements the
+// refusal names still read through it.
+type RemotePlanRefusalError struct {
+	Err error
+}
+
+func (e *RemotePlanRefusalError) Error() string { return planRefusalReason(e.Err) }
+
+func (e *RemotePlanRefusalError) Unwrap() error { return e.Err }
+
 // handlePullSchema handles POST /api/pull requests.
 func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 	var req apitypes.PullSchemaRequest
@@ -1039,6 +1053,9 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 				Target:     resolvedTarget.Target,
 				Err:        err,
 			}
+		}
+		if client.IsRemote() && grpcstatus.Code(err) == grpccodes.FailedPrecondition {
+			return nil, nil, &RemotePlanRefusalError{Err: err}
 		}
 		return nil, nil, err
 	}
@@ -3267,7 +3284,7 @@ func buildApplyOperationGroups(
 		// A member planned on its own runs its own changes, not the apply plan's:
 		// its target holds a schema the apply plan never described.
 		memberChanges := applyTaskChanges(member.Plan)
-		tasks := buildApplyTasks(member.Plan, memberChanges, environment, applyOpts, "", now)
+		tasks := buildApplyTasks(member.Plan, storage.NewPlanChangeOrdinals(member.Plan), memberChanges, environment, applyOpts, "", now)
 		operationKey, err := keys.qualify(member, "")
 		if err != nil {
 			return nil, false, err
@@ -3547,6 +3564,7 @@ func buildShardedApplyOperationGroups(
 		// of a mirrored environment carries the apply's plan, so this is the same
 		// shard set for every member there.
 		shardsByNamespace := changingShardsByNamespace(member.Plan.Shards)
+		firstMemberGroup := len(groups)
 		namespaces := make([]string, 0, len(shardsByNamespace))
 		for namespace := range shardsByNamespace {
 			namespaces = append(namespaces, namespace)
@@ -3588,6 +3606,10 @@ func buildShardedApplyOperationGroups(
 					group.Tasks = append(group.Tasks, buildApplyTask(member.Plan, ddlChange, environment, applyOpts, shard.Shard, now))
 				}
 			}
+		}
+		ordinals := storage.NewPlanChangeOrdinals(member.Plan)
+		for _, group := range groups[firstMemberGroup:] {
+			ordinals.Assign(group.Tasks)
 		}
 		finalizers, err := buildNamespaceFinalizerOperations(applyPlan, member, keys, cutoverPolicy, onFailure, now)
 		if err != nil {
@@ -3710,6 +3732,7 @@ func newPendingApplyOperation(member applyMember, applyPlan *storage.Plan, opera
 
 func buildApplyTasks(
 	plan *storage.Plan,
+	ordinals *storage.PlanChangeOrdinals,
 	taskChanges []storage.TableChange,
 	environment string,
 	applyOpts storage.ApplyOptions,
@@ -3720,6 +3743,7 @@ func buildApplyTasks(
 	for _, ddlChange := range taskChanges {
 		tasks = append(tasks, buildApplyTask(plan, ddlChange, environment, applyOpts, shard, now))
 	}
+	ordinals.Assign(tasks)
 	return tasks
 }
 

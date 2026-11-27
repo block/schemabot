@@ -7,6 +7,8 @@ CREATE TABLE `apply_comments` (
   `posted_phase` varchar(32) DEFAULT NULL,
   `posted_cutover_operation_id` bigint DEFAULT NULL,
   `pending_freeze_github_comment_id` bigint DEFAULT NULL,
+  `freeze_github_comment_id` bigint DEFAULT NULL,
+  `frozen_body` mediumtext,
   `observer_owner` varchar(255) DEFAULT NULL,
   `observer_heartbeat_at` datetime DEFAULT NULL,
   `edit_count` int NOT NULL DEFAULT '0',

@@ -44,7 +44,7 @@ lockStore.Acquire(ctx, &Lock{DatabaseName: "mydb", DatabaseType: "mysql", Owner:
 // Idempotent if the same owner already holds it
 ```
 
-`ForceRelease` is an admin override for the `schemabot unlock` command.
+`ForceRelease` is an admin override for the `schemabot unlock` command. `ForceReleaseByID` is the same override pinned to the lock row the administrator was shown: it deletes only that row, and when a different row holds the lock it deletes nothing and returns `ErrLockReplaced`.
 
 ## State Machine
 

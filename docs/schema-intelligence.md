@@ -893,6 +893,29 @@ an override.
 The field is absent for an apply an operator stopped, and for one whose stop
 cannot be read, which reads as an ordinary stop.
 
+`control_requests` lists the latest request of each control operation made
+against the apply, so a caller that sent `stop`, `cancel`, or another control
+command can tell whether it took effect. Each entry carries the `operation`, a
+`status` of `pending`, `completed`, or `failed`, a `revision` that rises each
+time a new request follows a settled one, `requested_by`, and, once settled,
+`settled_at`. A `failed` entry's `error_message` says why the command did not
+take effect. A PostgreSQL step that commits or fails on its own, for example,
+declines a cancel and runs on. The field is absent when no control command was
+ever sent, and when the requests cannot be read.
+
+```json
+"control_requests": [
+  {
+    "operation": "cancel",
+    "status": "failed",
+    "revision": 0,
+    "error_message": "cancel is supported for PostgreSQL index builds only: this schema change runs as plain DDL that commits or fails on its own",
+    "requested_by": "cli:alice",
+    "settled_at": "2026-03-04T17:22:41Z"
+  }
+]
+```
+
 An unknown `apply_id` answers `404` with `error_code` `not_found`. When the apply
 exists but the server cannot read its progress from the data plane that runs it,
 the route answers `503` with `error_code` `engine_unavailable`. That covers a

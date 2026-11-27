@@ -104,6 +104,9 @@ func testChangeEventLifecycle(t *testing.T, db *sql.DB, newStore func(*sql.DB, .
 	require.ErrorIs(t, restartedStore.ApplyOperations().MarkFailed(first, opID, "refused write"), storage.ErrApplyLeaseLost)
 	require.NoError(t, restartedStore.ApplyOperations().MarkFailedRetryable(reattached, opID, "retry after engine failure"))
 	require.NoError(t, restartedStore.ApplyOperations().MarkFailedRetryable(reattached, opID, "retry after engine failure"))
+	released, err := restartedStore.ApplyOperations().ReleaseFinishedClaim(ctx, recovered.Lease())
+	require.NoError(t, err)
+	require.True(t, released)
 
 	apply.State = state.Apply.FailedRetryable
 	require.NoError(t, store.Applies().Update(ctx, apply))
