@@ -1065,13 +1065,9 @@ func refusalForCause(err error, table string) *refusal {
 			// would send them hunting for an object the target lacks.
 			object = "in the schema that would hold table " + quotedTable(table)
 		}
-		remedy := fmt.Sprintf("provision with: %s (verified by: %s)", privilegeErr.Grant, privilegeErr.Check)
-		if privilegeErr.Hint != "" {
-			remedy += "; " + privilegeErr.Hint
-		}
 		return &refusal{reason: "insufficient-privileges",
 			cause:         fmt.Sprintf("the engine role lacks access for %s %s", privilegeErr.Tier, object),
-			remedy:        remedy,
+			remedy:        privilegeRemedy(privilegeErr),
 			provisionable: true}
 	}
 	// An invalid-index verdict is decided by its own code, never by the build

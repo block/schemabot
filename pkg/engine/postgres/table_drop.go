@@ -268,11 +268,19 @@ func dependentsDropReason(dependents []string) string {
 }
 
 func privilegeDropReason(err *preflight.PrivilegeError) string {
-	reason := fmt.Sprintf("the engine role cannot drop it, because only the table's owner can drop a table — provision with: %s (verified by: %s)", err.Grant, err.Check)
+	return "the engine role cannot drop it, because only the table's owner can drop a table — " + privilegeRemedy(err)
+}
+
+// privilegeRemedy is the statement that provisions the access a privilege
+// refusal names, with the refusal's hint. The catalog check that failed is
+// how the engine proved the access missing, not something the reader runs,
+// so it is left out.
+func privilegeRemedy(err *preflight.PrivilegeError) string {
+	remedy := "provision with: " + err.Grant
 	if err.Hint != "" {
-		reason += "; " + err.Hint
+		remedy += "; " + err.Hint
 	}
-	return reason
+	return remedy
 }
 
 // tableDropRefusals reads the reasons the target already gives to refuse
