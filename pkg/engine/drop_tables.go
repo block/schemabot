@@ -17,6 +17,8 @@ import (
 // leftover "_" table, so it is deliberately narrow: an entry names exactly one
 // table, matched exactly and case-sensitively, and a family of tables is
 // listed one by one, so the config diff shows every table a plan will drop.
+// The one comparison that ignores case is the refusal of the cutover
+// sentinel, which errs toward refusing.
 //
 // The zero value names nothing.
 type DroppedTables struct {

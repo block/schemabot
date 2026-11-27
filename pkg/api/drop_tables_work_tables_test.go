@@ -348,6 +348,29 @@ func TestPlanRefusesADropOfTheCutoverSentinel(t *testing.T) {
 	}
 }
 
+// A plan stored by an older server can carry a drop_tables list naming the
+// cutover sentinel. Apply creation holds the stored list to the same rule a
+// new plan is, so applying that plan by its id is refused as a blocked plan
+// and nothing is stored.
+func TestExecuteApplyRefusesAStoredPlanThatDropsTheCutoverSentinel(t *testing.T) {
+	svc, created, tasks := applyServiceWithAStoppedApplyOnUsers()
+	stored := executeApplyTestPlan()
+	stored.RecordDropTables([]string{"_SPIRIT_SENTINEL"})
+	svc.storage.(*mockStorageWithApplyStores).plans.(*staticPlanStore).plan = stored
+
+	resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{PlanID: "plan-1", Environment: "staging"})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `drop_tables entry "_SPIRIT_SENTINEL" is the table that holds a deferred cutover`)
+	_, blocked := errors.AsType[*blockedPlanError](err)
+	assert.True(t, blocked, "the refusal answers as a blocked plan: %v", err)
+	assert.Nil(t, resp)
+	assert.Zero(t, applyID)
+	assert.Nil(t, created.apply, "no apply is stored")
+	assert.Empty(t, tasks.tasks)
+	assert.Equal(t, applyMetricStatusRejected, applyMetricStatusForError(err), "the refusal is the caller's to resolve, not a server error")
+}
+
 // A data plane that predates drop_tables plans as though the list were empty:
 // the listed leftover stays, disclosed as a table skipped by its name. The
 // plan is kept, because that is the outcome the repository had before it

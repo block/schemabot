@@ -2441,6 +2441,12 @@ func (s *Service) createStoredApply(
 	if err := rejectUnsafeStoredPlanWithoutOptIn(plan, applyOpts); err != nil {
 		return nil, 0, err
 	}
+	// A plan an older server stored may carry a drop_tables entry the rule
+	// now refuses, such as the cutover sentinel, so its recorded list is
+	// held to the same rule a new plan is.
+	if _, err := engine.NewDroppedTables(plan.DropTables()); err != nil {
+		return nil, 0, &blockedPlanError{cause: err}
+	}
 	// An apply stopped after this plan was made is checked here: storage
 	// admits a new apply past a stopped one.
 	if err := s.refuseDropsOfUnsettledApplyWorkTables(ctx, plan.Database, plan.DatabaseType, req.Environment, plan.DropTables()); err != nil {
