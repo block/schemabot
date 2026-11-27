@@ -59,10 +59,10 @@ width as well as their native size (1100 × 670, 1100 × 740 for the shard, roll
 
 Pass a scenario name, such as `cli-vitess`, as the renderer’s first argument
 to refresh only that GIF. The PlanetScale fixture checks Enter against start
-and skip-revert requests, and checks that **c** sends the stop request used
-by the PlanetScale engine to cancel the deploy request.
+and skip-revert requests, and checks that **c** sends the cancel request for
+the apply.
 
-The operations animation runs `LogsCmd` against a loopback logs response, including its real follow prompt and colored formatter. The fixture cancels after the initial window; no external logs are fetched. Log messages match the queue event, Spirit runner output, and replica throttler. Selected batches arrive at compressed intervals, with the most recent 14 terminal lines kept in view as the tail scrolls.
+The operations animation runs `LogsCmd` against a loopback logs response, including its real follow prompt and colored formatter. The fixture ends the tail on its first poll, once the initial window has printed; no external logs are fetched. Log messages match the queue event, Spirit runner output, and replica throttler. Selected batches arrive at compressed intervals, with the most recent 14 terminal lines kept in view as the tail scrolls.
 
 The inventory uses the real databases command against a loopback fixture. The status fixture totals 500 changes and renders the default 20 rows, shown together in a stationary view.
 
