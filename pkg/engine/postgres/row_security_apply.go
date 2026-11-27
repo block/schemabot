@@ -71,6 +71,13 @@ func planCreateWithRowSecurity(ctx context.Context, pool *pgxpool.Pool, namespac
 	if errors.Is(err, preflight.ErrRelationExists) {
 		return nil, fmt.Errorf("table %q.%q was created while it was planned; plan again: %w", namespace, desired.Table(), err)
 	}
+	if r := classifyRefusal(err, desired.Table()); r != nil && r.provisionable {
+		// The target lacks something the create needs, such as the schema
+		// that would hold the table: the same verdict a table without row
+		// security gets, so the plan shows the create blocked with what to
+		// provision instead of failing.
+		return []engine.TableChange{blockedCreateWithRowSecurity(desired, r.detail)}, nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("preview creating table %q.%q with its row security: %w", namespace, desired.Table(), err)
 	}
@@ -78,6 +85,23 @@ func planCreateWithRowSecurity(ctx context.Context, pool *pgxpool.Pool, namespac
 		Table: desired.Table(), Operation: ddl.StatementCreateTable,
 		DDL: strings.Join(preview.Statements, ";\n"),
 	}}, nil
+}
+
+// blockedCreateWithRowSecurity is the create of desired, shown as the file
+// declares it, blocked with reason. The preview never ran, so the plan has no
+// derived statements to show; the file's own are what the operator wrote.
+func blockedCreateWithRowSecurity(desired statement.DesiredWithRowSecurity, reason string) engine.TableChange {
+	statements := desired.Statements()
+	sql := make([]string, 0, len(statements))
+	for _, stmt := range statements {
+		sql = append(sql, stmt.SQL())
+	}
+	return engine.TableChange{
+		Table: desired.Table(), Operation: ddl.StatementCreateTable,
+		DDL:           strings.Join(sql, ";\n"),
+		ExecutionMode: engine.ExecutionModeBlocked,
+		ModeReason:    reason,
+	}
 }
 
 // createsTableWithRowSecurity reports whether planned row security DDL

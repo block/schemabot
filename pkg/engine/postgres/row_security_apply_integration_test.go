@@ -210,6 +210,39 @@ func TestEngineCreateWithRowSecurityPlanAndApply(t *testing.T) {
 	assert.True(t, rollback.Changes[0].TableChanges[0].IsUnsafe)
 }
 
+// An owner declares a table with row security in a namespace the target does
+// not have yet. The plan shows the create blocked with the same cause a table
+// without row security gets, naming the schema to create, instead of failing
+// the plan.
+func TestEngineCreateWithRowSecurityInAMissingSchemaIsBlocked(t *testing.T) {
+	dsn, _ := testutil.StartPostgres(t, "rls_create_missing_schema")
+	eng := New()
+	plan := func(t *testing.T, file string) engine.TableChange {
+		t.Helper()
+		result, err := eng.Plan(t.Context(), &engine.PlanRequest{Database: "rls_create_missing_schema", Credentials: &engine.Credentials{DSN: dsn},
+			SchemaFiles: schema.SchemaFiles{"rls1": {Files: map[string]string{"documents.sql": file}}}})
+		require.NoError(t, err)
+		require.Len(t, result.Changes, 1)
+		require.Len(t, result.Changes[0].TableChanges, 1)
+		return result.Changes[0].TableChanges[0]
+	}
+
+	withRowSecurity := plan(t, `
+  CREATE TABLE documents (id bigint PRIMARY KEY);
+  ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON documents FOR SELECT USING (id = 1);
+ `)
+	without := plan(t, `CREATE TABLE documents (id bigint PRIMARY KEY);`)
+
+	assert.Equal(t, "documents", withRowSecurity.Table)
+	assert.Equal(t, ddl.StatementCreateTable, withRowSecurity.Operation)
+	assert.Equal(t, engine.ExecutionModeBlocked, withRowSecurity.ExecutionMode)
+	assert.Equal(t, `the schema that would hold table "documents" does not exist on the target; create the schema first`, withRowSecurity.ModeReason)
+	assert.Equal(t, without.ModeReason, withRowSecurity.ModeReason, "row security does not change the verdict on a missing schema")
+	assert.Contains(t, withRowSecurity.DDL, "CREATE TABLE documents")
+	assert.Contains(t, withRowSecurity.DDL, "CREATE POLICY readers ON documents")
+}
+
 // An apply runs the reviewed create only when the reviewed desired file still
 // derives the same statements. A schema file edited after the review derives
 // a different sequence, so the apply refuses and creates nothing.

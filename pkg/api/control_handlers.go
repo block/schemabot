@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"slices"
 	"strings"
@@ -124,6 +125,30 @@ func controlOperationErrorCode(err error) string {
 	return ""
 }
 
+// rollbackNotCapturedConflict refuses a rollback of an apply whose plan could
+// not save the current schema of a namespace. When the plan recorded which
+// tables kept it from saving, the refusal names them with why, as the plan
+// did before anyone applied it, and names the way to undo the change instead.
+func rollbackNotCapturedConflict(apply *storage.Apply, plan *storage.Plan) error {
+	for _, namespace := range slices.Sorted(maps.Keys(plan.Namespaces)) {
+		data := plan.Namespaces[namespace]
+		if data == nil || data.OriginalFilesCaptured || len(data.RollbackBlockers) == 0 {
+			continue
+		}
+		shown, more := presentation.RollbackBlockersShown(len(data.RollbackBlockers))
+		tables := make([]string, 0, shown+1)
+		for _, blocker := range data.RollbackBlockers[:shown] {
+			tables = append(tables, fmt.Sprintf("%s (%s)", blocker.Table, blocker.Reason))
+		}
+		if more > 0 {
+			tables = append(tables, presentation.RollbackBlockersMore(more))
+		}
+		return controlConflictf("apply %s can't be rolled back: when it was planned, SchemaBot couldn't save the current schema of these tables in namespace %s: %s. To undo the change, revert the schema files in a new pull request.",
+			apply.ApplyIdentifier, namespace, strings.Join(tables, ", "))
+	}
+	return controlConflictf("apply %s cannot be rolled back safely because its source plan has no stored original schema files", apply.ApplyIdentifier)
+}
+
 func controlOperationHTTPStatus(err error) int {
 	if status, _, ok := changeGateErrorStatus(err); ok {
 		return status
@@ -237,7 +262,7 @@ func (s *Service) ValidateRollbackSourceApply(ctx context.Context, req RollbackS
 		return apply, nil, terminalControlf("source plan %d not found for rollback apply %s", apply.PlanID, apply.ApplyIdentifier)
 	}
 	if !plan.HasOriginalFilesCapture() {
-		return apply, plan, controlConflictf("apply %s cannot be rolled back safely because its source plan has no stored original schema files", apply.ApplyIdentifier)
+		return apply, plan, rollbackNotCapturedConflict(apply, plan)
 	}
 
 	latestTask, err := latestCompletedTaskForRollback(ctx, taskStore, apply.Database, apply.DatabaseType, apply.Environment)
