@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -95,16 +96,19 @@ func (cmd *CancelCmd) Run(g *Globals) error {
 	var settled cancelSettlement
 	lookupErr := withLoading("Waiting for the schema change to end...", true, func() error {
 		var awaitErr error
-		settled, awaitErr = cmd.awaitEnd(ep, result.ControlRequest(cancelOperation))
+		settled, awaitErr = cmd.awaitEnd(ep, cancelRequestMatcher{
+			accepted: cancelResult.ControlRequestRevision,
+			before:   result.ControlRequest(cancelOperation),
+		})
 		return awaitErr
 	})
 	switch {
-	case settled.declined != nil:
+	case settled.state == "" && settled.request.declined():
 		templates.WriteCancelDeclined(templates.CancelDeclinedData{
 			Database:    cmd.Database,
 			Environment: cmd.Environment,
 			ApplyID:     cmd.ApplyID,
-			Reason:      settled.declined.ErrorMessage,
+			Reason:      settled.request.ErrorMessage,
 		})
 	case state.IsState(settled.state, state.Apply.Cancelled):
 		templates.WriteCancelSuccess(templates.CancelData{
@@ -112,6 +116,13 @@ func (cmd *CancelCmd) Run(g *Globals) error {
 			Environment:    cmd.Environment,
 			CancelledCount: int(cancelResult.CancelledCount),
 			SkippedCount:   int(cancelResult.SkippedCount),
+		})
+	case settled.state != "" && settled.request.completed():
+		templates.WriteCancelTookEffect(templates.CancelOvertakenData{
+			Database:    cmd.Database,
+			Environment: cmd.Environment,
+			ApplyID:     cmd.ApplyID,
+			State:       settled.state,
 		})
 	case settled.state != "":
 		templates.WriteCancelOvertaken(templates.CancelOvertakenData{
@@ -137,20 +148,76 @@ func (cmd *CancelCmd) Run(g *Globals) error {
 const cancelOperation = "cancel"
 
 // cancelSettlement is how a cancel's wait ended: the state the apply ended
-// in, or the cancel request the schema change declined while it runs on.
-// Both are empty when the apply is still active at the deadline.
+// in, if it ended, and this cancel's request as last read, if the progress
+// answer named it. Both are empty when the wait read neither before its
+// deadline.
 type cancelSettlement struct {
-	state    string
-	declined *apitypes.ControlRequestOutcome
+	state   string
+	request *cancelRequest
 }
 
-// awaitEnd polls the apply until it ends, its cancel request is declined, or
-// the settle timeout passes. before is the apply's cancel request as read
-// before this cancel was sent, so a request settled by an earlier cancel is
-// not mistaken for this one's answer. It returns the read error when the
-// apply's state could not be read. A stopped apply has not ended: the cancel
-// of a stopped apply still waits for a driver to consume it.
-func (cmd *CancelCmd) awaitEnd(ep string, before *apitypes.ControlRequestOutcome) (cancelSettlement, error) {
+// cancelRequest is this cancel's request as the progress API reports it.
+type cancelRequest struct {
+	apitypes.ControlRequestOutcome
+}
+
+func (r *cancelRequest) declined() bool {
+	return r != nil && r.Status == string(storage.ControlRequestFailed)
+}
+
+func (r *cancelRequest) completed() bool {
+	return r != nil && r.Status == string(storage.ControlRequestCompleted)
+}
+
+func (r *cancelRequest) settled() bool {
+	return r.declined() || r.completed()
+}
+
+// cancelRequestMatcher picks this cancel's request out of a progress answer.
+// The cancel request row is re-armed in place for every later cancel, so a
+// reported request is this cancel's only at the revision it was accepted at.
+type cancelRequestMatcher struct {
+	// accepted is the revision the server accepted this cancel at, or nil
+	// when the server does not report one.
+	accepted *int64
+	// before is the apply's cancel request as read before this cancel was
+	// sent, used only when accepted is nil.
+	before *apitypes.ControlRequestOutcome
+}
+
+// match returns req when it is this cancel's request. With the accepted
+// revision, that is req at exactly that revision: a later revision is a cancel
+// someone else sent after this one settled, and its outcome is not this
+// one's. Without it, req is this cancel's when none was recorded before it was
+// sent, when the one recorded then was still pending (the server answers a
+// repeat cancel with that request), or when it carries a later revision than
+// one that had already settled.
+func (m cancelRequestMatcher) match(req *apitypes.ControlRequestOutcome) *cancelRequest {
+	if req == nil {
+		return nil
+	}
+	if m.accepted != nil {
+		if req.Revision != *m.accepted {
+			return nil
+		}
+		return &cancelRequest{*req}
+	}
+	if m.before == nil || m.before.Status == string(storage.ControlRequestPending) || req.Revision > m.before.Revision {
+		return &cancelRequest{*req}
+	}
+	return nil
+}
+
+// awaitEnd polls the apply until the cancel's outcome is known or the settle
+// timeout passes, under one deadline that bounds every poll. The outcome is
+// known when the apply ends cancelled, when this cancel's request settles, or
+// when the apply ends and the progress answer names no request to wait on. An
+// apply can end failed with the cancel still pending, as when one shard failed
+// and the cancel ends the rest, so an ended apply waits for its request to
+// settle. It returns the read error when the apply's state could not be read.
+// A stopped apply has not ended: the cancel of a stopped apply still waits for
+// a driver to consume it.
+func (cmd *CancelCmd) awaitEnd(ep string, matcher cancelRequestMatcher) (cancelSettlement, error) {
 	timeout := cmd.settleTimeout
 	if timeout == 0 {
 		timeout = cancelSettleTimeout
@@ -159,38 +226,44 @@ func (cmd *CancelCmd) awaitEnd(ep string, before *apitypes.ControlRequestOutcome
 	if interval == 0 {
 		interval = cancelSettlePollInterval
 	}
-	deadline := time.Now().Add(timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	var last cancelSettlement
 	for {
-		progress, err := client.GetProgress(ep, cmd.ApplyID)
+		progress, err := client.GetProgressCtx(ctx, ep, cmd.ApplyID)
 		if err != nil {
-			return cancelSettlement{}, fmt.Errorf("get progress for apply %s: %w", cmd.ApplyID, err)
+			if ctx.Err() != nil {
+				return last, nil
+			}
+			return last, fmt.Errorf("get progress for apply %s: %w", cmd.ApplyID, err)
 		}
+		last = cancelSettlement{request: matcher.match(progress.ControlRequest(cancelOperation))}
 		if applyHasEnded(progress.State) {
-			return cancelSettlement{state: progress.State}, nil
+			last.state = progress.State
 		}
-		if req := progress.ControlRequest(cancelOperation); cancelDeclined(req, before) {
-			return cancelSettlement{declined: req}, nil
+		if cancelOutcomeKnown(last, progress) {
+			return last, nil
 		}
-		if time.Now().Add(interval).After(deadline) {
-			return cancelSettlement{}, nil
+		select {
+		case <-ctx.Done():
+			return last, nil
+		case <-time.After(interval):
 		}
-		time.Sleep(interval)
 	}
 }
 
-// cancelDeclined reports whether req is this cancel's request and the
-// schema change declined it. The request is this cancel's when none was
-// recorded before it was sent, when the one recorded then was still pending
-// (the server answers a repeat cancel with that request), or when it carries
-// a later revision than a request that had already settled.
-func cancelDeclined(req, before *apitypes.ControlRequestOutcome) bool {
-	if req == nil || req.Status != string(storage.ControlRequestFailed) {
-		return false
-	}
-	if before == nil || before.Status == string(storage.ControlRequestPending) {
+// cancelOutcomeKnown reports whether the wait can stop: the apply ended
+// cancelled, this cancel's request settled, or the apply ended and the
+// progress answer reports no cancel request to wait on.
+func cancelOutcomeKnown(settled cancelSettlement, progress *apitypes.ProgressResponse) bool {
+	if state.IsState(settled.state, state.Apply.Cancelled) {
 		return true
 	}
-	return req.Revision > before.Revision
+	if settled.request.settled() {
+		return true
+	}
+	return settled.state != "" && progress.ControlRequest(cancelOperation) == nil
 }
 
 // applyHasEnded reports whether an apply is in a terminal state a cancel can

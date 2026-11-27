@@ -41,6 +41,9 @@ type controlTestStub struct {
 	// control request has arrived.
 	controlRequests             []apitypes.ControlRequestOutcome
 	controlRequestsAfterControl []apitypes.ControlRequestOutcome
+	// progressDelayAfterControl, when set, holds every progress lookup made
+	// after the control request has arrived for that long before answering.
+	progressDelayAfterControl time.Duration
 }
 
 // controlTestServer serves a schema change in the given state and answers the
@@ -65,7 +68,18 @@ func serveControlTestStub(t *testing.T, stub controlTestStub) (*httptest.Server,
 	currentState := stub.applyState
 	progressStatus := stub.progressStatus
 	controlRequests := stub.controlRequests
+	var progressDelay time.Duration
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		delay := progressDelay
+		mu.Unlock()
+		if delay > 0 && r.Method == http.MethodGet {
+			select {
+			case <-time.After(delay):
+			case <-r.Context().Done():
+				return
+			}
+		}
 		mu.Lock()
 		defer mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
@@ -95,6 +109,7 @@ func serveControlTestStub(t *testing.T, stub controlTestStub) (*httptest.Server,
 			if stub.controlRequestsAfterControl != nil {
 				controlRequests = stub.controlRequestsAfterControl
 			}
+			progressDelay = stub.progressDelayAfterControl
 			if stub.controlStatus != 0 {
 				w.WriteHeader(stub.controlStatus)
 			}
@@ -354,6 +369,80 @@ func TestCancelCmdIgnoresAnEarlierDeclinedCancel(t *testing.T) {
 	assertSentOnce(t, *requests)
 	assert.Contains(t, out, "⏳ Cancel requested\n")
 	assert.NotContains(t, out, "an earlier decline")
+}
+
+// An operator cancels a sharded apply after one shard has already failed. The
+// cancel ends the shards still running and the apply ends failed, since
+// failed outranks cancelled. The cancel did what was asked, so the output says
+// it took effect and why the apply reads failed, rather than saying the
+// schema change ended before the cancel could act.
+func TestCancelCmdReportsACancelThatEndedTheRestOfAFailedRollout(t *testing.T) {
+	accepted := int64(3)
+	server, requests := serveControlTestStub(t, controlTestStub{
+		applyState:        state.Apply.Running,
+		controlPath:       "/api/cancel",
+		controlBody:       apitypes.CancelResponse{Accepted: true, CancelledCount: 2, ControlRequestRevision: &accepted},
+		stateAfterControl: state.Apply.Failed,
+		controlRequestsAfterControl: []apitypes.ControlRequestOutcome{
+			{Operation: "cancel", Status: "completed", Revision: accepted},
+		},
+	})
+
+	cmd := CancelCmd{ControlFlags: controlTestFlags(), AutoApprove: true, settleTimeout: time.Second, settlePollInterval: 10 * time.Millisecond}
+	out, err := runControlCmd(server.URL, cmd.Run)
+	require.NoError(t, err)
+	assertSentOnce(t, *requests)
+	assert.Equal(t, "✖ Cancel took effect\n\n"+
+		"Database:    orders\n"+
+		"Environment: staging\n\n"+
+		"The parts still running were cancelled. The schema change ended "+state.Apply.Failed+" because another part had already failed.\n"+
+		"This schema change cannot be resumed.\n\n"+
+		"To see what failed:\n"+
+		"  schemabot progress "+controlTestApplyID+" -e staging\n", out)
+}
+
+// The apply's cancel request is re-armed for every later cancel. When another
+// operator's cancel re-arms it after this one settled and the engine declines
+// that one, the decline is not this cancel's answer, so this cancel reads as
+// requested rather than declined.
+func TestCancelCmdIgnoresALaterCancelsDecline(t *testing.T) {
+	accepted := int64(1)
+	server, requests := serveControlTestStub(t, controlTestStub{
+		applyState:  state.Apply.Running,
+		controlPath: "/api/cancel",
+		controlBody: apitypes.CancelResponse{Accepted: true, CancelledCount: 1, ControlRequestRevision: &accepted},
+		controlRequestsAfterControl: []apitypes.ControlRequestOutcome{
+			{Operation: "cancel", Status: "failed", Revision: 2, ErrorMessage: "a later cancel's decline"},
+		},
+	})
+
+	cmd := CancelCmd{ControlFlags: controlTestFlags(), AutoApprove: true, settleTimeout: 30 * time.Millisecond, settlePollInterval: 10 * time.Millisecond}
+	out, err := runControlCmd(server.URL, cmd.Run)
+	require.NoError(t, err)
+	assertSentOnce(t, *requests)
+	assert.Contains(t, out, "⏳ Cancel requested\n")
+	assert.NotContains(t, out, "a later cancel's decline")
+}
+
+// A progress lookup that hangs does not hold the cancel past its settle
+// timeout: one deadline bounds the whole wait, including a lookup in flight,
+// and the cancel reads as requested when it passes.
+func TestCancelCmdWaitIsBoundedBySettleTimeout(t *testing.T) {
+	server, requests := serveControlTestStub(t, controlTestStub{
+		applyState:                state.Apply.Running,
+		controlPath:               "/api/cancel",
+		controlBody:               apitypes.CancelResponse{Accepted: true, CancelledCount: 1},
+		progressDelayAfterControl: 10 * time.Second,
+	})
+
+	cmd := CancelCmd{ControlFlags: controlTestFlags(), AutoApprove: true, settleTimeout: 50 * time.Millisecond, settlePollInterval: 10 * time.Millisecond}
+	started := time.Now()
+	out, err := runControlCmd(server.URL, cmd.Run)
+	require.NoError(t, err)
+	assert.Less(t, time.Since(started), 5*time.Second, "the settle timeout bounds a hanging progress lookup")
+	assertSentOnce(t, *requests)
+	assert.Contains(t, out, "⏳ Cancel requested\n")
+	assert.Contains(t, out, "The cancel is recorded. The schema change is still running")
 }
 
 // When the server refuses a control request, the CLI returns the server's

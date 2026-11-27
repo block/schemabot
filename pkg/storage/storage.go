@@ -2328,6 +2328,13 @@ type ControlRequestStore interface {
 	// is lowercase ASCII, which all supported dialects order identically.
 	ListSettled(ctx context.Context, applyID int64) ([]*ApplyControlRequest, error)
 
+	// ListByApply returns every control request for an apply, whatever its
+	// status, ordered by operation ascending, read in one statement so each
+	// operation appears once and from one snapshot. A reader reporting whether
+	// a command took effect uses it: two status-filtered reads can each miss a
+	// row that settles or re-arms between them.
+	ListByApply(ctx context.Context, applyID int64) ([]*ApplyControlRequest, error)
+
 	// RecordRemoteFailure records the terminal failure another plane reported
 	// for a control request, and creates the row when the local plane never held
 	// one. A locally completed row means the request was queued there, which a

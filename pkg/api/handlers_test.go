@@ -649,6 +649,10 @@ func (s *memoryControlRequestStore) ListSettled(_ context.Context, applyID int64
 	return s.latestByOperation(applyID, false), nil
 }
 
+func (s *memoryControlRequestStore) ListByApply(_ context.Context, applyID int64) ([]*storage.ApplyControlRequest, error) {
+	return append(s.latestByOperation(applyID, true), s.latestByOperation(applyID, false)...), nil
+}
+
 func (s *memoryControlRequestStore) latestByOperation(applyID int64, pending bool) []*storage.ApplyControlRequest {
 	s.mu.Lock()
 	defer s.mu.Unlock()

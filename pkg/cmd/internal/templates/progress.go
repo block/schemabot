@@ -1065,6 +1065,21 @@ func WriteCancelOvertaken(data CancelOvertakenData) {
 	fmt.Print(FormatNextCommand("To see how it ended", ControlCommand("progress", data.ApplyID, data.Environment)))
 }
 
+// WriteCancelTookEffect writes the output of a cancel that ended every part of
+// the schema change still running, on an apply that ended in another state
+// because a part of it had already failed.
+func WriteCancelTookEffect(data CancelOvertakenData) {
+	fmt.Printf("%s%s✖ Cancel took effect%s\n", ANSIBold, ANSIOrange, ANSIReset)
+	fmt.Println()
+	fmt.Printf("Database:    %s\n", data.Database)
+	fmt.Printf("Environment: %s\n", data.Environment)
+	fmt.Println()
+	fmt.Printf("The parts still running were cancelled. The schema change ended %s because another part had already failed.\n", data.State)
+	fmt.Printf("%sThis schema change cannot be resumed.%s\n", ANSIDim, ANSIReset)
+	fmt.Println()
+	fmt.Print(FormatNextCommand("To see what failed", ControlCommand("progress", data.ApplyID, data.Environment)))
+}
+
 // StartData contains data for rendering start command output.
 type StartData struct {
 	Database     string

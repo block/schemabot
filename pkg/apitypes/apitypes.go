@@ -1935,6 +1935,12 @@ type CancelResponse struct {
 	CancelledCount int64  `json:"cancelled_count"`
 	SkippedCount   int64  `json:"skipped_count"`
 	Status         string `json:"status,omitempty"`
+	// ControlRequestRevision is the revision of the cancel request this call
+	// recorded or joined. The progress API's control_requests entry for
+	// cancel carries the same revision until the request is re-armed by a
+	// later cancel, so a caller waiting on this cancel's outcome matches on
+	// it. Omitted when the cancel was not accepted.
+	ControlRequestRevision *int64 `json:"control_request_revision,omitempty"`
 }
 
 // StartResponse is the HTTP response for POST /api/start.

@@ -19,20 +19,14 @@ func (s *Service) progressControlRequests(ctx context.Context, apply *storage.Ap
 	if control == nil || apply == nil {
 		return nil
 	}
-	pending, err := control.ListPending(ctx, apply.ID)
+	requests, err := control.ListByApply(ctx, apply.ID)
 	if err != nil {
-		s.logger.Warn("progress omits control request outcomes: failed to list pending control requests",
+		s.logger.Warn("progress omits control request outcomes: failed to list the apply's control requests",
 			append(apply.LogAttrs(), "error", err)...)
 		return nil
 	}
-	settled, err := control.ListSettled(ctx, apply.ID)
-	if err != nil {
-		s.logger.Warn("progress omits control request outcomes: failed to list settled control requests",
-			append(apply.LogAttrs(), "error", err)...)
-		return nil
-	}
-	out := make([]apitypes.ControlRequestOutcome, 0, len(pending)+len(settled))
-	for _, req := range append(pending, settled...) {
+	out := make([]apitypes.ControlRequestOutcome, 0, len(requests))
+	for _, req := range requests {
 		outcome := apitypes.ControlRequestOutcome{
 			Operation:   string(req.Operation),
 			Status:      string(req.Status),
