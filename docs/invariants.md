@@ -2235,7 +2235,7 @@ only under a deployment-wide grant. *Enforced:* the
 trust-anchor config, which refuses to start without one, and identity-precedence rules in the auth
 layer (`pkg/auth`); the scoped lock release and re-acquire in `pkg/api/lock_handlers.go`, the release
 pinned to the lock row it checked, or to the row the caller named when it sends one, and the
-re-acquire told which row its acquire created (`ReleaseByID`, `ReleaseByIDIfUnused` and `Acquire` in
+re-acquire told which row its acquire created (`ReleaseByID`, `ReleaseByIDIfUnused`, `ForceReleaseByID` and `Acquire` in
 `pkg/storage/internal/sqlstore/locks.go`).
 
 ### AZ-4: Applying takes an authorized actor

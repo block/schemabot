@@ -176,3 +176,94 @@ func TestLockReleaseByID_KeepsALockTakenAgainUnderTheSameOwner(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, held, "command B's own release, naming its row, releases it")
 }
+
+// forceReleaseTestappLock sends a forced release of testapp's lock with extra
+// as the rest of the request body, and returns the answer.
+func forceReleaseTestappLock(t *testing.T, svc *Service, extra string) *httptest.ResponseRecorder {
+	t.Helper()
+	return serveLockRequest(t, svc.handleLockRelease, http.MethodDelete, "/api/locks",
+		`{"database":"testapp","database_type":"mysql","force":true`+extra+`}`)
+}
+
+// An administrator is shown that alice holds the testapp lock and is asked to
+// confirm a forced release. The release names the lock row they were shown, so
+// it removes that row whoever owns it.
+func TestForceLockRelease_ByIDReleasesTheLockNamed(t *testing.T) {
+	ctx := t.Context()
+	svc, st := lockReleaseByIDService(t)
+
+	shown := acquireTestappLock(t, svc)
+
+	rec := forceReleaseTestappLock(t, svc, `,"id":`+strconv.FormatInt(shown.Lock.ID, 10))
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.JSONEq(t, `{"status":"released"}`, rec.Body.String())
+	held, err := st.Locks().Get(ctx, "testapp", storage.DatabaseTypeMySQL)
+	require.NoError(t, err)
+	assert.Nil(t, held, "the lock the administrator was shown is released")
+}
+
+// While the administrator's question is open, alice's lock is released and
+// another owner takes the testapp lock. The forced release names the row the
+// administrator was shown, so it releases nothing: the new lock stays held under
+// its owner and the answer names it.
+func TestForceLockRelease_ByIDKeepsALockTakenSinceItWasShown(t *testing.T) {
+	ctx := t.Context()
+	svc, st := lockReleaseByIDService(t)
+
+	shown := acquireTestappLock(t, svc)
+	require.NoError(t, st.Locks().Release(ctx, "testapp", storage.DatabaseTypeMySQL, lockReleaseByIDOwner))
+	require.NoError(t, st.Locks().Acquire(ctx, &storage.Lock{
+		DatabaseName: "testapp", DatabaseType: storage.DatabaseTypeMySQL, Owner: "cli:bob@desktop",
+	}))
+	taken, err := st.Locks().Get(ctx, "testapp", storage.DatabaseTypeMySQL)
+	require.NoError(t, err)
+	require.NotNil(t, taken)
+	require.NotEqual(t, shown.Lock.ID, taken.ID)
+
+	rec := forceReleaseTestappLock(t, svc, `,"id":`+strconv.FormatInt(shown.Lock.ID, 10))
+
+	require.Equal(t, http.StatusConflict, rec.Code, rec.Body.String())
+	var resp apitypes.ErrorResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Equal(t, apitypes.ErrCodeLockReplaced, resp.ErrorCode)
+	assert.Equal(t,
+		`lock on database "testapp" is no longer the lock this release named: lock `+strconv.FormatInt(taken.ID, 10)+
+			` holds it now, not lock `+strconv.FormatInt(shown.Lock.ID, 10)+
+			`; nothing was released, so look at the lock held now before releasing it`,
+		resp.Error)
+	held, err := st.Locks().Get(ctx, "testapp", storage.DatabaseTypeMySQL)
+	require.NoError(t, err)
+	require.NotNil(t, held, "the lock taken since stays held")
+	assert.Equal(t, taken.ID, held.ID)
+	assert.Equal(t, "cli:bob@desktop", held.Owner)
+}
+
+// The lock the administrator was shown is already gone when the forced release
+// arrives, so the answer is that no lock is held.
+func TestForceLockRelease_ByIDReportsNoLockHeld(t *testing.T) {
+	svc, _ := lockReleaseByIDService(t)
+
+	rec := forceReleaseTestappLock(t, svc, `,"id":42`)
+
+	require.Equal(t, http.StatusNotFound, rec.Code, rec.Body.String())
+	var resp apitypes.ErrorResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Equal(t, "lock not found", resp.Error)
+}
+
+// A forced release that names no lock row removes whichever lock is held, as a
+// client that predates the row ID sends it.
+func TestForceLockRelease_WithoutIDReleasesWhateverIsHeld(t *testing.T) {
+	ctx := t.Context()
+	svc, st := lockReleaseByIDService(t)
+
+	acquireTestappLock(t, svc)
+
+	rec := forceReleaseTestappLock(t, svc, ``)
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	held, err := st.Locks().Get(ctx, "testapp", storage.DatabaseTypeMySQL)
+	require.NoError(t, err)
+	assert.Nil(t, held)
+}
