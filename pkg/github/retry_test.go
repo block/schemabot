@@ -62,6 +62,41 @@ func TestIsGitHubUnavailableClassification(t *testing.T) {
 	}
 }
 
+// TestIsRejectedRequestError pins down which failures count as a request
+// GitHub will refuse however often it is repeated. Callers stop retrying on
+// these, so availability failures, rate limits, and 404 must never match.
+func TestIsRejectedRequestError(t *testing.T) {
+	t.Parallel()
+
+	retryAfter := 5 * time.Second
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "403 forbidden", err: ghErrorResponse(http.StatusForbidden, "Resource not accessible by integration"), want: true},
+		{name: "422 validation failed", err: ghErrorResponse(http.StatusUnprocessableEntity, "Validation Failed"), want: true},
+		{name: "400 with a real validation message", err: ghErrorResponse(http.StatusBadRequest, "invalid request"), want: true},
+		{name: "wrapped 422", err: fmt.Errorf("edit issue comment: %w", ghErrorResponse(http.StatusUnprocessableEntity, "body is too long")), want: true},
+		{name: "404 is gone, not rejected", err: ghErrorResponse(http.StatusNotFound, "Not Found"), want: false},
+		{name: "429 too many requests", err: ghErrorResponse(http.StatusTooManyRequests, "slow down"), want: false},
+		{name: "empty-body 400 from the edge", err: ghErrorResponse(http.StatusBadRequest, ""), want: false},
+		{name: "500 internal server error", err: ghErrorResponse(http.StatusInternalServerError, "boom"), want: false},
+		{name: "primary rate limit", err: &gh.RateLimitError{Rate: gh.Rate{Reset: gh.Timestamp{Time: time.Now().Add(time.Minute)}}}, want: false},
+		{name: "secondary rate limit", err: &gh.AbuseRateLimitError{RetryAfter: &retryAfter}, want: false},
+		{name: "context deadline exceeded", err: context.DeadlineExceeded, want: false},
+		{name: "plain error", err: errors.New("something else"), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, tt.want, IsRejectedRequestError(tt.err))
+		})
+	}
+}
+
 // TestGitHubReadRetryDelay verifies the wait schedule: exponential growth
 // from the base delay, raised to a rate-limit retry-after hint when the
 // server provides one, and always capped so a long rate-limit window cannot

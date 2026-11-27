@@ -1816,7 +1816,7 @@ change, so plan it before upgrading rather than after.
 The `postgres:` block sets the largest table on which the PostgreSQL engine
 will execute native-safe DDL whose cost scales with the table's existing data
 (`ALTER TABLE` and a blocking `CREATE INDEX`), the maximum duration of a
-concurrent index build, and the statement budget SchemaBot's own storage
+concurrent index build and of a constraint validation, and the statement budget SchemaBot's own storage
 connections run under.
 The size limit is expressed in bytes and defaults to 1 GiB:
 
@@ -1824,6 +1824,7 @@ The size limit is expressed in bytes and defaults to 1 GiB:
 postgres:
   native_safe_table_size_limit_bytes: 4294967296
   concurrent_index_max_duration: 24h
+  validate_max_duration: 24h
   statement_timeout: 30s
 ```
 
@@ -1878,8 +1879,20 @@ a shorter value would round to zero on the server and switch the timer off),
 and durations above the largest `statement_timeout` PostgreSQL itself accepts
 (about 24 days); omit the option to use the default rather than setting `0`.
 
+`validate_max_duration` is a Go duration string and defaults to `24h`. It is
+the server-side `statement_timeout` of a `VALIDATE CONSTRAINT`, the scan that
+checks existing rows against a foreign key or check constraint added
+`NOT VALID`. The scan holds `SHARE UPDATE EXCLUSIVE`, so reads and writes
+continue while it runs. A scan that reaches the bound is cancelled and the
+step is refused; the constraint stays `NOT VALID` and keeps checking new
+writes. The scan's lock wait keeps the 3-second lock budget, or half the bound
+when the bound is shorter, so waiting behind other DDL is retried as lock
+contention rather than refused. It accepts `2ms` up to the same maximum as
+`concurrent_index_max_duration`.
+
 Concurrent index builds do not consult the size ceiling; their work is bounded
-by `concurrent_index_max_duration` instead.
+by `concurrent_index_max_duration` instead. Constraint validations do not
+either; theirs is bounded by `validate_max_duration`.
 
 The ceiling is process-wide: every PostgreSQL database this server drives
 shares the same value, and a database cannot override it in its own metadata.

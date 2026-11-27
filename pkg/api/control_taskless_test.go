@@ -35,7 +35,7 @@ func TestQueueCancelForTasklessApplyRecordsDurableRequest(t *testing.T) {
 		State:           state.Apply.Pending,
 		Environment:     "staging",
 	}
-	resp, responseStatus, err := svc.queueCancelForApplyOwner(t.Context(), apply, "operator")
+	resp, responseStatus, _, err := svc.queueCancelForApplyOwner(t.Context(), apply, "operator")
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	assert.True(t, resp.Accepted, "a task-less cancel must be accepted, not refused for lack of tasks")

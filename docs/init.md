@@ -23,7 +23,7 @@ $ schemabot init --sample --type mysql --non-interactive --json
 {"database":"shop","environment":"development","profile":"schemabot-sample-example","schema_dir":"/project/schema","plan_id":"plan-example","tables":2,"verified":true}
 ```
 
-Use `--type postgres` for PostgreSQL. Names and paths vary by project. The completion screen
+Use `--type postgres` for PostgreSQL, or `--type vitess` for a sharded Vitess cluster; `init --sample --type vitess` is how you set up a Vitess target. Names and paths vary by project. The completion screen
 prints your next command, including a profile flag when needed. Each project gets its own sample and runtime;
 retrying setup keeps your data and never overwrites schema edits. Initialization only succeeds
 when the files match the live database; use `plan` to review edits you have not applied yet. Samples listen only on `127.0.0.1`.

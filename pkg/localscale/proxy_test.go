@@ -229,3 +229,41 @@ func newTestPortAllocator(ports ...int) *portAllocator {
 		inUse: make(map[int]struct{}, len(ports)),
 	}
 }
+
+// boundAt is a listener that only reports the address it is bound at.
+type boundAt struct {
+	net.Listener
+	addr *net.TCPAddr
+}
+
+func (l boundAt) Addr() net.Addr { return l.addr }
+
+// A proxy range published as one block at an offset is advertised at that
+// offset from the moment the server starts, with no port map posted, so a
+// container Docker restarts on its own still hands out host-reachable ports. A
+// posted map entry still wins for the port it names.
+func TestProxyAdvertiseAddrAppliesTheConfiguredOffset(t *testing.T) {
+	offset, err := advertisedPortOffset(50000, [2]int{19100, 19131})
+	require.NoError(t, err)
+	s := &Server{proxyAdvertiseHost: "127.0.0.1", proxyPortOffset: offset}
+	proxy := &branchProxy{listener: boundAt{addr: &net.TCPAddr{IP: net.IPv4zero, Port: 19103}}}
+	require.Equal(t, "127.0.0.1:50003", s.proxyAdvertiseAddr(proxy, nil))
+
+	s.proxyPortMap = map[int]int{19103: 61000}
+	require.Equal(t, "127.0.0.1:61000", s.proxyAdvertiseAddr(proxy, nil))
+
+	unset := &Server{proxyAdvertiseHost: "127.0.0.1"}
+	require.Equal(t, "127.0.0.1:19103", unset.proxyAdvertiseAddr(proxy, nil))
+}
+
+func TestAdvertisedPortOffsetNeedsARangeThatFits(t *testing.T) {
+	offset, err := advertisedPortOffset(0, [2]int{})
+	require.NoError(t, err)
+	require.Zero(t, offset)
+
+	_, err = advertisedPortOffset(50000, [2]int{})
+	require.ErrorContains(t, err, "fixed proxy port range")
+
+	_, err = advertisedPortOffset(65530, [2]int{19100, 19131})
+	require.ErrorContains(t, err, "past port 65535")
+}

@@ -2,6 +2,7 @@ package commands
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -106,6 +107,47 @@ func TestPlanCmd_ServerErrorHumanOutput(t *testing.T) {
 	assert.Contains(t, plainOutput, "API status: HTTP 500")
 	assert.Contains(t, plainOutput, "Error code: plan_failed")
 	assert.Contains(t, plainOutput, "read secret file /secrets/db-passwords/test-password")
+}
+
+// A plan refused for the schema files as written prints the refusal and its
+// code, without the HTTP status: the fix is an edit to the files, not a retry.
+func TestPlanCmd_SchemaRefusalOmitsTheHTTPStatus(t *testing.T) {
+	const refusal = `plan failed: plan PostgreSQL table "h_coll": unsupported schema change: column "code" collation change`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/api/plan", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		body, err := json.Marshal(apitypes.ErrorResponse{Error: refusal, ErrorCode: apitypes.ErrCodeSchemaRefused})
+		require.NoError(t, err)
+		_, err = w.Write(body)
+		require.NoError(t, err)
+	}))
+	t.Cleanup(server.Close)
+
+	cmd := PlanCmd{SchemaDir: writeTestSchemaDir(t), Environment: "staging"}
+	var runErr error
+	output := captureStdout(func() {
+		runErr = cmd.Run(&Globals{Endpoint: server.URL})
+	})
+
+	require.ErrorIs(t, runErr, ErrSilent)
+	plainOutput := stripAnsi(output)
+	assert.Contains(t, plainOutput, "Plan failed\n  Database: testdb\n  Environment: staging\n  Error code: schema_refused\n", plainOutput)
+	assert.Contains(t, plainOutput, `column "code" collation change`, plainOutput)
+	assert.NotContains(t, plainOutput, "API status", plainOutput)
+}
+
+// A plan refused for its schema files reports the API's schema_refused code
+// in --json output, so an agent does not read the refusal as a server fault to
+// retry; any other failure keeps the generic api_error code.
+func TestPlanErrorCode(t *testing.T) {
+	refused := fmt.Errorf("plan staging: %w", &client.APIError{Status: http.StatusUnprocessableEntity, ErrorCode: apitypes.ErrCodeSchemaRefused})
+	assert.Equal(t, apitypes.ErrCodeSchemaRefused, planErrorCode(refused))
+
+	uncoded := &client.APIError{Status: http.StatusInternalServerError}
+	assert.Equal(t, "api_error", planErrorCode(uncoded))
+
+	assert.Equal(t, "api_error", planErrorCode(errors.New("dial tcp: connection refused")))
 }
 
 func TestPlanCmd_EnvironmentDiscoveryServerErrorHumanOutput(t *testing.T) {

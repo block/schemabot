@@ -1576,7 +1576,7 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 		sb.WriteString("\n---\n\n")
 		sb.WriteString("This schema change was cancelled and cannot be resumed. Open a new schema change to apply it again.\n")
 	case state.Apply.Failed:
-		writeMemberFooterAction(sb, data, "To retry:", AppendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
+		writeMemberFooterAction(sb, data, presentation.RetryLabel+":", AppendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 	case state.Apply.RevertWindow:
 		// Skip-revert (finalize) is the common path, so it leads; revert (undo) follows.
 		writeMemberFooterAction(sb, data, "To skip revert and keep changes:", AppendTenantFlag(fmt.Sprintf("schemabot skip-revert %s -e %s", data.ApplyID, data.Environment), data.Tenant))
@@ -1692,7 +1692,7 @@ func writeSummaryFailed(sb *strings.Builder, data ApplyStatusCommentData, comple
 	}
 
 	writeSummaryTableList(sb, data, budget)
-	writeMemberFooterAction(sb, data, "To retry:", AppendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
+	writeMemberFooterAction(sb, data, presentation.RetryLabel+":", AppendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 }
 
 // writeTablesStoppedAtCutover explains, under a failed apply's error, the
@@ -2084,11 +2084,11 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 	} else {
 		data.Step, data.StepsTotal, data.Statement = step.Step, step.StepsTotal, step.Statement
 	}
-	if work, err := apitypes.ParseBuildWork(resp.Metadata); err != nil {
-		slog.Warn("progress comment omits build work because the progress metadata is malformed", "apply_id", resp.ApplyID, "error", err)
-	} else {
-		data.BuildWork = work
+	work, err := apitypes.ParseBuildWork(resp.Metadata)
+	if err != nil {
+		slog.Warn("progress comment omits part of the build work because the progress metadata is malformed", "apply_id", resp.ApplyID, "error", err)
 	}
+	data.BuildWork = work
 
 	if changes, err := apitypes.ParseVSchemaChanges(resp.Metadata); err != nil {
 		slog.Warn("failed to parse VSchema changes from progress metadata", "apply_id", resp.ApplyID, "error", err)

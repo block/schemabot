@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/block/pg-sprite/pkg/executor"
@@ -35,6 +36,11 @@ func planRowSecurityOperation(ctx context.Context, pool *pgxpool.Pool, namespace
 		return nil, nil
 	} else if !errors.Is(err, schemadiff.ErrUnsupportedChange) {
 		return nil, err
+	}
+	if mixed, err := tableDefinitionDiffers(namespace, live, wanted); err != nil {
+		return nil, err
+	} else if mixed {
+		return nil, &mixedRowSecurityChangeError{table: desired.Table()}
 	}
 	// A delta still needs the executor's locked admission and fresh comparison.
 	preview, err := executor.PreviewRowSecurity(ctx, pool, namespace, desired, executor.Budget{
@@ -86,4 +92,42 @@ func validateRowSecurityApply(req *engine.ApplyRequest, operation statement.RowS
 	}
 	return nativeApply{namespace: namespace, table: tc.Table, sql: tc.DDL, steps: 1,
 		rowSecurity: found, reviewedSecurity: operation.Statements()}, nil
+}
+
+// tableDefinitionDiffers reports whether the file changes the table itself,
+// compared with its row security set aside on both sides. A row security
+// operation runs in one transaction that changes only the settings and
+// policies, so a table change beside a row security delta must be planned on
+// its own.
+func tableDefinitionDiffers(namespace string, live, wanted schemadiff.Model) (bool, error) {
+	live.RowSecurity, wanted.RowSecurity = schemadiff.RowSecurity{}, schemadiff.RowSecurity{}
+	changes, err := schemadiff.Diff(namespace, live, wanted)
+	if errors.Is(err, schemadiff.ErrUnsupportedChange) {
+		// The table changes in a way the planner refuses, which is still a
+		// change to its definition. Split from the row security change, the
+		// table's file plans on its own and names that refusal.
+		slog.Debug("table definition change beside a row security change is one the planner refuses; treating the file as mixed",
+			"namespace", namespace, "table", live.Table, "error", err)
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("compare table %q.%q without its row security: %w", namespace, live.Table, err)
+	}
+	return len(changes) > 0, nil
+}
+
+// mixedRowSecurityChangeError refuses a file that changes a table's row
+// security and its definition together. It is a schemadiff.ErrUnsupportedChange
+// to the planner's refusal handling, without that sentinel's text trailing
+// the remedy the author reads.
+type mixedRowSecurityChangeError struct {
+	table string
+}
+
+func (e *mixedRowSecurityChangeError) Error() string {
+	return fmt.Sprintf("table %q changes its row security and its definition in one file, which SchemaBot cannot run as one reviewed change; change the row security in one pull request and the table in another", e.table)
+}
+
+func (e *mixedRowSecurityChangeError) Is(target error) bool {
+	return target == schemadiff.ErrUnsupportedChange
 }

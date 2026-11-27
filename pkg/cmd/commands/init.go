@@ -27,14 +27,14 @@ import (
 // InitCmd accepts explicit inputs or collects missing decisions in a terminal.
 // Both routes use the same initialization workflow.
 type InitCmd struct {
-	Sample         bool         `help:"Start a disposable local MySQL or PostgreSQL database with sample tables (requires Docker)"`
+	Sample         bool         `help:"Start a disposable local MySQL, PostgreSQL, or Vitess database with sample tables (requires Docker)"`
 	NonInteractive bool         `name:"non-interactive" help:"Never prompt; report missing inputs instead"`
 	interactive    bool         `kong:"-"`
 	progress       func(string) `kong:"-"`
 	ReuseSchema    bool         `name:"reuse-schema" help:"Verify existing desired files without replacing them"`
 	Database       string       `short:"d" help:"Name to register for this database"`
 	Environment    string       `short:"e" help:"Environment to initialize"`
-	Type           string       `help:"Database engine: mysql or postgres"`
+	Type           string       `help:"Database engine: mysql, postgres, or vitess"`
 	DSN            string       `help:"Target connection as env:VARIABLE or file:/absolute/path (credentials stay out of schema files)"`
 	Integrated     bool         `help:"Create a separate schemabot database on the application server for SchemaBot state"`
 	StorageDSN     string       `name:"storage-dsn" help:"Existing separate state database as env:VARIABLE or file:/absolute/path; startup initializes SchemaBot metadata tables"`
@@ -42,6 +42,13 @@ type InitCmd struct {
 	Namespaces     []string     `name:"namespace" help:"Explicit namespace to import; repeat for multiple namespaces"`
 	Runtime        string       `default:"local" help:"Local runtime identity"`
 	JSON           bool         `name:"json" help:"Return the verified setup result as JSON"`
+
+	// Set by sample setup for a Vitess sample. The engine reaches such a target
+	// through a PlanetScale-compatible API, named by DSN, and reads shards and
+	// schema over the keyspace's own vtgate endpoint.
+	organization string `kong:"-"`
+	tokenRef     string `kong:"-"`
+	vtgateDSN    string `kong:"-"`
 }
 
 type initResult struct {
@@ -132,7 +139,7 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	if cmd.Integrated && cmd.StorageDSN != "" {
 		return nil, fmt.Errorf("choose --integrated or --storage-dsn, not both")
 	}
-	storage := api.StorageConfig{Dialect: cmd.Type, DSN: cmd.StorageDSN}
+	storage := api.StorageConfig{Dialect: storageDialect(cmd.Type), DSN: cmd.StorageDSN}
 	if cmd.Integrated {
 		storage.DSN = cmd.DSN
 		storage.Database = "schemabot"
@@ -209,9 +216,22 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	if err := localsetup.CheckConnection(ctx, cmd.Type, targetDSN); err != nil {
 		return nil, unregisteredInitError(ctx, fmt.Errorf("check %s: %w", cmd.DSN, err), initCancelledBeforeRegistration)
 	}
+	connection := api.EnvironmentConfig{DSN: cmd.DSN}
+	// A Vitess target is reached through a PlanetScale-compatible API, so the
+	// engine needs the endpoint, the organization holding the database, and the
+	// service token, where a SQL engine needs only a connection string.
+	if cmd.Type == "vitess" {
+		connection.APIURL = targetDSN
+		connection.Organization = cmd.organization
+		connection.TokenSecretRef = cmd.tokenRef
+		// DSN on a Vitess environment is the vtgate MySQL endpoint, not the
+		// API: the engine queries shards and schema over it, and storage
+		// isolation reads it as the database connection it is.
+		connection.DSN = cmd.vtgateDSN
+	}
 	registration := localsetup.Registration{
 		Database: cmd.Database, Environment: cmd.Environment, Engine: cmd.Type,
-		Connection: api.EnvironmentConfig{DSN: cmd.DSN}, Storage: storage,
+		Connection: connection, Storage: storage,
 	}
 	if cmd.Integrated {
 		cmd.reportProgress("Preparing a separate schemabot database on your server...")
@@ -223,7 +243,7 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 		if err != nil {
 			return nil, err
 		}
-		if err := localsetup.CheckConnection(ctx, cmd.Type, stateDSN); err != nil {
+		if err := localsetup.CheckConnection(ctx, storageDialect(cmd.Type), stateDSN); err != nil {
 			return nil, unregisteredInitError(ctx, fmt.Errorf("check %s: %w", cmd.StorageDSN, err), initCancelledBeforeRegistration)
 		}
 	}

@@ -1265,7 +1265,7 @@ func writeShardedFooter(sb *strings.Builder, data ShardedApplyData) {
 			fmt.Fprintf(sb, "\n%s\n", presentation.RetryOnceSettledNote)
 		}
 	case state.IsState(data.State, state.Apply.Failed):
-		writeFooterAction(sb, "To retry:", AppendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
+		writeFooterAction(sb, presentation.RetryLabel+":", AppendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 	case state.IsState(data.State, state.Apply.FailedRetryable):
 		writeFooterAction(sb, "An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:", AppendTenantFlag(fmt.Sprintf("schemabot stop %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.IsState(data.State, state.Apply.Stopped):

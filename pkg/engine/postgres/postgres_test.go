@@ -3,6 +3,7 @@ package postgres
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -57,11 +58,11 @@ func TestBaselinePolicyTableMembership(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.table, func(t *testing.T) {
-			assert.Equal(t, tt.wantRollbackReason, rollbackBaseline(declared, ignored).exclusionReason(tt.table))
+			assert.Equal(t, tt.wantRollbackReason, rollbackBaseline(declared, nil, ignored).exclusionReason(tt.table))
 			assert.Empty(t, pulledBaseline.exclusionReason(tt.table), "pull exports every enumerated table")
 		})
 	}
-	assert.Equal(t, engine.ExemptReasonIgnoreTables, rollbackBaseline(declared, mustIgnoredTables(t, []string{"audit_log_archive_2019"})).exclusionReason("audit_log_archive_2019"),
+	assert.Equal(t, engine.ExemptReasonIgnoreTables, rollbackBaseline(declared, nil, mustIgnoredTables(t, []string{"audit_log_archive_2019"})).exclusionReason("audit_log_archive_2019"),
 		"the exact ignore policy withholds a named table before introspection; the plan separately refuses declared contradictions")
 }
 
@@ -261,7 +262,9 @@ func TestExecutionVerdictBlocksPartitionedIndexShapeTheBuildRefuses(t *testing.T
 // closed set is reported as vocabulary that moved.
 func TestExecutionContractVerdictCoversEveryExecution(t *testing.T) {
 	blocked := map[planner.Execution]string{
-		planner.ExecutionBlockingIndexDrop: blockingIndexDropReason("users"),
+		planner.ExecutionBlockingIndexDrop:          blockingIndexDropReason("users"),
+		planner.ExecutionPartitionedKeyBuild:        partitionedKeyBuildReason("users"),
+		planner.ExecutionPartitionedForeignKeyBuild: partitionedForeignKeyBuildReason("users"),
 	}
 	for _, execution := range planner.Executions() {
 		t.Run(string(execution), func(t *testing.T) {
@@ -1228,6 +1231,26 @@ func TestBlockRewriteStepsLeavesAFullCopyStepItsOwnCause(t *testing.T) {
 	require.NoError(t, blockRewriteSteps(unblocked, "size verdict", nil, nil, fullCopy))
 	assert.Equal(t, engine.ExecutionModeBlocked, unblocked[0].ExecutionMode, "a full-copy step that carries no verdict yet is still blocked on an oversized table")
 	assert.Equal(t, "size verdict", unblocked[0].ModeReason)
+}
+
+// A reviewed VALIDATE CONSTRAINT keeps its verdict on a table past the size
+// ceiling: its scan holds SHARE UPDATE EXCLUSIVE, so reads and writes continue,
+// and the validation bound limits it instead of the table's size. A
+// validation with no planner record is not exempted on its statement alone.
+func TestBlockRewriteStepsKeepsReviewedValidations(t *testing.T) {
+	record, err := json.Marshal(reviewedUserKey())
+	require.NoError(t, err)
+	changes := []engine.TableChange{
+		{Table: "orders", DDL: reviewedValidationSQL, Metadata: map[string]string{reviewedValidationMetadataKey: string(record)}},
+		{Table: "orders", DDL: reviewedValidationSQL},
+		{Table: "orders", DDL: "ALTER TABLE public.orders ALTER COLUMN user_id TYPE numeric", Metadata: map[string]string{reviewedValidationMetadataKey: string(record)}},
+	}
+
+	require.NoError(t, blockRewriteSteps(changes, "size verdict", nil, nil, nil))
+	assert.Empty(t, changes[0].ExecutionMode, changes[0].ModeReason)
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
+	assert.Equal(t, "size verdict", changes[1].ModeReason)
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[2].ExecutionMode, "a record does not exempt a statement that is not a validation")
 }
 
 // TestTableChangesRendersAnIndexDropAsUnsafe proves a planned index drop on

@@ -8,6 +8,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	grpccodes "google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -181,6 +183,23 @@ func TestPlanRollout_UnplannedTargetNeedsAttention(t *testing.T) {
 	assert.Equal(t, apitypes.PlanMemberUnplanned, rollout.Attention[0].Reason)
 	assert.Equal(t, unplannedMemberDetail, rollout.Attention[0].Detail)
 	assert.NotContains(t, rollout.Attention[0].Detail, "10.0.0.7")
+}
+
+// A target the engine refused for the declared schema is listed for attention
+// with the refusal's own text, since that text says what to change; a fixed
+// "see server logs" line would send the operator to logs they may not read.
+func TestPlanRollout_RefusedTargetNeedsAttentionWithTheRefusal(t *testing.T) {
+	refusal := `column "code" collation change is not supported; declare the column's current collation`
+	svc := multiTargetService(t, &mockTernClient{planDiffErr: grpcstatus.Error(grpccodes.FailedPrecondition, refusal)}, &recordingPlanStore{})
+
+	rollout, err := svc.planRollout(t.Context(), planDiffReq(t), reviewedUsersPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)"),
+		&apitypes.PlanResponse{Deployment: "eu", Target: "testapp-001"})
+	require.NoError(t, err)
+	require.NotNil(t, rollout)
+	require.Len(t, rollout.Attention, 1)
+	assert.Equal(t, "eu/testapp-002", rollout.Attention[0].Member)
+	assert.Equal(t, apitypes.PlanMemberUnplanned, rollout.Attention[0].Reason)
+	assert.Equal(t, "refused: "+refusal, rollout.Attention[0].Detail)
 }
 
 // Deployments that mirror the primary run its plan, so one whose live schema
