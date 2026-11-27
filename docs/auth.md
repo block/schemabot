@@ -238,7 +238,9 @@ You can configure two separate checks:
 
 An approval does not let anyone run a command they are not authorized for.
 So when a plan comment offers an apply its reader cannot run, the comment
-lists who can, right under the apply command. The reader is whoever commented
+says so under its heading, before the DDL, and lists who can. If GitHub cannot
+answer whether the reader is authorized, the comment lists who can without
+saying the reader cannot. The reader is whoever commented
 the plan command, or the PR author on an automatic plan. Anyone listed can run
 the apply once the PR has the approval the review gate requires. A reader who
 can run the apply sees no list, and a plan with nothing to apply checks nobody.

@@ -1029,14 +1029,17 @@ func TestPlanForResolvedDatabaseAllowsDatabaseOperator(t *testing.T) {
 
 // The plan comment lists who can apply only to a reader the apply gate would
 // deny. A reader the gate admits sees nothing, since applying is their happy
-// path, and so does everyone when PR command authorization is off. When the
-// reader's authorization cannot be checked, the list still renders, since it
-// stays true and names whom to ask.
+// path, and so does everyone when PR command authorization is off. A reader the
+// gate denies is named as unable to run the apply. When the reader's
+// authorization cannot be checked, the list still renders without naming them,
+// since it stays true and names whom to ask.
 func TestApplyAuthorizationForPlanComment(t *testing.T) {
 	listed := &templates.ApplyAuthorizationData{
 		OperatorPrincipals: []string{"octocat/orders-operators", "mona"},
 		OtherPrincipals:    []string{"octocat/schema-admins"},
 	}
+	denied := *listed
+	denied.DeniedReader = "hubot"
 	tests := []struct {
 		name       string
 		enabled    bool
@@ -1046,7 +1049,7 @@ func TestApplyAuthorizationForPlanComment(t *testing.T) {
 	}{
 		{name: "operator user sees nothing", enabled: true, reader: "mona", teamStatus: http.StatusOK},
 		{name: "admin team member sees nothing", enabled: true, reader: "octo-admin", teamStatus: http.StatusOK},
-		{name: "unlisted reader sees the list", enabled: true, reader: "hubot", teamStatus: http.StatusOK, want: listed},
+		{name: "unlisted reader is told they cannot apply", enabled: true, reader: "hubot", teamStatus: http.StatusOK, want: &denied},
 		{name: "reader that cannot be checked sees the list", enabled: true, reader: "hubot", teamStatus: http.StatusInternalServerError, want: listed},
 		{name: "missing reader sees the list", enabled: true, reader: "", teamStatus: http.StatusOK, want: listed},
 		{name: "authorization off shows nothing", enabled: false, reader: "hubot", teamStatus: http.StatusOK},

@@ -167,8 +167,9 @@ func (h *Handler) enforcePRCommandActorAuthorization(
 // It runs the same check the apply gate does, so on top of the config read it
 // asks GitHub for reader's membership in each configured team until one
 // includes reader, reusing any membership this delivery has already read. When
-// that check cannot be evaluated, the list renders: it is still true, and it
-// names whom to ask.
+// that check cannot be evaluated, the list renders without naming reader: it is
+// still true, and it names whom to ask. Only a completed check that denies
+// reader names them as unable to run the apply.
 func (h *Handler) applyAuthorizationForPlanComment(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, database, reader string) *templates.ApplyAuthorizationData {
 	if h.service == nil || !h.service.Config().PRCommandAuthorizationEnabled() {
 		return nil
@@ -193,6 +194,10 @@ func (h *Handler) applyAuthorizationForPlanComment(ctx context.Context, client *
 			"matched_principal", result.MatchedPrincipal)
 		return nil
 	}
+	h.logger.Debug("plan comment tells the reader they cannot run the apply and lists who can",
+		"repo", repo, "pr", pr, "database", database, "reader", reader,
+		"reason", result.Reason)
+	auth.DeniedReader = reader
 	return auth
 }
 

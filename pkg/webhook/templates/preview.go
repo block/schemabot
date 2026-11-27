@@ -78,7 +78,7 @@ func PreviewCommentPlanIgnoredNamespaces() string {
 
 // PreviewCommentPlanWhoCanApply renders a sample auto-plan on a deployment
 // that turns on PR command authorization, for a PR whose author may not run
-// the apply, so it lists who can under the apply command.
+// the apply, so it says so under its heading and lists who can.
 func PreviewCommentPlanWhoCanApply() string {
 	data := previewPlanData()
 	data.RequestedBy = ""
@@ -86,6 +86,7 @@ func PreviewCommentPlanWhoCanApply() string {
 	data.ApplyAuthorization = &ApplyAuthorizationData{
 		OperatorPrincipals: []string{"acme/testapp-operators"},
 		OtherPrincipals:    []string{"acme/db-admins", "jdoe"},
+		DeniedReader:       "octocat",
 	}
 	return RenderPlanComment(data)
 }
