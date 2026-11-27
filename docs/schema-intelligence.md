@@ -849,6 +849,27 @@ index. `percent` is the whole-build percent with two decimals, for example
 `"35.45"`, and is present only while the index build is the step in flight. Read an
 operation's own fields from there and match a table to its operation by
 `deployment` and `operation_key`.
+A PostgreSQL step that needs a lock first waits up to 30 seconds outside the
+lock queue for a session holding a conflicting lock on its table, so its own
+lock request does not queue ahead of other readers and writers. While it waits,
+`metadata` names that session. `lock_holder_pid` is the process ID of the
+blocking session, not SchemaBot's own. `lock_holder_table` is the table it holds
+the lock on, `lock_holder_waited_ms` how long the step has waited so far, and
+`lock_holder_limit_ms` how long it waits before it gives up. All four are
+strings, and the durations are in milliseconds. They disappear once the holder
+releases its lock or the wait ends:
+
+```json
+"metadata": {
+  "step": "1",
+  "steps_total": "1",
+  "lock_holder_pid": "48213",
+  "lock_holder_table": "orders",
+  "lock_holder_waited_ms": "12500",
+  "lock_holder_limit_ms": "30000"
+}
+```
+
 `engine` names the engine running the apply, in one of two forms depending on
 where the response comes from. While the data plane reports the apply's
 progress, it is the engine's display name: `Spirit`, `PlanetScale`, `Strata`, or
