@@ -100,7 +100,9 @@ func releaseNotNullHelpers(ctx context.Context, pool *pgxpool.Pool, schema, tabl
 			Effect: "rejects writes that break " + strings.TrimSuffix(helper.Definition, " NOT VALID"),
 		}
 		if !slices.Contains(added, helper.Name) {
-			slog.Info("left a SET NOT NULL helper constraint in place: the stopped schema change did not add it",
+			// The caller logs each recorded constraint with the apply's
+			// identifiers, so this line is for tracing the engine alone.
+			slog.Debug("left a SET NOT NULL helper constraint in place: the schema change did not add it",
 				"outcome", outcome, "schema", schema, "table", table, "constraint", helper.Name)
 			constraint.Removal = dropConstraintStatement(schema, table, helper.Name)
 			result.PreexistingConstraints = append(result.PreexistingConstraints, constraint)
@@ -109,7 +111,7 @@ func releaseNotNullHelpers(ctx context.Context, pool *pgxpool.Pool, schema, tabl
 		err := dropNotNullHelper(ctx, pool, schema, table, helper)
 		switch {
 		case err == nil:
-			slog.Info("dropped the SET NOT NULL helper constraint a stopped schema change left on the table",
+			slog.Debug("dropped the SET NOT NULL helper constraint the schema change left on the table",
 				"outcome", outcome, "schema", schema, "table", table, "constraint", helper.Name)
 			result.RemovedConstraints = append(result.RemovedConstraints, constraint)
 		case errors.Is(err, executor.ErrDroppedObjectDrift):

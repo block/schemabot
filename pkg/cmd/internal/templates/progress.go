@@ -184,11 +184,27 @@ func WriteProgress(data ProgressData) {
 	// Table progress (sorted: failed and halted first, then active, sharded before unsharded, finished last)
 	// Hide tables during branch setup phases (all tables are Queued, not meaningful)
 	if len(activeTables) > 0 && !state.IsSetupPhase(data.State) {
+		// A table changed in several steps sorts by its most urgent step, and
+		// its steps stay together in the order they run, as the PR comment
+		// lists them: a completed step never drops below the failed step that
+		// came after it.
+		type tableRank struct{ priority, firstIndex int }
+		ranks := make(map[string]tableRank, len(activeTables))
+		for i, t := range activeTables {
+			key := t.Namespace + "." + t.TableName
+			p := ui.TableStatePriority(state.NormalizeTaskStatus(t.Status))
+			if rank, seen := ranks[key]; !seen {
+				ranks[key] = tableRank{priority: p, firstIndex: i}
+			} else if p < rank.priority {
+				rank.priority = p
+				ranks[key] = rank
+			}
+		}
 		sort.SliceStable(activeTables, func(i, j int) bool {
-			pi := ui.TableStatePriority(state.NormalizeTaskStatus(activeTables[i].Status))
-			pj := ui.TableStatePriority(state.NormalizeTaskStatus(activeTables[j].Status))
-			if pi != pj {
-				return pi < pj
+			ri := ranks[activeTables[i].Namespace+"."+activeTables[i].TableName]
+			rj := ranks[activeTables[j].Namespace+"."+activeTables[j].TableName]
+			if ri.priority != rj.priority {
+				return ri.priority < rj.priority
 			}
 			// Within the same priority, sharded tables (have shards) sort first
 			si := len(activeTables[i].Shards) > 0
@@ -196,7 +212,7 @@ func WriteProgress(data ProgressData) {
 			if si != sj {
 				return si
 			}
-			return false
+			return ri.firstIndex < rj.firstIndex
 		})
 
 		// Show keyspace headers for Vitess tables (any table with a namespace)

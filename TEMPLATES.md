@@ -6771,18 +6771,18 @@ step 2 of 3 · `CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON public.users
 
 **Schema `public`**
 
+**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE users ADD COLUMN last_seen_at timestamptz;
+```
+
 **`users`**: 🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 10.42%
 
 ```sql
 CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON users USING btree (last_seen_at);
 ```
 - Building index: 2,500 of 10,000 blocks
-
-**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
-
-```sql
-ALTER TABLE users ADD COLUMN last_seen_at timestamptz;
-```
 
 **`sessions`**: ⏳ Queued
 
@@ -8297,14 +8297,14 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 
 ### ❌ public
 
-**`users`** — Failed
-```sql
-CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON users USING btree (last_seen_at);
-```
-
 **`users`** — Completed
 ```sql
 ALTER TABLE users ADD COLUMN last_seen_at timestamptz;
+```
+
+**`users`** — Failed
+```sql
+CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON users USING btree (last_seen_at);
 ```
 
 **`sessions`** — Cancelled

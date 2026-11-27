@@ -127,7 +127,7 @@ func (c *LocalClient) releaseArtifacts(ctx context.Context, eng engine.Engine, a
 
 	byNamespace := c.cancelledArtifactTables(apply, tasks)
 	if len(byNamespace) == 0 {
-		c.logger.Debug("stopped schema change names no tables, so it left no artifacts to reclaim",
+		c.logger.Debug("schema change names no tables, so it left no artifacts to reclaim",
 			append(apply.LogAttrs(), "outcome", kind.outcome)...)
 		return nil
 	}
@@ -216,7 +216,7 @@ func (c *LocalClient) releaseNamespaceArtifacts(ctx context.Context, eng engine.
 		return reclaimed, err
 	}
 	if !reclaimed {
-		c.logger.Info("stopped schema change left no artifacts on the target",
+		c.logger.Info("schema change left no artifacts on the target",
 			append(apply.LogAttrs(), "namespace", namespace, "outcome", kind.outcome, "tables", artifacts.tables)...)
 	}
 	return reclaimed, nil
@@ -229,7 +229,7 @@ func (c *LocalClient) recordReleaseResult(ctx context.Context, apply *storage.Ap
 		return false
 	}
 	for _, constraint := range result.RemovedConstraints {
-		c.logger.Info("removed a constraint the stopped schema change added to a live table",
+		c.logger.Info("removed a constraint the schema change added to a live table",
 			append(apply.LogAttrs(), "namespace", namespace, "outcome", outcome, "table", constraint.Table, "constraint", constraint.Name)...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
 			removedConstraintMessage(constraint, outcome), "", "")
@@ -237,7 +237,7 @@ func (c *LocalClient) recordReleaseResult(ctx context.Context, apply *storage.Ap
 	for _, constraint := range result.RemainingConstraints {
 		// The constraint goes on checking the application's writes, which the
 		// operator cannot know unless something says so.
-		c.logger.Warn("a constraint the stopped schema change added is still on a live table",
+		c.logger.Warn("a constraint the schema change added is still on a live table",
 			append(apply.LogAttrs(), "namespace", namespace, "outcome", outcome, "table", constraint.Table, "constraint", constraint.Name)...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
 			remainingConstraintMessage(constraint, outcome), "", "")
@@ -245,7 +245,7 @@ func (c *LocalClient) recordReleaseResult(ctx context.Context, apply *storage.Ap
 	for _, constraint := range result.PreexistingConstraints {
 		// The schema change did not add it and the release does not remove
 		// it, but the operator may expect the table back as it was.
-		c.logger.Warn("a constraint the stopped schema change worked with, but did not add, is still on a live table",
+		c.logger.Warn("a constraint the schema change worked with, but did not add, is still on a live table",
 			append(apply.LogAttrs(), "namespace", namespace, "outcome", outcome, "table", constraint.Table, "constraint", constraint.Name)...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
 			preexistingConstraintMessage(constraint, outcome), "", "")
@@ -413,14 +413,14 @@ func (c *LocalClient) logSkippedArtifactRelease(ctx context.Context, apply *stor
 	if errors.As(err, &stopped) && stopped.reclaimedAny {
 		// Part of the release landed, and the entries before this one say where
 		// it went. Saying the copy was left in place would contradict them.
-		c.logger.Warn("stopped schema change artifact release stopped part-way; the rest was left on the target",
+		c.logger.Warn("schema change artifact release stopped part-way; the rest was left on the target",
 			append(apply.LogAttrs(), "namespace", stopped.namespace, "outcome", kind.outcome, "reason", reason, "error", err)...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Reclaiming the %s schema change's artifacts stopped in %s because %s. The entries before this one name what was reclaimed; everything else was left on the target", kind.outcome, stopped.namespace, reason), "", "")
 		return
 	}
 
-	c.logger.Warn("stopped schema change left its artifacts on the target",
+	c.logger.Warn("schema change left its artifacts on the target",
 		append(apply.LogAttrs(), "outcome", kind.outcome, "reason", reason, "error", err)...)
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
 		fmt.Sprintf("What the %s schema change left on the target was not reclaimed because %s", kind.outcome, reason), "", "")

@@ -1079,11 +1079,12 @@ func sortProgressRows(rows []TableProgressData) []TableProgressData {
 
 // sortRowsByTable orders rows for display without modifying the input. Tables
 // are ranked by the most urgent state among their rows under statePriority,
-// and a table's rows stay adjacent — ordered by their own state — so a table
-// whose plan produced several statements reads as one block rather than
-// scattering across the list by state. Tables with the same rank keep plan
-// order. When every row is a distinct table this is exactly a stable sort by
-// statePriority.
+// and a table's rows stay adjacent in plan order, so a table whose plan
+// produced several statements reads as one block, in the order its steps
+// run, rather than scattering across the list by state: a completed step
+// never drops below the failed step after it. Tables with the same rank keep
+// plan order. When every row is a distinct table this is exactly a stable
+// sort by statePriority.
 func sortRowsByTable(rows []TableProgressData, statePriority func(tableStatus string) int) []TableProgressData {
 	type tableRank struct {
 		priority   int
@@ -1112,10 +1113,7 @@ func sortRowsByTable(rows []TableProgressData, statePriority func(tableStatus st
 		if ri.priority != rj.priority {
 			return ri.priority < rj.priority
 		}
-		if ri.firstIndex != rj.firstIndex {
-			return ri.firstIndex < rj.firstIndex
-		}
-		return statePriority(sorted[i].Status) < statePriority(sorted[j].Status)
+		return ri.firstIndex < rj.firstIndex
 	})
 	return sorted
 }
