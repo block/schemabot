@@ -169,7 +169,7 @@ func (h *Handler) enforcePRCommandActorAuthorization(
 // includes reader, reusing any membership this delivery has already read. When
 // that check cannot be evaluated, the list renders without naming reader: it is
 // still true, and it names whom to ask. Only a completed check that denies
-// reader names them as unable to run the apply.
+// reader for not being on the list names them as unable to run the apply.
 func (h *Handler) applyAuthorizationForPlanComment(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, database, reader string) *templates.ApplyAuthorizationData {
 	if h.service == nil || !h.service.Config().PRCommandAuthorizationEnabled() {
 		return nil
@@ -193,6 +193,12 @@ func (h *Handler) applyAuthorizationForPlanComment(ctx context.Context, client *
 			"repo", repo, "pr", pr, "database", database, "reader", reader,
 			"matched_principal", result.MatchedPrincipal)
 		return nil
+	}
+	if result.Reason != api.ActorAuthReasonNotAuthorized {
+		h.logger.Warn("plan comment lists who can apply without naming the reader because the apply gate denied them for a reason other than not being listed",
+			"repo", repo, "pr", pr, "database", database, "reader", reader,
+			"reason", result.Reason)
+		return auth
 	}
 	h.logger.Debug("plan comment tells the reader they cannot run the apply and lists who can",
 		"repo", repo, "pr", pr, "database", database, "reader", reader,

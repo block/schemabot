@@ -1037,9 +1037,9 @@ type ApplyAuthorizationData struct {
 }
 
 // writeWhoCanApplyIfApplyOffered writes who may run the apply when the
-// comment's footer offers one, the same condition its freezes notice uses.
+// comment's footer offers one.
 func writeWhoCanApplyIfApplyOffered(sb *strings.Builder, data PlanCommentData) {
-	if !data.OffersApply() || data.MemberApplyRefusal != "" || data.applyWithheld {
+	if !data.OffersApply() {
 		return
 	}
 	writeWhoCanApply(sb, data.Database, data.ApplyAuthorization)

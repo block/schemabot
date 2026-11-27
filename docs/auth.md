@@ -244,9 +244,11 @@ saying the reader cannot. The reader is whoever commented
 the plan command, or the PR author on an automatic plan. Anyone listed can run
 the apply once the PR has the approval the review gate requires. A reader who
 can run the apply sees no list, and a plan with nothing to apply checks nobody.
-The plan command requires the same authorization as apply, so the list shows on
-automatic plans: a plan an operator comments answers the operator and shows
-none.
+The comment reflects the reader's membership when the plan ran. If they are
+added to an operator team later, the apply gate checks again and lets them
+apply, and the next plan stops saying they cannot. The plan command requires
+the same authorization as apply, so the list shows on automatic plans: a plan
+an operator comments answers the operator and shows none.
 
 The comment checks the reader against the same admins, repository admins, and
 operators the apply does. For each configured team, until one includes the
