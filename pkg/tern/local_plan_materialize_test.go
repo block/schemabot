@@ -53,7 +53,7 @@ func (s *fakePlanStorage) Applies() storage.ApplyStore { return noCompletedAppli
 
 type noCompletedApplies struct{ storage.ApplyStore }
 
-func (noCompletedApplies) GetLatestCompletedByDatabase(context.Context, string, string, string) (*storage.Apply, error) {
+func (noCompletedApplies) GetByDatabase(context.Context, string, string, string) ([]*storage.Apply, error) {
 	return nil, nil
 }
 

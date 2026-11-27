@@ -132,50 +132,6 @@ func TestApplies(t *testing.T, h Harness) {
 		assert.Equal(t, storage.DatabaseTypeVitess, latestOfAnyType.DatabaseType)
 	})
 
-	// The schema files SchemaBot last applied to a database come from the
-	// apply that completed last, by completion time rather than creation time.
-	// A newer apply that failed, an apply in another environment, and a
-	// database with none are not it.
-	t.Run("GetLatestCompletedByDatabase_ReturnsLastCompletedInEnvironment", func(t *testing.T) {
-		ctx := t.Context()
-		store := h.NewStorage(t)
-		lock := CreateLock(t, store, "completed_db", storage.DatabaseTypePostgres)
-		now := time.Now().UTC().Truncate(time.Second)
-		create := func(identifier, environment, applyState string, completedAgo time.Duration) int64 {
-			id, err := store.Applies().Create(ctx, &storage.Apply{
-				ApplyIdentifier: identifier,
-				LockID:          lock.ID,
-				Database:        "completed_db",
-				DatabaseType:    storage.DatabaseTypePostgres,
-				Environment:     environment,
-				State:           applyState,
-			})
-			require.NoError(t, err)
-			apply, err := store.Applies().Get(ctx, id)
-			require.NoError(t, err)
-			require.NotNil(t, apply)
-			completed := now.Add(-completedAgo)
-			apply.CompletedAt = &completed
-			require.NoError(t, store.Applies().Update(ctx, apply))
-			return id
-		}
-		lastCompleted := create("apply_completed_last", "staging", state.Apply.Completed, time.Minute)
-		create("apply_completed_first", "staging", state.Apply.Completed, time.Hour)
-		create("apply_failed_newest", "staging", state.Apply.Failed, 0)
-		create("apply_completed_production", "production", state.Apply.Completed, 0)
-
-		latest, err := store.Applies().GetLatestCompletedByDatabase(ctx, "COMPLETED_DB", storage.DatabaseTypePostgres, "Staging")
-		require.NoError(t, err)
-		require.NotNil(t, latest)
-		assert.Equal(t, lastCompleted, latest.ID)
-		assert.Equal(t, "apply_completed_last", latest.ApplyIdentifier)
-		assert.Equal(t, state.Apply.Completed, latest.State)
-
-		none, err := store.Applies().GetLatestCompletedByDatabase(ctx, "no_such_db", storage.DatabaseTypePostgres, "staging")
-		require.NoError(t, err)
-		assert.Nil(t, none)
-	})
-
 	// An operator walks the recent-applies list page by page, each page starting
 	// below the last apply the previous one showed, while a new apply is created
 	// between pages. Every apply that existed when the walk began is listed

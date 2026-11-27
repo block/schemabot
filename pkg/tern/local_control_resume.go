@@ -731,6 +731,7 @@ func (c *LocalClient) replanTargetSchema(ctx context.Context, apply *storage.App
 	// plan dropped by name, so a drop the apply has not yet run still reads as
 	// owed.
 	result, err := c.planWithEngine(ctx, &ternv1.PlanRequest{
+		Environment:  apply.Environment,
 		IgnoreTables: plan.IgnoreTables(),
 		DropTables:   plan.DropTables(),
 		// Judged under the policy this apply was admitted with, so a
@@ -930,6 +931,7 @@ type replanResult struct {
 // up an apply whose tables may have completed before a stop or crash.
 func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan) (*replanResult, error) {
 	replanOut, err := c.planWithEngine(ctx, &ternv1.PlanRequest{
+		Environment:     apply.Environment,
 		IgnoreTables:    plan.IgnoreTables(),
 		DropTables:      plan.DropTables(),
 		DirectExecution: DirectExecutionPolicyProto(apply.GetOptions().DirectExecution),

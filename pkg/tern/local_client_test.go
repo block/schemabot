@@ -602,6 +602,12 @@ func (s *snapshotApplyStore) Get(context.Context, int64) (*storage.Apply, error)
 	return &cp, nil
 }
 
+// GetByDatabase reports no apply history, so a replan has no schema files
+// last applied to compare against.
+func (s *snapshotApplyStore) GetByDatabase(context.Context, string, string, string) ([]*storage.Apply, error) {
+	return nil, nil
+}
+
 func (s *snapshotApplyStore) GetByApplyIdentifier(context.Context, string) (*storage.Apply, error) {
 	if s.err != nil {
 		return nil, s.err
@@ -842,9 +848,16 @@ type exactProgressStorage struct {
 	plans           storage.PlanStore
 }
 
-func (s *exactProgressStorage) Applies() storage.ApplyStore { return s.applies }
-func (s *exactProgressStorage) Tasks() storage.TaskStore    { return s.tasks }
-func (s *exactProgressStorage) Plans() storage.PlanStore    { return s.plans }
+// Applies serves the fixture's apply store; a fixture with none has no apply
+// history, so a replan has no schema files last applied to compare against.
+func (s *exactProgressStorage) Applies() storage.ApplyStore {
+	if s.applies == nil {
+		return noCompletedApplies{}
+	}
+	return s.applies
+}
+func (s *exactProgressStorage) Tasks() storage.TaskStore { return s.tasks }
+func (s *exactProgressStorage) Plans() storage.PlanStore { return s.plans }
 func (s *exactProgressStorage) ApplyLogs() storage.ApplyLogStore {
 	if s.logs != nil {
 		return s.logs

@@ -2029,7 +2029,7 @@ func (c *LocalClient) planWithEngine(ctx context.Context, req *ternv1.PlanReques
 		// SchemaBot last applied to tell a removed declaration from one never
 		// made. The MySQL family plans everything a file leaves out as a
 		// removal, so it needs no history.
-		applied, err := c.appliedSchemaFiles(ctx, req.Environment)
+		applied, err := c.appliedSchemaFiles(ctx, req.Environment, schemaFiles)
 		if err != nil {
 			return nil, err
 		}
@@ -2136,14 +2136,26 @@ func (c *LocalClient) enginePlanRequest(req *ternv1.PlanRequest, database string
 	}
 }
 
-// appliedSchemaFiles returns the schema files of the apply that last
-// completed on this database in environment, or nil when none has. An empty
-// environment matches nothing rather than every environment, so a plan that
-// names none never reads another environment's history.
-func (c *LocalClient) appliedSchemaFiles(ctx context.Context, environment string) (schema.SchemaFiles, error) {
+// appliedSchemaFiles returns, for each namespace of schemaFiles, the files
+// SchemaBot last applied to it on this deployment in environment, or nil
+// when it has applied none of them. An apply can leave a namespace out (an
+// ignored or unselected namespace), and a rollout member can apply a plan of
+// its own, so each namespace is taken from the newest completed apply whose
+// plan for this deployment addressed it: an apply that never touched a
+// namespace cannot erase what an earlier one applied there. Only the
+// namespaces the plan addresses are returned, since the engine reads history
+// for no other. An empty environment matches nothing rather than every
+// environment, so a plan that names none never reads another environment's
+// history.
+func (c *LocalClient) appliedSchemaFiles(ctx context.Context, environment string, schemaFiles schema.SchemaFiles) (schema.SchemaFiles, error) {
 	if environment == "" {
 		c.logger.Debug("plan names no environment; the engine plans without the schema files last applied",
 			"database", c.config.Database, "database_type", c.config.Type)
+		return nil, nil
+	}
+	if len(schemaFiles) == 0 {
+		c.logger.Debug("plan covers no namespace; there are no schema files last applied to compare against",
+			"database", c.config.Database, "database_type", c.config.Type, "environment", environment)
 		return nil, nil
 	}
 	if c.storage == nil {
@@ -2151,21 +2163,99 @@ func (c *LocalClient) appliedSchemaFiles(ctx context.Context, environment string
 			"database", c.config.Database, "database_type", c.config.Type, "environment", environment)
 		return nil, nil
 	}
-	apply, err := c.storage.Applies().GetLatestCompletedByDatabase(ctx, c.config.Database, c.config.Type, environment)
+	applies, err := c.storage.Applies().GetByDatabase(ctx, c.config.Database, c.config.Type, environment)
 	if err != nil {
-		return nil, fmt.Errorf("load the last completed apply for database %q in %s: %w", c.config.Database, environment, err)
+		return nil, fmt.Errorf("load the applies of database %q in %s: %w", c.config.Database, environment, err)
 	}
-	if apply == nil {
+	completed := completedNewestFirst(applies)
+	applied := make(schema.SchemaFiles)
+	for _, apply := range completed {
+		if len(applied) == len(schemaFiles) {
+			break
+		}
+		planIDs, err := c.appliedPlanIDs(ctx, apply)
+		if err != nil {
+			return nil, err
+		}
+		for _, planID := range planIDs {
+			plan, err := c.storage.Plans().GetByID(ctx, planID)
+			if err != nil {
+				return nil, fmt.Errorf("load plan %d of completed apply %s on database %q: %w", planID, apply.ApplyIdentifier, c.config.Database, err)
+			}
+			if plan == nil {
+				return nil, fmt.Errorf("plan %d of completed apply %s on database %q is not in storage", planID, apply.ApplyIdentifier, c.config.Database)
+			}
+			for namespace, files := range plan.SchemaFiles {
+				if _, wanted := schemaFiles[namespace]; !wanted {
+					continue
+				}
+				if _, found := applied[namespace]; found {
+					continue
+				}
+				applied[namespace] = files
+			}
+		}
+	}
+	if len(applied) == 0 {
 		return nil, nil
 	}
-	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+	return applied, nil
+}
+
+// appliedPlanIDs returns the plans a completed apply ran on this deployment:
+// each of its operations on this deployment runs its own plan or the
+// apply's (storage.PlanIDForOperation). An apply with operations, none of
+// them on this deployment, was narrowed to other targets and ran nothing
+// here. An apply with no operations ran its own plan.
+func (c *LocalClient) appliedPlanIDs(ctx context.Context, apply *storage.Apply) ([]int64, error) {
+	ops, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
 	if err != nil {
-		return nil, fmt.Errorf("load the plan of completed apply %s on database %q: %w", apply.ApplyIdentifier, c.config.Database, err)
+		return nil, fmt.Errorf("load the operations of completed apply %s on database %q: %w", apply.ApplyIdentifier, c.config.Database, err)
 	}
-	if plan == nil {
-		return nil, fmt.Errorf("the plan of completed apply %s on database %q is not in storage", apply.ApplyIdentifier, c.config.Database)
+	if len(ops) == 0 {
+		return []int64{apply.PlanID}, nil
 	}
-	return plan.SchemaFiles, nil
+	var planIDs []int64
+	for _, op := range ops {
+		if op.Deployment != c.config.Database {
+			continue
+		}
+		planID, err := storage.PlanIDForOperation(apply, op)
+		if err != nil {
+			return nil, fmt.Errorf("resolve the plan completed apply %s ran on deployment %q: %w", apply.ApplyIdentifier, c.config.Database, err)
+		}
+		if !slices.Contains(planIDs, planID) {
+			planIDs = append(planIDs, planID)
+		}
+	}
+	if len(planIDs) == 0 {
+		c.logger.Debug("completed apply ran nothing on this deployment; it adds no schema files last applied",
+			append(apply.LogAttrs(), "operation_deployment", c.config.Database)...)
+	}
+	return planIDs, nil
+}
+
+// completedNewestFirst returns the completed applies of applies, the most
+// recently completed first.
+func completedNewestFirst(applies []*storage.Apply) []*storage.Apply {
+	var completed []*storage.Apply
+	for _, apply := range applies {
+		if state.IsState(apply.State, state.Apply.Completed) {
+			completed = append(completed, apply)
+		}
+	}
+	sort.SliceStable(completed, func(i, j int) bool {
+		a, b := completed[i].CompletedAt, completed[j].CompletedAt
+		switch {
+		case a == nil || b == nil:
+			return a != nil
+		case !a.Equal(*b):
+			return a.After(*b)
+		default:
+			return completed[i].ID > completed[j].ID
+		}
+	})
+	return completed
 }
 
 func (c *LocalClient) planMySQLNamespacesWithEngine(ctx context.Context, eng engine.Engine, req *ternv1.PlanRequest, schemaFiles schema.SchemaFiles) (*engine.PlanResult, error) {
