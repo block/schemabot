@@ -101,17 +101,15 @@ func ensureVitess(ctx context.Context, project, version string, report func(stri
 		if err = ensureImage(ctx, image); err != nil {
 			return Database{}, err
 		}
-		hostPort, err := reserveHostPort(ctx)
+		// The API port and the proxy ports are reserved as one block, so the
+		// proxy ports can never include the API port. The proxy ports are
+		// published at an offset, so two projects can each run a sample without
+		// either taking the fixed ports the compose stack binds.
+		hostPort, err := reserveHostPortRange(ctx, sampleProxyPorts+1)
 		if err != nil {
 			return Database{}, err
 		}
-		// The proxy ports are published as one block at a reserved offset, so
-		// two projects can each run a sample without either taking the fixed
-		// ports the compose stack binds.
-		proxyBase, err := reserveHostPortRange(ctx, sampleProxyPorts)
-		if err != nil {
-			return Database{}, err
-		}
+		proxyBase := hostPort + 1
 		args := []string{
 			"create", "--name", name,
 			"--label", ownerLabel + "=" + name,
@@ -136,7 +134,11 @@ func ensureVitess(ctx context.Context, project, version string, report func(stri
 	}
 	if c.State.Status == "created" {
 		report("Preparing sample keyspace and tables")
-		if err = copyVitessSample(ctx, name); err != nil {
+		proxyBase, err := sampleProxyBase(c)
+		if err != nil {
+			return Database{}, fmt.Errorf("read the proxy ports of new sample %s: %w", name, err)
+		}
+		if err = copyVitessSample(ctx, name, proxyBase); err != nil {
 			return Database{}, err
 		}
 	}
@@ -144,6 +146,12 @@ func ensureVitess(ctx context.Context, project, version string, report func(stri
 		report("Starting your sample cluster")
 		if _, err = run(ctx, nil, "start", name); err != nil {
 			if c.State.Status == "created" {
+				// A container that never started holds no data. Removing it
+				// lets the retry reserve fresh ports instead of restarting the
+				// same bindings that just failed.
+				if _, rmErr := run(ctx, nil, "rm", name); rmErr != nil {
+					return Database{}, fmt.Errorf("start new sample %s: %w; remove it with docker rm %s and retry setup (removing it failed: %w)", name, err, name, rmErr)
+				}
 				return Database{}, fmt.Errorf("start new sample %s: %w; resolve the Docker error and retry setup", name, err)
 			}
 			return Database{}, fmt.Errorf("start sample %s: %w; if its ports are in use, stop the process holding them and retry docker start %s; keep the container to preserve its saved connection", name, err, name)
@@ -174,9 +182,11 @@ func ensureVitess(ctx context.Context, project, version string, report func(stri
 	if err := waitForLocalscale(ctx, name, result.APIURL); err != nil {
 		return Database{}, err
 	}
-	// The mapping is held in the server's memory, so it is registered on every
-	// start. Without it the API hands out the port the proxy listens on inside
-	// the container, which nothing on the host can reach.
+	// The sample's configuration already advertises each proxy port at its
+	// published host port, from the moment the server starts, so a container
+	// that Docker restarts on its own still hands out reachable addresses.
+	// Posting the map read from Docker also covers an image that predates that
+	// setting.
 	if err := postSampleProxyPortMap(ctx, result.APIURL, proxyPorts); err != nil {
 		return Database{}, err
 	}
@@ -188,6 +198,20 @@ func ensureVitess(ctx context.Context, project, version string, report func(stri
 		return Database{}, err
 	}
 	return result, nil
+}
+
+// sampleProxyBase reads the host port the container was created to publish its
+// first proxy port on.
+func sampleProxyBase(c container) (int, error) {
+	bindings := c.HostConfig.PortBindings[strconv.Itoa(sampleProxyPortStart)+"/tcp"]
+	if len(bindings) != 1 || bindings[0].HostIP != "127.0.0.1" {
+		return 0, fmt.Errorf("proxy port %d must be published on one loopback-only port", sampleProxyPortStart)
+	}
+	port, err := strconv.Atoi(bindings[0].HostPort)
+	if err != nil {
+		return 0, fmt.Errorf("proxy port %d is published on %q: %w", sampleProxyPortStart, bindings[0].HostPort, err)
+	}
+	return port, nil
 }
 
 // sampleProxyPortMap reads what host port each of the container's proxy ports
@@ -290,7 +314,7 @@ const (
 // copyVitessSample writes the sample's LocalScale configuration and seed schema
 // into a created-but-not-yet-started container, so its first boot comes up with
 // the keyspace and tables already in place.
-func copyVitessSample(ctx context.Context, name string) error {
+func copyVitessSample(ctx context.Context, name string, proxyBase int) error {
 	dir, err := os.MkdirTemp("", "schemabot-sample-")
 	if err != nil {
 		return err
@@ -300,7 +324,7 @@ func copyVitessSample(ctx context.Context, name string) error {
 			slog.Warn("remove sample seed directory", "error", err)
 		}
 	}()
-	config, err := json.MarshalIndent(localscaleConfig(), "", "  ")
+	config, err := json.MarshalIndent(localscaleConfig(proxyBase), "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode sample cluster configuration: %w", err)
 	}
@@ -328,8 +352,9 @@ func copyVitessSample(ctx context.Context, name string) error {
 
 // localscaleConfig is the sample's LocalScale configuration: one organization
 // holding one sharded database, with the delays a real PlanetScale deploy has
-// shortened to what a local demo can wait for.
-func localscaleConfig() map[string]any {
+// shortened to what a local demo can wait for. proxyBase is the host port the
+// first proxy port is published on.
+func localscaleConfig(proxyBase int) map[string]any {
 	return map[string]any{
 		"organizations": map[string]any{
 			sampleOrganization: map[string]any{
@@ -342,14 +367,15 @@ func localscaleConfig() map[string]any {
 				},
 			},
 		},
-		"listen_addr":            ":8080",
-		"schema_dir":             localscaleSchemaDir,
-		"proxy_advertise_host":   "127.0.0.1",
-		"proxy_port_start":       sampleProxyPortStart,
-		"proxy_port_end":         sampleProxyPortStart + sampleProxyPorts - 1,
-		"revert_window_duration": "30m",
-		"branch_creation_delay":  "1s",
-		"deploy_request_delay":   "1s",
+		"listen_addr":                ":8080",
+		"schema_dir":                 localscaleSchemaDir,
+		"proxy_advertise_host":       "127.0.0.1",
+		"proxy_port_start":           sampleProxyPortStart,
+		"proxy_port_end":             sampleProxyPortStart + sampleProxyPorts - 1,
+		"proxy_advertise_port_start": proxyBase,
+		"revert_window_duration":     "30m",
+		"branch_creation_delay":      "1s",
+		"deploy_request_delay":       "1s",
 	}
 }
 

@@ -64,6 +64,11 @@ type container struct {
 	NetworkSettings struct {
 		Ports map[string][]struct{ HostIP, HostPort string }
 	}
+	// HostConfig holds the bindings the container was created with, which
+	// Docker reports before the container first starts.
+	HostConfig struct {
+		PortBindings map[string][]struct{ HostIP, HostPort string }
+	}
 }
 
 // Ensure starts or reuses a sample owned by this project and engine. Docker keeps

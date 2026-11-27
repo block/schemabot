@@ -32,7 +32,7 @@ func TestSampleImageFollowsReleaseVersion(t *testing.T) {
 // sharded keyspace, so an apply reports progress per shard, seeded from the
 // directory the sample's schema is copied into.
 func TestSampleClusterConfigIsSharded(t *testing.T) {
-	encoded, err := json.Marshal(localscaleConfig())
+	encoded, err := json.Marshal(localscaleConfig(50000))
 	require.NoError(t, err)
 	var config struct {
 		Organizations map[string]struct {
@@ -43,11 +43,16 @@ func TestSampleClusterConfigIsSharded(t *testing.T) {
 				} `json:"keyspaces"`
 			} `json:"databases"`
 		} `json:"organizations"`
-		SchemaDir string `json:"schema_dir"`
+		SchemaDir               string `json:"schema_dir"`
+		ProxyPortStart          int    `json:"proxy_port_start"`
+		ProxyAdvertisePortStart int    `json:"proxy_advertise_port_start"`
 	}
 	require.NoError(t, json.Unmarshal(encoded, &config))
 
 	require.Equal(t, localscaleSchemaDir, config.SchemaDir)
+	require.Equal(t, sampleProxyPortStart, config.ProxyPortStart)
+	require.Equal(t, 50000, config.ProxyAdvertisePortStart,
+		"the cluster advertises its proxies at their published ports from its first start, so a restart Docker makes on its own still hands out reachable addresses")
 	require.Len(t, config.Organizations, 1)
 	databases := config.Organizations[sampleOrganization].Databases
 	require.Len(t, databases, 1)
@@ -110,6 +115,25 @@ func TestSampleSeedVSchemaCoversEveryTable(t *testing.T) {
 // loopback alone. A port left unpublished would make the API hand the engine an
 // address only the container can reach, and an apply would fail at "ping
 // branch" after the plan had already succeeded.
+// The first proxy port's host port is read from the bindings the container was
+// created with, which Docker reports before the container has ever started.
+func TestSampleProxyBaseReadsTheCreatedBinding(t *testing.T) {
+	var created container
+	created.HostConfig.PortBindings = map[string][]struct{ HostIP, HostPort string }{
+		strconv.Itoa(sampleProxyPortStart) + "/tcp": {{HostIP: "127.0.0.1", HostPort: "50001"}},
+	}
+	base, err := sampleProxyBase(created)
+	require.NoError(t, err)
+	require.Equal(t, 50001, base)
+
+	created.HostConfig.PortBindings[strconv.Itoa(sampleProxyPortStart)+"/tcp"][0].HostIP = "0.0.0.0"
+	_, err = sampleProxyBase(created)
+	require.ErrorContains(t, err, "loopback")
+
+	_, err = sampleProxyBase(container{})
+	require.ErrorContains(t, err, strconv.Itoa(sampleProxyPortStart))
+}
+
 func TestSampleProxyPortMapRequiresEveryPublishedPort(t *testing.T) {
 	full := sampleContainerWithProxyPorts(50000)
 	ports, err := sampleProxyPortMap(full)
