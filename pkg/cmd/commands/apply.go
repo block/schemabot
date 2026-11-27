@@ -261,6 +261,9 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 			if !stdinIsTerminal() {
 				return errLockTakeoverNeedsApproval(cfg.Database, cfg.Type, held, "nothing was applied", "take it over")
 			}
+			if held.ID < 1 {
+				return errLockTakeoverUnidentified(cfg.Database, cfg.Type, held, "nothing was applied", "take it over")
+			}
 			takeover = held
 		}
 	}
@@ -326,8 +329,7 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 				// The operator confirmed the lock shown at the prompt. A
 				// different lock now is one they were never shown.
 				if !cmd.AutoApprove && !sameLockHeld(takeover, existingLock) {
-					return fmt.Errorf("the lock on %s (%s) is now held by %s, a lock you were not shown, so nothing was changed; run the command again to review it",
-						cfg.Database, cfg.Type, ui.TerminalSafeLine(existingLock.Owner))
+					return errLockChangedSincePrompt(cfg.Database, cfg.Type, existingLock)
 				}
 				if err := withLoading("Releasing database lock...", cmd.Output != OutputFormatJSON, func() error {
 					return client.ForceReleaseLock(ep, cfg.Database, cfg.Type)

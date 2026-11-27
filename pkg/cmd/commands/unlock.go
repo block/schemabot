@@ -56,6 +56,9 @@ func (cmd *UnlockCmd) Run(g *Globals) error {
 			if !stdinIsTerminal() {
 				return errLockTakeoverNeedsApproval(database, dbType, existingLock, "it was not released", "release it")
 			}
+			if existingLock.ID < 1 {
+				return errLockTakeoverUnidentified(database, dbType, existingLock, "it was not released", "release it")
+			}
 			templates.WriteLockTakeoverWarning(lockHolderData(database, dbType, existingLock), templates.UnlockTakeoverConsequence)
 			confirmed, err := confirmAction(templates.UnlockTakeoverPrompt, "\nLock not changed.")
 			if err != nil {
@@ -63,6 +66,23 @@ func (cmd *UnlockCmd) Run(g *Globals) error {
 			}
 			if !confirmed {
 				return nil
+			}
+			// The answer covers the lock the prompt named. A lock released or
+			// taken again while the prompt was open is not that lock.
+			var current *client.LockInfo
+			if err := withLoading("Checking database lock...", true, func() error {
+				var lockErr error
+				current, lockErr = client.GetLock(ep, database, dbType)
+				return lockErr
+			}); err != nil {
+				return fmt.Errorf("check lock: %w", err)
+			}
+			if current == nil {
+				reportNoLockFound(ep, database, dbType)
+				return nil
+			}
+			if !sameLockHeld(existingLock, current) {
+				return errLockChangedSincePrompt(database, dbType, current)
 			}
 		}
 

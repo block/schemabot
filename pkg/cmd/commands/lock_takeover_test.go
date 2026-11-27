@@ -57,7 +57,7 @@ func withoutTerminal(t *testing.T) {
 // hours ago.
 func anotherOwnersLock() *client.LockInfo {
 	return &client.LockInfo{
-		Database: "orders", DatabaseType: "mysql", Owner: "octo-org/orders#7",
+		ID: 3, Database: "orders", DatabaseType: "mysql", Owner: "octo-org/orders#7",
 		Repository: "octo-org/orders", PullRequest: 7, CreatedAt: time.Now().Add(-2 * time.Hour),
 	}
 }
@@ -142,6 +142,59 @@ func TestUnlockCmdForceOfTheCallersOwnLockAsksNothing(t *testing.T) {
 	assert.NotContains(t, out, "belongs to another owner")
 	assert.Contains(t, out, "Force released lock for orders (mysql)\n")
 	require.Len(t, srv.releases, 1)
+}
+
+// The answer covers the lock the prompt named. When another lock holds the
+// database by the time the unlock goes to release it, nothing is released.
+func TestUnlockCmdForceDoesNotReleaseALockItDidNotShow(t *testing.T) {
+	replacement := anotherOwnersLock()
+	replacement.ID = 4
+	replacement.Owner = "octo-org/orders#9"
+	srv := &lockTestServer{held: anotherOwnersLock(), heldLater: replacement, releaseStatus: http.StatusOK, releaseBody: map[string]any{}}
+	endpoint := srv.start(t)
+	answerAtTerminal(t, "yes\n")
+
+	out, err := runUnlockCmd(endpoint, true)
+	require.Error(t, err)
+	assert.Equal(t, "the lock on orders (mysql) is now held by octo-org/orders#9, a lock you were not shown, "+
+		"so nothing was changed; run the command again to review it", err.Error())
+	assert.NotContains(t, out, "Force released")
+	assert.Empty(t, srv.releases, "a lock the prompt did not name must not be released")
+}
+
+// A server that does not report lock IDs cannot tell the lock the prompt named
+// from one the same owner took again, so a forced command that would ask is
+// refused before it asks, and -y is named as the way to go ahead.
+func TestForcedTakeoverIsRefusedWhenTheServerReportsNoLockID(t *testing.T) {
+	t.Run("unlock", func(t *testing.T) {
+		held := anotherOwnersLock()
+		held.ID = 0
+		srv := &lockTestServer{held: held, releaseStatus: http.StatusOK, releaseBody: map[string]any{}}
+		endpoint := srv.start(t)
+		answerAtTerminal(t, "yes\n")
+
+		out, err := runUnlockCmd(endpoint, true)
+		require.Error(t, err)
+		assert.Equal(t, "the lock on orders (mysql) is held by octo-org/orders#7, and this SchemaBot server does not report lock IDs, "+
+			"so the lock released could not be checked against the one you approve; it was not released. "+
+			"Add -y to release it without asking, or upgrade the server", err.Error())
+		assert.NotContains(t, out, unlockTakeoverPrompt)
+		assert.Empty(t, srv.releases)
+	})
+	t.Run("apply", func(t *testing.T) {
+		srv := &forceApplyServer{locks: []string{lockBody(t, 0, "cli:alice@build-host")}}
+		endpoint := srv.start(t)
+		answerAtTerminal(t, "yes\n")
+
+		out, err := srv.run(t, endpoint, false)
+		require.Error(t, err)
+		assert.Equal(t, "the lock on testdb (mysql) is held by cli:alice@build-host, and this SchemaBot server does not report lock IDs, "+
+			"so the lock released could not be checked against the one you approve; nothing was applied. "+
+			"Add -y to take it over without asking, or upgrade the server", err.Error())
+		assert.NotContains(t, out, "Do you want to apply")
+		assert.Empty(t, srv.releases)
+		assert.Zero(t, srv.acquires)
+	})
 }
 
 // forceApplyServer serves a forced apply of the testdb mysql database up to

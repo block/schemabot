@@ -49,6 +49,24 @@ func lockHolderData(database, dbType string, lock *client.LockInfo) templates.Lo
 	}
 }
 
+// errLockTakeoverUnidentified is the refusal for a forced command that would
+// ask before taking another owner's lock from a server that does not report
+// which lock row it read. Without the row, a lock released and taken again by
+// the same owner reads the same as the one the prompt named, so the answer
+// could not be held to the lock it was given for.
+func errLockTakeoverUnidentified(database, dbType string, lock *client.LockInfo, notDone, instead string) error {
+	return fmt.Errorf("the lock on %s (%s) is held by %s, and this SchemaBot server does not report lock IDs, "+
+		"so the lock released could not be checked against the one you approve; %s. Add -y to %s without asking, "+
+		"or upgrade the server", database, dbType, ui.TerminalSafeLine(lock.Owner), notDone, instead)
+}
+
+// errLockChangedSincePrompt is the refusal for a forced command whose lock is
+// no longer the one the prompt named when it goes to release it.
+func errLockChangedSincePrompt(database, dbType string, lock *client.LockInfo) error {
+	return fmt.Errorf("the lock on %s (%s) is now held by %s, a lock you were not shown, so nothing was changed; run the command again to review it",
+		database, dbType, ui.TerminalSafeLine(lock.Owner))
+}
+
 // errLockTakeoverNeedsApproval is the refusal for a forced command that would
 // take a lock from another owner when nothing can ask the operator. The holder
 // is whatever the caller that took the lock named itself, so its control runes

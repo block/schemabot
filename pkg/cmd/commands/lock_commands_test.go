@@ -21,7 +21,9 @@ import (
 // with that status. It records the body of each release request and the paths
 // of the reads it serves.
 type lockTestServer struct {
-	held          *client.LockInfo
+	held *client.LockInfo
+	// heldLater, when set, is the lock every lookup after the first finds.
+	heldLater     *client.LockInfo
 	listed        []*client.LockInfo
 	releaseStatus int
 	releaseBody   any
@@ -51,6 +53,10 @@ func (s *lockTestServer) start(t *testing.T) string {
 			if s.lookupStatus != 0 {
 				w.WriteHeader(s.lookupStatus)
 				assert.NoError(t, json.NewEncoder(w).Encode(lockReadFailure))
+				return
+			}
+			if s.heldLater != nil && len(s.reads) > 1 {
+				assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{"lock": s.heldLater}))
 				return
 			}
 			if s.held == nil {
