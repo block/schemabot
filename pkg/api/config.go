@@ -1850,6 +1850,11 @@ type PostgresConfig struct {
 	// When unset, postgres.DefaultConcurrentIndexMaxDuration applies.
 	ConcurrentIndexMaxDuration string `yaml:"concurrent_index_max_duration,omitempty"`
 
+	// ValidateMaxDuration bounds one VALIDATE CONSTRAINT scan, the step that
+	// checks existing rows against a constraint added NOT VALID. When unset,
+	// postgres.DefaultValidateMaxDuration applies.
+	ValidateMaxDuration string `yaml:"validate_max_duration,omitempty"`
+
 	// StatementTimeout bounds a single ordinary storage query on the
 	// connections SchemaBot opens to its own PostgreSQL storage database: the
 	// long-lived storage pool and the startup bootstrap's catalog reads. It
@@ -1900,6 +1905,11 @@ func (c PostgresConfig) ConcurrentIndexMaxDurationOrDefault() time.Duration {
 	return parseDurationOrDefault(c.ConcurrentIndexMaxDuration, postgresengine.DefaultConcurrentIndexMaxDuration)
 }
 
+// ValidateMaxDurationOrDefault returns the configured constraint validation bound.
+func (c PostgresConfig) ValidateMaxDurationOrDefault() time.Duration {
+	return parseDurationOrDefault(c.ValidateMaxDuration, postgresengine.DefaultValidateMaxDuration)
+}
+
 // StatementTimeoutOrDefault returns the configured storage statement budget or
 // its default. A configured "0" returns zero, meaning the budget is explicitly
 // disabled — callers pass that through to postgresconn, which writes
@@ -1909,24 +1919,38 @@ func (c PostgresConfig) StatementTimeoutOrDefault() time.Duration {
 	return parseDurationOrDefault(c.StatementTimeout, DefaultPostgresStatementTimeout)
 }
 
+// validateEngineDuration checks a duration the engine hands the server as a
+// statement_timeout: it must parse, be positive, and fit the server timer's
+// range. Empty means the default and passes.
+func validateEngineDuration(key, value string, minimum time.Duration) error {
+	if value == "" {
+		return nil
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return fmt.Errorf("%s %q is not a valid duration: %w", key, value, err)
+	}
+	if d <= 0 {
+		return fmt.Errorf("%s %q must be positive (omit it to use the default)", key, value)
+	}
+	if d < minimum {
+		return fmt.Errorf("%s %q is below the smallest bound the engine can honor (%s)", key, value, minimum)
+	}
+	if d > postgresengine.MaxConcurrentIndexMaxDuration {
+		return fmt.Errorf("%s %q exceeds the largest bound the engine can honor (%s)", key, value, postgresengine.MaxConcurrentIndexMaxDuration)
+	}
+	return nil
+}
+
 func (c PostgresConfig) validate() error {
 	if c.NativeSafeTableSizeLimitBytes != nil && *c.NativeSafeTableSizeLimitBytes <= 0 {
 		return fmt.Errorf("postgres.native_safe_table_size_limit_bytes must be positive, got %d", *c.NativeSafeTableSizeLimitBytes)
 	}
-	if c.ConcurrentIndexMaxDuration != "" {
-		d, err := time.ParseDuration(c.ConcurrentIndexMaxDuration)
-		if err != nil {
-			return fmt.Errorf("postgres.concurrent_index_max_duration %q is not a valid duration: %w", c.ConcurrentIndexMaxDuration, err)
-		}
-		if d <= 0 {
-			return fmt.Errorf("postgres.concurrent_index_max_duration %q must be positive (omit it to use the default)", c.ConcurrentIndexMaxDuration)
-		}
-		if d < postgresengine.MinConcurrentIndexMaxDuration {
-			return fmt.Errorf("postgres.concurrent_index_max_duration %q is below the smallest bound the engine can honor (%s, the server timer's resolution)", c.ConcurrentIndexMaxDuration, postgresengine.MinConcurrentIndexMaxDuration)
-		}
-		if d > postgresengine.MaxConcurrentIndexMaxDuration {
-			return fmt.Errorf("postgres.concurrent_index_max_duration %q exceeds the largest bound the engine can honor (%s)", c.ConcurrentIndexMaxDuration, postgresengine.MaxConcurrentIndexMaxDuration)
-		}
+	if err := validateEngineDuration("postgres.concurrent_index_max_duration", c.ConcurrentIndexMaxDuration, postgresengine.MinConcurrentIndexMaxDuration); err != nil {
+		return err
+	}
+	if err := validateEngineDuration("postgres.validate_max_duration", c.ValidateMaxDuration, postgresengine.MinValidateMaxDuration); err != nil {
+		return err
 	}
 	// Zero is a meaningful setting here, unlike the pool durations: it disables
 	// the budget explicitly instead of selecting the default.
