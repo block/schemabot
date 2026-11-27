@@ -2605,3 +2605,47 @@ func TestResumeApplyReplanFailurePausesForRetry(t *testing.T) {
 	assert.Equal(t, "re-plan failed during recovery: re-plan failed: no engine configured for type: vitess", applyStore.apply.ErrorMessage)
 	assert.Equal(t, state.Task.FailedRetryable, tasks[0].State)
 }
+
+// A multi-operation drive whose recovery cannot re-plan it pauses its own
+// operation row for retry and records the cause there, for the operator's
+// projection to lift onto the parent. The parent row is the operator's to
+// write and is left as found.
+func TestResumeApplyReplanFailurePausesTheLeasedOperation(t *testing.T) {
+	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{plan: &storage.Plan{ID: 5}})
+	ops := leasedOperationStore(client, apply)
+	ctx := storage.WithOperationLease(t.Context(), storage.OperationLease{ApplyID: apply.ID, OperationID: 3, Owner: "driver", Token: "op-token"})
+
+	err := client.resumeApplyWithTasks(ctx, apply, nil, tasks, nil, false, false)
+
+	require.NoError(t, err, "the pause is the drive's outcome")
+	assert.Equal(t, state.ApplyOperation.FailedRetryable, ops.ops[3].State)
+	assert.Equal(t, "re-plan failed during recovery: re-plan failed: no engine configured for type: vitess", ops.ops[3].ErrorMessage)
+	assert.Equal(t, state.Task.FailedRetryable, tasks[0].State)
+	assert.Equal(t, state.Apply.Running, applyStore.apply.State, "the operator projects the parent")
+}
+
+// An operation drive that pauses for retry with no tasks to carry the pause,
+// such as VSchema-only work, records it on its operation row. Left running,
+// the row would be re-claimed on every lease lapse outside the parent's
+// recovery budget.
+func TestMarkApplyRetryablePausesATasklessLeasedOperation(t *testing.T) {
+	client, apply, _, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{plan: &storage.Plan{ID: 5}})
+	ops := leasedOperationStore(client, apply)
+	ctx := storage.WithOperationLease(t.Context(), storage.OperationLease{ApplyID: apply.ID, OperationID: 3, Owner: "driver", Token: "op-token"})
+
+	require.NoError(t, client.markApplyRetryableWithTasks(ctx, apply, nil, "engine unavailable"))
+
+	assert.Equal(t, state.ApplyOperation.FailedRetryable, ops.ops[3].State)
+	assert.Equal(t, "engine unavailable", ops.ops[3].ErrorMessage)
+	assert.Equal(t, state.Apply.Running, applyStore.apply.State, "the operator projects the parent")
+}
+
+// leasedOperationStore wires a running operation 3 of apply into client's
+// storage, the row an operation-lease drive of the recovery fixture owns.
+func leasedOperationStore(client *LocalClient, apply *storage.Apply) *mockApplyOperationStore {
+	ops := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		3: {ID: 3, ApplyID: apply.ID, Deployment: "main", State: state.ApplyOperation.Running},
+	}}
+	client.storage.(*exactProgressStorage).applyOperations = ops
+	return ops
+}
