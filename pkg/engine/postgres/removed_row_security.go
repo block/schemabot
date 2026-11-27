@@ -77,22 +77,17 @@ type removedRowSecurityError struct {
 }
 
 func (e *removedRowSecurityError) Error() string {
-	return fmt.Sprintf("add ALTER TABLE %s DISABLE ROW LEVEL SECURITY; to remove %s from table %q, or put the file's row security clauses back to keep them. "+
+	return fmt.Sprintf("add ALTER TABLE %s DISABLE ROW LEVEL SECURITY; to %s on table %q, or put the file's row security clauses back to keep them. "+
 		"SchemaBot applied them, and a file without row security clauses leaves them in place",
-		pgx.Identifier{e.table}.Sanitize(), describeRowSecurity(e.live), e.table)
+		pgx.Identifier{e.table}.Sanitize(), removalOf(e.live), e.table)
 }
 
-// describeRowSecurity names what a table's row security holds, such as
-// `row level security enabled and policy "read all"`.
-func describeRowSecurity(rs schemadiff.RowSecurity) string {
+// removalOf names what the removal does to a table's row security, such as
+// `turn off row level security and drop policy "read all"`.
+func removalOf(rs schemadiff.RowSecurity) string {
 	var parts []string
-	switch {
-	case rs.Enabled && rs.Forced:
-		parts = append(parts, "row level security enabled and forced")
-	case rs.Enabled:
-		parts = append(parts, "row level security enabled")
-	case rs.Forced:
-		parts = append(parts, "row level security forced")
+	if rs.Enabled || rs.Forced {
+		parts = append(parts, "turn off row level security")
 	}
 	if len(rs.Policies) > 0 {
 		names := make([]string, len(rs.Policies))
@@ -103,7 +98,7 @@ func describeRowSecurity(rs schemadiff.RowSecurity) string {
 		if len(names) > 1 {
 			noun = "policies"
 		}
-		parts = append(parts, noun+" "+strings.Join(names, ", "))
+		parts = append(parts, "drop "+noun+" "+strings.Join(names, ", "))
 	}
 	return strings.Join(parts, " and ")
 }

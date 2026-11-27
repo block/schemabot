@@ -59,7 +59,7 @@ func TestEnginePlanRefusesRowSecurityTheFileNoLongerDeclares(t *testing.T) {
 		var refused *engine.PlanRefusedError
 		require.True(t, errors.As(err, &refused), "a removed declaration is a refusal the file's author fixes: %v", err)
 		assert.Contains(t, err.Error(), `"public"/"h_plain.sql"`)
-		assert.Contains(t, err.Error(), `add ALTER TABLE "h_plain" DISABLE ROW LEVEL SECURITY; to remove row level security enabled and policy "read all" from table "h_plain", or put the file's row security clauses back to keep them`)
+		assert.Contains(t, err.Error(), `add ALTER TABLE "h_plain" DISABLE ROW LEVEL SECURITY; to turn off row level security and drop policy "read all" on table "h_plain", or put the file's row security clauses back to keep them`)
 		assert.Contains(t, err.Error(), `SchemaBot applied them, and a file without row security clauses leaves them in place`)
 	})
 
@@ -69,7 +69,7 @@ func TestEnginePlanRefusesRowSecurityTheFileNoLongerDeclares(t *testing.T) {
 		reset(t, ctx)
 		_, err := plan(t, ctx, plainTable, schema.SchemaFiles{"public": {Files: map[string]string{"plain.sql": plainWithPolicy}}})
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), `from table "h_plain"`)
+		assert.Contains(t, err.Error(), `on table "h_plain"`)
 	})
 
 	t.Run("the removal it names plans", func(t *testing.T) {

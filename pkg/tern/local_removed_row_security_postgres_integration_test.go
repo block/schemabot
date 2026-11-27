@@ -75,7 +75,7 @@ CREATE POLICY "read all" ON h_plain FOR SELECT USING (true);`)
 
 	_, err = planFile(localClientTestEnvironment, `CREATE TABLE h_plain (id bigint PRIMARY KEY);`)
 	require.Error(t, err, "a revert of applied row security never plans as no changes")
-	assert.Contains(t, err.Error(), `add ALTER TABLE "h_plain" DISABLE ROW LEVEL SECURITY; to remove row level security enabled and policy "read all" from table "h_plain"`)
+	assert.Contains(t, err.Error(), `add ALTER TABLE "h_plain" DISABLE ROW LEVEL SECURITY; to turn off row level security and drop policy "read all" on table "h_plain"`)
 
 	other, err := planFile("production", `CREATE TABLE h_plain (id bigint PRIMARY KEY);`)
 	require.NoError(t, err)
