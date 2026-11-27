@@ -1214,7 +1214,7 @@ func TestRenderApplyStatusComment_Failed(t *testing.T) {
 	assert.Contains(t, result, "📊 1/3 complete")
 	assert.Contains(t, result, "1 failed")
 	assert.Contains(t, result, "1 cancelled")
-	assert.Contains(t, result, "To retry:")
+	assert.Contains(t, result, presentation.RetryLabel+":")
 	assert.Contains(t, result, "schemabot apply -e staging")
 }
 

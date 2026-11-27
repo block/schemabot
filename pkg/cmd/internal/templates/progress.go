@@ -406,7 +406,7 @@ func FormatVSchemaDiff(diff, indent string) string {
 func writeFailureGuidance() {
 	fmt.Println()
 	fmt.Printf("%sTo recover:%s Fix the issue above, then run a new apply.\n", ANSIBold, ANSIReset)
-	fmt.Printf("The new apply will only process tables that haven't completed.\n")
+	fmt.Printf("The new apply %s.\n", presentation.NewApplyRunsWhatRemains)
 }
 
 // FormatProgressState formats the state for display with color.
