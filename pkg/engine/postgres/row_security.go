@@ -40,23 +40,47 @@ func parseDesiredFiles(namespace string, files map[string]string) (map[string]st
 	for _, filename := range sortedKeys(files) {
 		desired, err := statement.ParseDesiredFile(files[filename])
 		if err != nil {
-			return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
+			// The parse reads only the file's text, so whatever it refuses is
+			// fixed by editing the file: a statement the file may not hold, a
+			// schema-qualified name, or a syntax error, which pg-sprite
+			// locates at its line and column.
+			return nil, desiredFileRefusal(namespace, filename, err)
 		}
 		parsed[filename] = desired
 	}
 	return parsed, nil
 }
 
-// plannerRefusal reports a decline of the declared schema as a plan refusal.
-// pg-sprite names each decline with a sentinel: a file its parser does not
-// admit (two tables, a statement a desired file may not hold, partitions, an
-// enum type mixed with other statements or carrying a bad label), a shape the
+// desiredFileRefusal is the refusal for a schema file the parser does not
+// admit. A syntax error is about one line of the file, so the refusal also
+// lists it as a problem located at that line, for a renderer that points the
+// file's author at it.
+func desiredFileRefusal(namespace, filename string, err error) error {
+	refusal := &engine.PlanRefusedError{Err: fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)}
+	var syntaxErr *statement.SyntaxError
+	if errors.As(err, &syntaxErr) {
+		refusal.Problems = []engine.PlanProblem{{
+			File:      namespace + "/" + filename,
+			Line:      syntaxErr.Line,
+			Message:   fmt.Sprintf("The statement has a syntax error at column %d: %s. Correct it in this file.", syntaxErr.Column, syntaxErr.Message),
+			Statement: syntaxErr.SourceLine,
+		}}
+	}
+	return refusal
+}
+
+// plannerRefusal reports a planner's decline of the declared schema as a plan
+// refusal. A planner reads the target as well as the files, so its errors mix
+// declines with failures of the connection or the role, and only the declines
+// are refusals. pg-sprite names each decline with a sentinel: a shape the
 // planner refuses while it builds the table (a partition or inheritance
 // declaration, a constraint repeated within one file, an expression whose text
 // never settles), a change no ALTER can converge, a foreign key to a table the
-// target lacks, and policies that read each other back. Each is fixed by
-// editing the schema files. Any other failure, such as a syntax error, a lost
-// connection, or a missing privilege, is returned as it came.
+// target lacks, policies that read each other back, and the parser's own
+// refusals when a planner reaches them. Each is fixed by editing the schema
+// files. Any other failure, such as a lost connection or a missing privilege,
+// is returned as it came. A file the parser does not admit never reaches a
+// planner: parseDesiredFiles refuses it first.
 //
 // pg-sprite keeps the closed set of these refusals in its migrate package,
 // which also carries its schema change runner, so the sentinels are named here

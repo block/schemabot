@@ -620,7 +620,11 @@ name the lock gets no release at all: the command keeps the lock and tells you
 to check `schemabot locks` and run `schemabot unlock` if nothing of yours runs
 under it. Locks span the
 database's environments; forcing one away from its owner is an administrative
-action, not a routine retry.
+action, not a routine retry. `unlock --force` and `apply --force` show who holds
+the lock and since when, then ask you to answer `yes` before they take it from
+another owner. A lock you hold yourself, or no lock, brings no question. `-y`
+skips the question, so scripts keep working. With no terminal to answer on and
+no `-y`, the command refuses, names the holder, and changes nothing.
 See [locks](schema-intelligence.md#check-locks) for the inspection request and
 response, and [access rules](auth.md#what-read-and-write-access-include) for
 who may act.
@@ -724,7 +728,7 @@ $ schemabot progress apply-example-73
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00% (throttled)
        ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
-       • Rows: 6,000,000 / 10,000,000 · ETA: 8m 0s
+       • Rows: 6,000,000 / 10,000,000 · ETA: 8m
        • ℹ️ Throttled: commit-latency 120ms >= 100ms · backing off while database writes commit slowly
 
   📖 Docs: https://github.com/block/schemabot/blob/main/docs/mysql.md#throttling
@@ -849,7 +853,7 @@ $ schemabot progress apply-example-84
        • Rows: 2,900,000 / 4,000,000 · ETA: 2m 45s
        • Shards: 4 (3 copying, 1 complete)
            ✓ -40: 1,000,000 rows
-           ◉ 40-80: 80.00% · 800,000 / 1,000,000 rows · ETA: 1m 0s
+           ◉ 40-80: 80.00% · 800,000 / 1,000,000 rows · ETA: 1m
            ◉ 80-c0: 65.00% · 650,000 / 1,000,000 rows · ETA: 1m 45s
            ◉ c0-: 45.00% · 450,000 / 1,000,000 rows · ETA: 2m 45s
 

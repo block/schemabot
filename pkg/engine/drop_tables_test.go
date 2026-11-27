@@ -7,6 +7,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// Dropping the cutover sentinel runs a deferred cutover nobody asked for, so an
+// entry naming it is refused in any case, while a name that only resembles it
+// is an ordinary entry.
+func TestNewDroppedTablesRefusesTheCutoverSentinelInAnyCase(t *testing.T) {
+	for _, entry := range []string{"_spirit_sentinel", "_SPIRIT_SENTINEL", "_Spirit_Sentinel"} {
+		_, err := NewDroppedTables([]string{"_jobs_old", entry})
+		require.Error(t, err, "entry %q", entry)
+		assert.Contains(t, err.Error(), `drop_tables entry "`+entry+`" is the table that holds a deferred cutover`)
+	}
+	drops, err := NewDroppedTables([]string{"_spirit_sentinel_old", "_spirit_sentinels", "spirit_sentinel"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"_spirit_sentinel_old", "_spirit_sentinels", "spirit_sentinel"}, drops.Entries())
+}
+
 // drop_tables takes exact names only, so a pattern, a path or a padded entry
 // fails the plan instead of dropping tables nobody listed by name.
 func TestNewDroppedTablesRefusesAnythingButAnExactName(t *testing.T) {

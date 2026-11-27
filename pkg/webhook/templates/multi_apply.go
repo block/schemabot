@@ -383,7 +383,7 @@ func writeAggregateFirstFailure(sb *strings.Builder, failure *presentation.Deplo
 		fmt.Fprintf(sb, "\n> "+glyph.Failed+" **First failure:** <code>%s</code>\n", name)
 		return
 	}
-	fmt.Fprintf(sb, "\n> "+glyph.Failed+" **First failure:** <code>%s</code> — %s\n", name, html.EscapeString(msg))
+	fmt.Fprintf(sb, "\n> "+glyph.Failed+" **First failure:** <code>%s</code> — %s\n", name, errorDetailMarkdown(msg))
 }
 
 // writeStoppedAtCutoverNote explains, under the first failure, the members

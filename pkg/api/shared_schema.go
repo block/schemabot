@@ -326,12 +326,12 @@ func tablesCreatedIn(parser ddl.StatementParser, namespace string, files *ternv1
 		}
 		stmts, err := parser.Split(content)
 		if err != nil {
-			return nil, fmt.Errorf("split schema file %s/%s: %w", namespace, name, err)
+			return nil, &schemaFileParseError{message: fmt.Sprintf("split schema file %s/%s: %v", namespace, name, err), err: err}
 		}
 		for _, stmt := range stmts {
 			stmtType, table, err := parser.Classify(stmt)
 			if err != nil {
-				return nil, fmt.Errorf("classify statement in schema file %s/%s: %w", namespace, name, err)
+				return nil, &schemaFileParseError{message: fmt.Sprintf("classify statement in schema file %s/%s: %v", namespace, name, err), err: err}
 			}
 			if stmtType == ddl.StatementCreateTable {
 				tables = append(tables, table)

@@ -2,7 +2,6 @@ package templates
 
 import (
 	"fmt"
-	"html"
 	"strings"
 
 	"github.com/block/schemabot/pkg/caller"
@@ -373,7 +372,7 @@ func RenderRollbackNotAccepted(database, environment, errorMessage string) strin
 	header := fmt.Sprintf("## Rollback Not Accepted\n\n"+
 		"**Database**: `%s` | **Environment**: `%s`\n\n", database, environment)
 	if msg := presentation.InlineError(errorMessage); msg != "" {
-		return header + "The rollback was not accepted: " + html.EscapeString(msg)
+		return header + "The rollback was not accepted: " + errorDetailMarkdown(msg)
 	}
 	return header + "The rollback was not accepted."
 }

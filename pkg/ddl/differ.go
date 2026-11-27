@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
 )
@@ -119,7 +120,7 @@ func (d *Differ) DiffTable(sourceStmt, targetStmt string) ([]string, error) {
 // a repository can name such a table in drop_tables, and the plan and the
 // apply's progress show that drop like any other change.
 func IsSpiritInternalTable(table string) bool {
-	if table == "_spirit_sentinel" || table == "_spirit_checkpoint" {
+	if table == sentinel.TableName || table == "_spirit_checkpoint" {
 		return true
 	}
 	// Spirit temporary tables: _tablename_new, _tablename_old, _tablename_chkpnt

@@ -120,13 +120,17 @@ type nativeApply struct {
 	partitionedIndex bool
 	enumValueAdd     bool
 	// dropped is the plan's record of the live object the statement drops,
-	// which the apply checks under the table's lock before dropping it.
+	// which the apply checks before dropping it: under the table's lock, or
+	// for an index drop, right before the concurrent drop.
 	dropped *schemadiff.DroppedObject
+	// indexDrop is set for a DROP INDEX CONCURRENTLY of the index dropped
+	// names, which runs through pg-sprite's concurrent index drop.
+	indexDrop bool
 	// validates is the plan's record of the live NOT VALID constraint the
 	// statement validates, which the apply checks under the validation's
 	// lock before validating it.
 	validates *schemadiff.ConstraintValidation
-	// database names the target for the logs and metrics of a table drop.
+	// database names the target for the logs and metrics of a drop.
 	database string
 	// droppedTable is the definition the plan recorded for a table the
 	// statement drops whole, which pg-sprite checks under the table's lock.
@@ -292,7 +296,7 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 	if err := plannedSchemaMatchesTarget(statements, req.Changes[0].Namespace); err != nil {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: %w", tc.Table, err)
 	}
-	change := nativeApply{namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL, steps: len(statements)}
+	change := nativeApply{database: req.Database, namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL, steps: len(statements)}
 	if len(statements) == 1 {
 		// The tier derivation above parsed this statement already, so a
 		// parse failure here is an invariant guard; the message stays curated
@@ -304,6 +308,10 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 		change.concurrentIndex = build == indexBuildConcurrent
 		change.partitionedIndex = build == indexBuildPartitioned
 		change.dropped, err = reviewedDropForApply(req.Database, tc, statements[0])
+		if err != nil {
+			return nativeApply{}, err
+		}
+		change.indexDrop, err = indexDropForApply(req.Database, change.namespace, tc.Table, statements[0], change.dropped)
 		if err != nil {
 			return nativeApply{}, err
 		}
@@ -1044,6 +1052,13 @@ func refusalForCause(err error, table string) *refusal {
 		return &refusal{reason: "partitioned-index-bound-exceeded", cause: partitionedBoundErr.Error(),
 			remedy: fmt.Sprintf("raise %s and re-run", concurrentIndexBoundOption)}
 	}
+	// A cancelled concurrent drop can leave the index invalid, which no plan
+	// drops, so the refusal names the index and the drop to finish by hand.
+	// Decided before the budget arm, which would hide the index.
+	var dropInterruptedErr *indexDropInterruptedError
+	if errors.As(err, &dropInterruptedErr) {
+		return indexDropInterruptedRefusal(dropInterruptedErr, table)
+	}
 	var budgetErr *executor.BudgetError
 	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
 		return &refusal{reason: "not-native-safe-budget-exceeded", cause: budgetErr.Error()}
@@ -1177,7 +1192,7 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		executor.CodeUnsupportedPartitionedParent, executor.CodeNotConcurrentIndexBuild,
 		executor.CodeUnnamedIndex, executor.CodeUnqualifiedTable,
 		executor.CodeUnsupportedAcceptedBlocking, executor.CodeNotCreateIndex,
-		executor.CodeNotAddKeyConstraint:
+		executor.CodeNotAddKeyConstraint, executor.CodeNotAddForeignKey:
 		// Shape refusals: the executor refused the statement's form at
 		// admission, so retrying the identical plan refails the same way.
 		return &refusal{reason: "unsupported-statement-shape",
@@ -1302,6 +1317,40 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return &refusal{reason: "unsupported-statement-shape",
 			cause:  fmt.Sprintf("a partition of %s is itself partitioned, which the key build does not run", quotedTable(table)),
 			remedy: "add the key to that partition by hand, then " + replanRemedy}, true
+	case executor.CodePartitionedForeignKeyNameTaken:
+		// The build left the occupant alone, so only an operator freeing the
+		// name, or the schema file choosing another, changes the outcome.
+		return &refusal{reason: "partitioned-foreign-key-name-taken",
+			cause:  fmt.Sprintf("a name the foreign key on partitioned table %s needs on a partition is held by another constraint", quotedTable(table)),
+			remedy: "rename the foreign key in the schema file and re-plan, or drop or rename the constraint that holds the name"}, true
+	case executor.CodePartitionedForeignKeyConflict:
+		return &refusal{reason: "partitioned-foreign-key-conflict",
+			cause:  fmt.Sprintf("a partition of %s has duplicate foreign keys the parent's cannot adopt; nothing was added", quotedTable(table)),
+			remedy: "drop the partition's duplicate foreign keys, then " + replanRemedy}, true
+	case executor.CodePartitionedForeignKeyReferencedTable:
+		return &refusal{reason: "unsupported-statement-shape",
+			cause:  fmt.Sprintf("the foreign key on %s must reference a plain table outside its partitions", quotedTable(table)),
+			remedy: "reference a plain table outside the partition tree in the schema file, then " + replanRemedy}, true
+	case executor.CodePartitionedForeignKeyUnsupportedShape:
+		return &refusal{reason: "unsupported-statement-shape",
+			cause:  fmt.Sprintf("the foreign key on partitioned table %s has no name or a clause its partitions cannot carry", quotedTable(table)),
+			remedy: "name the foreign key and drop that clause in the schema file, then " + replanRemedy}, true
+	case executor.CodePartitionedForeignKeyParentConflict:
+		// Nothing was created, and the parent's own constraint stays until
+		// an operator or the schema file changes it.
+		return &refusal{reason: "partitioned-foreign-key-parent-conflict",
+			cause:  fmt.Sprintf("partitioned table %s already uses the foreign key's name, or has it under another name", quotedTable(table)),
+			remedy: "rename the foreign key in the schema file, or free the name, then " + replanRemedy}, true
+	case executor.CodePartitionedForeignKeySubPartitioned:
+		return &refusal{reason: "unsupported-statement-shape",
+			cause:  fmt.Sprintf("a partition of %s is itself partitioned, which the foreign key build does not run", quotedTable(table)),
+			remedy: "add the foreign key to that partition by hand, then " + replanRemedy}, true
+	case executor.CodePartitionedForeignKeyNotValidSupported:
+		// The server accepts NOT VALID on the partitioned table, so a new
+		// plan routes the foreign key to the NOT VALID then VALIDATE steps.
+		return &refusal{reason: "partitioned-foreign-key-not-valid-supported",
+			cause:  fmt.Sprintf("the server adds a foreign key on partitioned table %s online without the partition build; nothing was created", quotedTable(table)),
+			remedy: replanRemedy}, true
 	case executor.CodePartitionedIndexTablespace:
 		return &refusal{reason: "unsupported-statement-shape",
 			cause:  fmt.Sprintf("the index on %s names a TABLESPACE, which the partitions' indexes would not use", quotedTable(table)),
@@ -1353,7 +1402,7 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		executor.CodeRenamedIndexDrift, executor.CodeDroppedIndexDrift:
 		// The index or constraint the planned statement names changed after
 		// planning — dropped, replaced, left invalid, or now backing a
-		// constraint — read again under the table's lock; nothing was
+		// constraint — read again right before the statement; nothing was
 		// applied. The plan is stale, so only a re-plan changes the outcome.
 		return &refusal{reason: "planned-object-drift",
 			cause:  fmt.Sprintf("the index or constraint the planned statement for %s names changed after planning", quotedTable(table)),
@@ -1427,11 +1476,12 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		executor.CodeInvalidIndexAbandoned, executor.CodeInvalidIndexBuildInFlight,
 		executor.CodeInvalidIndexBuilderUnobservable, executor.CodeInvalidIndexUnproven,
 		executor.CodePartitionedIndexUnsettled, executor.CodePartitionedKeyUnsettled,
+		executor.CodePartitionedForeignKeyUnsettled, executor.CodePartitionedForeignKeyLeafChanged,
 		executor.CodeDetachInterrupted, executor.CodeExecutionFailed:
 		// Operational outcomes: a bounded lock race, the caller's own
 		// context ending or an external stop, an invalid-index state a retry
-		// recovers or an operator clears or waits out, a partitioned index
-		// or key build that a rerun resumes, a concurrent detach that running the
+		// recovers or an operator clears or waits out, a partitioned index,
+		// key, or foreign key build that a rerun resumes, a concurrent detach that running the
 		// same statement again finishes, or a failure outside the typed set. A retry can succeed once conditions change, so
 		// none is a permanent refusal.
 		return nil, true
@@ -1447,6 +1497,24 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 // column's auto-named sequence lands on a standalone type of that name —
 // and then the operator changes the name on one side or the other.
 const createCollisionRemedy = "re-plan, and if it recurs drop or rename the occupant or give the constraint, index, or sequence another name"
+
+// indexDropInterruptedRefusal names the index whose concurrent drop was
+// cancelled and the statement that finishes it. The statement is built from
+// the plan's schema and index name with SQL identifier quoting, which
+// PostgreSQL's identifier length bounds, so it runs as shown.
+func indexDropInterruptedRefusal(err *indexDropInterruptedError, table string) *refusal {
+	index := boundedQuote(err.index, quotedTableWidth)
+	reason := "index-drop-cancelled"
+	what := "was cancelled before it finished"
+	if err.timedOut {
+		reason = "index-drop-timed-out"
+		what = fmt.Sprintf("ran past %s and was cancelled", err.limit)
+	}
+	return &refusal{reason: reason,
+		cause: fmt.Sprintf("the drop of index %s on %s %s, which can leave the index invalid", index, quotedTable(table), what),
+		remedy: fmt.Sprintf("if index %s is still on the table and invalid, finish the drop outside SchemaBot by running %s, then %s",
+			index, err.finishDropStatement(), replanRemedy)}
+}
 
 // createCollisionRefusal names the kinds of relation that can hold a name
 // the create set claims, so the operator knows where to look; the server
@@ -1823,6 +1891,11 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 		// must not reach the transactional optimistic executor.
 		return buildIndexConcurrently(ctx, pool, change, tracker, logger)
 	}
+	if change.indexDrop {
+		// A concurrent drop cannot run inside a transaction block either, so
+		// it takes pg-sprite's checked concurrent drop.
+		return executeIndexDrop(ctx, pool, change, tracker, logger)
+	}
 	// Every other statement runs exactly as reviewed, under the
 	// per-statement and lock limits. The apply never rewrites a statement
 	// here: it executes the DDL the plan surfaced, which tableChanges
@@ -1990,6 +2063,11 @@ func provenCatalogOnly(ctx context.Context, pool *pgxpool.Pool, statement pgstat
 
 func applyTablePreflightLimit(change nativeApply, tableSizeLimit int64) int64 {
 	if change.durationBoundedIndexBuild() {
+		return preflight.NoSizeLimit
+	}
+	if change.indexDrop {
+		// A concurrent index drop scans no rows, so the table's size does
+		// not bound it.
 		return preflight.NoSizeLimit
 	}
 	return tableSizeLimit
@@ -2720,6 +2798,21 @@ func executorProgressMetadata(ctx context.Context, tracker buildTracker, result 
 		metadata["lockers_done"] = strconv.FormatUint(work.LockersDone, 10)
 		metadata["lockers_total"] = strconv.FormatUint(work.LockersTotal, 10)
 	}
+	// A step waiting outside the lock queue for a conflicting session to end
+	// names that session, so an operator can see what the apply waits on.
+	// The keys are absent once the wait ends.
+	if wait := snapshot.Detail.LockHolderWait; wait != nil {
+		metadata[lockHolderPIDMetadataKey] = strconv.FormatUint(uint64(wait.PID), 10)
+		if table := sanitizeReasonText(wait.Table); table != "" {
+			metadata[lockHolderTableMetadataKey] = table
+		}
+		metadata[lockHolderWaitedMetadataKey] = strconv.FormatInt(wait.Waited.Milliseconds(), 10)
+		metadata[lockHolderLimitMetadataKey] = strconv.FormatInt(wait.Limit.Milliseconds(), 10)
+	} else {
+		for _, key := range lockHolderMetadataKeys {
+			delete(metadata, key)
+		}
+	}
 	// pg-sprite's percent describes work in flight, so it only refines a
 	// running result's percent. A terminal result's percent is decided by its
 	// state; a stale build snapshot must not pull a completed apply below 100.
@@ -2737,6 +2830,19 @@ func executorProgressMetadata(ctx context.Context, tracker buildTracker, result 
 	}
 	return nil
 }
+
+// Metadata keys describing a step that waits outside PostgreSQL's lock queue
+// for a conflicting session to end before it requests its lock: the waiting
+// session's PID, the table, how long the step has waited, and how long it
+// waits at most, both in milliseconds.
+const (
+	lockHolderPIDMetadataKey    = "lock_holder_pid"
+	lockHolderTableMetadataKey  = "lock_holder_table"
+	lockHolderWaitedMetadataKey = "lock_holder_waited_ms"
+	lockHolderLimitMetadataKey  = "lock_holder_limit_ms"
+)
+
+var lockHolderMetadataKeys = []string{lockHolderPIDMetadataKey, lockHolderTableMetadataKey, lockHolderWaitedMetadataKey, lockHolderLimitMetadataKey}
 
 // runningPercentMetadataKey is the metadata key that carries pg-sprite's
 // percent for a running index build with its decimals, so a large build

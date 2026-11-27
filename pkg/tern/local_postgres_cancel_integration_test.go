@@ -5,6 +5,7 @@ package tern
 import (
 	"database/sql"
 	"log/slog"
+	"strconv"
 	"testing"
 	"time"
 
@@ -155,6 +156,8 @@ func TestLocalClientPostgresCancelOfPlainDDLIsDeclined(t *testing.T) {
 	t.Cleanup(func() { _ = reader.Rollback() })
 	_, err = reader.ExecContext(t.Context(), `SELECT count(*) FROM public.orders`)
 	require.NoError(t, err)
+	var readerPID int
+	require.NoError(t, reader.QueryRowContext(t.Context(), `SELECT pg_backend_pid()`).Scan(&readerPID))
 
 	result, err := client.Apply(t.Context(), &ternv1.ApplyRequest{PlanId: plan.PlanId, Environment: localClientTestEnvironment,
 		DdlChanges: plan.Changes[0].TableChanges})
@@ -162,8 +165,13 @@ func TestLocalClientPostgresCancelOfPlainDDLIsDeclined(t *testing.T) {
 	require.True(t, result.Accepted, result.ErrorMessage)
 	startTestOperator(t, stor, client, result.ApplyId)
 
-	require.Eventually(t, func() bool { return alterWaitingOnLock(t, targetDB) },
-		postgresCancelDeadline, 50*time.Millisecond, "the ALTER never queued behind the open reader")
+	// The ALTER waits for the reader outside the lock queue before it asks for
+	// its lock, and the engine names the reader while it waits.
+	require.Eventually(t, func() bool {
+		progress, err := client.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: result.ApplyId, Environment: localClientTestEnvironment})
+		require.NoError(t, err)
+		return progress.GetMetadata()["lock_holder_pid"] == strconv.Itoa(readerPID)
+	}, postgresCancelDeadline, 50*time.Millisecond, "the ALTER never reported waiting on the open reader")
 
 	cancelResp, err := client.Cancel(t.Context(), &ternv1.CancelRequest{ApplyId: result.ApplyId, Environment: localClientTestEnvironment})
 	require.NoError(t, err)
@@ -195,15 +203,6 @@ func TestLocalClientPostgresCancelOfPlainDDLIsDeclined(t *testing.T) {
 	require.NoError(t, targetDB.QueryRowContext(t.Context(),
 		`SELECT count(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'orders' AND column_name = 'coupon_code'`).Scan(&columns))
 	assert.Equal(t, 1, columns, "the change the cancel declined is applied")
-}
-
-// alterWaitingOnLock reports whether an ALTER TABLE is waiting for a lock.
-func alterWaitingOnLock(t *testing.T, db *sql.DB) bool {
-	t.Helper()
-	var n int
-	require.NoError(t, db.QueryRowContext(t.Context(), `SELECT count(*) FROM pg_catalog.pg_stat_activity
-		WHERE wait_event_type = 'Lock' AND query ILIKE 'ALTER TABLE%'`).Scan(&n))
-	return n > 0
 }
 
 // An operator cancels a PostgreSQL SET NOT NULL whose validation keeps

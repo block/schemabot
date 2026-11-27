@@ -81,6 +81,72 @@ func newControlInternalErrorService(applies storage.ApplyStore, controls storage
 	return svc
 }
 
+// The text a control error shows the requester is the text SchemaBot wrote on
+// the typed error, so a wrap added on the way up to the PR comment stays out
+// of it, and an error with no such text shows nothing.
+func TestAuthoredControlFailureMessage(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		want     string
+		authored bool
+	}{
+		{
+			name:     "a wrapped conflict shows its own text",
+			err:      fmt.Errorf("execute start: %w", controlConflictf("apply %s already completed and cannot be started", "apply-123")),
+			want:     "apply apply-123 already completed and cannot be started",
+			authored: true,
+		},
+		{
+			name:     "a wrapped engine-unavailable answer shows its own text",
+			err:      fmt.Errorf("execute cutover: %w", controlHTTPCodeErrorf(http.StatusServiceUnavailable, apitypes.ErrCodeEngineUnavailable, "the engine for apply %s is not available; retry in a moment", "apply-123")),
+			want:     "the engine for apply apply-123 is not available; retry in a moment",
+			authored: true,
+		},
+		{
+			name:     "a wrapped authored terminal failure shows its own text",
+			err:      fmt.Errorf("execute revert: %w", authoredTerminalControlf("revert window for apply %s has closed", "apply-123")),
+			want:     "revert window for apply apply-123 has closed",
+			authored: true,
+		},
+		{
+			name: "a terminal failure that wraps an error shows nothing",
+			err:  terminalControlf("apply %s is inconsistent: %w", "apply-123", errors.New(sensitiveControlFailure)),
+		},
+		{
+			name: "an untyped failure shows nothing",
+			err:  fmt.Errorf("execute stop: %w", errors.New(sensitiveControlFailure)),
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := AuthoredControlFailureMessage(tc.err)
+
+			assert.Equal(t, tc.authored, ok)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// An apply with no deployment recorded cannot be routed on any attempt, so
+// the control target refuses it as a terminal failure whose text says
+// nothing was changed and a retry fails the same way, while the cause stays
+// in the server log.
+func TestControlTargetRefusesApplyWithoutDeploymentAsTerminal(t *testing.T) {
+	apply := activeTestApply("apply-internal-error")
+	apply.Deployment = ""
+	svc := newControlInternalErrorService(&staticApplyStore{apply: apply}, &memoryControlRequestStore{}, slog.New(slog.DiscardHandler))
+
+	_, _, _, err := svc.controlTarget(t.Context(), "skip-revert", apply.ApplyIdentifier, apply.Environment)
+
+	require.Error(t, err)
+	assert.True(t, IsTerminalControlError(err), "a retry meets the same record")
+	shown, ok := AuthoredControlFailureMessage(err)
+	require.True(t, ok)
+	assert.Equal(t, controlMissingDeploymentMessage("skip-revert", "apply-internal-error"), shown)
+	assert.NotContains(t, shown, "missing stored deployment metadata")
+}
+
 // A control request that cannot load its apply answers 500 with a fixed message
 // that names the operation and the apply and says nothing was changed. The
 // storage error stays in the server log with the apply identifier and path.

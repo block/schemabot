@@ -389,10 +389,10 @@ func TestSumTargetRows(t *testing.T) {
 func TestTargetRowsLine(t *testing.T) {
 	size := int64(4_000_000_000)
 	exact := TargetRows{Copied: 3420, Total: 4000, Counted: 4, ETASeconds: 120}
-	assert.Equal(t, "Rows: 3,420 / 4,000 · ~4.0 GB · ETA: 2m 0s", exact.RowsLine(4, &size))
+	assert.Equal(t, "Rows: 3,420 / 4,000 · ~4.0 GB · ETA: 2m", exact.RowsLine(4, &size))
 
 	partial := TargetRows{Copied: 1420, Total: 2000, Counted: 2, ETASeconds: 120, ETAFloor: true}
-	assert.Equal(t, "Rows: 1,420 / 2,000 across 2 of 3 targets · ~4.0 GB across all 3 targets · ETA: ≥ 2m 0s", partial.RowsLine(3, &size))
+	assert.Equal(t, "Rows: 1,420 / 2,000 across 2 of 3 targets · ~4.0 GB across all 3 targets · ETA: ≥ 2m", partial.RowsLine(3, &size))
 
 	estimated := TargetRows{Copied: 500, Total: 2000, Counted: 2, Estimated: true, ETAFloor: true}
 	assert.Equal(t, "Rows: 500 / ~2k", estimated.RowsLine(2, nil))

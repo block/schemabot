@@ -143,9 +143,9 @@ func WriteProgress(data ProgressData) {
 	if state.IsState(data.State, state.Apply.RevertWindow) {
 		if expiresStr := data.Metadata["revert_expires_at"]; expiresStr != "" {
 			if expires, err := time.Parse(time.RFC3339, expiresStr); err == nil {
-				remaining := time.Until(expires)
+				remaining := expires.Sub(nowFunc())
 				if remaining > 0 {
-					rows = append(rows, BoxRow{"Revert expires in", ui.FormatDurationSeconds(int64(remaining.Seconds()))})
+					rows = append(rows, BoxRow{"Revert expires in", ui.FormatHumanDuration(remaining)})
 				}
 			}
 		}

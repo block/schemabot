@@ -5,14 +5,14 @@ go 1.26.11
 require (
 	github.com/DataDog/datadog-go/v5 v5.8.3
 	github.com/alecthomas/kong v1.17.0
-	github.com/aws/aws-sdk-go-v2 v1.47.8
+	github.com/aws/aws-sdk-go-v2 v1.48.0
 	github.com/aws/aws-sdk-go-v2/config v1.33.16
-	github.com/aws/aws-sdk-go-v2/credentials v1.20.16
-	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.50.11
+	github.com/aws/aws-sdk-go-v2/credentials v1.21.3
+	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.51.0
 	github.com/aws/aws-sdk-go-v2/service/sqs v1.52.0
-	github.com/aws/aws-sdk-go-v2/service/sts v1.51.9
+	github.com/aws/aws-sdk-go-v2/service/sts v1.53.0
 	github.com/block/mysql v0.0.0-20261122231317-2d9dfd496f60
-	github.com/block/pg-sprite v0.5.7-0.20261126204222-dc687a2834ab
+	github.com/block/pg-sprite v0.5.7-0.20261127054114-8e2257559dda
 	github.com/block/spirit v0.20.1-0.20261122162747-cc0fa5849d1f
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0
 	github.com/charmbracelet/bubbles v1.0.0
@@ -42,7 +42,7 @@ require (
 	github.com/testcontainers/testcontainers-go v0.45.1-0.20261109125418-f31e98d4ee9b // pinned for reaper recovery from a reaper that is being removed; move to the first release that includes it (v0.46.0)
 	github.com/testcontainers/testcontainers-go/modules/mysql v0.45.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.45.0
-	github.com/wasilibs/go-pgquery v0.0.0-20261106060434-4301e51f8dbf
+	github.com/wasilibs/go-pgquery v0.0.0-20261124022233-3939604ca45d
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.72.0
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.45.0
@@ -98,16 +98,16 @@ require (
 	github.com/aquarapid/vaultlib v0.5.1 // indirect
 	github.com/armon/go-metrics v0.4.1 // indirect
 	github.com/atotto/clipboard v0.1.4 // indirect
-	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.20.8 // indirect
-	github.com/aws/aws-sdk-go-v2/internal/configsources v1.5.11 // indirect
-	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.8.11 // indirect
-	github.com/aws/aws-sdk-go-v2/internal/v4a v1.5.11 // indirect
-	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.24 // indirect
-	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.14.11 // indirect
-	github.com/aws/aws-sdk-go-v2/service/signin v1.12.4 // indirect
-	github.com/aws/aws-sdk-go-v2/service/sso v1.39.4 // indirect
-	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.44.4 // indirect
-	github.com/aws/smithy-go v1.28.8 // indirect
+	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.20.9 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/configsources v1.5.12 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.8.12 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/v4a v1.5.12 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.25 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.14.12 // indirect
+	github.com/aws/aws-sdk-go-v2/service/signin v1.14.0 // indirect
+	github.com/aws/aws-sdk-go-v2/service/sso v1.39.5 // indirect
+	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.44.5 // indirect
+	github.com/aws/smithy-go v1.28.9 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect

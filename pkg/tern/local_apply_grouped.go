@@ -14,6 +14,7 @@ import (
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // executeGroupedApply runs all DDLs in one engine operation. For Spirit with
@@ -1613,7 +1614,7 @@ func (c *LocalClient) autoTriggerCutover(ctx context.Context, eng engine.Engine,
 		}
 		if !ps.cutoverNotReadyEscalated {
 			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
-				fmt.Sprintf("Cutover has not been accepted by the engine backend for %s; SchemaBot keeps retrying every progress tick", notReadyFor.Round(time.Second)), "", "")
+				fmt.Sprintf("Cutover has not been accepted by the engine backend for %s; SchemaBot keeps retrying every progress tick", ui.FormatHumanDuration(notReadyFor.Round(time.Second))), "", "")
 			ps.cutoverNotReadyEscalated = true
 		}
 		logger.Error("auto-cutover has been rejected as not-ready beyond the staging window; the engine backend is not staging the cutover and the drive keeps retrying",
@@ -1787,7 +1788,7 @@ func (c *LocalClient) reportAutoSkipRevertFailure(ctx context.Context, logger *s
 	}
 	if !ps.autoSkipRevertEscalated {
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
-			fmt.Sprintf("The engine has not accepted the skip-revert for %s; the revert window stays open and SchemaBot keeps retrying every progress tick", failingFor.Round(time.Second)), "", "")
+			fmt.Sprintf("The engine has not accepted the skip-revert for %s; the revert window stays open and SchemaBot keeps retrying every progress tick", ui.FormatHumanDuration(failingFor.Round(time.Second))), "", "")
 		ps.autoSkipRevertEscalated = true
 	}
 	logger.Error("auto-skip revert has been failing beyond the escalation window; the revert window stays open and the drive keeps retrying",

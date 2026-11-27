@@ -549,7 +549,7 @@ func isWordByte(c byte) bool {
 // the PR author's schema that the quoting does not recognise. Text already in a
 // code span is left as written, which a Markdown renderer shows literally.
 func markdownReason(reason string) string {
-	return mapOutsideCodeSpans(ui.CodeQuoteIdentifiers(flattenIdentifier(reason)), escapeProse)
+	return mapOutsideCodeSpans(ui.CodeQuoteIdentifiers(flattenIdentifier(reason)), false, escapeProse)
 }
 
 // escapeProse is escapeInlineMarkdown for text that may also name a mention: a
@@ -576,6 +576,41 @@ func codeMentions(text string, words func(string) string) string {
 	}
 	b.WriteString(words(text[last:]))
 	return b.String()
+}
+
+// codeMentionTags writes each mention in prose as an inline code element, which
+// GitHub does not notify, and leaves every other character as it is. The
+// element is HTML rather than a backtick span so it holds in any prose: a
+// backtick the prose already carries cannot pair with a delimiter written here,
+// and the element reads the same inside a table cell or a folded summary. A
+// backslash before a mention would turn the element's opening bracket into
+// literal text and leave the mention live, so one that is not itself escaped
+// gets a second backslash, which shows the same text.
+func codeMentionTags(prose string) string {
+	spans := mentionSpans(prose)
+	if len(spans) == 0 {
+		return prose
+	}
+	var b strings.Builder
+	last := 0
+	for _, span := range spans {
+		before := prose[last:span[0]]
+		b.WriteString(before)
+		if trailingBackslashes(before)%2 == 1 {
+			b.WriteByte('\\')
+		}
+		b.WriteString("<code>")
+		b.WriteString(prose[span[0]:span[1]])
+		b.WriteString("</code>")
+		last = span[1]
+	}
+	b.WriteString(prose[last:])
+	return b.String()
+}
+
+// trailingBackslashes counts the backslashes that end text.
+func trailingBackslashes(text string) int {
+	return len(text) - len(strings.TrimRight(text, `\`))
 }
 
 // escapeProseWords is escapeInlineMarkdown without the escapes that change
@@ -619,12 +654,20 @@ func startsHTML(r rune) bool {
 
 // mapOutsideCodeSpans applies rewrite to the parts of text a Markdown renderer
 // reads as prose and keeps each code span as written. A span is a backtick run
-// closed by the next run of the same length; a run with no such closer is
-// prose, so its backticks reach rewrite. A kept span begins and ends a maximal
-// backtick run, so the prose beside it never does; when rewrite writes a code
-// span of its own at that edge, a space keeps its delimiter apart from the
-// kept span's, since joined they would be one longer run that closes neither.
-func mapOutsideCodeSpans(text string, rewrite func(string) string) string {
+// closed by the next run of the same length before a blank line, since
+// Markdown carries a span across a line break but never across a blank line;
+// a run with no such closer is prose, so its backticks reach rewrite. A kept
+// span begins and ends a maximal backtick run, so the prose beside it never
+// does; when rewrite writes a code span of its own at that edge, a space keeps
+// its delimiter apart from the kept span's, since joined they would be one
+// longer run that closes neither.
+//
+// With escapedBackticks, a backslash escapes the first backtick of a run, as
+// it does when the text is rendered as written, so that backtick is prose and
+// the rest of the run, if any, is what opens a span. A caller whose rewrite
+// doubles a backslash in prose leaves it off: after the rewrite that backtick
+// is no longer escaped, so the span the scanner finds is the one rendered.
+func mapOutsideCodeSpans(text string, escapedBackticks bool, rewrite func(string) string) string {
 	var b strings.Builder
 	proseStart := 0
 	writeProse := func(prose string, spanFollows bool) {
@@ -646,6 +689,12 @@ func mapOutsideCodeSpans(text string, rewrite func(string) string) string {
 		for i < len(text) && text[i] == '`' {
 			i++
 		}
+		if escapedBackticks && trailingBackslashes(text[proseStart:spanStart])%2 == 1 {
+			spanStart++
+			if spanStart == i {
+				continue
+			}
+		}
 		spanEnd := endOfCodeSpan(text, i, i-spanStart)
 		if spanEnd < 0 {
 			continue
@@ -660,9 +709,13 @@ func mapOutsideCodeSpans(text string, rewrite func(string) string) string {
 }
 
 // endOfCodeSpan returns the index just past the first run of exactly delimiter
-// backticks at or after from, or -1 when the text has none.
+// backticks at or after from, or -1 when a blank line or the end of the text
+// comes first.
 func endOfCodeSpan(text string, from, delimiter int) int {
 	for i := from; i < len(text); {
+		if startsBlankLine(text, i) {
+			return -1
+		}
 		if text[i] != '`' {
 			i++
 			continue
@@ -676,4 +729,14 @@ func endOfCodeSpan(text string, from, delimiter int) int {
 		}
 	}
 	return -1
+}
+
+// startsBlankLine reports whether text has a line break at i that is followed
+// by a line holding only spaces or tabs, which ends a Markdown paragraph.
+func startsBlankLine(text string, i int) bool {
+	if text[i] != '\n' {
+		return false
+	}
+	rest := strings.TrimLeft(text[i+1:], " \t")
+	return rest == "" || rest[0] == '\n'
 }

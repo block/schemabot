@@ -508,7 +508,7 @@ func TestExecutePullSchema_ATableAnyTargetSkippedIsSkippedForTheEnvironment(t *t
 	second := pulledTables(map[string]string{"users": pullUsersDDL})
 	second.Namespaces["testapp"].SkippedTables = []*ternv1.SkippedTable{
 		{Table: "audits", Reason: "unlogged tables cannot be rendered as a desired schema"},
-		{Table: "events", Reason: "schema files cannot describe its trigger"},
+		{Table: "events", Reason: "schema files cannot describe its table inheritance"},
 	}
 	client := newPerTargetPullClient(map[string]*ternv1.PullSchemaResponse{
 		"testapp-001": primary,
@@ -525,7 +525,7 @@ func TestExecutePullSchema_ATableAnyTargetSkippedIsSkippedForTheEnvironment(t *t
 	assert.Equal(t, map[string]string{"users": pullUsersDDL}, ns.Tables, "a table one target skipped gets no file")
 	assert.Equal(t, []apitypes.SkippedTable{
 		{Table: "audits", Reason: "unlogged tables cannot be rendered as a desired schema"},
-		{Table: "events", Reason: "schema files cannot describe its trigger"},
+		{Table: "events", Reason: "schema files cannot describe its table inheritance"},
 	}, ns.SkippedTables)
 	assert.Equal(t, int32(1), resp.TableCount)
 	require.Len(t, resp.Targets, 2)
@@ -543,7 +543,7 @@ func TestExecutePullSchema_SkippedTableInANamespaceTheBaselineLacks(t *testing.T
 	shard.Namespaces = map[string]*ternv1.PulledNamespace{"testapp_0": {
 		Tables: map[string]string{},
 		SkippedTables: []*ternv1.SkippedTable{
-			{Table: "events", Reason: "schema files cannot describe its trigger"},
+			{Table: "events", Reason: "schema files cannot describe its table inheritance"},
 		},
 	}}
 	client := newPerTargetPullClient(map[string]*ternv1.PullSchemaResponse{
@@ -560,7 +560,7 @@ func TestExecutePullSchema_SkippedTableInANamespaceTheBaselineLacks(t *testing.T
 	require.Contains(t, resp.Namespaces, "testapp_0")
 	assert.Empty(t, resp.Namespaces["testapp_0"].Tables)
 	assert.Equal(t, []apitypes.SkippedTable{
-		{Table: "events", Reason: "schema files cannot describe its trigger"},
+		{Table: "events", Reason: "schema files cannot describe its table inheritance"},
 	}, resp.Namespaces["testapp_0"].SkippedTables)
 	assertTableCountMatchesNamespaces(t, resp)
 }
