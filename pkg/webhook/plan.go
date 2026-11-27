@@ -1150,7 +1150,11 @@ func (h *Handler) postFailingAggregateForMultiEnvSetupError(ctx context.Context,
 // durable driver may re-drive. suppressRetryComments silences only the
 // unexpected-failure fallback comment on durable attempts, where the driver
 // retries and posts the single terminal answer instead; recognized rejections
-// always comment because they are the command's answer.
+// always comment because they are the command's answer. The comment's detail
+// comes from userFacingError, as on every other PR error comment: a recognized
+// data plane failure renders a fixed line and its raw error goes only to the
+// server log, and any other error text passes through the renderer's
+// redaction (AV-8).
 func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID int64, environment, databaseName, requestedBy, commandName string, err error, suppressRetryComments bool) bool {
 	data := templates.SchemaErrorData{
 		RequestedBy:  requestedBy,
@@ -1301,7 +1305,7 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 	if errors.As(err, &envNotConfiguredErr) {
 		h.logger.Warn("schema request: environment not configured on this server", logFields...)
 		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "environment_not_configured")
-		data.ErrorDetail = err.Error()
+		data.ErrorDetail = userFacingErrorDetail(userFacingError(err))
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(data))
 		return true
 	}
@@ -1309,7 +1313,7 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 	h.logger.Error("schema request failed", logFields...)
 	metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "unexpected")
 	if !suppressRetryComments {
-		data.ErrorDetail = err.Error()
+		data.ErrorDetail = userFacingErrorDetail(userFacingError(err))
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(data))
 	}
 	return false
