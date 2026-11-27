@@ -1968,7 +1968,9 @@ tables the branch still lacks, refuses a branch that differs outside the reviewe
 validates the branch against the declared schema before creating or adopting the deploy request.
 On PostgreSQL, a statement that drops a table, a column, a constraint, an index, or a NOT NULL runs only with the
 planner's record of that object, which the plan stores with the change and every apply path passes
-back, matching a task to its change by the statement's canonical form (`planChangeMetadata` in
+back, matching a task to the change it was created from by the position recorded on the task
+(`AssignPlanChangeOrdinals` in `pkg/storage/plan_change_ordinal.go`), and a task written without
+one by the statement's canonical form (`planChangeMetadata` in
 `pkg/tern/plan_change_metadata.go`); the apply refuses a drop with no record
 and drops nothing when the object no longer matches it under the table's lock
 (`reviewedDropForApply` and `executeReviewedDrop` in `pkg/engine/postgres/apply.go`;
