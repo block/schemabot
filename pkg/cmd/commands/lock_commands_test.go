@@ -90,6 +90,12 @@ func runUnlockCmd(endpoint string, force bool) (string, error) {
 	return runLockCmd(endpoint, cmd.Run)
 }
 
+// runApprovedForceUnlockCmd runs a forced unlock that was given -y.
+func runApprovedForceUnlockCmd(endpoint string) (string, error) {
+	cmd := UnlockCmd{Database: "orders", Type: "mysql", Force: true, AutoApprove: true}
+	return runLockCmd(endpoint, cmd.Run)
+}
+
 // An operator lists the database locks and sees each lock's database, type,
 // owner, age, pull request and last activity, followed by the commands that
 // release one.
@@ -235,7 +241,7 @@ func TestUnlockCmdForceReleasesAnotherOwnersLock(t *testing.T) {
 	}
 	endpoint := srv.start(t)
 
-	out, err := runUnlockCmd(endpoint, true)
+	out, err := runApprovedForceUnlockCmd(endpoint)
 	require.NoError(t, err)
 	assert.Contains(t, out, "Force released lock for orders (mysql)\n")
 	assert.Contains(t, out, "   Previous owner: octo-org/orders#7\n")
@@ -257,7 +263,7 @@ func TestUnlockCmdReturnsAForceReleaseDenialAsAnError(t *testing.T) {
 	}
 	endpoint := srv.start(t)
 
-	out, err := runUnlockCmd(endpoint, true)
+	out, err := runApprovedForceUnlockCmd(endpoint)
 	require.Error(t, err)
 	assert.Equal(t, "force release lock: force releasing locks on orders requires membership in db-admins", err.Error())
 	assert.NotContains(t, out, "Force released")
