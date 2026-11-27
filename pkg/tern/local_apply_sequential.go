@@ -2138,10 +2138,18 @@ func (c *LocalClient) taskNeedsRowSecurityFiles(task *storage.Task) (bool, error
 	if err != nil {
 		return false, err
 	}
-	rls, ok := parser.(interface{ CanonicalRowSecurity(string) (string, error) })
+	rls, ok := parser.(interface {
+		DeclaresRowSecurity(string) (bool, error)
+	})
 	if !ok {
 		return false, nil
 	}
-	_, err = rls.CanonicalRowSecurity(task.DDL)
-	return err == nil, nil
+	// Both an atomic row security change and the create of a new table with
+	// its row security are applied against the reviewed files, so either one
+	// carries them.
+	declares, err := rls.DeclaresRowSecurity(task.DDL)
+	if err != nil {
+		return false, fmt.Errorf("read whether task %s declares row security: %w", task.TaskIdentifier, err)
+	}
+	return declares, nil
 }

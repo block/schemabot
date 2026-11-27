@@ -858,6 +858,11 @@ func canonicalDDLForDrift(p ddl.StatementParser, raw string) (string, error) {
 	// a trailing statement cannot hide behind the classification of the first.
 	createSet, err := ddl.ParseCreateSet(p, raw)
 	if err != nil {
+		if canonical, ok, rlsErr := canonicalCreateWithRowSecurity(p, raw); rlsErr != nil {
+			return "", fmt.Errorf("DDL rejected by the statement parser: %w", rlsErr)
+		} else if ok {
+			return canonical, nil
+		}
 		return "", fmt.Errorf("DDL rejected by the statement parser: %w", err)
 	}
 	canonical := make([]string, 0, len(createSet.Statements))
@@ -869,6 +874,58 @@ func canonicalDDLForDrift(p ddl.StatementParser, raw string) (string, error) {
 		canonical = append(canonical, c)
 	}
 	return strings.Join(canonical, ";\n"), nil
+}
+
+// canonicalCreateWithRowSecurity canonicalizes the planned create of a new
+// table with its row security: a CREATE TABLE followed by statements that are
+// each either DDL the parser classifies or one atomic row security operation,
+// with at least one of the latter. Every statement is canonicalized and kept
+// in order, so no statement hides behind another's classification. ok is
+// false, with no error, when raw is not that shape at all; an error means it
+// is that shape and a statement in it is one drift cannot verify.
+func canonicalCreateWithRowSecurity(p ddl.StatementParser, raw string) (canonical string, ok bool, err error) {
+	rls, hasGrammar := p.(interface{ CanonicalRowSecurity(string) (string, error) })
+	if !hasGrammar {
+		return "", false, nil
+	}
+	statements, err := p.Split(raw)
+	if err != nil {
+		return "", false, nil
+	}
+	if len(statements) < 2 {
+		return "", false, nil
+	}
+	firstType, _, err := p.Classify(statements[0])
+	if err != nil {
+		return "", false, nil
+	}
+	if firstType != ddl.StatementCreateTable {
+		return "", false, nil
+	}
+	parts := make([]string, 0, len(statements))
+	declaresRowSecurity := false
+	for i, statement := range statements {
+		if i > 0 {
+			if c, rlsErr := rls.CanonicalRowSecurity(statement); rlsErr == nil {
+				parts = append(parts, c)
+				declaresRowSecurity = true
+				continue
+			}
+		}
+		stmtType, _, classifyErr := p.Classify(statement)
+		if classifyErr != nil {
+			return "", false, nil
+		}
+		c, canonErr := canonicalDriftStatement(p, statement, stmtType)
+		if canonErr != nil {
+			return "", true, fmt.Errorf("statement %d of create with row security: %w", i+1, canonErr)
+		}
+		parts = append(parts, c)
+	}
+	if !declaresRowSecurity {
+		return "", false, nil
+	}
+	return strings.Join(parts, ";\n"), true, nil
 }
 
 // canonicalDriftStatement canonicalizes one statement that must be DDL. Two
