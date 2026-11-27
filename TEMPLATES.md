@@ -8894,7 +8894,7 @@ Single table progress (default):
 
 
 To recover: Fix the issue above, then run a new apply.
-The new apply will only process tables that haven't completed.
+The new apply plans again from the live schema and runs only what is not applied yet.
 
 ```
 </details>
@@ -9302,7 +9302,7 @@ Sequential mode: First table failed (others cancelled)
 
 
 To recover: Fix the issue above, then run a new apply.
-The new apply will only process tables that haven't completed.
+The new apply plans again from the live schema and runs only what is not applied yet.
 
 ```
 </details>
@@ -9335,7 +9335,7 @@ Sequential mode: Middle table failed
 
 
 To recover: Fix the issue above, then run a new apply.
-The new apply will only process tables that haven't completed.
+The new apply plans again from the live schema and runs only what is not applied yet.
 
 ```
 </details>
@@ -9603,7 +9603,7 @@ To resume from where it stopped:
 
 
 To recover: Fix the issue above, then run a new apply.
-The new apply will only process tables that haven't completed.
+The new apply plans again from the live schema and runs only what is not applied yet.
 
 ```
 </details>
@@ -11074,7 +11074,7 @@ _No details available yet._
 
 ---
 
-To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e production
 ```
@@ -11427,7 +11427,7 @@ _No details available yet._
 
 ---
 
-To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e production
 ```
@@ -11968,7 +11968,7 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6 -e production
 ```
 
-A new apply can retry the failure once this one finishes or is stopped; it reprocesses only the tables that haven't completed.
+A new apply can retry the failure once this one finishes or is stopped; it plans again from the live schema and runs only what is not applied yet.
 
 _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
@@ -12400,7 +12400,7 @@ To stop this schema change:
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
-To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
   schemabot apply -s <schema_dir> -e production
 
 ```
@@ -12446,7 +12446,7 @@ To retry once the failure above is resolved — a new apply reprocesses only the
 
 To stop this schema change:
   schemabot stop apply-multi-a1b2c3d4 -e production
-A new apply can retry the failure once this one finishes or is stopped; it reprocesses only the tables that haven't completed.
+A new apply can retry the failure once this one finishes or is stopped; it plans again from the live schema and runs only what is not applied yet.
 
 ```
 </details>
@@ -12750,7 +12750,7 @@ To resume from where it stopped:
 
 
 To recover: Fix the issue above, then run a new apply.
-The new apply will only process tables that haven't completed.
+The new apply plans again from the live schema and runs only what is not applied yet.
 
 ```
 </details>
@@ -12797,7 +12797,7 @@ The new apply will only process tables that haven't completed.
 
 
 To recover: Fix the issue above, then run a new apply.
-The new apply will only process tables that haven't completed.
+The new apply plans again from the live schema and runs only what is not applied yet.
 ```
 </details>
 
@@ -12966,7 +12966,7 @@ Sequential mode: First table failed (others cancelled)
 
 
 To recover: Fix the issue above, then run a new apply.
-The new apply will only process tables that haven't completed.
+The new apply plans again from the live schema and runs only what is not applied yet.
 
 ```
 </details>
@@ -12999,7 +12999,7 @@ Sequential mode: Middle table failed
 
 
 To recover: Fix the issue above, then run a new apply.
-The new apply will only process tables that haven't completed.
+The new apply plans again from the live schema and runs only what is not applied yet.
 
 ```
 </details>
