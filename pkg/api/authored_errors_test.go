@@ -15,6 +15,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	grpccodes "google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
@@ -84,6 +86,12 @@ var markedErrorTypes = map[string]authoredErrorCase{
 	"schemaFileParseError": {
 		err:              &schemaFileParseError{message: "split schema file core/orders.sql: syntax error near 'CREAT'", err: errors.New("syntax error near 'CREAT'")},
 		contains:         "split schema file core/orders.sql",
+		quotesRepository: true,
+	},
+	"RemotePlanRefusalError": {
+		err: &RemotePlanRefusalError{Err: fmt.Errorf("plan app/staging: %w",
+			grpcstatus.Error(grpccodes.FailedPrecondition, "drop_tables entries were written in the last 24h"))},
+		contains:         "drop_tables entries were written in the last 24h",
 		quotesRepository: true,
 	},
 }

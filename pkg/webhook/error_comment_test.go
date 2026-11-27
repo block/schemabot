@@ -10,6 +10,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/engine"
@@ -103,6 +105,17 @@ func TestUserFacingError(t *testing.T) {
 			name: "authored text quoting a statement is flattened",
 			err:  &engine.PlanRefusedError{Err: errors.New("the schema files drop table `orders_seq`:\nDROP TABLE `orders_seq`;\n")},
 			want: "the schema files drop table `orders_seq`: DROP TABLE `orders_seq`;",
+		},
+		{
+			name: "a remote plan refusal shows its own reason, redacted",
+			err: fmt.Errorf("plan orders/staging: %w", &api.RemotePlanRefusalError{Err: status.Error(codes.FailedPrecondition,
+				"drop_tables entries for orders were written in the last 24h by 10.1.2.3:3306")}),
+			want: "drop_tables entries for orders were written in the last 24h by [endpoint redacted]",
+		},
+		{
+			name: "a FailedPrecondition the plan boundary did not mark shows the fixed line",
+			err:  status.Error(codes.FailedPrecondition, "dial tcp 10.1.2.3:3306: refused"),
+			want: retryLine,
 		},
 		{
 			name: "authored text that sanitizes to nothing shows the fixed line",
