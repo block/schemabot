@@ -56,7 +56,7 @@ Your agent does not need to be told what your schema looks like. It can ask.
 |---|---|
 | What databases are there, on which engines and environments? | `databases` |
 | What is in this one right now? | `pull`, which returns the live schema as SQL or JSON. `onboard` writes it into a new declarative schema directory |
-| What is running against it at this moment? | `status`, and `locks` for what is held |
+| What is running at this moment? | `status`, which lists active applies across every database, and `locks` for what is held |
 | What has run against it, and what did one of those do? | `status -d <database>` for the apply history, then `status <apply_id>` and `logs <apply_id>` |
 | What DDL has been proposed for it? | `list-plans`, which returns stored plans whether or not they were applied |
 
@@ -194,7 +194,7 @@ the agent uses your credentials.
   approval for the environments served by that instance, or a database's
   own `review_policy` to require one for that database alone. The PR
   author's own approval does not count. An approval keeps counting after
-  later pushes unless GitHub dismisses it. Set `require_reapproval: true` to
+  later pushes until the reviewer requests changes or GitHub dismisses it. Set `require_reapproval: true` to
   require a new approval when the PR's schema change differs from the one
   approved.
 - **Review destructive changes before allowing them.** Changes flagged as unsafe
