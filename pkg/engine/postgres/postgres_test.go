@@ -759,7 +759,7 @@ func TestTableChangesDerivesTiersForBlockedSteps(t *testing.T) {
 	report.Statements = []pgplan.Statement{
 		{SQL: "ALTER TABLE public.users ALTER COLUMN email TYPE bigint", Route: planner.RouteCopyAndSwap, Backend: router.BackendCopyAndSwap, Disposition: router.DispositionUnavailable},
 		{SQL: "ALTER TABLE public.users ADD CONSTRAINT users_email_key UNIQUE (email)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionRewriteRequired},
-		{SQL: "DROP INDEX public.users_legacy_idx CASCADE", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionUnavailable},
+		{SQL: "REINDEX INDEX CONCURRENTLY public.users_legacy_idx", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionUnavailable},
 	}
 
 	changes, tiers, _, err := tableChanges(report, nil, parser)
@@ -815,7 +815,7 @@ func TestBlockMissingPrivilegesNamesGrantOnPlannerBlockedPlan(t *testing.T) {
 	report.Statements = []pgplan.Statement{
 		{SQL: "ALTER TABLE public.users ALTER COLUMN email TYPE bigint", Route: planner.RouteCopyAndSwap, Backend: router.BackendCopyAndSwap, Disposition: router.DispositionUnavailable},
 		{SQL: "ALTER TABLE public.users ADD CONSTRAINT users_email_key UNIQUE (email)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionRewriteRequired},
-		{SQL: "DROP INDEX public.users_legacy_idx CASCADE", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionUnavailable},
+		{SQL: "REINDEX INDEX CONCURRENTLY public.users_legacy_idx", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionUnavailable},
 	}
 	changes, tiers, _, err := tableChanges(report, nil, parser)
 	require.NoError(t, err)
@@ -1180,6 +1180,68 @@ func TestBlockRewriteStepsKeepsEarlierVerdictsAndIndexBuilds(t *testing.T) {
 	require.NoError(t, blockRewriteSteps(changes, "size verdict", partitionedBuilds, nil))
 	assert.Equal(t, []string{"privilege verdict", "size verdict"}, engine.BlockedCauses(changes[0].ModeReason))
 	assert.Equal(t, "size verdict", changes[1].ModeReason)
+}
+
+// TestBlockRewriteStepsKeepsConcurrentIndexDrops proves the size verdict
+// leaves a concurrent index drop executable on a table over the ceiling: the
+// drop reads no rows and rewrites nothing, so the table's size does not bound
+// it. A blocking index drop and a drop of several indexes stay under the
+// ceiling.
+func TestBlockRewriteStepsKeepsConcurrentIndexDrops(t *testing.T) {
+	changes := []engine.TableChange{
+		{Table: "orders", DDL: "DROP INDEX CONCURRENTLY public.orders_status_idx"},
+		{Table: "orders", DDL: "DROP INDEX public.orders_status_idx"},
+		{Table: "orders", DDL: "DROP INDEX public.orders_a_idx, public.orders_b_idx"},
+	}
+
+	require.NoError(t, blockRewriteSteps(changes, "size verdict", nil, nil))
+	assert.Empty(t, changes[0].ExecutionMode)
+	assert.Empty(t, changes[0].ModeReason)
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
+	assert.Equal(t, "size verdict", changes[1].ModeReason)
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[2].ExecutionMode)
+	assert.Equal(t, "size verdict", changes[2].ModeReason)
+}
+
+// TestTableChangesRendersAnIndexDropAsUnsafe proves a planned index drop on
+// an existing table is an executable, unsafe step that carries the planner's
+// record of the index and the owner tier, so the apply can check the index
+// before dropping it and the operator acknowledges it with --allow-unsafe.
+func TestTableChangesRendersAnIndexDropAsUnsafe(t *testing.T) {
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+	exists := true
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Schema = "public"
+	report.Table = "orders"
+	report.TableExists = &exists
+	dropped := schemadiff.DroppedObject{
+		Kind:       schemadiff.DroppedIndex,
+		Name:       "orders_status_idx",
+		Definition: "CREATE INDEX orders_status_idx ON public.orders USING btree (status)",
+	}
+	report.Statements = []pgplan.Statement{{
+		SQL:         "DROP INDEX public.orders_status_idx",
+		ExecSQL:     []string{"DROP INDEX CONCURRENTLY public.orders_status_idx"},
+		Kind:        schemadiff.ChangeDropIndex,
+		Route:       planner.RouteNative,
+		Backend:     router.BackendNative,
+		Disposition: router.DispositionExecute,
+		Destructive: true,
+		Drops:       &dropped,
+	}}
+
+	changes, tiers, _, err := tableChanges(report, nil, parser)
+	require.NoError(t, err)
+	require.Len(t, changes, 1)
+	assert.Empty(t, changes[0].ExecutionMode, changes[0].ModeReason)
+	assert.Equal(t, "DROP INDEX CONCURRENTLY public.orders_status_idx", changes[0].DDL)
+	assert.True(t, changes[0].IsUnsafe)
+	assert.Equal(t, []preflight.Tier{preflight.TierAlterInPlace}, tiers)
+	recorded, err := reviewedDropFromMetadata(changes[0].Metadata)
+	require.NoError(t, err)
+	require.NotNil(t, recorded)
+	assert.Equal(t, dropped, *recorded)
 }
 
 // TestBlockRewriteStepsFailsClosedOnUnparseableStep proves an executable step
