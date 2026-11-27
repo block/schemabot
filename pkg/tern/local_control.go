@@ -1026,7 +1026,7 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 
 	if targetApply != nil {
 		if err := c.releaseCancelledArtifacts(ctx, eng, targetApply, tasks); err != nil {
-			c.logSkippedArtifactRelease(ctx, targetApply, err)
+			c.logSkippedArtifactRelease(ctx, targetApply, cancelledRelease, err)
 		}
 		// The cancel is consumed at a drive checkpoint, where no engine call
 		// holds work the drive set up, so no drive's own cleanup reclaims work

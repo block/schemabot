@@ -2006,6 +2006,7 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		if handedBack, err := c.cancelTasksQueuedBehindFailure(ctx, apply, tasks, failedTask); handedBack || err != nil {
 			return err
 		}
+		c.releaseFailedApplyArtifacts(ctx, apply, tasks, failedTask)
 		adoptSequentialOutcome(apply, failedTask, stoppedByUser, now)
 		logger.Info("sequential operation drive settled; operator derives the operation row and projects the parent",
 			"stopped_by_user", stoppedByUser, "failed_task", failedTask != nil, "settled_state", apply.State)
@@ -2046,6 +2047,11 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 	if handedBack, err := c.cancelTasksQueuedBehindFailure(ctx, apply, tasks, failedTask); handedBack || err != nil {
 		return err
 	}
+	// The release runs before the outcome is stored, while this drive still
+	// holds the apply, so no later apply can reach the target between the
+	// failure and the release. A drive that stores no outcome leaves the apply
+	// to the next drive, which releases again and finds nothing left.
+	c.releaseFailedApplyArtifacts(ctx, apply, tasks, failedTask)
 	adoptSequentialOutcome(apply, failedTask, stoppedByUser, now)
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		if c.driveCancelled(ctx, apply, "while persisting the sequential outcome") {

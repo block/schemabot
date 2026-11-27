@@ -389,3 +389,31 @@ func TestParseProgressResponseDropsTerminalEscapesFromServerText(t *testing.T) {
 	require.Len(t, data.Tables, 1)
 	assert.Equal(t, "replica lag[31m", data.Tables[0].ThrottleReason)
 }
+
+// A NOT NULL change fails at its validation, and the drive records the steps
+// queued behind it cancelled without running them. Nobody cancelled them, so
+// the CLI reads them as not run. The same rows in an apply an operator
+// cancelled still read as cancelled before they started.
+func TestParseProgressResponseReadsStepsBehindAFailureAsNotRun(t *testing.T) {
+	queued := func(applyState string) TableProgress {
+		data := ParseProgressResponse(&apitypes.ProgressResponse{
+			State: applyState,
+			Tables: []*apitypes.TableProgressResponse{{
+				TableName:  "users",
+				Keyspace:   "public",
+				ChangeType: "alter",
+				DDL:        `ALTER TABLE "public"."users" ALTER COLUMN "name" SET NOT NULL`,
+				Status:     "STATE_CANCELLED",
+			}},
+		})
+		require.Len(t, data.Tables, 1)
+		return data.Tables[0]
+	}
+
+	failed := FormatTableProgressWithActivity(queued(state.Apply.Failed), "", "")
+	assert.Contains(t, failed, "users: ⏭️ Not run")
+	assert.NotContains(t, failed, "Cancelled")
+
+	cancelled := FormatTableProgressWithActivity(queued(state.Apply.Cancelled), "", "")
+	assert.Contains(t, cancelled, "users: 🚫 Cancelled (not started)")
+}

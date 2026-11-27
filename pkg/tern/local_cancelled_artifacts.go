@@ -57,17 +57,78 @@ type namespaceArtifacts struct {
 // leftover artifacts are inert disk where an undeliverable cancel is a wedged
 // pull request.
 func (c *LocalClient) releaseCancelledArtifacts(ctx context.Context, eng engine.Engine, apply *storage.Apply, tasks []*storage.Task) error {
+	return c.releaseArtifacts(ctx, eng, apply, tasks, cancelledRelease)
+}
+
+// artifactRelease is one way a schema change can stop short with its
+// artifacts on the target: the engine capability that reclaims them, and the
+// word the logs use for how the change ended.
+type artifactRelease struct {
+	outcome string
+	release func(context.Context, engine.Engine, *engine.ReleaseArtifactsRequest) (bool, *engine.ReleaseArtifactsResult, error)
+}
+
+var (
+	cancelledRelease = artifactRelease{outcome: "cancelled", release: engine.ReleaseCancelledArtifacts}
+	failedRelease    = artifactRelease{outcome: "failed", release: engine.ReleaseFailedArtifacts}
+)
+
+// releaseFailedApplyArtifacts removes the constraints an apply that failed for
+// good added to failedTask's table and left there: the apply ends, so nothing
+// will reach the step that removes them, and they go on checking the
+// application's writes. Only the failed task's table is in scope, since a
+// sequential drive starts a table's statements only after the ones before
+// them finished. A release that does not complete is logged to the server log
+// and the apply log and does not change the apply's outcome.
+func (c *LocalClient) releaseFailedApplyArtifacts(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, failedTask *storage.Task) {
+	if failedTask == nil || !state.IsState(failedTask.State, state.Task.Failed) {
+		return
+	}
+	eng := c.getEngine()
+	if _, ok := eng.(engine.FailedArtifactReleaser); !ok {
+		// An engine without the capability adds no constraint a failure strands,
+		// and keeps a failed apply's row copy for its resume.
+		c.logger.Debug("failed schema change leaves nothing this engine releases",
+			append(apply.LogAttrs(), "engine_type", c.config.Type)...)
+		return
+	}
+	var sameTable []*storage.Task
+	for _, task := range tasks {
+		if task != nil && sameTaskTable(task, failedTask) {
+			sameTable = append(sameTable, task)
+		}
+	}
+	if err := c.releaseArtifacts(ctx, eng, apply, sameTable, failedRelease); err != nil {
+		c.logSkippedArtifactRelease(ctx, apply, failedRelease, err)
+	}
+}
+
+// sameTaskTable reports whether two tasks change the same table of the same
+// schema, within the same apply operation.
+func sameTaskTable(a, b *storage.Task) bool {
+	if a.Namespace != b.Namespace || a.TableName != b.TableName {
+		return false
+	}
+	if a.ApplyOperationID == nil || b.ApplyOperationID == nil {
+		return a.ApplyOperationID == nil && b.ApplyOperationID == nil
+	}
+	return *a.ApplyOperationID == *b.ApplyOperationID
+}
+
+// releaseArtifacts reclaims what a stopped apply left on the target through
+// kind's engine capability, under an exclusive hold on that target.
+func (c *LocalClient) releaseArtifacts(ctx context.Context, eng engine.Engine, apply *storage.Apply, tasks []*storage.Task, kind artifactRelease) error {
 	if eng == nil {
 		return fmt.Errorf("no engine configured for type: %s", c.config.Type)
 	}
 	if apply == nil {
-		return fmt.Errorf("apply is required to reclaim cancelled schema change artifacts")
+		return fmt.Errorf("apply is required to reclaim %s schema change artifacts", kind.outcome)
 	}
 
 	byNamespace := c.cancelledArtifactTables(apply, tasks)
 	if len(byNamespace) == 0 {
-		c.logger.Debug("cancelled schema change names no tables, so it left no artifacts to reclaim",
-			apply.LogAttrs()...)
+		c.logger.Debug("stopped schema change names no tables, so it left no artifacts to reclaim",
+			append(apply.LogAttrs(), "outcome", kind.outcome)...)
 		return nil
 	}
 
@@ -77,10 +138,10 @@ func (c *LocalClient) releaseCancelledArtifacts(ctx context.Context, eng engine.
 	err := c.storage.Applies().WithExclusiveTarget(releaseCtx, apply, func(ctx context.Context) error {
 		reclaimedAny := false
 		for _, namespace := range slices.Sorted(maps.Keys(byNamespace)) {
-			reclaimed, err := c.releaseNamespaceArtifacts(ctx, eng, apply, namespace, byNamespace[namespace])
+			reclaimed, err := c.releaseNamespaceArtifacts(ctx, eng, apply, namespace, byNamespace[namespace], kind)
 			reclaimedAny = reclaimedAny || reclaimed
 			if err != nil {
-				return &artifactReleaseError{namespace: namespace, reclaimedAny: reclaimedAny, err: err}
+				return &artifactReleaseError{outcome: kind.outcome, namespace: namespace, reclaimedAny: reclaimedAny, err: err}
 			}
 		}
 		return nil
@@ -105,13 +166,14 @@ func releaseOutranItsHold(releaseCtx context.Context, err error) bool {
 // different words for an operator: "your copy is still where it was" is only
 // true when nothing moved.
 type artifactReleaseError struct {
+	outcome      string
 	namespace    string
 	reclaimedAny bool
 	err          error
 }
 
 func (e *artifactReleaseError) Error() string {
-	return fmt.Sprintf("reclaim cancelled schema change artifacts in %s: %v", e.namespace, e.err)
+	return fmt.Sprintf("reclaim %s schema change artifacts in %s: %v", e.outcome, e.namespace, e.err)
 }
 
 func (e *artifactReleaseError) Unwrap() error { return e.err }
@@ -120,7 +182,7 @@ func (e *artifactReleaseError) Unwrap() error { return e.err }
 // its data went, so an operator can answer "where did my copy go" from the pull
 // request timeline rather than a server-log dig. It reports whether anything
 // was reclaimed, including by a release that then failed.
-func (c *LocalClient) releaseNamespaceArtifacts(ctx context.Context, eng engine.Engine, apply *storage.Apply, namespace string, artifacts *namespaceArtifacts) (bool, error) {
+func (c *LocalClient) releaseNamespaceArtifacts(ctx context.Context, eng engine.Engine, apply *storage.Apply, namespace string, artifacts *namespaceArtifacts, kind artifactRelease) (bool, error) {
 	creds, err := c.credentialsForTask(artifacts.task)
 	if err != nil {
 		return false, fmt.Errorf("resolve credentials to reclaim artifacts in %s: %w", namespace, err)
@@ -132,60 +194,61 @@ func (c *LocalClient) releaseNamespaceArtifacts(ctx context.Context, eng engine.
 	if err != nil {
 		return false, fmt.Errorf("resolve the schema to reclaim artifacts in %s: %w", namespace, err)
 	}
-	supported, result, err := engine.ReleaseCancelledArtifacts(ctx, eng, &engine.ReleaseArtifactsRequest{
+	supported, result, err := kind.release(ctx, eng, &engine.ReleaseArtifactsRequest{
 		Database:         physical,
 		Tables:           artifacts.tables,
 		Credentials:      creds,
 		AddedConstraints: artifacts.addedConstraints,
 	})
 	if !supported {
-		// The engine's unfinished work lives in the service it drives, which
-		// released it when the cancel reached it. There is nothing local.
-		c.logger.Debug("engine leaves no artifacts on the target, so a cancel reclaims nothing",
-			append(apply.LogAttrs(), "engine", eng.Name(), "namespace", namespace)...)
+		// The engine leaves nothing on the target that this way of stopping
+		// strands: its unfinished work lives in the service it drives, or a
+		// later apply resumes from it.
+		c.logger.Debug("engine leaves no artifacts on the target to reclaim for this outcome",
+			append(apply.LogAttrs(), "engine", eng.Name(), "namespace", namespace, "outcome", kind.outcome)...)
 		return false, nil
 	}
 	// What the release did is recorded before its error is returned: a release
 	// that fails part-way has still moved the copy, and the entry naming where
 	// it went is what an operator follows to recover it.
-	reclaimed := c.recordReleaseResult(ctx, apply, namespace, result)
+	reclaimed := c.recordReleaseResult(ctx, apply, namespace, kind.outcome, result)
 	if err != nil {
 		return reclaimed, err
 	}
 	if !reclaimed {
-		c.logger.Info("cancelled schema change left no artifacts on the target",
-			append(apply.LogAttrs(), "namespace", namespace, "tables", artifacts.tables)...)
+		c.logger.Info("stopped schema change left no artifacts on the target",
+			append(apply.LogAttrs(), "namespace", namespace, "outcome", kind.outcome, "tables", artifacts.tables)...)
 	}
 	return reclaimed, nil
 }
 
 // recordReleaseResult writes what one schema's release reclaimed and retained to
 // the server log and the apply log, and reports whether it reclaimed anything.
-func (c *LocalClient) recordReleaseResult(ctx context.Context, apply *storage.Apply, namespace string, result *engine.ReleaseArtifactsResult) bool {
+func (c *LocalClient) recordReleaseResult(ctx context.Context, apply *storage.Apply, namespace, outcome string, result *engine.ReleaseArtifactsResult) bool {
 	if result == nil {
 		return false
 	}
 	for _, constraint := range result.RemovedConstraints {
-		c.logger.Info("removed a constraint the cancelled schema change added to a live table",
-			append(apply.LogAttrs(), "namespace", namespace, "table", constraint.Table, "constraint", constraint.Name)...)
+		c.logger.Info("removed a constraint the stopped schema change added to a live table",
+			append(apply.LogAttrs(), "namespace", namespace, "outcome", outcome, "table", constraint.Table, "constraint", constraint.Name)...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
-			removedConstraintMessage(constraint), "", "")
+			removedConstraintMessage(constraint, outcome), "", "")
 	}
 	for _, constraint := range result.RemainingConstraints {
 		// The constraint goes on checking the application's writes, which the
-		// operator who cancelled cannot know unless something says so.
-		c.logger.Warn("a constraint the cancelled schema change added is still on a live table",
-			append(apply.LogAttrs(), "namespace", namespace, "table", constraint.Table, "constraint", constraint.Name)...)
+		// operator cannot know unless something says so.
+		c.logger.Warn("a constraint the stopped schema change added is still on a live table",
+			append(apply.LogAttrs(), "namespace", namespace, "outcome", outcome, "table", constraint.Table, "constraint", constraint.Name)...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
-			remainingConstraintMessage(constraint), "", "")
+			remainingConstraintMessage(constraint, outcome), "", "")
 	}
 	for _, constraint := range result.PreexistingConstraints {
-		// The cancel did not add it and does not remove it, but the operator
-		// who cancelled may expect the table back as it was.
-		c.logger.Warn("a constraint the cancelled schema change worked with, but did not add, is still on a live table",
-			append(apply.LogAttrs(), "namespace", namespace, "table", constraint.Table, "constraint", constraint.Name)...)
+		// The schema change did not add it and the release does not remove
+		// it, but the operator may expect the table back as it was.
+		c.logger.Warn("a constraint the stopped schema change worked with, but did not add, is still on a live table",
+			append(apply.LogAttrs(), "namespace", namespace, "outcome", outcome, "table", constraint.Table, "constraint", constraint.Name)...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
-			preexistingConstraintMessage(constraint), "", "")
+			preexistingConstraintMessage(constraint, outcome), "", "")
 	}
 	reclaimed := len(result.Preserved) > 0 || len(result.Discarded) > 0 || len(result.RemovedConstraints) > 0
 	if len(result.Preserved) > 0 || len(result.Discarded) > 0 {
@@ -216,25 +279,25 @@ func (c *LocalClient) recordReleaseResult(ctx context.Context, apply *storage.Ap
 
 // removedConstraintMessage describes, for the apply log, a constraint the
 // release dropped from a live table.
-func removedConstraintMessage(constraint engine.EngineConstraint) string {
-	return fmt.Sprintf("Removed constraint %s from %s. The cancelled schema change added it, and it %s",
-		constraint.Name, constraint.Table, constraint.Effect)
+func removedConstraintMessage(constraint engine.EngineConstraint, outcome string) string {
+	return fmt.Sprintf("Removed constraint %s from %s. The %s schema change added it, and it %s",
+		constraint.Name, constraint.Table, outcome, constraint.Effect)
 }
 
 // remainingConstraintMessage describes, for the apply log, a constraint the
 // release could not drop, what it does to writes, and the statement that
 // drops it.
-func remainingConstraintMessage(constraint engine.EngineConstraint) string {
-	return fmt.Sprintf("Constraint %s is still on %s. The cancelled schema change added it, and it %s until it is dropped. Drop it with: %s",
-		constraint.Name, constraint.Table, constraint.Effect, constraint.Removal)
+func remainingConstraintMessage(constraint engine.EngineConstraint, outcome string) string {
+	return fmt.Sprintf("Constraint %s is still on %s. The %s schema change added it, and it %s until it is dropped. Drop it with: %s",
+		constraint.Name, constraint.Table, outcome, constraint.Effect, constraint.Removal)
 }
 
 // preexistingConstraintMessage describes, for the apply log, a constraint the
 // release left because the schema change did not add it, what it does to
 // writes, and the statement that drops it.
-func preexistingConstraintMessage(constraint engine.EngineConstraint) string {
-	return fmt.Sprintf("Constraint %s is still on %s. It was there before the cancelled schema change, so the cancel left it, and it %s until it is dropped. Drop it with: %s",
-		constraint.Name, constraint.Table, constraint.Effect, constraint.Removal)
+func preexistingConstraintMessage(constraint engine.EngineConstraint, outcome string) string {
+	return fmt.Sprintf("Constraint %s is still on %s. It was there before the %s schema change, so SchemaBot left it, and it %s until it is dropped. Drop it with: %s",
+		constraint.Name, constraint.Table, outcome, constraint.Effect, constraint.Removal)
 }
 
 // releasedArtifactsMessage describes a release for the apply log, naming where
@@ -343,24 +406,24 @@ func (c *LocalClient) constraintsTaskAdded(apply *storage.Apply, task *storage.T
 // logSkippedArtifactRelease records that a cancel left artifacts on the target,
 // on both the server log and the apply log. An operator seeing a cancelled
 // schema change needs to know a copy survived it, and why.
-func (c *LocalClient) logSkippedArtifactRelease(ctx context.Context, apply *storage.Apply, err error) {
+func (c *LocalClient) logSkippedArtifactRelease(ctx context.Context, apply *storage.Apply, kind artifactRelease, err error) {
 	reason := skippedArtifactReleaseReason(err)
 
 	var stopped *artifactReleaseError
 	if errors.As(err, &stopped) && stopped.reclaimedAny {
 		// Part of the release landed, and the entries before this one say where
 		// it went. Saying the copy was left in place would contradict them.
-		c.logger.Warn("cancelled schema change artifact release stopped part-way; the rest was left on the target",
-			append(apply.LogAttrs(), "namespace", stopped.namespace, "reason", reason, "error", err)...)
+		c.logger.Warn("stopped schema change artifact release stopped part-way; the rest was left on the target",
+			append(apply.LogAttrs(), "namespace", stopped.namespace, "outcome", kind.outcome, "reason", reason, "error", err)...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
-			fmt.Sprintf("Reclaiming the cancelled schema change's artifacts stopped in %s because %s. The entries before this one name what was reclaimed; everything else was left on the target", stopped.namespace, reason), "", "")
+			fmt.Sprintf("Reclaiming the %s schema change's artifacts stopped in %s because %s. The entries before this one name what was reclaimed; everything else was left on the target", kind.outcome, stopped.namespace, reason), "", "")
 		return
 	}
 
-	c.logger.Warn("cancelled schema change left its artifacts on the target",
-		append(apply.LogAttrs(), "reason", reason, "error", err)...)
+	c.logger.Warn("stopped schema change left its artifacts on the target",
+		append(apply.LogAttrs(), "outcome", kind.outcome, "reason", reason, "error", err)...)
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
-		fmt.Sprintf("What the cancelled schema change left on the target was not reclaimed because %s", reason), "", "")
+		fmt.Sprintf("What the %s schema change left on the target was not reclaimed because %s", kind.outcome, reason), "", "")
 }
 
 // skippedArtifactReleaseReason states why a release left artifacts behind, in

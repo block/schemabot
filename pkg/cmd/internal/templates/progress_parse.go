@@ -140,6 +140,10 @@ type TableProgress struct {
 	// target left to run, so a target still pending on it never starts it and
 	// reads as not started rather than queued.
 	RolloutSettled bool
+	// ApplyFailed marks a table of an apply that ended failed. A table such an
+	// apply recorded cancelled before it started never ran because an earlier
+	// one failed, not because anyone cancelled it, so it reads as not run.
+	ApplyFailed bool
 	// Resuming marks a table of a resuming apply. While no target has moved
 	// it on from where the stop left it (presentation.AwaitingResume), its
 	// stopped progress is from before the stop and whether the copy continues
@@ -271,6 +275,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			Throttled:           tbl.Throttled,
 			ThrottleReason:      ui.TerminalSafe(tbl.ThrottleReason),
 			IsInstant:           tbl.IsInstant,
+			ApplyFailed:         state.IsState(data.State, state.Apply.Failed),
 		}
 		copies := make([]presentation.ShardCopy, 0, len(tbl.Shards))
 		for _, sh := range tbl.Shards {

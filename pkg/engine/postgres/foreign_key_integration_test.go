@@ -197,7 +197,8 @@ func TestEngineApplyForeignKeys(t *testing.T) {
 
 // An owner adds a foreign key that an existing row breaks. The apply adds the
 // key without checking existing rows, then fails at the validation, naming the
-// key and the fix. The key stays in place unvalidated, so new writes are
+// key and the fix, and ends the apply rather than retrying it. The key stays
+// in place unvalidated, so new writes are
 // already checked. Once the owner fixes the row, the next plan is only the
 // validation, and applying it completes.
 func TestEngineApplyForeignKeyOverABrokenRow(t *testing.T) {
@@ -219,7 +220,8 @@ func TestEngineApplyForeignKeyOverABrokenRow(t *testing.T) {
 	require.Len(t, outcomes, 2, "the add completes and the validation fails")
 	assert.Equal(t, engine.StateCompleted, outcomes[0].State, outcomes[0].ErrorMessage)
 	assert.Equal(t, engine.StateFailed, outcomes[1].State)
-	assert.Equal(t, `existing rows in "orders" break foreign key "orders_user_id_fkey"; the key is in place and checks new writes; fix those rows, then retry`, outcomes[1].ErrorMessage)
+	assert.Equal(t, `existing rows in "orders" break foreign key "orders_user_id_fkey"; the key is in place and checks new writes; fix those rows, then apply again`, outcomes[1].ErrorMessage)
+	assert.False(t, outcomes[1].Retryable, "a retry cannot pass until someone fixes the row, so the apply ends at once")
 	assert.False(t, foreignKeyValidated(t, db, "orders_user_id_fkey"), "the key stays in place, unvalidated")
 	_, err = db.ExecContext(t.Context(), `INSERT INTO public.orders VALUES (12, 98)`)
 	require.Error(t, err, "new writes are checked before the key is validated")

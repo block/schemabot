@@ -734,6 +734,8 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			bar := ui.ProgressBar(cancelledPercent, ui.ColorOrange)
 			writeTableLine(&b, t, "%s 🚫 Cancelled at %s%s", bar,
 				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), presentation.ShardCoverageSuffix(tableFacts(t)))
+		} else if t.ApplyFailed {
+			writeTableLine(&b, t, "⏭️ Not run")
 		} else {
 			writeTableLine(&b, t, "🚫 Cancelled (not started)")
 		}

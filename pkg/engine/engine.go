@@ -444,6 +444,36 @@ func ReleaseCancelledArtifacts(ctx context.Context, eng Engine, req *ReleaseArti
 	return true, result, err
 }
 
+// FailedArtifactReleaser is an optional capability for engines that add a
+// constraint of their own to a live table as a step of a change and remove it
+// in a later step. When the apply fails for good between the two, nothing is
+// left to drive the change, and the constraint goes on checking the
+// application's writes, the same cost a cancel would leave. The release
+// removes the constraints the failed apply added, as a cancel does.
+//
+// Row copies are out of scope: an engine may resume a failed apply's copy
+// from them, so a failure keeps them. Callers hold the same claim and
+// apply-target lock a cancelled release needs.
+type FailedArtifactReleaser interface {
+	// ReleaseFailedArtifacts removes the constraints req.AddedConstraints
+	// names that the failed schema change left on req.Tables, and reports
+	// what it removed and what it left.
+	ReleaseFailedArtifacts(ctx context.Context, req *ReleaseArtifactsRequest) (*ReleaseArtifactsResult, error)
+}
+
+// ReleaseFailedArtifacts removes eng's constraints a failed apply left on the
+// target when eng owns any, and reports whether the engine implements the
+// capability at all. An engine that does not leaves nothing a failure
+// strands, so there is nothing to release and nothing to report.
+func ReleaseFailedArtifacts(ctx context.Context, eng Engine, req *ReleaseArtifactsRequest) (supported bool, result *ReleaseArtifactsResult, err error) {
+	releaser, ok := eng.(FailedArtifactReleaser)
+	if !ok {
+		return false, nil, nil
+	}
+	result, err = releaser.ReleaseFailedArtifacts(ctx, req)
+	return true, result, err
+}
+
 // CancelledResumeStateReclaimer is an optional capability for engines whose
 // drive sets up work in the service it drives before anything in that service
 // owns the work's teardown, and records the work in the apply's stored resume
