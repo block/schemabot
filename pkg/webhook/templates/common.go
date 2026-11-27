@@ -284,6 +284,28 @@ func sanitizeCellError(msg string) string {
 	return msg
 }
 
+// errorDetailMarkdown renders an already sanitized error message as Markdown
+// text. GitHub notifies whoever an @handle in a comment names, and an error
+// message quotes the PR author's input — database names, schema paths,
+// statements — so a mention in it would notify a person or team who has
+// nothing to do with the failure. Every mention outside a code span is written
+// as inline code, which notifies nobody; a code span the message already holds
+// is left as written, since a mention inside it is already inert.
+//
+// The message is HTML-escaped first and the mentions are written afterwards, so
+// the markup added for a mention is never escaped and a character reference such
+// as &#64; becomes the text "&amp;#64;" instead of the @ it names. Escaping
+// leaves backticks alone, so the code spans found in the escaped text are the
+// ones in the original. A backslash before a backtick is kept, so an escaped
+// backtick opens no span here, as it opens none on GitHub.
+//
+// Every renderer that puts an error message into PR comment markdown goes
+// through this function, so a new one has one place to get mention handling
+// from (AV-8).
+func errorDetailMarkdown(sanitized string) string {
+	return mapOutsideCodeSpans(html.EscapeString(sanitized), true, codeMentionTags)
+}
+
 // quoteBlockLines keeps a multi-line message inside a Markdown blockquote by
 // prefixing continuation lines with the quote marker, so engine errors cannot
 // escape into the surrounding comment structure.
@@ -303,7 +325,7 @@ func writeErrorBlock(sb *strings.Builder, severity, msg string) {
 	if sanitized == "" {
 		return
 	}
-	fmt.Fprintf(sb, "\n> %s **Error:** %s\n", severity, quoteBlockLines(html.EscapeString(sanitized)))
+	fmt.Fprintf(sb, "\n> %s **Error:** %s\n", severity, quoteBlockLines(errorDetailMarkdown(sanitized)))
 }
 
 // writeTableErrorLine writes a task's last error as a blockquote below its
@@ -316,7 +338,7 @@ func writeTableErrorLine(sb *strings.Builder, severity, msg string) {
 	if sanitized == "" {
 		return
 	}
-	fmt.Fprintf(sb, "> %s Last error: %s\n", severity, quoteBlockLines(html.EscapeString(sanitized)))
+	fmt.Fprintf(sb, "> %s Last error: %s\n", severity, quoteBlockLines(errorDetailMarkdown(sanitized)))
 }
 
 // taskErrorAddsDetail reports whether a failed table's own error message adds
@@ -375,7 +397,7 @@ func writeLastUpdatedFooter(sb *strings.Builder, timestamp string, updateCadence
 	}
 	cadenceNote := ""
 	if updateCadence > 0 {
-		cadenceNote = " · changes show within ~" + ui.FormatExactDuration(updateCadence)
+		cadenceNote = " · changes show within ~" + ui.FormatHumanDuration(updateCadence)
 	}
 	escapedTimestamp := html.EscapeString(timestamp)
 	fmt.Fprintf(sb, "\n_Last updated: <relative-time datetime=\"%s\">%s</relative-time> (%s)%s_\n",

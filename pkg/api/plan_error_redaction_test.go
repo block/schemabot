@@ -255,6 +255,26 @@ func TestHandlePlanKeepsTextWrittenForTheReader(t *testing.T) {
 	}
 }
 
+// A remote data plane's plan refusal reaches the webhook marked as text written
+// for the reader, so the pull request explains the refusal the same way it
+// does a local engine's. The text is the refusal's own, without the gRPC
+// framing or the wrap that names an address, and the status code still reads
+// through it.
+func TestExecutePlanMarksARemoteRefusalAsAuthored(t *testing.T) {
+	const refusal = "drop_tables entries were written in the last 24h"
+	svc := withheldDropService(&capturingPlanStore{}, &mockTernClient{isRemote: true,
+		planErr: fmt.Errorf("plan via 10.0.0.5:3306: %w", status.Error(codes.FailedPrecondition, refusal))})
+
+	_, err := svc.ExecutePlan(t.Context(), redactionPlanRequest())
+
+	require.Error(t, err)
+	text, quotesRepository, ok := AuthoredTextOf(err)
+	require.True(t, ok, "a remote refusal must be marked as authored: %v", err)
+	assert.Equal(t, refusal, text)
+	assert.True(t, quotesRepository)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+}
+
 // A pull that fails inside SchemaBot answers 500 with a fixed message that
 // names the database and the environment and says to retry. The cause stays in
 // the server log.

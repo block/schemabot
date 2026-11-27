@@ -331,9 +331,15 @@ drops, require a plan. See [lint and safety levels](lint-and-safety-levels.md#au
 ### Skip tables schema files cannot describe
 
 A PostgreSQL pull refuses the whole request when one table has a shape schema
-files cannot describe, such as a trigger or an `UNLOGGED` table. A caller that
-writes schema files can set `skip_unrepresentable_tables` to get every other
-table instead. Each skipped table comes back in `skipped_tables` with the reason.
+files cannot describe, such as an `UNLOGGED` table or a table that inherits from
+another. A caller that writes schema files can set `skip_unrepresentable_tables`
+to get every other table instead. Each skipped table comes back in
+`skipped_tables` with the reason.
+
+Triggers and comments do not make a table unrepresentable. The pulled file
+holds the table's columns, constraints, and indexes, and the triggers and
+comments stay on the live table, outside the file. Plans and applies neither
+read nor change them.
 
 ```http
 POST /api/pull
@@ -350,7 +356,7 @@ Content-Type: application/json
     "public": {
       "tables": {"orders": "CREATE TABLE orders (...);"},
       "skipped_tables": [
-        {"table": "accounts", "reason": "schema files cannot describe its trigger"}
+        {"table": "audit_log", "reason": "unlogged tables cannot be rendered as a desired schema"}
       ]
     }
   },
@@ -381,7 +387,7 @@ schemabot pull -d shop -e production
 ```sql
 -- Namespace `public` — 1 table
 -- ⚠️ Skipped 1 table, not in the output:
---   accounts: schema files cannot describe its trigger
+--   audit_log: unlogged tables cannot be rendered as a desired schema
 ```
 
 `schemabot onboard` and `schemabot init` set it too, and write each skipped
@@ -735,7 +741,7 @@ live view:
 ```text
 ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00% (throttled)
   ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
-  • Rows: 6,000,000 / 10,000,000 · ~3.2 GB · ETA: 42m 0s
+  • Rows: 6,000,000 / 10,000,000 · ~3.2 GB · ETA: 42m
   • ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget
 
   📖 Docs: https://github.com/block/schemabot/blob/main/docs/mysql.md#throttling
@@ -1284,7 +1290,7 @@ Output excerpt:
 ```text
 ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00% (throttled)
   ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
-  • Rows: 6,000,000 / 10,000,000 · ~3.2 GB · ETA: 42m 0s
+  • Rows: 6,000,000 / 10,000,000 · ~3.2 GB · ETA: 42m
   • ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget
 
   📖 Docs: https://github.com/block/schemabot/blob/main/docs/mysql.md#throttling

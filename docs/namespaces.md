@@ -583,9 +583,18 @@ target may still have the table and plan its drop.
   that still receives rows, such as the shadow table of an online schema change
   another tool is running, is not a leftover yet. Wait until nothing writes to
   it. The check reads the write time MySQL keeps in memory, which starts empty
-  when the server restarts, so a table not written since the last restart
-  passes however recently it was written before it. Passing the check does not
-  prove nothing uses the table: confirm that yourself before you list it.
+  when the server starts. When MySQL has no write time for a listed table, the
+  plan proceeds only if the server has been up for at least 24 hours, since it
+  would have recorded any write in that time. On a server up for less, the plan
+  is refused and says how long to wait. MySQL also keeps no write time for a
+  table it has evicted from its dictionary cache, which it does only to a table
+  nothing has open, or for any table after a replica that was already running
+  takes over as the writer, so in those cases a write in the last 24 hours goes
+  unseen. Passing the check does not prove nothing uses the table: confirm that
+  yourself before you list it.
+- `_spirit_sentinel`, in any case, is refused. It is the table that holds an
+  apply started with `--defer-cutover` until someone runs the cutover, so
+  dropping it would run that cutover. Run it with `schemabot cutover` instead.
 - A listed table that is a working table of a SchemaBot apply on the same
   database and environment that is still running or is stopped, such as its
   copy `_users_new` or its checkpoint `_users_chkpnt`, is refused, naming the

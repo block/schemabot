@@ -86,6 +86,43 @@ func TestLockTemplatesDropTerminalEscapes(t *testing.T) {
 			"   Previous owner: cli:jdoe"+lineAttackCleaned+"\n", output)
 	})
 
+	t.Run("the warning before a forced command takes another owner's lock", func(t *testing.T) {
+		output := captureStdout(t, func() {
+			WriteLockTakeoverWarning(LockConflictData{
+				Database:     "orders",
+				DatabaseType: "mysql",
+				Owner:        "cli:jdoe" + lineAttack,
+				Repository:   "acme/shop" + lineAttack,
+				PullRequest:  412,
+				CreatedAt:    heldSince,
+			}, UnlockTakeoverConsequence)
+		})
+
+		assert.Equal(t, "\n"+glyph.Attention+"  The lock on orders (mysql) belongs to another owner\n"+
+			"   Held by: cli:jdoe"+lineAttackCleaned+"\n"+
+			"   Since:   just now\n"+
+			"   PR:      acme/shop"+lineAttackCleaned+"#412\n"+
+			"   Releasing it removes their claim on this database.\n", output)
+	})
+
+	t.Run("the warning names a PR's lock once when the PR owns it", func(t *testing.T) {
+		output := captureStdout(t, func() {
+			WriteLockTakeoverWarning(LockConflictData{
+				Database:     "orders",
+				DatabaseType: "mysql",
+				Owner:        "acme/shop#412",
+				Repository:   "acme/shop",
+				PullRequest:  412,
+				CreatedAt:    heldSince,
+			}, ApplyTakeoverConsequence)
+		})
+
+		assert.Equal(t, "\n"+glyph.Attention+"  The lock on orders (mysql) belongs to another owner\n"+
+			"   Held by: acme/shop#412\n"+
+			"   Since:   just now\n"+
+			"   Applying with --force releases it and takes the lock for you.\n", output)
+	})
+
 	t.Run("an unlock refused because someone else owns the lock", func(t *testing.T) {
 		output := captureStdout(t, func() {
 			WriteUnlockNotOwned("orders", "mysql", "cli:jdoe"+lineAttack)
