@@ -36,6 +36,11 @@ type controlTestStub struct {
 	// progressStatusAfterControl, when set, fails every progress lookup made
 	// after the control request has arrived with that HTTP status.
 	progressStatusAfterControl int
+	// controlRequests are the control request outcomes the progress lookup
+	// reports, and controlRequestsAfterControl the ones it reports once the
+	// control request has arrived.
+	controlRequests             []apitypes.ControlRequestOutcome
+	controlRequestsAfterControl []apitypes.ControlRequestOutcome
 }
 
 // controlTestServer serves a schema change in the given state and answers the
@@ -59,6 +64,7 @@ func serveControlTestStub(t *testing.T, stub controlTestStub) (*httptest.Server,
 	var mu sync.Mutex
 	currentState := stub.applyState
 	progressStatus := stub.progressStatus
+	controlRequests := stub.controlRequests
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -71,9 +77,10 @@ func serveControlTestStub(t *testing.T, stub controlTestStub) (*httptest.Server,
 				return
 			}
 			assert.NoError(t, json.NewEncoder(w).Encode(apitypes.ProgressResponse{
-				State:    currentState,
-				Database: "orders",
-				ApplyID:  controlTestApplyID,
+				State:           currentState,
+				Database:        "orders",
+				ApplyID:         controlTestApplyID,
+				ControlRequests: controlRequests,
 			}))
 		case r.Method == http.MethodPost && r.URL.Path == stub.controlPath:
 			var req apitypes.ControlRequest
@@ -84,6 +91,9 @@ func serveControlTestStub(t *testing.T, stub controlTestStub) (*httptest.Server,
 			}
 			if stub.progressStatusAfterControl != 0 {
 				progressStatus = stub.progressStatusAfterControl
+			}
+			if stub.controlRequestsAfterControl != nil {
+				controlRequests = stub.controlRequestsAfterControl
 			}
 			if stub.controlStatus != 0 {
 				w.WriteHeader(stub.controlStatus)
@@ -295,6 +305,55 @@ func TestCancelCmdReportsASchemaChangeThatEndedFirst(t *testing.T) {
 		"Environment: staging\n\n"+
 		"To see how it ended:\n"+
 		"  schemabot progress "+controlTestApplyID+" -e staging\n", out)
+}
+
+// An engine can decline a cancel it cannot carry out, such as a PostgreSQL
+// step that commits or fails on its own. The schema change runs on, so the
+// output says the cancel did not take effect, gives the engine's reason, and
+// names the command that watches the change finish, rather than claiming a
+// cancel or leaving the operator waiting for one.
+func TestCancelCmdReportsADeclinedCancel(t *testing.T) {
+	const reason = "cancel is supported for PostgreSQL index builds only: this schema change runs as plain DDL that commits or fails on its own"
+	server, requests := serveControlTestStub(t, controlTestStub{
+		applyState:  state.Apply.Running,
+		controlPath: "/api/cancel",
+		controlBody: apitypes.CancelResponse{Accepted: true, CancelledCount: 1},
+		controlRequestsAfterControl: []apitypes.ControlRequestOutcome{
+			{Operation: "cancel", Status: "failed", ErrorMessage: reason},
+		},
+	})
+
+	cmd := CancelCmd{ControlFlags: controlTestFlags(), AutoApprove: true, settleTimeout: time.Second, settlePollInterval: 10 * time.Millisecond}
+	out, err := runControlCmd(server.URL, cmd.Run)
+	require.NoError(t, err)
+	assertSentOnce(t, *requests)
+	assert.Equal(t, "⛔ Cancel did not take effect\n\n"+
+		"Database:    orders\n"+
+		"Environment: staging\n\n"+
+		reason+"\n"+
+		"The schema change keeps running and finishes on its own.\n\n"+
+		"To watch it finish:\n"+
+		"  schemabot progress "+controlTestApplyID+" -e staging\n", out)
+}
+
+// A cancel that failed before this one was sent is not this cancel's answer.
+// Until the new request settles, the cancel reads as requested.
+func TestCancelCmdIgnoresAnEarlierDeclinedCancel(t *testing.T) {
+	earlier := apitypes.ControlRequestOutcome{Operation: "cancel", Status: "failed", Revision: 0, ErrorMessage: "an earlier decline"}
+	server, requests := serveControlTestStub(t, controlTestStub{
+		applyState:                  state.Apply.Running,
+		controlPath:                 "/api/cancel",
+		controlBody:                 apitypes.CancelResponse{Accepted: true, CancelledCount: 1},
+		controlRequests:             []apitypes.ControlRequestOutcome{earlier},
+		controlRequestsAfterControl: []apitypes.ControlRequestOutcome{earlier},
+	})
+
+	cmd := CancelCmd{ControlFlags: controlTestFlags(), AutoApprove: true, settleTimeout: 30 * time.Millisecond, settlePollInterval: 10 * time.Millisecond}
+	out, err := runControlCmd(server.URL, cmd.Run)
+	require.NoError(t, err)
+	assertSentOnce(t, *requests)
+	assert.Contains(t, out, "⏳ Cancel requested\n")
+	assert.NotContains(t, out, "an earlier decline")
 }
 
 // When the server refuses a control request, the CLI returns the server's

@@ -8,6 +8,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // Bounds on how long cancel waits for the schema change to end once the server
@@ -91,26 +92,33 @@ func (cmd *CancelCmd) Run(g *Globals) error {
 		return err
 	}
 
-	var settled string
+	var settled cancelSettlement
 	lookupErr := withLoading("Waiting for the schema change to end...", true, func() error {
 		var awaitErr error
-		settled, awaitErr = cmd.awaitEnd(ep)
+		settled, awaitErr = cmd.awaitEnd(ep, result.ControlRequest(cancelOperation))
 		return awaitErr
 	})
 	switch {
-	case state.IsState(settled, state.Apply.Cancelled):
+	case settled.declined != nil:
+		templates.WriteCancelDeclined(templates.CancelDeclinedData{
+			Database:    cmd.Database,
+			Environment: cmd.Environment,
+			ApplyID:     cmd.ApplyID,
+			Reason:      settled.declined.ErrorMessage,
+		})
+	case state.IsState(settled.state, state.Apply.Cancelled):
 		templates.WriteCancelSuccess(templates.CancelData{
 			Database:       cmd.Database,
 			Environment:    cmd.Environment,
 			CancelledCount: int(cancelResult.CancelledCount),
 			SkippedCount:   int(cancelResult.SkippedCount),
 		})
-	case settled != "":
+	case settled.state != "":
 		templates.WriteCancelOvertaken(templates.CancelOvertakenData{
 			Database:    cmd.Database,
 			Environment: cmd.Environment,
 			ApplyID:     cmd.ApplyID,
-			State:       settled,
+			State:       settled.state,
 		})
 	default:
 		templates.WriteCancelPending(templates.CancelPendingData{
@@ -124,12 +132,25 @@ func (cmd *CancelCmd) Run(g *Globals) error {
 	return nil
 }
 
-// awaitEnd polls the apply until it ends or the settle timeout passes. It
-// returns the state the apply ended in, or "" when it is still active at the
-// deadline or its state could not be read, with the read error in that case.
-// A stopped apply has not ended: the cancel of a stopped apply still waits
-// for a driver to consume it.
-func (cmd *CancelCmd) awaitEnd(ep string) (string, error) {
+// cancelOperation is the control operation name the progress API reports a
+// cancel request under.
+const cancelOperation = "cancel"
+
+// cancelSettlement is how a cancel's wait ended: the state the apply ended
+// in, or the cancel request the schema change declined while it runs on.
+// Both are empty when the apply is still active at the deadline.
+type cancelSettlement struct {
+	state    string
+	declined *apitypes.ControlRequestOutcome
+}
+
+// awaitEnd polls the apply until it ends, its cancel request is declined, or
+// the settle timeout passes. before is the apply's cancel request as read
+// before this cancel was sent, so a request settled by an earlier cancel is
+// not mistaken for this one's answer. It returns the read error when the
+// apply's state could not be read. A stopped apply has not ended: the cancel
+// of a stopped apply still waits for a driver to consume it.
+func (cmd *CancelCmd) awaitEnd(ep string, before *apitypes.ControlRequestOutcome) (cancelSettlement, error) {
 	timeout := cmd.settleTimeout
 	if timeout == 0 {
 		timeout = cancelSettleTimeout
@@ -142,16 +163,34 @@ func (cmd *CancelCmd) awaitEnd(ep string) (string, error) {
 	for {
 		progress, err := client.GetProgress(ep, cmd.ApplyID)
 		if err != nil {
-			return "", fmt.Errorf("get progress for apply %s: %w", cmd.ApplyID, err)
+			return cancelSettlement{}, fmt.Errorf("get progress for apply %s: %w", cmd.ApplyID, err)
 		}
 		if applyHasEnded(progress.State) {
-			return progress.State, nil
+			return cancelSettlement{state: progress.State}, nil
+		}
+		if req := progress.ControlRequest(cancelOperation); cancelDeclined(req, before) {
+			return cancelSettlement{declined: req}, nil
 		}
 		if time.Now().Add(interval).After(deadline) {
-			return "", nil
+			return cancelSettlement{}, nil
 		}
 		time.Sleep(interval)
 	}
+}
+
+// cancelDeclined reports whether req is this cancel's request and the
+// schema change declined it. The request is this cancel's when none was
+// recorded before it was sent, when the one recorded then was still pending
+// (the server answers a repeat cancel with that request), or when it carries
+// a later revision than a request that had already settled.
+func cancelDeclined(req, before *apitypes.ControlRequestOutcome) bool {
+	if req == nil || req.Status != string(storage.ControlRequestFailed) {
+		return false
+	}
+	if before == nil || before.Status == string(storage.ControlRequestPending) {
+		return true
+	}
+	return req.Revision > before.Revision
 }
 
 // applyHasEnded reports whether an apply is in a terminal state a cancel can

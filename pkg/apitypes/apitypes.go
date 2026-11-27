@@ -1997,6 +1997,42 @@ type ProgressResponse struct {
 	// the apply is stopped and the stop that stopped it was a freeze's (one
 	// with running "stop"), not an operator's.
 	StoppedByFreeze *FreezeStopRef `json:"stopped_by_freeze,omitempty"`
+	// ControlRequests is the latest request of each control operation made
+	// against this apply, so a caller that issued one can tell whether it took
+	// effect. Set only on apply-id lookups.
+	ControlRequests []ControlRequestOutcome `json:"control_requests,omitempty"`
+}
+
+// ControlRequestOutcome is where one control request against an apply stands.
+type ControlRequestOutcome struct {
+	// Operation is the control operation: "stop", "start", "cutover",
+	// "cancel", "revert", "skip_revert", or "release".
+	Operation string `json:"operation"`
+	// Status is "pending" until the schema change acts on the request, then
+	// "completed" when it took effect or "failed" when it did not.
+	Status string `json:"status"`
+	// Revision tells a request apart from an earlier one for the same
+	// operation: a new request after a settled one carries a higher revision.
+	Revision int64 `json:"revision"`
+	// ErrorMessage says why a failed request did not take effect.
+	ErrorMessage string `json:"error_message,omitempty"`
+	RequestedBy  string `json:"requested_by,omitempty"`
+	// SettledAt is when the request completed or failed, RFC 3339.
+	SettledAt string `json:"settled_at,omitempty"`
+}
+
+// ControlRequest returns the latest request of the named control operation,
+// or nil when none was made.
+func (r *ProgressResponse) ControlRequest(operation string) *ControlRequestOutcome {
+	if r == nil {
+		return nil
+	}
+	for i := range r.ControlRequests {
+		if r.ControlRequests[i].Operation == operation {
+			return &r.ControlRequests[i]
+		}
+	}
+	return nil
 }
 
 // FreezeStopRef names the freeze that stopped an apply.

@@ -1018,6 +1018,33 @@ func WriteCancelPending(data CancelPendingData) {
 	fmt.Print(FormatNextCommand("To watch it end", ControlCommand("progress", data.ApplyID, data.Environment)))
 }
 
+// CancelDeclinedData contains data for rendering a cancel the schema change
+// declined.
+type CancelDeclinedData struct {
+	Database    string
+	Environment string
+	ApplyID     string
+	// Reason is the engine's reason the cancel did not take effect.
+	Reason string
+}
+
+// WriteCancelDeclined writes the output of a cancel the schema change
+// declined, such as a step that cannot be interrupted. The change keeps
+// running to its own end, so the output says the cancel did nothing.
+func WriteCancelDeclined(data CancelDeclinedData) {
+	fmt.Printf("%s%s%s Cancel did not take effect%s\n", ANSIBold, ANSIYellow, glyph.Refused, ANSIReset)
+	fmt.Println()
+	fmt.Printf("Database:    %s\n", data.Database)
+	fmt.Printf("Environment: %s\n", data.Environment)
+	fmt.Println()
+	if data.Reason != "" {
+		fmt.Println(data.Reason)
+	}
+	fmt.Println("The schema change keeps running and finishes on its own.")
+	fmt.Println()
+	fmt.Print(FormatNextCommand("To watch it finish", ControlCommand("progress", data.ApplyID, data.Environment)))
+}
+
 // CancelOvertakenData contains data for rendering a cancel the schema change
 // finished before acting on.
 type CancelOvertakenData struct {
