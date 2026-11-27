@@ -31,7 +31,8 @@ that is waiting on something.
 
 Its [command policy](../skills/schemabot/references/command-policy.md) spells
 out, for every PR comment command, whether your agent posts it, asks you first,
-or hands it to you. The rest of this page is where those rules come from.
+or hands it to you. That policy is the complete list; the rest of this page
+explains the reasoning behind it.
 
 The skill is a standard `SKILL.md` directory in the
 [Agent Skills](https://agentskills.io) format, which agents such as Claude
@@ -72,8 +73,10 @@ removes the step agents are worst at.
 
 `plan` then returns the exact DDL SchemaBot would run, along with the lint
 findings for it, before anything touches the database. That is the review
-surface: your agent can read what it is about to cause, and so can you. On a
-pull request SchemaBot plans on its own and posts the same DDL as a comment.
+surface: your agent can read what it is about to cause, and so can you.
+Creating a plan takes write access, so a read-only agent reads the DDL from
+the comment SchemaBot posts on the pull request, where it plans on its own, or
+from a stored plan it finds with `list-plans`.
 
 ### Follow a change
 
@@ -88,8 +91,8 @@ is.
 
 ### Read all of it as data
 
-Most read commands return JSON, so your agent does not have to parse a table
-meant for a terminal.
+These commands emit JSON, so your agent does not have to parse a table meant
+for a terminal.
 
 | Commands | JSON option |
 |---|---|
