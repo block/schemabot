@@ -1332,7 +1332,7 @@ func undeclaredTableDrop(namespace, table string, parser ddl.StatementParser) (e
 		Operation:    operation,
 		DDL:          sql,
 		IsUnsafe:     true,
-		UnsafeReason: sanitizeReasonText(fmt.Sprintf("DROP TABLE removes all data from table %q", table)),
+		UnsafeReason: sanitizeReasonText(fmt.Sprintf("statement drops table %q: every row in it is deleted, and reverting the schema file creates the table again empty", table)),
 	}, nil
 }
 
@@ -1860,6 +1860,9 @@ func destructiveReason(statement pgplan.Statement, table string, addsColumn bool
 		return fmt.Sprintf("statement replaces %s %q on table %q with the definition built as %q: the old %s is dropped only while that index is valid, and from then on its old definition no longer applies",
 			noun, name, table, oneFinding(statement.ReplacedBy), noun)
 	}
+	if replacesConstraintInPlace(statement) {
+		return inPlaceReplacementReason(statement, name, table)
+	}
 	switch dropped.Kind {
 	case schemadiff.DroppedColumn:
 		reason := fmt.Sprintf("statement drops column %q from table %q: its values are deleted, and reverting the schema file adds the column back empty", name, table)
@@ -1873,11 +1876,65 @@ func destructiveReason(statement pgplan.Statement, table string, addsColumn bool
 	case schemadiff.DroppedNotNull:
 		return fmt.Sprintf("statement lets column %q of table %q hold NULL: once NULLs are written, making it NOT NULL again means fixing those rows first", name, table)
 	case schemadiff.DroppedConstraint:
-		return fmt.Sprintf("statement drops constraint %q from table %q: the rule it enforces stops applying, and rows written after the drop are not checked against it", name, table)
+		return droppedConstraintReason(name, table, dropped.Definition)
 	case schemadiff.DroppedIndex:
+		if strings.HasPrefix(dropped.Definition, "CREATE UNIQUE INDEX ") {
+			return fmt.Sprintf("statement drops unique index %q from table %q: rows written after the drop can repeat the values it keeps unique, and building it again fails once any do", name, table)
+		}
 		return fmt.Sprintf("statement drops index %q from table %q: queries that use it lose it, and putting it back means building it again", name, table)
 	default:
 		return fmt.Sprintf("statement removes live structure from table %q", table)
+	}
+}
+
+// replacesConstraintInPlace reports a statement that drops a constraint and
+// adds its new definition under the same name in one ALTER TABLE, which is
+// how pg-sprite replaces a changed constraint in place: the statement's kind
+// is the add, and what it drops is the old definition. A foreign key and any
+// other constraint are classified apart only for routing; both are the same
+// in-place replacement here.
+func replacesConstraintInPlace(statement pgplan.Statement) bool {
+	if statement.Drops == nil || statement.Drops.Kind != schemadiff.DroppedConstraint {
+		return false
+	}
+	return statement.Kind == schemadiff.ChangeAddConstraint || statement.Kind == schemadiff.ChangeAddForeignKey
+}
+
+// inPlaceReplacementReason is the reason for a constraint replaced in place.
+// The table holds the constraint at every moment, so what the reviewer
+// accepts is that the old definition stops applying. A primary key or unique
+// constraint takes over an index built beforehand under a temporary name; a
+// CHECK or foreign key is added NOT VALID, and the step after it checks the
+// existing rows against the new definition.
+func inPlaceReplacementReason(statement pgplan.Statement, name, table string) string {
+	if statement.Adopts != nil {
+		return fmt.Sprintf("statement replaces constraint %q on table %q with the index built as %q, dropping the old definition in the same step that attaches the new one: the table keeps the constraint throughout, and from then on its old definition no longer applies",
+			name, table, oneFinding(statement.Adopts.Index))
+	}
+	return fmt.Sprintf("statement replaces constraint %q on table %q, dropping the old definition in the same step that adds the new one: every write is checked against one of them, the next step checks existing rows against the new one, and from then on the old definition no longer applies",
+		name, table)
+}
+
+// droppedConstraintReason is the reason for a constraint the plan drops
+// without replacing. It says which rule stops being checked by quoting the
+// definition PostgreSQL decompiles for it, whose leading keyword tells a
+// primary key, a unique constraint, a foreign key, and a CHECK apart.
+func droppedConstraintReason(name, table, definition string) string {
+	if definition == "" {
+		return fmt.Sprintf("statement drops constraint %q from table %q: rows written after the drop are not checked against it", name, table)
+	}
+	def := oneFinding(sanitizeStatementText(definition))
+	switch {
+	case strings.HasPrefix(definition, "PRIMARY KEY "):
+		return fmt.Sprintf("statement drops primary key %q from table %q: rows written after the drop are not checked against %s, so they can repeat its values, and while the table is in a publication that replicates updates and deletes, those fail until the table has another replica identity", name, table, def)
+	case strings.HasPrefix(definition, "UNIQUE "):
+		return fmt.Sprintf("statement drops unique constraint %q from table %q: rows written after the drop are not checked against %s, so they can repeat its values, and adding it back fails once any do", name, table, def)
+	case strings.HasPrefix(definition, "FOREIGN KEY "):
+		return fmt.Sprintf("statement drops foreign key %q from table %q: rows written after the drop are not checked against %s, so they can point at rows that do not exist", name, table, def)
+	case strings.HasPrefix(definition, "CHECK "):
+		return fmt.Sprintf("statement drops check constraint %q from table %q: rows written after the drop are not checked against %s", name, table, def)
+	default:
+		return fmt.Sprintf("statement drops constraint %q from table %q: rows written after the drop are not checked against %s", name, table, def)
 	}
 }
 

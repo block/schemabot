@@ -16,7 +16,7 @@ import (
 var droppedReasonSentences = map[schemadiff.DroppedKind]string{
 	schemadiff.DroppedColumn:     `statement drops column "note" from table "users": its values are deleted, and reverting the schema file adds the column back empty`,
 	schemadiff.DroppedNotNull:    `statement lets column "note" of table "users" hold NULL: once NULLs are written, making it NOT NULL again means fixing those rows first`,
-	schemadiff.DroppedConstraint: `statement drops constraint "note" from table "users": the rule it enforces stops applying, and rows written after the drop are not checked against it`,
+	schemadiff.DroppedConstraint: `statement drops constraint "note" from table "users": rows written after the drop are not checked against it`,
 	schemadiff.DroppedIndex:      `statement drops index "note" from table "users": queries that use it lose it, and putting it back means building it again`,
 }
 
@@ -73,6 +73,66 @@ func TestDestructiveReasonReplacement(t *testing.T) {
 	constraint.ReplacedBy = "users_email_key_new"
 	assert.Equal(t, `statement replaces constraint "users_email_key" on table "users" with the definition built as "users_email_key_new": the old constraint is dropped only while that index is valid, and from then on its old definition no longer applies`,
 		destructiveReason(constraint, "users", false))
+}
+
+// A dropped constraint says which rule stops being checked, by the kind its
+// definition names and the definition itself, and a dropped unique index
+// says its values can repeat.
+func TestDestructiveReasonNamesWhatStopsBeingChecked(t *testing.T) {
+	for _, tc := range []struct {
+		kind       schemadiff.DroppedKind
+		definition string
+		want       string
+	}{
+		{schemadiff.DroppedConstraint, "PRIMARY KEY (id)",
+			`statement drops primary key "note" from table "users": rows written after the drop are not checked against PRIMARY KEY (id), so they can repeat its values, and while the table is in a publication that replicates updates and deletes, those fail until the table has another replica identity`},
+		{schemadiff.DroppedConstraint, "UNIQUE (a, v)",
+			`statement drops unique constraint "note" from table "users": rows written after the drop are not checked against UNIQUE (a, v), so they can repeat its values, and adding it back fails once any do`},
+		{schemadiff.DroppedConstraint, "FOREIGN KEY (account_id) REFERENCES accounts(id)",
+			`statement drops foreign key "note" from table "users": rows written after the drop are not checked against FOREIGN KEY (account_id) REFERENCES accounts(id), so they can point at rows that do not exist`},
+		{schemadiff.DroppedConstraint, "CHECK ((qty > 0))",
+			`statement drops check constraint "note" from table "users": rows written after the drop are not checked against CHECK ((qty > 0))`},
+		{schemadiff.DroppedConstraint, "EXCLUDE USING gist (during WITH &&)",
+			`statement drops constraint "note" from table "users": rows written after the drop are not checked against EXCLUDE USING gist (during WITH &&)`},
+		{schemadiff.DroppedConstraint, "CHECK ((code <> 'a; b'))",
+			`statement drops check constraint "note" from table "users": rows written after the drop are not checked against CHECK ((code <> 'a, b'))`},
+		{schemadiff.DroppedIndex, "CREATE UNIQUE INDEX note ON public.users USING btree (a, v)",
+			`statement drops unique index "note" from table "users": rows written after the drop can repeat the values it keeps unique, and building it again fails once any do`},
+		{schemadiff.DroppedIndex, "CREATE INDEX note ON public.users USING btree (a)",
+			`statement drops index "note" from table "users": queries that use it lose it, and putting it back means building it again`},
+	} {
+		t.Run(tc.definition, func(t *testing.T) {
+			statement := droppedStatement(tc.kind, "note")
+			statement.Drops.Definition = tc.definition
+			got := destructiveReason(statement, "users", false)
+			assert.Equal(t, tc.want, got)
+			assert.Equal(t, []string{tc.want}, ui.LintReasons(got), "the reason renders as one finding")
+		})
+	}
+}
+
+// A constraint whose definition changes under the same name is replaced in
+// one statement that drops the old definition and adds the new one, so the
+// table holds the constraint throughout. The reason says so rather than
+// that rows go unchecked, for a key that takes over a prebuilt index and for
+// a rule added NOT VALID.
+func TestDestructiveReasonInPlaceConstraintReplacement(t *testing.T) {
+	key := droppedStatement(schemadiff.DroppedConstraint, "users_email_key")
+	key.Kind = schemadiff.ChangeAddConstraint
+	key.Drops.Definition = "UNIQUE (email)"
+	key.Adopts = &schemadiff.IndexAdoption{Index: "users_email_key_new"}
+	assert.Equal(t, `statement replaces constraint "users_email_key" on table "users" with the index built as "users_email_key_new", dropping the old definition in the same step that attaches the new one: the table keeps the constraint throughout, and from then on its old definition no longer applies`,
+		destructiveReason(key, "users", false))
+
+	for _, kind := range []schemadiff.ChangeKind{schemadiff.ChangeAddConstraint, schemadiff.ChangeAddForeignKey} {
+		rule := droppedStatement(schemadiff.DroppedConstraint, "users_qty_check")
+		rule.Kind = kind
+		rule.Drops.Definition = "CHECK ((qty > 0))"
+		got := destructiveReason(rule, "users", false)
+		assert.Equal(t, `statement replaces constraint "users_qty_check" on table "users", dropping the old definition in the same step that adds the new one: every write is checked against one of them, the next step checks existing rows against the new one, and from then on the old definition no longer applies`,
+			got, kind)
+		assert.Len(t, ui.LintReasons(got), 1, "the reason renders as one finding")
+	}
 }
 
 // A statement that is not destructive has no reason, and one that records no
