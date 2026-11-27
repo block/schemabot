@@ -75,8 +75,7 @@ CREATE POLICY "read all" ON h_plain FOR SELECT USING (true);`)
 
 	_, err = planFile(localClientTestEnvironment, `CREATE TABLE h_plain (id bigint PRIMARY KEY);`)
 	require.Error(t, err, "a revert of applied row security never plans as no changes")
-	assert.Contains(t, err.Error(), `table "h_plain" no longer declares row security, but the schema files SchemaBot last applied did, and the table still has row level security enabled and policy "read all"`)
-	assert.Contains(t, err.Error(), `ALTER TABLE "h_plain" DISABLE ROW LEVEL SECURITY;`)
+	assert.Contains(t, err.Error(), `add ALTER TABLE "h_plain" DISABLE ROW LEVEL SECURITY; to remove row level security enabled and policy "read all" from table "h_plain"`)
 
 	other, err := planFile("production", `CREATE TABLE h_plain (id bigint PRIMARY KEY);`)
 	require.NoError(t, err)

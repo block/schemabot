@@ -77,11 +77,9 @@ type removedRowSecurityError struct {
 }
 
 func (e *removedRowSecurityError) Error() string {
-	return fmt.Sprintf("table %q no longer declares row security, but the schema files SchemaBot last applied did, and the table still has %s. "+
-		"A file without row security clauses leaves them in place, so this plan would not remove them. "+
-		"To remove them, add ALTER TABLE %s DISABLE ROW LEVEL SECURITY; to the file. "+
-		"To keep them, put the file's row security clauses back",
-		e.table, describeRowSecurity(e.live), pgx.Identifier{e.table}.Sanitize())
+	return fmt.Sprintf("add ALTER TABLE %s DISABLE ROW LEVEL SECURITY; to remove %s from table %q, or put the file's row security clauses back to keep them. "+
+		"SchemaBot applied them, and a file without row security clauses leaves them in place",
+		pgx.Identifier{e.table}.Sanitize(), describeRowSecurity(e.live), e.table)
 }
 
 // describeRowSecurity names what a table's row security holds, such as
