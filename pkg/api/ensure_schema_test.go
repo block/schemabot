@@ -699,3 +699,42 @@ func TestApplyStorageConvergenceRunStartsNothingAfterAStop(t *testing.T) {
 	assert.ErrorIs(t, err, context.Canceled)
 	assert.Zero(t, eng.applies, "no statement may be issued after the convergence was stopped")
 }
+
+// Startup drops only the working tables Spirit gives the storage tables: each
+// table's copy, renamed-away original and checkpoint, and the checkpoint and
+// sentinel a run shares. A table at MySQL's 64-character name limit maps to the
+// truncated names Spirit gives its working tables, and nothing else that ends
+// in _new, _old or _chkpnt is in the set.
+func TestStorageSpiritWorkingTablesAreSpiritsNamesForTheStorageTables(t *testing.T) {
+	long := strings.Repeat("a", 64)
+	files := schema.SchemaFiles{storageSchemaNamespace: &schema.Namespace{Files: map[string]string{
+		"tasks.sql":   "CREATE TABLE `tasks` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+		long + ".sql": "CREATE TABLE `" + long + "` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}}}
+
+	got, err := storageSpiritWorkingTables(files)
+	require.NoError(t, err)
+
+	assert.Equal(t, map[string]bool{
+		"_spirit_sentinel":                        true,
+		"_spirit_checkpoint":                      true,
+		"_tasks_new":                              true,
+		"_tasks_old":                              true,
+		"_tasks_chkpnt":                           true,
+		"_" + strings.Repeat("a", 59) + "_new":    true,
+		"_" + strings.Repeat("a", 59) + "_old":    true,
+		"_" + strings.Repeat("a", 56) + "_chkpnt": true,
+	}, got)
+}
+
+// A storage schema file that does not create a table names no working tables,
+// so reading the set fails and names the file rather than guessing.
+func TestStorageSpiritWorkingTablesRefusesAFileThatCreatesNoTable(t *testing.T) {
+	files := schema.SchemaFiles{storageSchemaNamespace: &schema.Namespace{Files: map[string]string{
+		"tasks.sql": "ALTER TABLE `tasks` ADD COLUMN `note` varchar(255) DEFAULT NULL",
+	}}}
+
+	_, err := storageSpiritWorkingTables(files)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "tasks.sql is not a CREATE TABLE statement")
+}
