@@ -167,22 +167,30 @@ func TestTaskHistoryAddsTheStoredStepsAResumedDriveLeftOut(t *testing.T) {
 	assert.Equal(t, []string{"users_name_not_null_check"}, artifacts.addedConstraints["users"])
 }
 
-// A resumed drive fails the validation of a constraint an earlier drive
-// added, and the release cannot read the apply's stored tasks. The completed
-// ADD that proves the apply added the constraint is among them, so the
-// release drops nothing: the constraint stays on the table, and the apply log
-// says the cleanup was skipped and why.
+// An apply replaces the users_name_check rule: an earlier drive dropped the
+// old rule, and a resumed drive adds the new one NOT VALID and fails to
+// validate it. The resumed drive carries only the add and the validation, and
+// the release cannot read the apply's stored tasks, which hold the drop. The
+// drive's own tasks would show an added constraint with nothing dropped, so
+// the release drops nothing: the new rule stays as the table's only check on
+// names, and the apply log says the cleanup was skipped and why.
 func TestReleaseFailedApplyArtifactsKeepsConstraintsWhenTheTaskHistoryIsUnread(t *testing.T) {
 	apply := &storage.Apply{ID: 11, ApplyIdentifier: "apply-11", Database: "shop"}
+	add := &storage.Task{ApplyID: apply.ID, TaskIdentifier: "add", Namespace: "public", TableName: "users", State: state.Task.Completed,
+		DDL: "ALTER TABLE public.users ADD CONSTRAINT users_name_check CHECK (length(name) > 1) NOT VALID"}
 	failedValidate := &storage.Task{ApplyID: apply.ID, TaskIdentifier: "validate", Namespace: "public", TableName: "users", State: state.Task.Failed,
-		DDL: "ALTER TABLE public.users VALIDATE CONSTRAINT users_name_not_null_check"}
+		DDL: "ALTER TABLE public.users VALIDATE CONSTRAINT users_name_check"}
 	c, logs := newFailureLogTestClient(apply, nil)
 	c.config.Type = storage.DatabaseTypePostgres
 	c.storage.(*controlTestStorage).tasks = &unreadableTaskStore{err: errors.New("connection refused")}
 	releaser := &recordingFailedReleaser{}
 	c.postgresEngine = releaser
 
-	c.releaseFailedApplyArtifacts(t.Context(), apply, []*storage.Task{failedValidate}, failedValidate)
+	drive := []*storage.Task{add, failedValidate}
+	require.Equal(t, []string{"users_name_check"}, c.cancelledArtifactTables(apply, drive)["public"].addedConstraints["users"],
+		"the drive's tasks alone show the replacement as a constraint the apply added")
+
+	c.releaseFailedApplyArtifacts(t.Context(), apply, drive, failedValidate)
 
 	assert.Zero(t, releaser.calls, "a release that cannot prove what the apply added drops nothing")
 	require.Len(t, logs.entries, 1)
