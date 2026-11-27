@@ -131,6 +131,11 @@ func (s *writeRecordingLockStore) ForceRelease(context.Context, string, string) 
 	return nil
 }
 
+func (s *writeRecordingLockStore) ForceReleaseByID(context.Context, int64, string, string) error {
+	*s.writes = append(*s.writes, "locks.ForceReleaseByID")
+	return nil
+}
+
 // serveAsPaymentsOperator sends one request through the full route table as a
 // member of payments-team, whose grant covers the payments database in staging
 // only, and returns the status and the decoded error message.

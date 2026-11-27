@@ -1224,7 +1224,7 @@ func TestBuildOnboardWritePlanWithholdsSkippedTables(t *testing.T) {
 				Tables: map[string]string{"orders": "CREATE TABLE orders (\n  id bigint PRIMARY KEY\n);\n"},
 				SkippedTables: []apitypes.SkippedTable{
 					{Table: "audit_log", Reason: "unlogged tables cannot be rendered as a desired schema"},
-					{Table: "flyway_schema_history", Reason: "schema files cannot describe its trigger"},
+					{Table: "flyway_schema_history", Reason: "schema files cannot describe its table inheritance"},
 				},
 			},
 		},
@@ -1243,7 +1243,7 @@ func TestBuildOnboardWritePlanWithholdsSkippedTables(t *testing.T) {
 	out := stripAnsi(captureStdout(plan.printExclusionDisclosure))
 	assert.Contains(t, out, "Not managed in namespace public: 2 tables have no schema file, so schemabot.yaml lists them in ignore_tables:\n")
 	assert.Contains(t, out, "  audit_log: unlogged tables cannot be rendered as a desired schema\n")
-	assert.Contains(t, out, "  flyway_schema_history: schema files cannot describe its trigger\n")
+	assert.Contains(t, out, "  flyway_schema_history: schema files cannot describe its table inheritance\n")
 }
 
 // ignore_tables reads a name wrapped in slashes as a pattern, so listing a
@@ -1312,7 +1312,7 @@ func TestOnboardWritePlanSeparatesASkippedTablesLeftoverFile(t *testing.T) {
 		Namespaces: map[string]*apitypes.PulledNamespace{
 			"public": {
 				Tables:        map[string]string{"orders": "CREATE TABLE orders (id bigint PRIMARY KEY);\n"},
-				SkippedTables: []apitypes.SkippedTable{{Table: "accounts", Reason: "schema files cannot describe its trigger"}},
+				SkippedTables: []apitypes.SkippedTable{{Table: "accounts", Reason: "schema files cannot describe its table inheritance"}},
 			},
 		},
 	}, client.PlanExclusions{})

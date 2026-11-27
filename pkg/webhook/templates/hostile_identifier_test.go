@@ -233,7 +233,7 @@ func TestMarkdownReasonDefusesEveryMention(t *testing.T) {
 		"`a`@octocat`b`@hubot",
 	} {
 		t.Run(reason, func(t *testing.T) {
-			mapOutsideCodeSpans(markdownReason(reason), func(prose string) string {
+			mapOutsideCodeSpans(markdownReason(reason), false, func(prose string) string {
 				assert.NotContains(t, prose, "@", "an @ outside a code span can notify")
 				assert.NotContains(t, strings.ReplaceAll(prose, `\&`, ""), "&", "an ampersand outside a code span can start a character reference that spells an @")
 				return prose

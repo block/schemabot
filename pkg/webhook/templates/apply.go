@@ -665,7 +665,7 @@ func revertWindowCountdown(revertExpiresAt string) string {
 	if remaining <= 0 {
 		return ""
 	}
-	return fmt.Sprintf("Closes in %s", ui.FormatExactDuration(remaining))
+	return fmt.Sprintf("Closes in %s", ui.FormatHumanDuration(remaining))
 }
 
 // taskSettledBeforeCutover reports whether a row is out of the cutover's way:
@@ -1775,7 +1775,7 @@ func durationDisplay(startedAt, completedAt string) string {
 	if endTime.Before(startTime) {
 		return ""
 	}
-	return ui.FormatExactDuration(endTime.Sub(startTime))
+	return ui.FormatHumanDuration(endTime.Sub(startTime))
 }
 
 func writeCompletedSummaryDetails(sb *strings.Builder, data ApplyStatusCommentData, budget *ddlBlockBudget) {

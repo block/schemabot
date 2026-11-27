@@ -170,7 +170,7 @@ func TestInitFailedConnectionDoesNotRegister(t *testing.T) {
 	t.Setenv("INIT_STATE", "user@tcp(localhost:3306)/state")
 	cmd := InitCmd{Database: "app", Environment: "dev", Type: "mysql", DSN: "env:INIT_BAD_TARGET", StorageDSN: "env:INIT_STATE", Runtime: "local", Namespaces: []string{"app"}, SchemaDir: filepath.Join(home, "schema")}
 	_, err := cmd.initialize(t.Context(), &Globals{})
-	require.ErrorContains(t, err, "before registering runtime")
+	require.ErrorContains(t, err, "check env:INIT_BAD_TARGET: ")
 	require.NoDirExists(t, filepath.Join(home, ".schemabot", "runtimes", "local"))
 	require.NoDirExists(t, cmd.SchemaDir)
 }

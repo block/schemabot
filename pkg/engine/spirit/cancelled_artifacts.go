@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/utils"
 
 	"github.com/block/schemabot/pkg/engine"
@@ -39,7 +40,7 @@ import (
 // that change over without an operator asking for it, which is why a release
 // requires that no schema change in the schema is live — not merely none on the
 // tables it names.
-const deferredCutoverSentinelTable = "_spirit_sentinel"
+const deferredCutoverSentinelTable = sentinel.TableName
 
 // ReleaseCancelledArtifacts reclaims a cancelled schema change's artifacts for
 // tables named by the caller, connecting from the request's credentials rather

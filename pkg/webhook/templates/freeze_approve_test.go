@@ -16,7 +16,7 @@ func TestRenderFreezeOverrideApprovedDefusesMentionsInTheReason(t *testing.T) {
 	})
 	assert.True(t, strings.HasPrefix(body, "✅ @dave approved `ovr-1a2b3c4d5e6f7a8b` for apply on `orders` in production. Requested by @carol: "), body)
 	assert.Contains(t, body, "It expires at 2026-11-22 10:00:00 UTC. @carol can now re-run the command.")
-	mapOutsideCodeSpans(body, func(prose string) string {
+	mapOutsideCodeSpans(body, false, func(prose string) string {
 		assert.NotContains(t, prose, "@acme", "a mention in the reason must not notify")
 		return prose
 	})

@@ -330,8 +330,8 @@ Sanitizing is a property of the rendering boundary rather than of each call site
 makes it hold: the callers that pass an error through to a comment do not individually decide to
 be careful. The unredacted error goes to the server log next to the repo, PR, environment,
 database, and command, so nothing is lost for triage. Inbound webhook payloads are size-bounded
-before decode. *Enforced:* the comment and table-cell sanitizers in
-`pkg/webhook/templates/common.go`, applied by the error renderers themselves
+before decode. *Enforced:* the comment and table-cell sanitizers and the error-detail
+escaper (`errorDetailMarkdown`) in `pkg/webhook/templates/common.go`, applied by the error renderers themselves
 (`pkg/webhook/templates/errors.go`); the code fences sized past any backtick run in their
 content, DDL fences drawing on a budget shared across the comment, and the code span that holds
 an identifier read from the PR's schema files, its `schemabot.yaml`, or a command's `-d` flag —
@@ -342,7 +342,8 @@ escaper that writes a mention as code and a character reference as text (`escape
 `pkg/webhook/templates/fence.go`), applied to a lint or unsafe change reason that quotes such
 names outside any code span (`markdownReason`, also there) and to engine reasons, exempt-table
 reasons, per-deployment apply refusals, and throttle reasons
-(`pkg/webhook/templates/plan.go`, `pkg/webhook/templates/apply.go`); the Check Run
+(`pkg/webhook/templates/plan.go`, `pkg/webhook/templates/apply.go`); the command error line
+(`userFacingError` in `pkg/webhook/error_comment.go`); the Check Run
 summary sanitizer and its markup escaper (`pkg/webhook/check_publisher.go`); the drift summary
 clamp (`pkg/webhook/plan_drift.go`); the log-text sanitizer applied to every line, level, and
 group heading in the failed-summary log fold (`pkg/webhook/templates/failure_logs.go`); the
@@ -1758,9 +1759,13 @@ codepoints are identical in the CLI and in a PR comment, the bar is built from e
 terminal colors so it renders the same in both, and the multi-deployment rollup that decides what
 an apply is called is derived once from the operation rows and rendered by both. Only markup
 differs between surfaces, ANSI color against markdown emphasis, and colored output degrades to the
-same text byte for byte when it is not going to a terminal. *Enforced:* the severity vocabulary
-and its rules (`pkg/glyph`), the shared bar and its colors (`pkg/ui`), the shared rollup
-(`pkg/presentation`), and a custom analyzer run by the pre-commit hook that blocks a commit
+same text byte for byte when it is not going to a terminal. A duration reads one way on every
+surface too, as its two largest non-zero units, so an apply's run time, a revert window's time
+left, a table's ETA, and the watch view's running timers agree. *Enforced:* the severity vocabulary
+and its rules (`pkg/glyph`), the shared bar and its colors (`pkg/ui`), the shared duration
+formatter (`FormatHumanDuration` in `pkg/ui`, pinned by `TestDurationsReadTheSameOnEverySurface`
+and, for the watch view's timers, `TestWatchModel_TimersReadAsHumanDurations`),
+the shared rollup (`pkg/presentation`), and a custom analyzer run by the pre-commit hook that blocks a commit
 introducing a severity glyph as a literal outside its home package
 (`pkg/analyzers/severityglyphs`, `scripts/lint-fix.sh`).
 
@@ -1781,10 +1786,14 @@ While a rollout is copying a table on several targets, the table has one reading
 the percent beside its bar, the rows copied of the rows to copy, how many targets those rows cover,
 its planned size, and whether its ETA is a floor. That reading is derived once from the targets'
 progress and rendered by the CLI and the PR comment alike, so the two never disagree about how far
-one rollout has got. *Enforced:* the shared derivation (`SumTargetRows`, `PercentAcrossTargets`,
-`AcrossTargetsPercent`, and `TargetsTableSizeClause` in `pkg/presentation`), and a test that
-renders the same rollouts through both surfaces and fails when they read differently
-(`TestRolledUpTableReadsTheSameInTheCLIAndThePRComment` in `pkg/cmd/internal/templates`).
+one rollout has got. The table's state across its targets is likewise derived once, failure first and otherwise the
+least finished state any target is in (`RollupTaskStatus`), so a table that failed on one target
+never reads as in flight on one surface and failed on the other, and a table never reads further
+along than its slowest target. *Enforced:* the shared derivation (`SumTargetRows`, `PercentAcrossTargets`,
+`AcrossTargetsPercent`, `TargetsTableSizeClause`, and `RollupTaskStatus` in `pkg/presentation`), and
+tests that render the same rollouts through both surfaces and fail when they read differently
+(`TestRolledUpTableReadsTheSameInTheCLIAndThePRComment` and
+`TestRolledUpTableStatusReadsTheSameInTheCLIAndThePRComment` in `pkg/cmd/internal/templates`).
 
 ### UX-8: A table in flight reads the same on every surface, whichever engine runs it
 
@@ -1959,13 +1968,17 @@ the re-plan speaks for a shard-tagged task at all. `remainingPlannedChanges` on 
 path of the PlanetScale engine (`pkg/engine/planetscale/apply.go`) runs only reviewed DDL for the
 tables the branch still lacks, refuses a branch that differs outside the reviewed DDL, and
 validates the branch against the declared schema before creating or adopting the deploy request.
-On PostgreSQL, a statement that drops a table, a column, a constraint, or a NOT NULL runs only with the
+On PostgreSQL, a statement that drops a table, a column, a constraint, an index, or a NOT NULL runs only with the
 planner's record of that object, which the plan stores with the change and every apply path passes
 back, matching a task to its change by the statement's canonical form (`planChangeMetadata` in
 `pkg/tern/plan_change_metadata.go`); the apply refuses a drop with no record
 and drops nothing when the object no longer matches it under the table's lock
 (`reviewedDropForApply` and `executeReviewedDrop` in `pkg/engine/postgres/apply.go`;
 `tableDropForApply` and `executeTableDrop` in `pkg/engine/postgres/table_drop.go`).
+An index drop runs `DROP INDEX CONCURRENTLY`, which holds no lock between its check and the
+drop: the index is checked on the dropping session right before the drop, and an index another
+session renamed aside and replaced in that window is detected after the drop and refuses the
+apply (`indexDropForApply` and `executeIndexDrop` in `pkg/engine/postgres/index_drop.go`).
 The re-plan an apply runs after a confirmation, or after an automatic apply posts its plan, holds
 each statement the confirmed plan ran to the engine's record of the objects it acts on: a record
 that differs refuses the confirmation, or stops the automatic apply for manual confirmation
@@ -1996,7 +2009,7 @@ Unsafe changes (error-severity lint findings such as table and column drops) blo
 unfinished row copy, require the operator to confirm the specific consequences disclosed to
 them. The re-plan that runs just before execution re-checks that verdict, so a plan that changed
 after the confirmation stops rather than running something the operator never saw. *Enforced:* lint gates and the pull request apply flow, for both `apply` and `apply-confirm`
-(`pkg/api/plan_handlers.go`, `pkg/webhook/apply_gating.go`, `pkg/webhook/apply_execute.go`), including the refusal, at plan and again at apply creation, of a `drop_tables` entry that names a working table of an apply on the same database and environment that has not settled, a stopped one included, since a drop discloses no copy it discards (`refuseDropsOfUnsettledApplyWorkTables` in `pkg/api/drop_tables_work_tables.go`), the re-check that the work of every rollout member, the
+(`pkg/api/plan_handlers.go`, `pkg/webhook/apply_gating.go`, `pkg/webhook/apply_execute.go`), including the refusal, at plan and again at apply creation, of a `drop_tables` entry that names a working table of an apply on the same database and environment that has not settled, a stopped one included, since a drop discloses no copy it discards (`refuseDropsOfUnsettledApplyWorkTables` in `pkg/api/drop_tables_work_tables.go`), and the refusal, at plan and again at apply creation, of a `drop_tables` entry that names the cutover sentinel table, since dropping it runs a deferred cutover nobody requested (`NewDroppedTables` in `pkg/engine/drop_tables.go`, re-checked by `createStoredApply` in `pkg/api/plan_handlers.go`), the re-check that the work of every rollout member, the
 primary target's included, is what the confirmation, or the comment an automatic apply posted,
 was given against and carries no consequence it did not disclose (`confirmedConvergedTargetRound`, `confirmationCoversPrimaryTarget`, `confirmationCoversMemberWork` and `memberWorkRefusal` in
 `pkg/webhook/apply_member_work.go`), with an automatic apply running other members' work only once that comment has landed (`applyCommandCore` in `pkg/webhook/apply_handlers.go`), where every member's discarded copies take the same two-step confirm as the primary plan's, consent being recorded copy by copy with the target each is on and a copy the confirmation did not name stopping the apply again (`rolloutDiscardedCopies`, `rolloutDisclosedCopies` and `undisclosedDiscards` in `pkg/webhook/apply_member_work.go`, recorded on the lock as `DisclosedCopies`, disclosed under each target's plan by `writeTargetDiscardedCopies` in `pkg/webhook/templates/plan.go`) and a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopiesUnreported` and `MemberDiscardedCopies` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`); every rollout
@@ -2224,7 +2237,7 @@ only under a deployment-wide grant. *Enforced:* the
 trust-anchor config, which refuses to start without one, and identity-precedence rules in the auth
 layer (`pkg/auth`); the scoped lock release and re-acquire in `pkg/api/lock_handlers.go`, the release
 pinned to the lock row it checked, or to the row the caller named when it sends one, and the
-re-acquire told which row its acquire created (`ReleaseByID`, `ReleaseByIDIfUnused` and `Acquire` in
+re-acquire told which row its acquire created (`ReleaseByID`, `ReleaseByIDIfUnused`, `ForceReleaseByID` and `Acquire` in
 `pkg/storage/internal/sqlstore/locks.go`).
 
 ### AZ-4: Applying takes an authorized actor

@@ -527,7 +527,7 @@ func TestApplyKeyspaceChanges_SnapshotDeferralIsRetriedAndReported(t *testing.T)
 	require.Len(t, events, 3*maxRetries)
 	assert.Contains(t, events[0].Message, "Retrying keyspace commerce on branch schemabot-testdb-snap")
 	assert.Contains(t, events[0].Message, "(attempt 2)")
-	assert.Contains(t, events[0].Message, "PlanetScale is taking a schema snapshot of the branch, retrying for up to 1m0s more")
+	assert.Contains(t, events[0].Message, "PlanetScale is taking a schema snapshot of the branch, retrying for up to 1m more")
 	assert.NotContains(t, events[0].Message, "Cannot update VSchema")
 }
 

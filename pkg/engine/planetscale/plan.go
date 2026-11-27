@@ -335,15 +335,15 @@ func parseDesiredSchemas(keyspace string, ns *schema.Namespace) ([]table.TableSc
 		}
 		stmts, err := ddl.SplitStatements(content)
 		if err != nil {
-			return nil, fmt.Errorf("split SQL for keyspace %s: %w", keyspace, err)
+			return nil, &engine.PlanRefusedError{Err: fmt.Errorf("split SQL for keyspace %s: %w", keyspace, err)}
 		}
 		for _, stmt := range stmts {
 			ct, err := statement.ParseCreateTable(stmt)
 			if err != nil {
-				return nil, fmt.Errorf("parse desired schema in keyspace %s/%s: %w", keyspace, filename, err)
+				return nil, &engine.PlanRefusedError{Err: fmt.Errorf("parse desired schema in keyspace %s/%s: %w", keyspace, filename, err)}
 			}
 			if err := ddl.ValidateCreateTable(ct); err != nil {
-				return nil, fmt.Errorf("SQL usage error in keyspace %s/%s: %w", keyspace, filename, err)
+				return nil, &engine.PlanRefusedError{Err: fmt.Errorf("SQL usage error in keyspace %s/%s: %w", keyspace, filename, err)}
 			}
 			if err := declared.Declare(keyspace+"/"+filename, ct.TableName); err != nil {
 				return nil, &engine.PlanRefusedError{Err: err}

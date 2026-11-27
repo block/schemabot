@@ -663,6 +663,36 @@ func ServerMayHaveActed(err error) bool {
 	return false
 }
 
+// WithoutCheckAdvice returns err with the line that tells the operator to
+// check what the server did with the failed request removed from its message.
+// A command that has already looked and told the operator what it found uses
+// it, so the error does not ask for a check the output has just answered. The
+// returned error still wraps err, so ServerMayHaveActed and errors.Is see
+// through it.
+func WithoutCheckAdvice(err error) error {
+	return checkedRequestError{err: err}
+}
+
+type checkedRequestError struct{ err error }
+
+func (e checkedRequestError) Error() string {
+	msg := e.err.Error()
+	var warning string
+	if connErr, ok := errors.AsType[*ConnectionError](e.err); ok {
+		warning = connErr.effect().warning()
+	} else if readErr, ok := errors.AsType[*ResponseReadError](e.err); ok {
+		warning = readErr.effect().warning()
+	}
+	if warning == "" {
+		return msg
+	}
+	return strings.Replace(msg, "\n"+warning, "", 1)
+}
+
+func (e checkedRequestError) Unwrap() error {
+	return e.err
+}
+
 // requestEffect says what a failed request may have left behind on the
 // server, which decides what the operator is told before sending it again.
 type requestEffect struct {
