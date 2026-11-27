@@ -3557,16 +3557,16 @@ func TestApplyStore_ExpireRetryable_DeclinesAnApplyWhoseOperationADriverHolds(t 
 	// The deployment whose redispatches spent the budget: its lease has gone
 	// stale, so no driver is coming back for it.
 	abandoned := leasedOperationFor(t, store, apply, "region-a")
-	backdateOperationHeartbeat(t, abandoned, storage.ApplyLeaseStaleAfter+time.Minute)
+	backdateOperationHeartbeat(t, store, abandoned, storage.ApplyLeaseStaleAfter+time.Minute)
 	// The sibling a driver is holding right now, heartbeated as of this instant.
 	held := leasedOperationFor(t, store, apply, "region-b")
 
 	abandonedTask := createRetryableReapTask(t, store, apply, "task_expire_fanout_abandoned", "users", state.Task.Running, "")
-	attachTaskToOperation(t, abandonedTask.TaskIdentifier, abandoned)
+	attachTaskToOperation(t, store, abandonedTask.TaskIdentifier, abandoned)
 	liveTask := createRetryableReapTask(t, store, apply, "task_expire_fanout_live", "orders", state.Task.Running, "")
-	attachTaskToOperation(t, liveTask.TaskIdentifier, held)
+	attachTaskToOperation(t, store, liveTask.TaskIdentifier, held)
 	queuedTask := createRetryableReapTask(t, store, apply, "task_expire_fanout_queued", "products", state.Task.Pending, "")
-	attachTaskToOperation(t, queuedTask.TaskIdentifier, held)
+	attachTaskToOperation(t, store, queuedTask.TaskIdentifier, held)
 
 	expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 	require.NoError(t, err)
@@ -3582,7 +3582,7 @@ func TestApplyStore_ExpireRetryable_DeclinesAnApplyWhoseOperationADriverHolds(t 
 	assertTaskState(t, store, queuedTask.TaskIdentifier, state.Task.Pending)
 
 	// The driver dies and its lease ages out. Nothing else changes.
-	backdateOperationHeartbeat(t, held, storage.ApplyLeaseStaleAfter+time.Minute)
+	backdateOperationHeartbeat(t, store, held, storage.ApplyLeaseStaleAfter+time.Minute)
 
 	expired, err = store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 	require.NoError(t, err)
@@ -3617,16 +3617,16 @@ func TestApplyStore_ExpireRetryable_DefersUntilARetryableOperationsLeaseIsStale(
 	require.NoError(t, err)
 
 	failedTask := createRetryableReapTask(t, store, apply, "task_expire_settled_failed", "users", state.Task.FailedRetryable, "copy failed")
-	attachTaskToOperation(t, failedTask.TaskIdentifier, settled)
+	attachTaskToOperation(t, store, failedTask.TaskIdentifier, settled)
 	queuedTask := createRetryableReapTask(t, store, apply, "task_expire_settled_queued", "orders", state.Task.Pending, "")
-	attachTaskToOperation(t, queuedTask.TaskIdentifier, settled)
+	attachTaskToOperation(t, store, queuedTask.TaskIdentifier, settled)
 
 	expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 	require.NoError(t, err)
 	assert.Empty(t, expired, "a fresh retryable lease may belong to a newly admitted drive")
 	assertTaskState(t, store, failedTask.TaskIdentifier, state.Task.FailedRetryable)
 	assertTaskState(t, store, queuedTask.TaskIdentifier, state.Task.Pending)
-	backdateOperationHeartbeat(t, settled, storage.ApplyLeaseStaleAfter+time.Minute)
+	backdateOperationHeartbeat(t, store, settled, storage.ApplyLeaseStaleAfter+time.Minute)
 	expired, err = store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 	require.NoError(t, err)
 	require.Len(t, expired, 1)
@@ -3641,6 +3641,7 @@ func TestApplyStore_ExpireRetryable_DefersUntilARetryableOperationsLeaseIsStale(
 // still queued behind it. Every lease on it has gone stale, so no driver holds
 // any of its rows.
 type degradedRollout struct {
+	store      *Storage
 	apply      *storage.Apply
 	halted     int64
 	paused     int64
@@ -3660,28 +3661,29 @@ func stageDegradedRollout(t *testing.T, store *Storage, applyID string, planID i
 	_, err := testDB.ExecContext(ctx, `UPDATE apply_operations SET state = ?, completed_at = NOW() WHERE id = ?`,
 		state.ApplyOperation.Failed, halted)
 	require.NoError(t, err)
-	backdateOperationHeartbeat(t, halted, storage.ApplyLeaseStaleAfter+time.Minute)
+	backdateOperationHeartbeat(t, store, halted, storage.ApplyLeaseStaleAfter+time.Minute)
 	haltedTask := createRetryableReapTask(t, store, apply, applyID+"_halted", "users", state.Task.Failed, "halt failed")
-	attachTaskToOperation(t, haltedTask.TaskIdentifier, halted)
+	attachTaskToOperation(t, store, haltedTask.TaskIdentifier, halted)
 
 	paused := leasedOperationFor(t, store, apply, "region-b")
 	_, err = testDB.ExecContext(ctx, `UPDATE apply_operations SET state = ? WHERE id = ?`,
 		state.ApplyOperation.FailedRetryable, paused)
 	require.NoError(t, err)
-	backdateOperationHeartbeat(t, paused, storage.ApplyLeaseStaleAfter+time.Minute)
+	backdateOperationHeartbeat(t, store, paused, storage.ApplyLeaseStaleAfter+time.Minute)
 	pausedTask := createRetryableReapTask(t, store, apply, applyID+"_paused", "users", state.Task.FailedRetryable, "copy failed")
-	attachTaskToOperation(t, pausedTask.TaskIdentifier, paused)
+	attachTaskToOperation(t, store, pausedTask.TaskIdentifier, paused)
 	pausedQueuedTask := createRetryableReapTask(t, store, apply, applyID+"_paused_queued", "orders", state.Task.Pending, "")
-	attachTaskToOperation(t, pausedQueuedTask.TaskIdentifier, paused)
+	attachTaskToOperation(t, store, pausedQueuedTask.TaskIdentifier, paused)
 
 	queued, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: "region-c", Target: apply.Database, State: state.ApplyOperation.Pending,
 	})
 	require.NoError(t, err)
 	queuedTask := createRetryableReapTask(t, store, apply, applyID+"_queued", "users", state.Task.Pending, "")
-	attachTaskToOperation(t, queuedTask.TaskIdentifier, queued)
+	attachTaskToOperation(t, store, queuedTask.TaskIdentifier, queued)
 
 	return degradedRollout{
+		store:      store,
 		apply:      apply,
 		halted:     halted,
 		paused:     paused,
@@ -3701,7 +3703,7 @@ func spendPausedRetryBudget(t *testing.T, rollout degradedRollout, attempts int)
 	ctx := t.Context()
 	_, err := testDB.ExecContext(ctx, `UPDATE apply_operations SET attempt = ? WHERE id = ?`, attempts, rollout.paused)
 	require.NoError(t, err)
-	backdateOperationHeartbeat(t, rollout.paused, storage.ApplyLeaseStaleAfter+time.Minute)
+	backdateOperationHeartbeat(t, rollout.store, rollout.paused, storage.ApplyLeaseStaleAfter+time.Minute)
 	_, err = testDB.ExecContext(ctx, `UPDATE applies SET attempt = ? WHERE id = ?`, attempts, rollout.apply.ID)
 	require.NoError(t, err)
 }
@@ -3768,7 +3770,7 @@ func TestApplyStore_ExpireRetryableOperations_ExpiresAStaleRolloutUnderBudget(t 
 
 	rollout := stageDegradedRollout(t, store, "apply_degraded_window", 531)
 	spendPausedRetryBudget(t, rollout, 1)
-	backdateOperationHeartbeat(t, rollout.paused, 48*time.Hour)
+	backdateOperationHeartbeat(t, store, rollout.paused, 48*time.Hour)
 	_, err := testDB.ExecContext(ctx, `UPDATE applies SET updated_at = NOW() WHERE id = ?`, rollout.apply.ID)
 	require.NoError(t, err)
 
@@ -3817,7 +3819,7 @@ func TestApplyStore_ExpireRetryableOperations_DefersWhileASiblingIsDriven(t *tes
 	// The queued deployment is picked up and driven while the pause ages out.
 	held := leasedOperationFor(t, store, rollout.apply, "region-d")
 	liveTask := createRetryableReapTask(t, store, rollout.apply, "apply_degraded_driven_live", "users", state.Task.Running, "")
-	attachTaskToOperation(t, liveTask.TaskIdentifier, held)
+	attachTaskToOperation(t, store, liveTask.TaskIdentifier, held)
 
 	expired, err := store.Applies().ExpireRetryableOperations(ctx, 10)
 	require.NoError(t, err)
@@ -3826,7 +3828,7 @@ func TestApplyStore_ExpireRetryableOperations_DefersWhileASiblingIsDriven(t *tes
 	assertTaskState(t, store, rollout.pausedTask.TaskIdentifier, state.Task.FailedRetryable)
 	assertTaskState(t, store, liveTask.TaskIdentifier, state.Task.Running)
 
-	backdateOperationHeartbeat(t, held, storage.ApplyLeaseStaleAfter+time.Minute)
+	backdateOperationHeartbeat(t, store, held, storage.ApplyLeaseStaleAfter+time.Minute)
 
 	expired, err = store.Applies().ExpireRetryableOperations(ctx, 10)
 	require.NoError(t, err)
@@ -3883,7 +3885,7 @@ func TestApplyStore_ExpireRetryableOperations_HandsTheRolloutToTheProjectionPast
 	_, err = testDB.ExecContext(ctx, `UPDATE apply_operations SET operation_key = ? WHERE id = ?`,
 		"commerce/-80/users", rollout.paused)
 	require.NoError(t, err)
-	backdateOperationHeartbeat(t, rollout.paused, storage.ApplyLeaseStaleAfter+time.Minute)
+	backdateOperationHeartbeat(t, store, rollout.paused, storage.ApplyLeaseStaleAfter+time.Minute)
 	finalizer, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: rollout.apply.ID, Deployment: "region-b", Target: rollout.apply.Database,
 		OperationKey: "commerce/group_finalizer", OperationKind: storage.ApplyOperationKindGroupFinalizer,
@@ -3938,7 +3940,7 @@ func TestApplyStore_ExpireRetryableOperations_HandsTheRolloutToTheProjectionPast
 			_, err := testDB.ExecContext(ctx, `UPDATE apply_operations SET on_failure = ? WHERE apply_id = ?`,
 				tc.onFailure, rollout.apply.ID)
 			require.NoError(t, err)
-			backdateOperationHeartbeat(t, rollout.halted, storage.ApplyLeaseStaleAfter+time.Minute)
+			backdateOperationHeartbeat(t, store, rollout.halted, storage.ApplyLeaseStaleAfter+time.Minute)
 			spendPausedRetryBudget(t, rollout, maxRecoveryAttempts)
 			backdateApplyUpdatedAt(t, rollout.apply.ID, 2*storage.ApplyLeaseStaleAfter)
 

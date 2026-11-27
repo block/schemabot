@@ -1982,7 +1982,7 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsFailedRetryableWithinB
 	// A lone operation with tasks is driven under the parent lease, whose
 	// ClaimApplyByID moves the parent and the row out of failed_retryable.
 	task := createRetryableReapTask(t, store, apply, "task_op_retryable_ok", "users", state.Task.FailedRetryable, "copy failed")
-	attachTaskToOperation(t, task.TaskIdentifier, id)
+	attachTaskToOperation(t, store, task.TaskIdentifier, id)
 
 	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
@@ -2241,7 +2241,7 @@ func TestApplyOperationStore_FindNextApplyOperation_SingleOpRedispatchDoesNotCon
 	})
 	require.NoError(t, err)
 	task := createRetryableReapTask(t, store, apply, "task_op_singleop_budget", "users", state.Task.FailedRetryable, "copy failed")
-	attachTaskToOperation(t, task.TaskIdentifier, id)
+	attachTaskToOperation(t, store, task.TaskIdentifier, id)
 
 	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
@@ -2297,7 +2297,7 @@ func TestApplyOperationStore_FindNextApplyOperation_OperationLeaseRedispatchOfAL
 			setOperationAttempt(t, id, maxRecoveryAttempts-1)
 			if tc.withTask {
 				task := createRetryableReapTask(t, store, apply, "task_op_lone_lease", "users", state.Task.FailedRetryable, "copy failed")
-				attachTaskToOperation(t, task.TaskIdentifier, id)
+				attachTaskToOperation(t, store, task.TaskIdentifier, id)
 			}
 
 			claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
@@ -2763,8 +2763,7 @@ func testFailedRetryableRedispatchAdmitsOneDriver(t *testing.T, store *Storage) 
 	})
 	require.NoError(t, err)
 	task := createRetryableReapTask(t, store, apply, "task_op_fr_redispatch_one_driver", "users", state.Task.FailedRetryable, "validate failed")
-	_, err = store.db.ExecContext(ctx, `UPDATE tasks SET apply_operation_id = ? WHERE task_identifier = ?`, id, task.TaskIdentifier)
-	require.NoError(t, err)
+	attachTaskToOperation(t, store, task.TaskIdentifier, id)
 
 	first, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
 	require.NoError(t, err)
@@ -2789,11 +2788,8 @@ func testFailedRetryableRedispatchAdmitsOneDriver(t *testing.T, store *Storage) 
 	assert.Equal(t, "driver-b", handedOff.LeaseOwner)
 
 	// driver-b dies holding the lease: the row is taken once its heartbeat is
-	// stale. The heartbeat is written in UTC, the zone the storage clock
-	// keeps, so a PostgreSQL timestamp without a zone reads it correctly.
-	_, err = store.db.ExecContext(ctx, `UPDATE apply_operations SET updated_at = ? WHERE id = ?`,
-		time.Now().UTC().Add(-2*storage.ApplyLeaseStaleAfter), id)
-	require.NoError(t, err)
+	// stale.
+	backdateOperationHeartbeat(t, store, id, 2*storage.ApplyLeaseStaleAfter)
 	recovered, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-c")
 	require.NoError(t, err)
 	require.NotNil(t, recovered, "a retry whose claimant died must be claimable once its lease is stale")
