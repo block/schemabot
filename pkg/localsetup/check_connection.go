@@ -39,7 +39,7 @@ func CheckConnection(ctx context.Context, engine, dsn string) error {
 	var one int
 	if err := db.QueryRowContext(ctx, "SELECT 1").Scan(&one); err != nil {
 		slog.DebugContext(ctx, "check setup connection failed", "engine", engine, "error", err)
-		return &setupConnectionError{message: "we couldn’t connect; check the address, credentials, and network, then try again", cause: err}
+		return connectionCheckError("we couldn’t connect; check the address, credentials, and network, then try again", err)
 	}
 	return nil
 }

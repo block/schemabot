@@ -1,7 +1,7 @@
 package commands
 
 import (
-	"fmt"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/jackc/pgx/v5"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -115,17 +116,17 @@ func TestInitConnectionScreenStates(t *testing.T) {
 	require.Contains(t, checking, "Checking connection")
 	require.NotContains(t, checking, "enter continue")
 	require.NotContains(t, checking, "unencrypted")
-	m.Update(initConnectionMsg{generation: m.generation, err: fmt.Errorf("could not connect: connection refused")})
+	m.Update(initConnectionMsg{generation: m.generation, err: errors.New("the server refused the connection; check that the database is running and that the host and port are right")})
 	failed := stripANSI(m.View())
-	require.Contains(t, failed, "Couldn’t connect.")
+	require.Contains(t, failed, "The server refused the connection. Check that the database is running")
 	require.Contains(t, failed, "enter retry")
 	require.NotContains(t, failed, "VPN")
 	require.NotContains(t, failed, "enter continue")
-	require.Less(t, strings.Index(failed, "Couldn’t connect"), strings.Index(failed, "enter retry"))
+	require.Less(t, strings.Index(failed, "The server refused the connection"), strings.Index(failed, "enter retry"))
 	wizardKey(m, tea.KeyEnter)
 	require.Empty(t, m.err)
 	require.True(t, m.checkingConnection)
-	require.NotContains(t, stripANSI(m.View()), "Couldn’t connect")
+	require.NotContains(t, stripANSI(m.View()), "The server refused the connection")
 	m.Update(initConnectionMsg{generation: m.generation})
 	connected := stripANSI(m.View())
 	require.Contains(t, connected, "✓ Connected")
@@ -195,6 +196,37 @@ func TestInitConnectionAutoAdvance(t *testing.T) {
 			} else {
 				require.Equal(t, 3, m.step)
 			}
+		})
+	}
+}
+
+// The setup wizard shows a connection failure as two sentences, the cause and
+// its fix. A quoted name in the cause keeps its exact spelling, even when it
+// holds the "; " that joins the two.
+func TestInitConnectionFailureKeepsAQuotedName(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		message string
+		want    string
+	}{
+		{
+			name:    "a plain name",
+			message: `database "shop" does not exist on the server; check the database name in the connection string`,
+			want:    `Database "shop" does not exist on the server. Check the database name in the connection string.`,
+		},
+		{
+			name:    "a name holding the delimiter",
+			message: `database "shop; live" does not exist on the server; check the database name in the connection string`,
+			want:    `Database "shop; live" does not exist on the server. Check the database name in the connection string.`,
+		},
+		{
+			name:    "a line without a fix",
+			message: "the connection check was cancelled",
+			want:    "The connection check was cancelled.",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, initConnectionFailure(tc.message))
 		})
 	}
 }
