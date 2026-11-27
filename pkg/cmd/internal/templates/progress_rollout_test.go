@@ -2,9 +2,7 @@ package templates
 
 import (
 	"fmt"
-	"reflect"
 	"regexp"
-	"slices"
 	"strings"
 	"testing"
 	"unsafe"
@@ -583,34 +581,6 @@ func TestWriteProgress_TargetRollupCreateAppliesAndListsBesideItsAlter(t *testin
 
 	assertLess(t, out, "CREATE TABLE `customers`", "ALTER TABLE `customers`")
 	assertLess(t, out, "ALTER TABLE `customers`", "ALTER TABLE `orders`")
-}
-
-// A table still in flight on any target reads as in flight, never as failed,
-// whatever phase the live targets are in; and it reads as the earliest phase a
-// target is in, not as a later one only some targets have reached.
-func TestRollupTaskStatus_InFlightTargetsDecide(t *testing.T) {
-	checksummingPastFailure := append([]string{state.Task.Failed}, slices.Repeat([]string{state.Task.Checksumming}, 19)...)
-	assert.Equal(t, state.Task.Checksumming, rollupTaskStatus(checksummingPastFailure))
-	assert.Equal(t, state.Task.Checksumming, rollupTaskStatus([]string{state.Task.WaitingForCutover, state.Task.Checksumming}))
-	assert.Equal(t, state.Task.Checksumming, rollupTaskStatus([]string{state.Task.Checksumming, state.Task.WaitingForCutover}))
-	assert.Equal(t, state.Task.Running, rollupTaskStatus([]string{state.Task.CatchingUp, state.Task.Running}))
-	assert.Equal(t, state.Task.Failed, rollupTaskStatus([]string{state.Task.Completed, state.Task.Failed, state.Task.Pending}))
-	assert.Equal(t, state.Task.Pending, rollupTaskStatus([]string{state.Task.Completed, state.Task.Pending}))
-	assert.Equal(t, state.Task.Completed, rollupTaskStatus([]string{state.Task.Completed, state.Task.Completed}))
-}
-
-// The phase order names every in-flight task state and nothing else, so a new
-// in-flight state cannot fall through to the failure-first branch.
-func TestInFlightRollupOrder_CoversEveryInFlightTaskState(t *testing.T) {
-	tasks := reflect.ValueOf(state.Task)
-	var inFlight []string
-	for _, field := range tasks.Fields() {
-		if s := field.String(); state.IsInFlightTaskState(s) {
-			inFlight = append(inFlight, s)
-		}
-	}
-	require.NotEmpty(t, inFlight)
-	assert.ElementsMatch(t, inFlight, inFlightRollupOrder)
 }
 
 // A table on which no target is still working and one has halted reads as

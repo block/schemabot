@@ -44,11 +44,9 @@ func AssertRanks(t *testing.T, states []string, want map[string]int, rank func(s
 }
 
 // RollupTier is a group of states that a rollup prefers over every state in a
-// later tier. Within a tier, the rollup prefers the state listed first, or,
-// when FirstReported is set, whichever state the targets report first.
+// later tier. Within a tier, the rollup prefers the state listed first.
 type RollupTier struct {
-	States        []string
-	FirstReported bool
+	States []string
 }
 
 // AssertRollup checks that tiers name every state exactly once, and that for
@@ -90,7 +88,7 @@ func preferred(tiers []RollupTier, first, second string) string {
 			return first
 		}
 		return second
-	case tiers[firstTier].FirstReported || firstPosition <= secondPosition:
+	case firstPosition <= secondPosition:
 		return first
 	default:
 		return second
