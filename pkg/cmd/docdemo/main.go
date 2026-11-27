@@ -204,7 +204,7 @@ func vitess(phase string, percentages []int, enter bool) string {
 	response.Tables = []*apitypes.TableProgressResponse{table}
 	expected := "/api/start"
 	if phase == state.Apply.Running {
-		expected = "/api/stop"
+		expected = "/api/cancel"
 	}
 	if phase == state.Apply.RevertWindow {
 		expected = "/api/skip-revert"
@@ -414,15 +414,26 @@ func followLogView(count int) string {
 	for i, entry := range messages[:count] {
 		entries = append(entries, &apitypes.LogEntry{ID: int64(i + 1), ApplyID: "apply-example-73", Level: entry.level, Message: entry.message, CreatedAt: time.Date(2026, 1, 15, 14, 20+i/2, i%2*15, 0, time.UTC)})
 	}
+	// The tail reads the initial window, then polls. End it on the first poll
+	// rather than inside the initial read: the client abandons a read whose
+	// context is cancelled, so cancelling there would print no entries.
+	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/api/logs" || r.URL.Query().Get("apply_id") != "apply-example-73" || r.URL.Query().Get("limit") != "50" {
+		requests++
+		wantLimit := "50"
+		if requests > 1 {
+			wantLimit = "500"
+		}
+		if r.Method != http.MethodGet || r.URL.Path != "/api/logs" || r.URL.Query().Get("apply_id") != "apply-example-73" || r.URL.Query().Get("limit") != wantLimit {
 			panic("unexpected logs request")
+		}
+		if requests > 1 {
+			cancel()
 		}
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(apitypes.LogsResponse{ApplyID: "apply-example-73", Logs: entries}); err != nil {
 			panic(err)
 		}
-		cancel()
 	}))
 	defer server.Close()
 	output := capture(func() {
