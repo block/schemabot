@@ -817,10 +817,12 @@ The plan lists the tables it exempted, by namespace, in the PR comment and in
 `schemabot plan` and `schemabot apply` output.
 
 **Tables `pull` cannot write.** `pull` skips a table that has something the
-file format cannot represent, such as a trigger, a table or column comment, or
-a foreign key it cannot write, and names it with the reason. `onboard` and
-`init` add the table to `ignore_tables`, so the next plan leaves it alone
-instead of dropping it. See [Schema pull](#schema-pull).
+file format cannot represent, such as table inheritance or a foreign key it
+cannot write, and names it with the reason. `onboard` and `init` add the table
+to `ignore_tables`, so the next plan leaves it alone instead of dropping it.
+See [Schema pull](#schema-pull). A table with a trigger or a comment is not
+skipped: its file leaves them out, and they stay on the live table. See
+[Triggers](#triggers).
 
 A hand-written file can use `CREATE UNLOGGED TABLE`, `PARTITION BY`, and an
 `INHERITS` child flattened to its own columns. Each inheritance child and
@@ -1016,7 +1018,9 @@ schema file format. These include tables with:
 - Table inheritance, or `UNLOGGED`
 - Explicit collations
 - Sequence defaults it cannot represent safely
-- Triggers, or table or column comments. See [Triggers](#triggers)
+
+Triggers and table or column comments are not on this list. `pull` writes the
+table without them, and they stay on the live table. See [Triggers](#triggers).
 
 Storage parameters, such as `fillfactor` or `autovacuum_enabled`, are not on
 this list. `pull` writes them into the table's `WITH (...)` clause. SchemaBot
@@ -1040,11 +1044,30 @@ SchemaBot does not manage triggers, by design. A schema file declares a
 table's shape: its columns, constraints, and indexes. A trigger runs a
 function, and a function is procedural code. pg-sprite cannot compare it with
 a file, show its effect in a plan, or change it online, so triggers stay
-outside the declarative model.
+outside the declarative model. Table and column comments stay outside it too.
 
-`onboard` and `init` skip a table with a trigger and list it in
-`ignore_tables`, so SchemaBot never changes or drops it. To manage the table, move the trigger's work
-out of the database and remove the trigger.
+`pull`, `onboard`, and `init` write a table that has a trigger or a comment
+like any other table, and leave the trigger and the comments on the live table.
+A plan never adds, changes, or drops either, and a rewrite that would copy the
+table into a new one is refused while it has a trigger. Two things follow from
+the trigger living outside the file:
+
+- **A plan cannot see what a trigger function reads.** Deleting `updated_at`
+  from the file of a table whose trigger sets `NEW.updated_at` plans a plain
+  `DROP COLUMN`, and every later `UPDATE` on the table then fails. Check a
+  table's triggers before you drop a column from its file.
+- **A new environment gets the table without them.** Where the table does not
+  exist yet, the plan creates it from the file alone. Create its trigger and
+  comments there outside SchemaBot.
+
+A table that an earlier `onboard` or `init` listed in `ignore_tables` for a
+trigger or a comment stays there. To manage it, in one pull request add the
+table's file from `schemabot pull -d shop -e staging` and remove the table
+from `ignore_tables`. Removing the entry without the file makes the plan show
+a `DROP TABLE`. The plan for that pull request shows no change to the table.
+
+To keep the trigger's work in view of every plan, move it out of the database
+and remove the trigger.
 
 | The trigger | Replace it with |
 |---|---|
@@ -1062,15 +1085,10 @@ out of the database and remove the trigger.
    DROP TRIGGER orders_set_updated_at ON orders;
    DROP FUNCTION set_updated_at();
    ```
-3. In one pull request, add the table's file from `schemabot pull -d shop -e
-   staging` and remove the table from `ignore_tables`. Removing the entry
-   without the file makes the plan show a `DROP TABLE`.
 
-The plan for that pull request shows no change to the table.
-
-Table and column comments, and explicit column collations, are skipped the
-same way. Changing a column's collation rewrites the column, so it stays out
-of the files.
+A table with an explicit column collation is skipped and listed in
+`ignore_tables`. Changing a column's collation rewrites the column, so it
+stays out of the files.
 
 The schema intelligence API's detailed catalog output is not available for
 PostgreSQL. A request for it is rejected rather than answered with the basic
