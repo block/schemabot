@@ -651,17 +651,19 @@ func missingGrantDetail(err error, table string) (string, bool) {
 const sqlstateForeignKeyViolation = "23503"
 
 // brokenForeignKeyDetail names the foreign key whose validation failed on
-// existing rows. The key was added NOT VALID in an earlier step, so it stays
-// in place and checks new writes, and a new apply finishes it once the owner
-// fixes the rows. The detail is built from the server's typed fields, never its
-// message, because the message quotes the offending row's values.
+// existing rows. A new apply finishes it once the owner fixes the rows. The
+// drive removes the key when this apply added it NOT VALID, and leaves one
+// that was already on the table, so the detail does not say the key stays:
+// the apply log says what became of it. The detail is built from the server's
+// typed fields, never its message, because the message quotes the offending
+// row's values.
 func brokenForeignKeyDetail(err error, table string) (string, bool) {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateForeignKeyViolation {
 		return "", false
 	}
 	return sanitizeReasonText(fmt.Sprintf(
-		"existing rows in %q break foreign key %q; the key is in place and checks new writes; fix those rows, then apply again",
+		"existing rows in %q break foreign key %q; fix those rows, then apply again",
 		table, pgErr.ConstraintName)), true
 }
 

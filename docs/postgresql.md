@@ -889,7 +889,7 @@ creates does not count: create the referenced table first, then add the key.
 | Step | Locks | Takes |
 |---|---|---|
 | `ADD CONSTRAINT ... NOT VALID` | `SHARE ROW EXCLUSIVE` on both tables, under the 3-second `lock_timeout` | Milliseconds. From here on, new writes are checked |
-| `VALIDATE CONSTRAINT` | `SHARE UPDATE EXCLUSIVE` on the table and `ROW SHARE` on the referenced table. Reads and writes continue on both | Up to the 30-second statement budget. A longer scan is refused, and the key stays `NOT VALID` |
+| `VALIDATE CONSTRAINT` | `SHARE UPDATE EXCLUSIVE` on the table and `ROW SHARE` on the referenced table. Reads and writes continue on both | Up to the 30-second statement budget. A longer scan is refused, and the apply fails |
 
 A new table's `REFERENCES` takes the same brief `SHARE ROW EXCLUSIVE` on each
 referenced table. On a busy referenced table, the step times out and the apply
@@ -897,9 +897,16 @@ retries.
 
 **When existing rows break the key.** The validation fails and names the key.
 The apply ends there without retrying, since a retry cannot pass until the
-rows change. The key stays in place, not yet validated, and keeps checking new
-writes. Fix the rows that reference missing keys, then plan and apply again.
-The next plan shows only the `VALIDATE CONSTRAINT`.
+rows change.
+
+SchemaBot then removes the key the apply added, so writes are checked as they
+were before the apply. The apply log names the key it removed. Fix the rows
+that reference missing keys, then plan and apply again.
+
+A key that was already on the table `NOT VALID` stays, and the apply log names
+it with the statement that drops it. The next plan shows only its
+`VALIDATE CONSTRAINT`. Cancelling the apply during the validation removes a key
+the apply added the same way.
 
 **To remove a foreign key.** A dropped foreign key is usually one the file left
 out. To keep it, declare it in the file. To remove it, run the
@@ -1565,7 +1572,7 @@ A declined operation is refused at one of two layers:
 | `engine.ExternallyAuthoritativeProgress.ProgressIsExternallyAuthoritative` | Not applicable; not implemented | Progress is held in the engine instance's in-memory apply map, not in an external service that every instance can query authoritatively. | [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go) |
 | `engine.SynchronousWorkRegistration.RegistersWorkSynchronously` | Implemented; returns `true` | `Apply` claims the tracked progress entry before returning and has no remote provisioning phase. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
 | `engine.CancelledArtifactReleaser.ReleaseCancelledArtifacts` | Implemented | PostgreSQL creates no copy tables. A cancelled `SET NOT NULL` can leave the helper `CHECK` its first step added, which rejects NULL writes until it is dropped, so the release drops each helper pg-sprite recognizes on the apply's tables that a task of the apply that ran added, through the checked drop, and names any it cannot drop with the statement that does. A helper the apply took over from an earlier run stays. An invalid concurrent index is removed by the cancel itself before it settles. | [`pkg/engine/postgres/cancelled_artifacts.go`](../pkg/engine/postgres/cancelled_artifacts.go), [`pkg/engine/postgres/cancel.go`](../pkg/engine/postgres/cancel.go) |
-| `engine.FailedArtifactReleaser.ReleaseFailedArtifacts` | Implemented | When rows break a validation and the apply fails for good, the `SET NOT NULL` helper `CHECK` that a task of the apply added stays on the table and rejects NULL writes. The release drops it the same way a cancel does, and leaves a helper that was there before the apply. A foreign key stays `NOT VALID` and keeps checking new writes. | [`pkg/engine/postgres/cancelled_artifacts.go`](../pkg/engine/postgres/cancelled_artifacts.go) |
+| `engine.FailedArtifactReleaser.ReleaseFailedArtifacts` | Implemented | When rows break a validation and the apply fails for good, the `SET NOT NULL` helper `CHECK` that a task of the apply added stays on the table and rejects NULL writes. The release drops it the same way a cancel does, and leaves a helper that was there before the apply. A foreign key or `CHECK` the apply added `NOT VALID` and was still validating is dropped the same way, and one that was there before stays. | [`pkg/engine/postgres/cancelled_artifacts.go`](../pkg/engine/postgres/cancelled_artifacts.go) |
 | `engine.CancelledResumeStateReclaimer.ReclaimCancelledResumeState` | Not applicable; not implemented | Each statement runs in this process against the target directly; nothing is set up in a remote service ahead of the work that owns its teardown, so a cancel that lands between drives finds no stored resume state naming work to reclaim. | [`pkg/engine/engine.go`](../pkg/engine/engine.go), [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go) |
 | `engine.ControlResumeValidator.ValidateControlResumeState` | Not applicable; not implemented | Control requests use `ResumeState.MigrationContext` only as the in-memory apply key and have no opaque, operation-specific remote state to validate. | [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go), [`pkg/engine/postgres/cancel.go`](../pkg/engine/postgres/cancel.go) |
 | `engine.ShardKeyedPlanning.PlansEachShard` | Not applicable; not implemented | A PostgreSQL target is not sharded, so its tasks carry no shard and the plan never needs to speak for one. | [`pkg/engine/engine.go`](../pkg/engine/engine.go) |

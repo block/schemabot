@@ -46,6 +46,12 @@ type namespaceArtifacts struct {
 	// addedConstraints names, per table, the constraints the apply's tasks
 	// that ran added.
 	addedConstraints map[string][]string
+	// validatedConstraints names, per table, the constraints the apply's plan
+	// validates in a step of its own.
+	validatedConstraints map[string][]string
+	// replacedConstraints names, per table, the constraints a task drops and
+	// adds again under the same name in one statement.
+	replacedConstraints map[string][]string
 }
 
 // releaseCancelledArtifacts reclaims the artifacts the cancelled apply left on
@@ -195,10 +201,11 @@ func (c *LocalClient) releaseNamespaceArtifacts(ctx context.Context, eng engine.
 		return false, fmt.Errorf("resolve the schema to reclaim artifacts in %s: %w", namespace, err)
 	}
 	supported, result, err := kind.release(ctx, eng, &engine.ReleaseArtifactsRequest{
-		Database:         physical,
-		Tables:           artifacts.tables,
-		Credentials:      creds,
-		AddedConstraints: artifacts.addedConstraints,
+		Database:             physical,
+		Tables:               artifacts.tables,
+		Credentials:          creds,
+		AddedConstraints:     artifacts.addedConstraints,
+		ValidatedConstraints: artifacts.validatedConstraints,
 	})
 	if !supported {
 		// The engine leaves nothing on the target that this way of stopping
@@ -363,44 +370,108 @@ func (c *LocalClient) cancelledArtifactTables(apply *storage.Apply, tasks []*sto
 		if !slices.Contains(entry.tables, task.TableName) {
 			entry.tables = append(entry.tables, task.TableName)
 		}
-		for _, constraint := range c.constraintsTaskAdded(apply, task) {
-			if entry.addedConstraints == nil {
-				entry.addedConstraints = map[string][]string{}
-			}
-			entry.addedConstraints[task.TableName] = append(entry.addedConstraints[task.TableName], constraint)
-		}
+		constraints := c.taskConstraintChanges(apply, task)
+		entry.addedConstraints = appendTableNames(entry.addedConstraints, task.TableName, constraints.added)
+		entry.validatedConstraints = appendTableNames(entry.validatedConstraints, task.TableName, constraints.validated)
+		entry.replacedConstraints = appendTableNames(entry.replacedConstraints, task.TableName, constraints.replaced)
+	}
+	for _, entry := range byNamespace {
+		c.withholdReplacedConstraints(apply, entry)
 	}
 	return byNamespace
 }
 
-// constraintsTaskAdded names the constraints a task's statement adds, when
-// the task ran. A task that never left pending added nothing, so a
+// withholdReplacedConstraints takes the constraints a task replaced in place
+// out of the ones the release may drop. The replacement dropped the old rule
+// and added the new one NOT VALID in one statement, so the unvalidated rule a
+// failed or cancelled validation leaves is the only one checking the table's
+// writes. Dropping it would leave the table with neither.
+func (c *LocalClient) withholdReplacedConstraints(apply *storage.Apply, entry *namespaceArtifacts) {
+	for table, replaced := range entry.replacedConstraints {
+		for _, name := range replaced {
+			c.logger.Info("a release keeps a constraint the schema change replaced in place: it is the only rule on the table",
+				append(apply.LogAttrs(), "namespace", entry.task.Namespace, "table", table, "constraint", name)...)
+		}
+		entry.addedConstraints[table] = withoutNames(entry.addedConstraints[table], replaced)
+		entry.validatedConstraints[table] = withoutNames(entry.validatedConstraints[table], replaced)
+	}
+}
+
+// appendTableNames adds names to table's entry in byTable, creating the map
+// when it is nil and names is not empty.
+func appendTableNames(byTable map[string][]string, table string, names []string) map[string][]string {
+	if len(names) == 0 {
+		return byTable
+	}
+	if byTable == nil {
+		byTable = map[string][]string{}
+	}
+	byTable[table] = append(byTable[table], names...)
+	return byTable
+}
+
+// withoutNames returns names with every entry of drop removed.
+func withoutNames(names, drop []string) []string {
+	return slices.DeleteFunc(slices.Clone(names), func(name string) bool {
+		return slices.Contains(drop, name)
+	})
+}
+
+// constraintChanges is what one task's statement does to its table's
+// constraints, as far as a release needs to know.
+type constraintChanges struct {
+	// added names the constraints the statement adds, when the task ran.
+	added []string
+	// validated names the constraints the statement validates in a step of
+	// its own, whether or not the task ran: the plan's intent is what makes
+	// an unvalidated constraint of that name an unfinished step.
+	validated []string
+	// replaced names the constraints the statement drops and adds again.
+	replaced []string
+}
+
+// taskConstraintChanges reads which constraints a task's statement adds,
+// validates and replaces. A task that never left pending added nothing, so a
 // constraint of the same name on its table is not the apply's to remove. A
 // statement that cannot be read attributes nothing, which leaves any
 // constraint in place rather than risk removing one the apply did not add.
-func (c *LocalClient) constraintsTaskAdded(apply *storage.Apply, task *storage.Task) []string {
-	if state.IsState(task.State, state.Task.Pending) {
-		return nil
-	}
+func (c *LocalClient) taskConstraintChanges(apply *storage.Apply, task *storage.Task) constraintChanges {
 	parser, err := c.statementParser()
 	if err != nil {
-		c.logger.Warn("a cancel cannot read which constraints the task added, so it removes none of them",
+		c.logger.Warn("a release cannot read which constraints the task added, so it removes none of them",
 			append(task.LogAttrs(), "database", apply.Database, "error", err)...)
-		return nil
+		return constraintChanges{}
 	}
 	changes, err := parser.ObjectChanges(task.DDL)
 	if err != nil {
-		c.logger.Warn("a cancel cannot read which constraints the task added, so it removes none of them",
+		c.logger.Warn("a release cannot read which constraints the task added, so it removes none of them",
 			append(task.LogAttrs(), "database", apply.Database, "error", err)...)
-		return nil
+		return constraintChanges{}
 	}
-	var added []string
-	for _, object := range changes.Added {
-		if object.Kind == ddl.ObjectConstraint {
-			added = append(added, object.Name)
+	dropped := constraintNames(changes.Dropped)
+	var result constraintChanges
+	result.validated = constraintNames(changes.Validated)
+	for _, name := range constraintNames(changes.Added) {
+		if slices.Contains(dropped, name) {
+			result.replaced = append(result.replaced, name)
+			continue
+		}
+		if !state.IsState(task.State, state.Task.Pending) {
+			result.added = append(result.added, name)
 		}
 	}
-	return added
+	return result
+}
+
+// constraintNames names the constraints among objects.
+func constraintNames(objects []ddl.SchemaObject) []string {
+	var names []string
+	for _, object := range objects {
+		if object.Kind == ddl.ObjectConstraint {
+			names = append(names, object.Name)
+		}
+	}
+	return names
 }
 
 // logSkippedArtifactRelease records that a cancel left artifacts on the target,

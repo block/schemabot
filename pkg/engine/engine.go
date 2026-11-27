@@ -370,6 +370,13 @@ type ReleaseArtifactsRequest struct {
 	// it, since a constraint of the same name that was already on the table
 	// belongs to whatever put it there.
 	AddedConstraints map[string][]string
+	// ValidatedConstraints names, per table, the constraints the apply's plan
+	// validates in a step of its own, whether or not that step ran. A
+	// constraint the schema change added unvalidated to check it apart from
+	// the add is one of these, and a release drops it only when it is also
+	// in AddedConstraints. One the schema change wanted left unvalidated is
+	// in neither, and stays.
+	ValidatedConstraints map[string][]string
 }
 
 // ReleaseArtifactsResult reports what a release reclaimed and what it left

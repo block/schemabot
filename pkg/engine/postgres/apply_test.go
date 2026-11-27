@@ -1717,7 +1717,7 @@ func TestClassifyApplyFailureBrokenForeignKey(t *testing.T) {
 	failure := classifyApplyFailure(err, "orders", nil)
 
 	assert.False(t, failure.retryable, "rows that break the key keep breaking it until someone fixes them")
-	assert.Equal(t, `existing rows in "orders" break foreign key "orders_user_id_fkey"; the key is in place and checks new writes; fix those rows, then apply again`, failure.detail)
+	assert.Equal(t, `existing rows in "orders" break foreign key "orders_user_id_fkey"; fix those rows, then apply again`, failure.detail)
 	assert.NotContains(t, failure.detail, "99")
 }
 
