@@ -342,7 +342,8 @@ escaper that writes a mention as code and a character reference as text (`escape
 `pkg/webhook/templates/fence.go`), applied to a lint or unsafe change reason that quotes such
 names outside any code span (`markdownReason`, also there) and to engine reasons, exempt-table
 reasons, per-deployment apply refusals, and throttle reasons
-(`pkg/webhook/templates/plan.go`, `pkg/webhook/templates/apply.go`); the Check Run
+(`pkg/webhook/templates/plan.go`, `pkg/webhook/templates/apply.go`); the command error line
+(`userFacingError` in `pkg/webhook/error_comment.go`); the Check Run
 summary sanitizer and its markup escaper (`pkg/webhook/check_publisher.go`); the drift summary
 clamp (`pkg/webhook/plan_drift.go`); the log-text sanitizer applied to every line, level, and
 group heading in the failed-summary log fold (`pkg/webhook/templates/failure_logs.go`); the
