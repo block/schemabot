@@ -295,7 +295,7 @@ func TestStopRefusalsClassifyEveryEngine(t *testing.T) {
 // else, and both when its stored progress cannot be read.
 func TestStopOfPostgresApplyIsRefusedBeforeItIsRecorded(t *testing.T) {
 	const cancel = "`schemabot cancel apply-postgres-stop -e staging`"
-	const progress = "`schemabot progress apply-postgres-stop -e staging`"
+	const progress = "`schemabot progress apply-postgres-stop -e staging --no-watch`"
 	operation := func(metadata string) *storage.ApplyOperation {
 		return &storage.ApplyOperation{ID: 11, ApplyID: 1, ProgressMetadata: metadata}
 	}

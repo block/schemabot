@@ -580,7 +580,10 @@ locked.
 
 **Stop is not supported.** A concurrent build has no midpoint to resume from,
 so a stop would be a cancel under another name. Other statements have nothing
-to pause.
+to pause. SchemaBot refuses the stop before recording it. The refusal names
+the cancel command when a lone index build is running, and otherwise
+`schemabot progress <apply-id> -e <env> --no-watch`, or the apply's progress
+comment on a pull request.
 
 ### Greenfield tables
 
@@ -966,8 +969,11 @@ PostgreSQL targets do not support:
 - **`cancel` of anything but an index build.** See
   [Control operations](#control-operations).
 
-SchemaBot records a `stop`, or a `cancel` of a statement that is not an index
-build, and then declines it. The apply runs on until it completes or fails.
+SchemaBot refuses a `stop` before recording anything, and names what to do
+instead: `cancel` for a lone index build, or following the apply's progress
+for anything else. It records a `cancel` of a statement that is not an index
+build and then declines it. Either way, the apply runs on until it completes
+or fails.
 
 To interrupt a running statement yourself, find its backend in
 `pg_stat_activity` and run `pg_cancel_backend` from your own database session.

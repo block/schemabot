@@ -119,13 +119,13 @@ func TestStopCmdNamesTheRemedyWithTheInvokedRoute(t *testing.T) {
 		{
 			name: "anything else is followed until it finishes",
 			code: apitypes.ErrCodeStopUnsupportedFinishes,
-			want: "This schema change can't be paused, and it finishes on its own. To follow it: `schemabot progress " + stopTestApplyID + " -e staging --profile alternate`",
+			want: "This schema change can't be paused, and it finishes on its own. To follow it: `schemabot progress " + stopTestApplyID + " -e staging --no-watch --profile alternate`",
 		},
 		{
 			name: "an unknown shape names both",
 			code: apitypes.ErrCodeStopUnsupported,
 			want: "This schema change can't be paused. If it is a single index build, end it with `schemabot cancel " + stopTestApplyID + " -e staging --profile alternate`" +
-				"; anything else finishes on its own. To follow it: `schemabot progress " + stopTestApplyID + " -e staging --profile alternate`",
+				"; anything else finishes on its own. To follow it: `schemabot progress " + stopTestApplyID + " -e staging --no-watch --profile alternate`",
 		},
 	}
 	for _, tt := range tests {

@@ -279,7 +279,7 @@ func TestControlRoutesAnswerForTernClientFailure(t *testing.T) {
 				assert.Equal(t, tc.wantInternal, IsInternalControlError(err), operation)
 				assert.Equal(t, tc.wantTerminal, IsTerminalControlError(err), operation)
 				assert.Equal(t, tc.wantMessage, err.Error(), operation)
-				assert.Equal(t, tc.wantCode, controlOperationErrorCode(err), operation)
+				assert.Equal(t, tc.wantCode, ControlOperationErrorCode(err), operation)
 				assertTernClientFailureLogged(t, logBuf.Bytes(), tc.wantLogged, tc.wantLogDetail, operation)
 			}
 		})
@@ -423,7 +423,7 @@ func TestControlTernClientFailure(t *testing.T) {
 	t.Run("missing configuration entry is a terminal 404 with the deployment-not-found code", func(t *testing.T) {
 		err := controlTernClientFailure(apply, "ghost", fmt.Errorf("unknown deployment %q: %w", "ghost", errTernDeploymentNotConfigured))
 		assert.Equal(t, http.StatusNotFound, ControlOperationHTTPStatus(err))
-		assert.Equal(t, apitypes.ErrCodeDeploymentNotFound, controlOperationErrorCode(err))
+		assert.Equal(t, apitypes.ErrCodeDeploymentNotFound, ControlOperationErrorCode(err))
 		assert.Equal(t, notConfiguredMessage, err.Error())
 		assert.True(t, IsTerminalControlError(err))
 	})
@@ -442,8 +442,8 @@ func TestControlTernClientFailure(t *testing.T) {
 	t.Run("any other failure is a retryable 503 with a fixed message and the engine-unavailable code", func(t *testing.T) {
 		err := controlTernClientFailure(apply, "ghost", errors.New("resolve DSN for orders/staging: open /secrets/dsn: no such file"))
 		assert.Equal(t, http.StatusServiceUnavailable, ControlOperationHTTPStatus(err))
-		assert.Equal(t, apitypes.ErrCodeEngineUnavailable, controlOperationErrorCode(err))
-		assert.True(t, apitypes.IsRetryableErrorCode(controlOperationErrorCode(err)))
+		assert.Equal(t, apitypes.ErrCodeEngineUnavailable, ControlOperationErrorCode(err))
+		assert.True(t, apitypes.IsRetryableErrorCode(ControlOperationErrorCode(err)))
 		assert.Equal(t, controlEngineUnavailableMessage, err.Error())
 		assert.True(t, IsInternalControlError(err))
 		assert.False(t, IsTerminalControlError(err))

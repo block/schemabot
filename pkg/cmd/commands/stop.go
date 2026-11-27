@@ -109,21 +109,24 @@ func stopUnsupportedRefusal(err error, applyID, environment string) (string, boo
 	if !errors.As(err, &apiErr) {
 		return "", false
 	}
-	command := func(name string) string {
+	command := func(name string, flags ...string) string {
 		args := []string{name, applyID}
 		if environment != "" {
 			args = append(args, "-e", environment)
 		}
-		return "`" + cliname.Command(args...) + "`"
+		return "`" + cliname.Command(append(args, flags...)...) + "`"
 	}
+	// A watching progress can stop or cancel the apply from its keys, so the
+	// hint names the one that prints once.
+	progress := command("progress", "--no-watch")
 	switch apiErr.ErrorCode {
 	case apitypes.ErrCodeStopUnsupportedCancel:
 		return "This schema change can't be paused. To end it: " + command("cancel"), true
 	case apitypes.ErrCodeStopUnsupportedFinishes:
-		return "This schema change can't be paused, and it finishes on its own. To follow it: " + command("progress"), true
+		return "This schema change can't be paused, and it finishes on its own. To follow it: " + progress, true
 	case apitypes.ErrCodeStopUnsupported:
 		return "This schema change can't be paused. If it is a single index build, end it with " + command("cancel") +
-			"; anything else finishes on its own. To follow it: " + command("progress"), true
+			"; anything else finishes on its own. To follow it: " + progress, true
 	default:
 		return "", false
 	}

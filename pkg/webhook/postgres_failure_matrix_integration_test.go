@@ -241,7 +241,7 @@ func TestPostgresConfigFixtureStopIsRefusedAndAStoredStopIsDeclined(t *testing.T
 		Caller:      "integration-test",
 	})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "PostgreSQL can't pause this schema change, and it finishes on its own. To follow it: `schemabot progress "+running.ApplyIdentifier+" -e "+running.Environment+"`")
+	assert.Contains(t, err.Error(), "PostgreSQL can't pause this schema change, and it finishes on its own. To follow it: `schemabot progress "+running.ApplyIdentifier+" -e "+running.Environment+" --no-watch`")
 	refused, err := svc.Storage().ControlRequests().GetByOperation(t.Context(), running.ID, storage.ControlOperationStop)
 	require.NoError(t, err)
 	assert.Nil(t, refused, "a refused stop records no control request")

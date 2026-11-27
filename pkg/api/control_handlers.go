@@ -110,9 +110,10 @@ func authoredTerminalControlf(format string, args ...any) error {
 	return &terminalControlError{err: err, shown: err.Error()}
 }
 
-// controlOperationErrorCode is the error code a rejection carries, empty for
-// one that carries none.
-func controlOperationErrorCode(err error) string {
+// ControlOperationErrorCode is the error code a rejection carries, empty for
+// one that carries none. The PR comment reads it to name a remedy in its own
+// command form, where the server's message names the CLI's.
+func ControlOperationErrorCode(err error) string {
 	if _, code, ok := changeGateErrorStatus(err); ok {
 		return code
 	}
@@ -489,7 +490,7 @@ func (s *Service) writeControlError(w http.ResponseWriter, opName string, apply 
 		s.logger.Error(opName+" failed", attrs...)
 		// The code is what tells a client that an engine-unavailable 503 is
 		// worth retrying.
-		code := controlOperationErrorCode(err)
+		code := ControlOperationErrorCode(err)
 		if authored, ok := AuthoredControlFailureMessage(err); ok {
 			s.writeErrorCode(w, status, code, opName+" failed: "+authored)
 			return
@@ -497,7 +498,7 @@ func (s *Service) writeControlError(w http.ResponseWriter, opName string, apply 
 		s.writeErrorCode(w, status, code, controlInternalFailureMessage(opName, apply))
 	} else {
 		s.logger.Warn(opName+" rejected", attrs...)
-		s.writeErrorCode(w, status, controlOperationErrorCode(err), opName+" rejected: "+err.Error())
+		s.writeErrorCode(w, status, ControlOperationErrorCode(err), opName+" rejected: "+err.Error())
 	}
 }
 
@@ -596,7 +597,7 @@ func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, o
 			append(apply.LogAttrs(),
 				"operation", operation, "error", err)...)
 		failure := controlTernClientFailure(apply, deployment, err)
-		s.writeErrorCode(w, controlOperationHTTPStatus(failure), controlOperationErrorCode(failure), failure.Error())
+		s.writeErrorCode(w, controlOperationHTTPStatus(failure), ControlOperationErrorCode(failure), failure.Error())
 		return nil, nil, "", false
 	}
 
@@ -1423,10 +1424,13 @@ func (s *Service) stopRefusalForEngine(ctx context.Context, apply *storage.Apply
 // cancel for a concurrent index build that is its only statement, which is
 // what the PR comment offers, and following its progress for anything else,
 // which finishes on its own. The error code names the same remedy, so the CLI
-// can render the command with the route the operator invoked it with.
+// can render the command with the route the operator invoked it with and the
+// PR comment can render it as a comment command or point at its progress
+// comment. progress is named with --no-watch because a watching progress can
+// stop or cancel the apply from its keys.
 func (s *Service) postgresStopRefusal(ctx context.Context, apply *storage.Apply) (string, string) {
 	cancel := fmt.Sprintf("`schemabot cancel %s -e %s`", apply.ApplyIdentifier, apply.Environment)
-	progress := fmt.Sprintf("`schemabot progress %s -e %s`", apply.ApplyIdentifier, apply.Environment)
+	progress := fmt.Sprintf("`schemabot progress %s -e %s --no-watch`", apply.ApplyIdentifier, apply.Environment)
 	command, err := s.storedStopCommand(ctx, apply)
 	if err != nil {
 		s.logger.Warn("operator: could not read the apply's stored progress for a refused PostgreSQL stop; the refusal names the remedy for each kind of statement",
