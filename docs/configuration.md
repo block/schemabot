@@ -1884,10 +1884,14 @@ checks existing rows against a foreign key or check constraint added
 `NOT VALID`. The scan holds `SHARE UPDATE EXCLUSIVE`, so reads and writes
 continue while it runs. A scan that reaches the bound is cancelled and the
 step is refused; the constraint stays `NOT VALID` and keeps checking new
-writes. It accepts the same range as `concurrent_index_max_duration`.
+writes. The scan's lock wait keeps the 3-second lock budget, or half the bound
+when the bound is shorter, so waiting behind other DDL is retried as lock
+contention rather than refused. It accepts `2ms` up to the same maximum as
+`concurrent_index_max_duration`.
 
 Concurrent index builds do not consult the size ceiling; their work is bounded
-by `concurrent_index_max_duration` instead.
+by `concurrent_index_max_duration` instead. Constraint validations do not
+either; theirs is bounded by `validate_max_duration`.
 
 The ceiling is process-wide: every PostgreSQL database this server drives
 shares the same value, and a database cannot override it in its own metadata.

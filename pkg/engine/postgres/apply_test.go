@@ -329,8 +329,7 @@ func TestClassifyRefusal(t *testing.T) {
 				nameValidationBound(&executor.BudgetError{Cause: executor.CauseStatement, Budget: 36 * time.Hour}, "orders_user_id_fkey", 36*time.Hour)),
 			wantReason: "validation-bound-exceeded",
 			wantDetail: []string{
-				`validating constraint "orders_user_id_fkey" ran past postgres.validate_max_duration (36h0m0s) and was cancelled`,
-				"the constraint stays NOT VALID: it checks new writes, not existing rows",
+				`constraint "orders_user_id_fkey" ran past postgres.validate_max_duration (36h0m0s); it stays NOT VALID and checks new writes only`,
 				"raise postgres.validate_max_duration and re-run",
 			},
 			wantNotDetail: []string{"statement budget", replanRemedy},
@@ -1386,6 +1385,29 @@ func TestCreateNamesUnverifiedRefusalLeadSurvivesStatusReasonClamp(t *testing.T)
 	}
 }
 
+// A validation refused for running past its bound ends in the remedy, and the
+// whole remedy stays inside the status listing's kept width for any legal
+// constraint name at the widest bound, including a name whose quoting doubles
+// its bytes, so the narrowest operator surface still says what to do.
+func TestValidationBoundRefusalKeepsItsRemedyInTheStatusWidth(t *testing.T) {
+	const remedy = "raise postgres.validate_max_duration and re-run"
+	for _, constraint := range []string{
+		strings.Repeat("a", maxIdentifierLength),
+		strings.Repeat(`"`, maxIdentifierLength),
+		strings.Repeat("\n", maxIdentifierLength/2),
+	} {
+		err := fmt.Errorf("validate reviewed constraint %q on PostgreSQL table %q: %w", constraint, "orders",
+			nameValidationBound(&executor.BudgetError{Cause: executor.CauseStatement, Budget: MaxConcurrentIndexMaxDuration}, constraint, MaxConcurrentIndexMaxDuration))
+
+		r := classifyRefusal(err, "orders")
+
+		require.NotNil(t, r)
+		assert.Equal(t, "validation-bound-exceeded", r.reason)
+		assert.True(t, strings.HasSuffix(r.detail, remedy), r.detail)
+		assert.LessOrEqual(t, len(r.detail), statusReasonKeptWidth, r.detail)
+	}
+}
+
 // widestCreateSet is a statement count wider than any create set a schema
 // file can carry: it is the largest count a 32-bit integer holds, and its
 // step clause is the widest the composition is asked to leave room for.
@@ -2210,6 +2232,57 @@ func TestHaltWorkOwnedByEndsOnlyThatOwnersBuild(t *testing.T) {
 	assert.Equal(t, engine.StateRunning, pollProgress(t, eng, "task-b").State, "drive-b's build is not drive-a's to halt")
 }
 
+// A drive that hands its apply back halts a constraint validation it started,
+// as it does an index build: the scan can run for hours, and left running it
+// would hold the table's lock under a lease nobody renews. The halt records
+// no cancel, so the drive publishes a retryable failure and the next driver
+// validates the constraint, which stayed NOT VALID.
+func TestHaltWorkOwnedByEndsAValidationWithoutRecordingACancel(t *testing.T) {
+	scripted := newScriptedExecutor(func(*progress.Tracker) error {
+		return errors.New("the executor must be ended by its context, not released")
+	})
+	eng := New()
+	eng.execute = scripted.execute
+	t.Cleanup(eng.Drain)
+	t.Cleanup(scripted.release)
+	record, err := json.Marshal(reviewedUserKey())
+	require.NoError(t, err)
+	const key = "task-validate"
+	accepted, err := eng.Apply(engine.WithWorkOwner(t.Context(), "drive-a"), &engine.ApplyRequest{
+		Database: "app",
+		Changes: []engine.SchemaChange{{Namespace: "public", TableChanges: []engine.TableChange{{
+			Table: "orders", DDL: reviewedValidationSQL,
+			Metadata: map[string]string{reviewedValidationMetadataKey: string(record)},
+		}}}},
+		Credentials: &engine.Credentials{DSN: "postgres://schemabot:secret@db.invalid/app?sslmode=disable"},
+		ResumeState: &engine.ResumeState{MigrationContext: key},
+		Logger:      slog.New(slog.DiscardHandler),
+	})
+	require.NoError(t, err)
+	require.True(t, accepted.Accepted)
+	scripted.envelope(t)
+	scripted.tracker(t)
+
+	ctx, cancel := context.WithTimeout(t.Context(), backgroundApplyDeadline)
+	defer cancel()
+	require.NoError(t, eng.HaltWorkOwnedBy(ctx, "drive-a"))
+
+	terminal := pollProgress(t, eng, key)
+	require.Equal(t, engine.StateFailed, terminal.State, "a halt is not an operator cancel")
+	assert.True(t, terminal.Retryable, "the next driver validates the constraint the halt left NOT VALID")
+}
+
+// A validation's lock wait keeps the short lock budget, and gets half the
+// bound when the bound is shorter, so the lock wait always ends before the
+// bound's statement timer and lock contention is never read as an over-long
+// scan.
+func TestValidationLockBudgetEndsBeforeTheBound(t *testing.T) {
+	assert.Equal(t, optimisticLockTimeout, validationLockBudget(DefaultValidateMaxDuration))
+	assert.Equal(t, optimisticLockTimeout, validationLockBudget(2*optimisticLockTimeout))
+	assert.Equal(t, 500*time.Millisecond, validationLockBudget(time.Second))
+	assert.Equal(t, time.Millisecond, validationLockBudget(MinValidateMaxDuration), "the shortest bound still leaves a whole-millisecond lock wait")
+}
+
 // A halt for shutdown leaves plain DDL to finish, so a statement that will not
 // return within the shutdown budget is reported as still holding the target
 // rather than interrupted.
@@ -3009,15 +3082,15 @@ func TestValidationApplyRunsUnderTheValidationBound(t *testing.T) {
 }
 
 // TestValidateMaxDurationIsNormalizedLikeTheBuildBound pins the validation
-// bound to the range statement_timeout can hold, as the build bound is: a
-// bound that is not positive adopts the default, and one outside the range
-// is clamped into it.
+// bound to the range statement_timeout can hold with a whole-millisecond lock
+// wait inside it: a bound that is not positive adopts the default, and one
+// outside the range is clamped into it.
 func TestValidateMaxDurationIsNormalizedLikeTheBuildBound(t *testing.T) {
 	assert.Equal(t, DefaultValidateMaxDuration, New().ValidateMaxDuration())
 	assert.Equal(t, 24*time.Hour, DefaultValidateMaxDuration)
 	assert.Equal(t, DefaultValidateMaxDuration, New().WithValidateMaxDuration(0).ValidateMaxDuration())
 	assert.Equal(t, DefaultValidateMaxDuration, New().WithValidateMaxDuration(-time.Second).ValidateMaxDuration())
-	assert.Equal(t, MinConcurrentIndexMaxDuration, New().WithValidateMaxDuration(500*time.Microsecond).ValidateMaxDuration())
+	assert.Equal(t, MinValidateMaxDuration, New().WithValidateMaxDuration(time.Millisecond).ValidateMaxDuration())
 	assert.Equal(t, MaxConcurrentIndexMaxDuration, New().WithValidateMaxDuration(MaxConcurrentIndexMaxDuration+1).ValidateMaxDuration())
 	assert.Equal(t, 36*time.Hour, New().WithValidateMaxDuration(36*time.Hour).ValidateMaxDuration())
 }

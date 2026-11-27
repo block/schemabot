@@ -6305,8 +6305,9 @@ postgres:
 }
 
 // postgres.validate_max_duration bounds one VALIDATE CONSTRAINT scan. It
-// defaults to a day, as the index build bound does, and is held to the same
-// range the server's statement_timeout can carry.
+// defaults to a day, as the index build bound does, and is held to the range
+// the server's statement_timeout can carry with a whole-millisecond lock wait
+// inside it.
 func TestPostgresValidateMaxDuration(t *testing.T) {
 	t.Run("unset uses default", func(t *testing.T) {
 		assert.Equal(t, 24*time.Hour, (PostgresConfig{}).ValidateMaxDurationOrDefault())
@@ -6336,7 +6337,7 @@ postgres:
 	}{
 		{"0", "must be positive"},
 		{"tomorrow", "is not a valid duration"},
-		{"500us", "below the smallest bound the engine can honor (1ms"},
+		{"1ms", "below the smallest bound the engine can honor (2ms"},
 		{(postgresengine.MaxConcurrentIndexMaxDuration + time.Millisecond).String(), "exceeds the largest bound the engine can honor"},
 	}
 	for _, tt := range tests {

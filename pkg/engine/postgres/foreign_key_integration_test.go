@@ -6,8 +6,10 @@ import (
 	"database/sql"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/block/pg-sprite/pkg/schemadiff"
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -256,13 +258,13 @@ func TestEngineApplyForeignKeyValidationPastItsBound(t *testing.T) {
 		"users.sql":  "CREATE TABLE users (id bigint PRIMARY KEY)",
 		"orders.sql": "CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint NOT NULL REFERENCES users (id))",
 	}
-	eng := New().WithValidateMaxDuration(MinConcurrentIndexMaxDuration)
+	eng := New().WithValidateMaxDuration(MinValidateMaxDuration)
 
 	outcomes := applyPlannedSteps(t, eng, dsn, planForeignKeyFiles(t, eng, database, dsn, files))
 	require.Len(t, outcomes, 2, "the add completes and the validation is refused")
 	assert.Equal(t, engine.StateCompleted, outcomes[0].State, outcomes[0].ErrorMessage)
 	assert.Equal(t, engine.StateFailed, outcomes[1].State)
-	assert.Contains(t, outcomes[1].ErrorMessage, `validating constraint "orders_user_id_fkey" ran past postgres.validate_max_duration (1ms)`)
+	assert.Contains(t, outcomes[1].ErrorMessage, `constraint "orders_user_id_fkey" ran past postgres.validate_max_duration (2ms)`)
 	assert.Contains(t, outcomes[1].ErrorMessage, "raise postgres.validate_max_duration and re-run")
 	assert.False(t, foreignKeyValidated(t, db, "orders_user_id_fkey"), "the key stays in place, unvalidated")
 	_, err = db.ExecContext(t.Context(), `INSERT INTO public.orders VALUES (300001, 5000)`)
@@ -274,6 +276,91 @@ func TestEngineApplyForeignKeyValidationPastItsBound(t *testing.T) {
 	require.Len(t, replan.Changes[0].TableChanges, 1)
 	assert.Equal(t, "ALTER TABLE public.orders VALIDATE CONSTRAINT orders_user_id_fkey", replan.Changes[0].TableChanges[0].DDL)
 	outcomes = applyPlannedSteps(t, raised, dsn, replan)
+	require.Len(t, outcomes, 1)
+	assert.Equal(t, engine.StateCompleted, outcomes[0].State, outcomes[0].ErrorMessage)
+	assert.True(t, foreignKeyValidated(t, db, "orders_user_id_fkey"))
+}
+
+// A table past the deployment's native-safe size ceiling has a foreign key
+// left NOT VALID. The plan validates it in place, and that step is not
+// blocked for the table's size: the scan lets reads and writes continue and
+// runs under the validation bound instead. Applying it validates the key.
+func TestEnginePlanValidationOnATablePastTheSizeCeiling(t *testing.T) {
+	const database = "plan_validation_size_test"
+	dsn, db := testutil.StartPostgres(t, database)
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint NOT NULL);
+		INSERT INTO public.users SELECT g FROM generate_series(1, 100) g;
+		INSERT INTO public.orders SELECT g, 1 + g % 100 FROM generate_series(1, 1000) g;
+		ALTER TABLE public.orders ADD CONSTRAINT orders_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users (id) NOT VALID`)
+	require.NoError(t, err)
+	files := map[string]string{
+		"users.sql":  "CREATE TABLE users (id bigint PRIMARY KEY)",
+		"orders.sql": "CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint NOT NULL REFERENCES users (id))",
+	}
+	eng := NewWithTableSizeLimit(1)
+
+	plan := planForeignKeyFiles(t, eng, database, dsn, files)
+	require.Len(t, plan.Changes, 1)
+	require.Len(t, plan.Changes[0].TableChanges, 1, "only the validation is left to run")
+	step := plan.Changes[0].TableChanges[0]
+	assert.Contains(t, step.DDL, "VALIDATE CONSTRAINT")
+	assert.Empty(t, step.ExecutionMode, step.ModeReason)
+
+	outcomes := applyPlannedSteps(t, eng, dsn, plan)
+	require.Len(t, outcomes, 1)
+	assert.Equal(t, engine.StateCompleted, outcomes[0].State, outcomes[0].ErrorMessage)
+	assert.True(t, foreignKeyValidated(t, db, "orders_user_id_fkey"))
+}
+
+// A deployment sets a validation bound shorter than the lock budget. The
+// validation queues behind another session's lock on the table, and its lock
+// wait, half the bound, ends before the bound's statement timer, so the step
+// fails as lock contention the drive retries, not as a scan that ran past its
+// bound. Once the lock is released, applying the validation again completes.
+func TestEngineApplyValidationBehindALockIsRetriedNotRefused(t *testing.T) {
+	const database = "apply_foreign_key_lock_wait_test"
+	dsn, db := testutil.StartPostgres(t, database)
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint NOT NULL);
+		INSERT INTO public.users SELECT g FROM generate_series(1, 100) g;
+		INSERT INTO public.orders SELECT g, 1 + g % 100 FROM generate_series(1, 1000) g`)
+	require.NoError(t, err)
+	files := map[string]string{
+		"users.sql":  "CREATE TABLE users (id bigint PRIMARY KEY)",
+		"orders.sql": "CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint NOT NULL REFERENCES users (id))",
+	}
+	plan := planForeignKeyFiles(t, New(), database, dsn, files)
+	require.Len(t, plan.Changes, 1)
+	require.Len(t, plan.Changes[0].TableChanges, 2, "the key is added NOT VALID, then validated")
+	add, validate := *plan, *plan
+	add.Changes = []engine.SchemaChange{{Namespace: plan.Changes[0].Namespace, TableChanges: plan.Changes[0].TableChanges[:1]}}
+	validate.Changes = []engine.SchemaChange{{Namespace: plan.Changes[0].Namespace, TableChanges: plan.Changes[0].TableChanges[1:]}}
+	outcomes := applyPlannedSteps(t, New(), dsn, &add)
+	require.Len(t, outcomes, 1)
+	require.Equal(t, engine.StateCompleted, outcomes[0].State, outcomes[0].ErrorMessage)
+
+	conn, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(conn)
+	tx, err := conn.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	_, err = tx.ExecContext(t.Context(), "LOCK TABLE public.orders IN SHARE UPDATE EXCLUSIVE MODE")
+	require.NoError(t, err)
+
+	short := New().WithValidateMaxDuration(600 * time.Millisecond)
+	outcomes = applyPlannedSteps(t, short, dsn, &validate)
+	require.Len(t, outcomes, 1)
+	assert.Equal(t, engine.StateFailed, outcomes[0].State)
+	assert.True(t, outcomes[0].Retryable, "lock contention is retried: %s", outcomes[0].ErrorMessage)
+	assert.Contains(t, outcomes[0].ErrorMessage, "retry once lock contention subsides")
+	assert.NotContains(t, outcomes[0].ErrorMessage, "validate_max_duration", "the scan never started, so the bound did not end it")
+	assert.False(t, foreignKeyValidated(t, db, "orders_user_id_fkey"))
+
+	require.NoError(t, tx.Rollback())
+	outcomes = applyPlannedSteps(t, short, dsn, &validate)
 	require.Len(t, outcomes, 1)
 	assert.Equal(t, engine.StateCompleted, outcomes[0].State, outcomes[0].ErrorMessage)
 	assert.True(t, foreignKeyValidated(t, db, "orders_user_id_fkey"))

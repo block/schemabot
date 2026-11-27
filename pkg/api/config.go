@@ -1922,7 +1922,7 @@ func (c PostgresConfig) StatementTimeoutOrDefault() time.Duration {
 // validateEngineDuration checks a duration the engine hands the server as a
 // statement_timeout: it must parse, be positive, and fit the server timer's
 // range. Empty means the default and passes.
-func validateEngineDuration(key, value string) error {
+func validateEngineDuration(key, value string, minimum time.Duration) error {
 	if value == "" {
 		return nil
 	}
@@ -1933,8 +1933,8 @@ func validateEngineDuration(key, value string) error {
 	if d <= 0 {
 		return fmt.Errorf("%s %q must be positive (omit it to use the default)", key, value)
 	}
-	if d < postgresengine.MinConcurrentIndexMaxDuration {
-		return fmt.Errorf("%s %q is below the smallest bound the engine can honor (%s, the server timer's resolution)", key, value, postgresengine.MinConcurrentIndexMaxDuration)
+	if d < minimum {
+		return fmt.Errorf("%s %q is below the smallest bound the engine can honor (%s)", key, value, minimum)
 	}
 	if d > postgresengine.MaxConcurrentIndexMaxDuration {
 		return fmt.Errorf("%s %q exceeds the largest bound the engine can honor (%s)", key, value, postgresengine.MaxConcurrentIndexMaxDuration)
@@ -1946,10 +1946,10 @@ func (c PostgresConfig) validate() error {
 	if c.NativeSafeTableSizeLimitBytes != nil && *c.NativeSafeTableSizeLimitBytes <= 0 {
 		return fmt.Errorf("postgres.native_safe_table_size_limit_bytes must be positive, got %d", *c.NativeSafeTableSizeLimitBytes)
 	}
-	if err := validateEngineDuration("postgres.concurrent_index_max_duration", c.ConcurrentIndexMaxDuration); err != nil {
+	if err := validateEngineDuration("postgres.concurrent_index_max_duration", c.ConcurrentIndexMaxDuration, postgresengine.MinConcurrentIndexMaxDuration); err != nil {
 		return err
 	}
-	if err := validateEngineDuration("postgres.validate_max_duration", c.ValidateMaxDuration); err != nil {
+	if err := validateEngineDuration("postgres.validate_max_duration", c.ValidateMaxDuration, postgresengine.MinValidateMaxDuration); err != nil {
 		return err
 	}
 	// Zero is a meaningful setting here, unlike the pool durations: it disables

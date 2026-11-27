@@ -3,6 +3,7 @@ package postgres
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -1199,6 +1200,26 @@ func TestBlockRewriteStepsKeepsConcurrentIndexDrops(t *testing.T) {
 	assert.Equal(t, "size verdict", changes[1].ModeReason)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[2].ExecutionMode)
 	assert.Equal(t, "size verdict", changes[2].ModeReason)
+}
+
+// A reviewed VALIDATE CONSTRAINT keeps its verdict on a table past the size
+// ceiling: its scan holds SHARE UPDATE EXCLUSIVE, so reads and writes continue,
+// and the validation bound limits it instead of the table's size. A
+// validation with no planner record is not exempted on its statement alone.
+func TestBlockRewriteStepsKeepsReviewedValidations(t *testing.T) {
+	record, err := json.Marshal(reviewedUserKey())
+	require.NoError(t, err)
+	changes := []engine.TableChange{
+		{Table: "orders", DDL: reviewedValidationSQL, Metadata: map[string]string{reviewedValidationMetadataKey: string(record)}},
+		{Table: "orders", DDL: reviewedValidationSQL},
+		{Table: "orders", DDL: "ALTER TABLE public.orders ALTER COLUMN user_id TYPE numeric", Metadata: map[string]string{reviewedValidationMetadataKey: string(record)}},
+	}
+
+	require.NoError(t, blockRewriteSteps(changes, "size verdict", nil, nil))
+	assert.Empty(t, changes[0].ExecutionMode, changes[0].ModeReason)
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
+	assert.Equal(t, "size verdict", changes[1].ModeReason)
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[2].ExecutionMode, "a record does not exempt a statement that is not a validation")
 }
 
 // TestTableChangesRendersAnIndexDropAsUnsafe proves a planned index drop on

@@ -171,10 +171,21 @@ type buildShape struct {
 	// concurrent build per partition, so a signal to the build in flight
 	// does not reach the partitions after it.
 	partitioned bool
+	// haltable is set for the work a shutdown or a drive handing the apply
+	// back ends instead of waiting out: the changes bounded by a long
+	// duration rather than the per-statement limit. An index build leaves an
+	// invalid index the next driver recovers, and a constraint validation
+	// leaves the constraint NOT VALID for the next driver to validate, so
+	// neither leaves work half-applied.
+	haltable bool
 }
 
 func (c nativeApply) buildShape() buildShape {
-	return buildShape{cancellable: c.durationBoundedIndexBuild(), partitioned: c.partitionedIndex}
+	return buildShape{
+		cancellable: c.durationBoundedIndexBuild(),
+		partitioned: c.partitionedIndex,
+		haltable:    c.durationBoundedIndexBuild() || c.durationBoundedValidation(),
+	}
 }
 
 // targetConn carries one background apply's connection inputs: the raw DSN
@@ -1915,14 +1926,14 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 		// pg-sprite reads the constraint again under the validation's lock
 		// and refuses with ErrValidatedConstraintDrift, validating nothing,
 		// when it no longer has the definition the plan recorded.
-		// The scan runs under the validation bound; its lock wait keeps the
+		// The scan runs under the validation bound; its lock wait keeps a
 		// short lock budget, so queueing behind other DDL never holds the
 		// apply for the whole bound.
 		if change.validateMaxDuration <= 0 {
 			return fmt.Errorf("validate reviewed constraint %q on PostgreSQL table %q: validation bound is not set", change.validates.Constraint, change.table)
 		}
 		if err := executor.ExecuteNativeValidatingWithProgress(ctx, pool, table, statement, executor.Budget{
-			LockTimeout: optimisticLockTimeout, StatementTimeout: change.validateMaxDuration,
+			LockTimeout: validationLockBudget(change.validateMaxDuration), StatementTimeout: change.validateMaxDuration,
 		}, executor.DefaultRetryPolicy(), *change.validates, tracker); err != nil {
 			return fmt.Errorf("validate reviewed constraint %q on PostgreSQL table %q: %w", change.validates.Constraint, change.table,
 				nameValidationBound(err, change.validates.Constraint, change.validateMaxDuration))
@@ -2524,12 +2535,25 @@ type validationBoundError struct {
 	err        error
 }
 
+// Error is the refusal's cause. The constraint name is held to the width of
+// a maximal identifier, so with the widest bound the cause and the remedy
+// that follows it fit inside the status listing's kept width and the listing
+// still says what to do.
 func (e *validationBoundError) Error() string {
-	return fmt.Sprintf("validating constraint %q ran past %s (%s) and was cancelled; the constraint stays NOT VALID: it checks new writes, not existing rows",
-		e.constraint, validationBoundOption, e.bound)
+	return fmt.Sprintf("constraint %s ran past %s (%s); it stays NOT VALID and checks new writes only",
+		boundedQuote(e.constraint, quotedTableWidth), validationBoundOption, e.bound)
 }
 
 func (e *validationBoundError) Unwrap() error { return e.err }
+
+// validationLockBudget is the lock wait a validation under bound gets: the
+// short lock budget, or half the bound when the bound is shorter. The lock is
+// the first thing the statement waits for, so a wait behind other DDL always
+// ends at its lock budget before the bound's statement timer fires, and lock
+// contention is retried as contention instead of refused as an over-long scan.
+func validationLockBudget(bound time.Duration) time.Duration {
+	return min(optimisticLockTimeout, bound/2)
+}
 
 // nameValidationBound wraps a validation failure caused by the bound's
 // statement timeout firing so the operator detail names the option; every
@@ -2971,7 +2995,7 @@ func (e *Engine) claimProgress(key string, result *engine.ProgressResult, tracke
 	done := make(chan struct{})
 	e.progress[key] = &trackedApply{
 		result: result, tracker: tracker, logger: logger,
-		cancellableBuild: shape.cancellable, partitionedBuild: shape.partitioned, cancelApply: cancelApply, done: done,
+		cancellableBuild: shape.cancellable, partitionedBuild: shape.partitioned, haltable: shape.haltable, cancelApply: cancelApply, done: done,
 		owner: owner,
 	}
 	return done

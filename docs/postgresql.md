@@ -201,6 +201,7 @@ If your tables belong to a dedicated owner role, read
 | Change | What happens |
 |---|---|
 | Add a nullable column, or another `ALTER TABLE` that only changes the catalog | Runs on a table of any size, with a 3-second `lock_timeout` and a 30-second `statement_timeout`. See [Catalog-only changes](#catalog-only-changes) |
+| `VALIDATE CONSTRAINT` of a constraint left `NOT VALID` | Runs on a table of any size, bounded by `postgres.validate_max_duration` (24 hours by default). Reads and writes continue through the scan |
 | Any other `ALTER TABLE` on a table larger than 1 GiB | Blocked. The limit is `postgres.native_safe_table_size_limit_bytes` |
 | `ALTER TABLE` that rewrites the table, such as most column type changes | Blocked. It needs a copy of the table, which SchemaBot does not run on PostgreSQL yet |
 | `CREATE INDEX` on an existing table | Runs as `CREATE INDEX CONCURRENTLY`, bounded by `postgres.concurrent_index_max_duration` (24 hours by default). It can be cancelled |
@@ -421,7 +422,7 @@ unsafe to leave in place.
 | `ALTER TABLE` | Each attempt gets a 3-second lock budget, retried on contention, and a 30-second statement budget | Fixed |
 | `CREATE INDEX CONCURRENTLY` | Build duration, enforced as the server-side `statement_timeout`. 24 hours by default | `postgres.concurrent_index_max_duration` |
 | Index on a partitioned table | The same duration, for each partition and for the whole build | `postgres.concurrent_index_max_duration` |
-| `VALIDATE CONSTRAINT` | Scan duration, enforced as the server-side `statement_timeout`. 24 hours by default. Each attempt gets the same 3-second lock budget as `ALTER TABLE` | `postgres.validate_max_duration` |
+| `VALIDATE CONSTRAINT` | Scan duration, enforced as the server-side `statement_timeout`. 24 hours by default. No table size limit. Each attempt gets the same 3-second lock budget as `ALTER TABLE`, or half the bound when the bound is shorter | `postgres.validate_max_duration` |
 | `CREATE TABLE` | No size limit, since the table starts empty | None |
 
 The size limit bounds work that grows with existing data, so index builds,
