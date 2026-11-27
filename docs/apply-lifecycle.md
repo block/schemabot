@@ -243,10 +243,15 @@ apply starts every operation with a full budget.
 ## Refused at plan time
 
 `POST /api/plan` answers `422 schema_refused` when the engine cannot plan the
-schema files as written, or a schema file does not parse. The `error` says
-what to change in the files. Planning the same files again gets the same
-answer, so edit the files and plan again instead of retrying. A `5xx` is a
-server fault, and a retry may succeed.
+schema files as written, or a schema file does not parse. The `error` names
+the remedy: usually a change to the files, sometimes a condition to wait for,
+such as a table to drop going quiet. Follow it, then plan again; repeating the
+request before then gets the same answer. A `5xx` is a server fault, and a
+retry may succeed.
+
+In a rollout, a member the engine refuses is listed under the rollout's
+members needing attention, with the refusal as its detail, and the response
+is `200` for the members that planned.
 
 ## Refused before an apply exists
 

@@ -1876,9 +1876,10 @@ func authoredMessage(err error) (string, bool) {
 
 // refusedSchema answers a plan that failed for the declared schema as written
 // with 422 schema_refused and the refusal's own text, and reports whether it
-// did. Planning the same files again gets the same answer, so it is the
-// request's answer rather than a server fault, and a client that retries a 5xx
-// would only repeat it.
+// did. The text names the remedy, a change to the files or a condition to
+// wait for, and until it is followed planning again gets the same answer. It
+// is the request's answer rather than a server fault, and a client that
+// retries a 5xx would only repeat it.
 func (s *Service) refusedSchema(w http.ResponseWriter, req PlanRequest, err error) bool {
 	text, ok := schemaRefusalText(err)
 	if !ok {

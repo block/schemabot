@@ -193,8 +193,9 @@ func outputPlanRequestError(database, environment string, err error) bool {
 		fmt.Printf("  Environment: %s\n", environment)
 	}
 	if apiErr != nil {
-		// A refusal of the schema files is answered by editing them, so the
-		// HTTP status, which reads as a server fault to retry, is left out.
+		// A refusal of the schema files is answered by the remedy its text
+		// names, so the HTTP status, which reads as a server fault to retry,
+		// is left out.
 		if apiErr.ErrorCode != apitypes.ErrCodeSchemaRefused {
 			fmt.Printf("  API status: HTTP %d\n", apiErr.Status)
 		}
