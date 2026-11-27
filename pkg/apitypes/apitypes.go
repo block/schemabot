@@ -1485,6 +1485,110 @@ func (r *PlanResponse) HasBlockedChanges() bool {
 	return r.FirstBlockedChange() != nil
 }
 
+// BlockedChange is a planned change its engine refuses to run. Statements on
+// one table refused for the same reason are named once, with how many there
+// are, and a change refused on several shards is named once, with the shards
+// it is refused on.
+type BlockedChange struct {
+	Table  string
+	Reason string
+	// Steps is how many of the table's planned statements the reason refuses,
+	// counted once per shard.
+	Steps int
+	// Shards lists the shards the change is refused on, in plan order. It is
+	// empty for a change planned once for its namespace. TotalShards is the
+	// number of shards the plan covers, so a renderer can say "all shards".
+	Shards      []string
+	TotalShards int
+}
+
+// BlockedChanges returns the plan's changes that carry the blocked verdict, in
+// plan order. Every surface that says a plan cannot be applied lists these,
+// so the CLI and the PR comment name the same changes for the same reasons.
+// A plan with per-shard changes is read per shard, so a change refused on one
+// shard names it; otherwise the namespace-level changes are read.
+func (r *PlanResponse) BlockedChanges() []BlockedChange {
+	if r == nil {
+		return nil
+	}
+	if blocked := shardBlockedChanges(r.Shards); len(blocked) > 0 {
+		return blocked
+	}
+	var grouped blockedChangeGroups
+	for _, t := range r.FlatTables() {
+		if t.EngineBlocked() {
+			grouped.add(t).Steps++
+		}
+	}
+	return grouped.list()
+}
+
+// shardBlockedChanges groups the blocked per-shard changes by table and
+// reason, so a change refused on several shards is listed once with them.
+// Its step count is the most statements any one shard carries for it.
+func shardBlockedChanges(shards []*ShardPlanResponse) []BlockedChange {
+	total := 0
+	for _, sp := range shards {
+		if sp != nil {
+			total++
+		}
+	}
+	var grouped blockedChangeGroups
+	for _, sp := range shards {
+		if sp == nil {
+			continue
+		}
+		stepsOnShard := make(map[*BlockedChange]int)
+		for _, t := range sp.Changes {
+			if !t.EngineBlocked() {
+				continue
+			}
+			bc := grouped.add(t)
+			bc.TotalShards = total
+			if stepsOnShard[bc] == 0 {
+				bc.Shards = append(bc.Shards, sp.Shard)
+			}
+			stepsOnShard[bc]++
+			bc.Steps = max(bc.Steps, stepsOnShard[bc])
+		}
+	}
+	return grouped.list()
+}
+
+// blockedChangeGroups collects blocked changes keyed by table and reason, in
+// the order each key is first seen.
+type blockedChangeGroups struct {
+	order []*BlockedChange
+	byKey map[[2]string]*BlockedChange
+}
+
+// add returns the group for the change's table and reason, creating it on
+// first sight.
+func (g *blockedChangeGroups) add(t *TableChangeResponse) *BlockedChange {
+	k := [2]string{t.TableName, t.ModeReason}
+	if bc := g.byKey[k]; bc != nil {
+		return bc
+	}
+	if g.byKey == nil {
+		g.byKey = make(map[[2]string]*BlockedChange)
+	}
+	bc := &BlockedChange{Table: t.TableName, Reason: t.ModeReason}
+	g.byKey[k] = bc
+	g.order = append(g.order, bc)
+	return bc
+}
+
+func (g *blockedChangeGroups) list() []BlockedChange {
+	if len(g.order) == 0 {
+		return nil
+	}
+	out := make([]BlockedChange, 0, len(g.order))
+	for _, bc := range g.order {
+		out = append(out, *bc)
+	}
+	return out
+}
+
 // FirstBlockedChange returns the first planned change carrying the blocked
 // execution-mode verdict, namespace-level changes before per-shard ones, or
 // nil when there is none. A refusal names this change and its engine's reason,

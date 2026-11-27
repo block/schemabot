@@ -603,6 +603,82 @@ func WriteChangeNotice(severity, heading string, changes []UnsafeChange) {
 	fmt.Println()
 }
 
+// BlockedChange is a planned change its engine refuses to run. Causes is the
+// engine's reason split into its independent causes, each a remedy of its
+// own. Shards names the shards it is refused on, empty for a change planned
+// once for its namespace, and TotalShards is how many shards the plan covers.
+type BlockedChange struct {
+	Table  string
+	Causes []string
+	// Steps is how many of the table's statements the reason refuses. Zero
+	// reads as one.
+	Steps       int
+	Shards      []string
+	TotalShards int
+}
+
+// WriteBlockedChanges lists the changes the engine refuses to run, under the
+// heading the PR comment uses. Each cause after a change's first is its own
+// line, since each needs its own fix. An apply refuses these whatever its
+// flags, so the section names the refusal rather than asking for consent.
+func WriteBlockedChanges(changes []BlockedChange) {
+	if len(changes) == 0 {
+		return
+	}
+	n := 0
+	for _, c := range changes {
+		n += max(c.Steps, 1)
+	}
+	noun := "changes"
+	if n == 1 {
+		noun = "change"
+	}
+	fmt.Printf("%s Cannot apply: %d %s the engine refuses to execute\n", glyph.Refused, n, noun)
+	for _, c := range changes {
+		table := blockedChangeLabel(c)
+		if len(c.Causes) == 0 {
+			fmt.Printf("  - %s\n", table)
+			continue
+		}
+		fmt.Printf("  - %s: %s\n", table, c.Causes[0])
+		for _, cause := range c.Causes[1:] {
+			fmt.Printf("    - %s\n", cause)
+		}
+	}
+	fmt.Println()
+	fmt.Println(presentation.BlockedChangesRemedy)
+	fmt.Println()
+}
+
+// blockedChangeLabel names a blocked change's table, with how many of its
+// statements are refused when there are several, and the shards it is
+// refused on, as the PR comment does.
+func blockedChangeLabel(c BlockedChange) string {
+	var details []string
+	if c.Steps > 1 {
+		details = append(details, fmt.Sprintf("%d steps", c.Steps))
+	}
+	if len(c.Shards) > 0 {
+		details = append(details, blockedShardList(c.Shards, c.TotalShards))
+	}
+	if len(details) == 0 {
+		return c.Table
+	}
+	return fmt.Sprintf("%s (%s)", c.Table, strings.Join(details, "; "))
+}
+
+// blockedShardList names the shards a blocked change is refused on: by name
+// when they are few, and as coverage ("all 32 shards") when they are many.
+func blockedShardList(shards []string, total int) string {
+	if len(shards) > presentation.MemberNamesInlineLimit {
+		return presentation.CoveragePhrase(presentation.ShardNoun, len(shards), total)
+	}
+	if len(shards) == 1 {
+		return presentation.ShardNoun.Singular + " " + shards[0]
+	}
+	return presentation.ShardNoun.Plural + " " + strings.Join(shards, ", ")
+}
+
 // WriteUnsafeChangesBlocked writes the unsafe changes list and instruction to re-run with --allow-unsafe.
 // The apply was refused, so Refused attaches to the refusal itself — the heading
 // names the blocked apply, not the unsafeness of the changes.

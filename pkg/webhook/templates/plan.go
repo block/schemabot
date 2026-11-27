@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/apitypes"
+
 	"github.com/mattn/go-runewidth"
 
 	"github.com/block/schemabot/pkg/caller"
@@ -78,6 +80,9 @@ type UnsafeChangeData struct {
 type BlockedChangeData struct {
 	Table  string
 	Reason string
+	// Steps is how many of the table's statements the reason refuses, so
+	// several refused for one reason are named once. Zero reads as one.
+	Steps int
 	// Shards names the shards this blocked change applies to, for a sharded
 	// plan where only some shards carry it. Empty for a non-sharded change.
 	Shards []string
@@ -101,6 +106,9 @@ type BlockedChangeData struct {
 type DirectChangeData struct {
 	Table  string
 	Reason string
+	// Steps mirrors BlockedChangeData.Steps, so the two disclosures keep one
+	// shape and convert into each other. Zero reads as one.
+	Steps int
 	// Shards names the shards this direct change applies to, for a sharded
 	// plan where only some shards carry it. Empty for a non-sharded change.
 	Shards []string
@@ -3368,19 +3376,59 @@ func driftDetailSuffix(detail string) string {
 // names: an unsupported shape needs a rewrite, a missing grant needs
 // provisioning.
 func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
-	n := len(changes)
+	n := blockedStatementCount(changes)
 	fmt.Fprintf(sb, glyph.Refused+" **Cannot apply**: %d %s the engine refuses to execute\n", n, pluralize("change", n))
 	for _, c := range changes {
-		table := inlineCode(c.Table)
-		if len(c.Shards) > 0 {
-			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
-		}
+		table := blockedChangeLabel(c)
 		if len(c.Targets) > 0 {
 			table = fmt.Sprintf("%s on %s", table, planGroupList(targetNoun, c.Targets, c.TotalTargets))
 		}
 		writeEngineReasonItem(sb, table, c.Reason)
 	}
-	sb.WriteString("\nAn apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.\n\n")
+	sb.WriteString("\n" + presentation.BlockedChangesRemedy + "\n\n")
+}
+
+// BlockedChangesData is the plan's blocked changes as the plan comment lists
+// them, from the derivation the CLI plan lists too.
+func BlockedChangesData(plan *apitypes.PlanResponse) []BlockedChangeData {
+	var out []BlockedChangeData
+	for _, bc := range plan.BlockedChanges() {
+		out = append(out, BlockedChangeData{
+			Table:       bc.Table,
+			Reason:      bc.Reason,
+			Steps:       bc.Steps,
+			Shards:      bc.Shards,
+			TotalShards: bc.TotalShards,
+		})
+	}
+	return out
+}
+
+// blockedStatementCount is how many statements the blocked changes stand for,
+// counting each change's steps.
+func blockedStatementCount(changes []BlockedChangeData) int {
+	n := 0
+	for _, c := range changes {
+		n += max(c.Steps, 1)
+	}
+	return n
+}
+
+// blockedChangeLabel names a blocked change's table, with how many of its
+// statements are refused when there are several, and the shards it is
+// refused on.
+func blockedChangeLabel(c BlockedChangeData) string {
+	var details []string
+	if c.Steps > 1 {
+		details = append(details, fmt.Sprintf("%d steps", c.Steps))
+	}
+	if len(c.Shards) > 0 {
+		details = append(details, planShardList(c.Shards, c.TotalShards))
+	}
+	if len(details) == 0 {
+		return inlineCode(c.Table)
+	}
+	return fmt.Sprintf("%s (%s)", inlineCode(c.Table), strings.Join(details, "; "))
 }
 
 // directMySQLConsequence is the MySQL consequence sentence of the

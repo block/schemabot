@@ -323,14 +323,10 @@ func renderBlockedChangesApplyRejected(data PlanCommentData, budget *ddlBlockBud
 	writePlanSummary(&sb, data, totalStatements, keyspaceUpdates)
 
 	sb.WriteString("---\n\n")
-	n := len(data.BlockedChanges)
+	n := blockedStatementCount(data.BlockedChanges)
 	fmt.Fprintf(&sb, "**"+glyph.Refused+" Apply rejected**: %d planned %s the engine refuses to execute\n", n, pluralize("change", n))
 	for _, c := range data.BlockedChanges {
-		table := inlineCode(c.Table)
-		if len(c.Shards) > 0 {
-			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
-		}
-		writeEngineReasonItem(&sb, table, c.Reason)
+		writeEngineReasonItem(&sb, blockedChangeLabel(c), c.Reason)
 	}
 	sb.WriteString("\nFix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.\n")
 

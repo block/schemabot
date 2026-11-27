@@ -969,7 +969,7 @@ ALTER TABLE orders ADD COLUMN notes text;
 
 ⛔ **Cannot apply**: 1 change the engine refuses to execute
 - `users`: statement for table "users" adds a column together with a constraint, which builds or checks the constraint while the table is locked; add the column without the constraint and apply it, then add the constraint with a name as its own change
-  - statement for table "users": table size 2147483648 bytes exceeds the 1073741824-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit
+  - statement for table "users": the table is 2.0 GiB with its indexes, over the 1.0 GiB limit SchemaBot sets for a native-safe apply, not a PostgreSQL limit; raise postgres.native_safe_table_size_limit_bytes to change a table this size, then plan again
 
 An apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
 
@@ -1410,7 +1410,7 @@ ALTER TABLE orders ADD COLUMN notes text;
 
 **⛔ Apply rejected**: 1 planned change the engine refuses to execute
 - `users`: statement for table "users" adds a column together with a constraint, which builds or checks the constraint while the table is locked; add the column without the constraint and apply it, then add the constraint with a name as its own change
-  - statement for table "users": table size 2147483648 bytes exceeds the 1073741824-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit
+  - statement for table "users": the table is 2.0 GiB with its indexes, over the 1.0 GiB limit SchemaBot sets for a native-safe apply, not a PostgreSQL limit; raise postgres.native_safe_table_size_limit_bytes to change a table this size, then plan again
 
 Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
 
@@ -4235,6 +4235,41 @@ Options: ⏸️ Defer Cutover
        CREATE INDEX CONCURRENTLY idx_orders_placed_at ON orders USING btree (placed_at);
 
 📋 Plan: 1 table to create, 1 table to alter, 1 index to create
+
+
+```
+</details>
+
+<details>
+<summary><a name="plan-postgres-blocked"></a><strong>Plan (Postgres, Blocked)</strong></summary>
+
+```
+
+╭─────────────────────────────────────────────╮
+│  PostgreSQL Schema Change Plan              │
+│                                             │
+│  Database: testapp                          │
+│  Environment: staging                       │
+╰─────────────────────────────────────────────╯
+
+     ~ events
+       ALTER TABLE public.events ADD CONSTRAINT events_kind_not_null_check CHECK (kind IS NOT NULL) NOT VALID;
+
+     ~ events
+       ALTER TABLE public.events VALIDATE CONSTRAINT events_kind_not_null_check;
+
+     ~ events
+       ALTER TABLE public.events ALTER COLUMN kind SET NOT NULL;
+
+     ~ events
+       ALTER TABLE public.events DROP CONSTRAINT events_kind_not_null_check;
+
+📋 Plan: 1 table to alter
+
+⛔ Cannot apply: 4 changes the engine refuses to execute
+  - events (4 steps): statement for table "events": the table is 1.4 GiB with its indexes, over the 1.0 GiB limit SchemaBot sets for a native-safe apply, not a PostgreSQL limit; raise postgres.native_safe_table_size_limit_bytes to change a table this size, then plan again
+
+An apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
 
 
 ```

@@ -1311,7 +1311,7 @@ func TestBlockOversizedTableAppendsSizeCauseToPrivilegeBlocks(t *testing.T) {
 		causes := engine.BlockedCauses(change.ModeReason)
 		require.Len(t, causes, 2)
 		assert.Equal(t, "missing ALTER privilege", causes[0])
-		assert.True(t, strings.HasPrefix(causes[1], `statement for table "users": table size 2048 bytes exceeds`))
+		assert.True(t, strings.HasPrefix(causes[1], `statement for table "users": the table is 2.0 KiB with its indexes, over the 1.0 KiB limit`))
 	}
 }
 
@@ -1352,7 +1352,7 @@ func TestBlockOversizedTableNeutralizesCauseSeparatorInTableName(t *testing.T) {
 	require.Len(t, changes, 1)
 	causes := engine.BlockedCauses(changes[0].ModeReason)
 	require.Len(t, causes, 1)
-	assert.True(t, strings.HasPrefix(causes[0], `statement for table "users // forged cause": table size 2048 bytes exceeds`), causes[0])
+	assert.True(t, strings.HasPrefix(causes[0], `statement for table "users // forged cause": the table is 2.0 KiB with its indexes, over the 1.0 KiB limit`), causes[0])
 }
 
 // The dependency verdict quotes the absent table's name, which a schema author
@@ -1497,7 +1497,7 @@ func TestBlockOversizedTableBlocksExecutableRewrite(t *testing.T) {
 	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
 	require.NoError(t, err)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
-	assert.Equal(t, `statement for table "users": table size 2048 bytes exceeds the 1024-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit`, changes[0].ModeReason)
+	assert.Equal(t, `statement for table "users": the table is 2.0 KiB with its indexes, over the 1.0 KiB limit SchemaBot sets for a native-safe apply, not a PostgreSQL limit; raise postgres.native_safe_table_size_limit_bytes to change a table this size, then plan again`, changes[0].ModeReason)
 }
 
 // A step whose every planner decision is proven catalog-only stays executable
@@ -1540,7 +1540,7 @@ func TestBlockOversizedTableBlocksStepWithAnUnprovenDecision(t *testing.T) {
 	changes, err := blockOversizedTableWithCheck(t.Context(), nil, "orders_db", report, changes, 1024, checkTable)
 	require.NoError(t, err)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
-	assert.Contains(t, changes[0].ModeReason, "1024-byte threshold")
+	assert.Contains(t, changes[0].ModeReason, "over the 1.0 KiB limit")
 }
 
 // catalogOnlySteps exempts only statements whose decisions are all proven, and

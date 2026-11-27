@@ -29,6 +29,7 @@ import (
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 const (
@@ -1076,11 +1077,7 @@ func refusalForCause(err error, table string) *refusal {
 	}
 	var sizeErr *preflight.SizeError
 	if errors.As(err, &sizeErr) {
-		// Name whose limit this is: read cold, the size text sounds like a
-		// property of PostgreSQL or of the change, when it is SchemaBot's
-		// own conservatism for the native-safe path.
-		return &refusal{reason: "table-too-large",
-			cause: sizeErr.Error() + "; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit"}
+		return tableTooLargeRefusal(sizeErr)
 	}
 	// Decided before the bare table sentinels below: the unverified-create
 	// wrap carries the read-back's own cause inside it, and a table no longer
@@ -2450,6 +2447,26 @@ func (e *indexRecoveryError) Error() string {
 }
 
 func (e *indexRecoveryError) Unwrap() error { return e.err }
+
+// tableSizeLimitOption is the server option that sets the largest table a
+// native-safe apply changes.
+const tableSizeLimitOption = "postgres.native_safe_table_size_limit_bytes"
+
+// tableTooLargeRefusal says how big the table is against the limit, in units
+// a person reads, and names the option that sets it. It says whose limit this
+// is because, read cold, a size refusal sounds like a property of PostgreSQL
+// or of the change, when it is SchemaBot's own conservatism for the
+// native-safe path. Two sizes that round to the same figure are given in
+// bytes, so the table never reads as no larger than its limit.
+func tableTooLargeRefusal(sizeErr *preflight.SizeError) *refusal {
+	size, limit := ui.FormatBytesBinary(sizeErr.TotalBytes), ui.FormatBytesBinary(sizeErr.LimitBytes)
+	if size == limit {
+		size, limit = fmt.Sprintf("%d bytes", sizeErr.TotalBytes), fmt.Sprintf("%d bytes", sizeErr.LimitBytes)
+	}
+	return &refusal{reason: "table-too-large",
+		cause:  fmt.Sprintf("the table is %s with its indexes, over the %s limit SchemaBot sets for a native-safe apply, not a PostgreSQL limit", size, limit),
+		remedy: fmt.Sprintf("raise %s to change a table this size, then plan again", tableSizeLimitOption)}
+}
 
 // concurrentIndexBoundOption is the configuration key an operator changes
 // when a concurrent index build needs more time than the bound allows.
