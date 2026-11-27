@@ -549,7 +549,7 @@ func isWordByte(c byte) bool {
 // the PR author's schema that the quoting does not recognise. Text already in a
 // code span is left as written, which a Markdown renderer shows literally.
 func markdownReason(reason string) string {
-	return mapOutsideCodeSpans(ui.CodeQuoteIdentifiers(flattenIdentifier(reason)), escapeProse)
+	return mapOutsideCodeSpans(ui.CodeQuoteIdentifiers(flattenIdentifier(reason)), false, escapeProse)
 }
 
 // escapeProse is escapeInlineMarkdown for text that may also name a mention: a
@@ -661,7 +661,13 @@ func startsHTML(r rune) bool {
 // does; when rewrite writes a code span of its own at that edge, a space keeps
 // its delimiter apart from the kept span's, since joined they would be one
 // longer run that closes neither.
-func mapOutsideCodeSpans(text string, rewrite func(string) string) string {
+//
+// With escapedBackticks, a backslash escapes the first backtick of a run, as
+// it does when the text is rendered as written, so that backtick is prose and
+// the rest of the run, if any, is what opens a span. A caller whose rewrite
+// doubles a backslash in prose leaves it off: after the rewrite that backtick
+// is no longer escaped, so the span the scanner finds is the one rendered.
+func mapOutsideCodeSpans(text string, escapedBackticks bool, rewrite func(string) string) string {
 	var b strings.Builder
 	proseStart := 0
 	writeProse := func(prose string, spanFollows bool) {
@@ -682,6 +688,12 @@ func mapOutsideCodeSpans(text string, rewrite func(string) string) string {
 		spanStart := i
 		for i < len(text) && text[i] == '`' {
 			i++
+		}
+		if escapedBackticks && trailingBackslashes(text[proseStart:spanStart])%2 == 1 {
+			spanStart++
+			if spanStart == i {
+				continue
+			}
 		}
 		spanEnd := endOfCodeSpan(text, i, i-spanStart)
 		if spanEnd < 0 {

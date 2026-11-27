@@ -86,6 +86,21 @@ func TestErrorDetailMarkdown(t *testing.T) {
 			want: "a `x\n\n<code>@octocat</code> y` b",
 		},
 		{
+			name: "escaped backticks open no span, so the mention between them is prose",
+			in:   "failed on \\` x @octocat y\\` today",
+			want: "failed on \\` x <code>@octocat</code> y\\` today",
+		},
+		{
+			name: "an escaped backslash before a backtick leaves the span open",
+			in:   "failed on \\\\` x @octocat y` today",
+			want: "failed on \\\\` x @octocat y` today",
+		},
+		{
+			name: "the backtick after an escaped one opens the span",
+			in:   "a \\``@octocat` b",
+			want: "a \\` `@octocat` b",
+		},
+		{
 			name: "a span across one line break is kept",
 			in:   "a `x\n@octocat y` b",
 			want: "a `x\n@octocat y` b",

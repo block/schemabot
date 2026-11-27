@@ -296,13 +296,14 @@ func sanitizeCellError(msg string) string {
 // the markup added for a mention is never escaped and a character reference such
 // as &#64; becomes the text "&amp;#64;" instead of the @ it names. Escaping
 // leaves backticks alone, so the code spans found in the escaped text are the
-// ones in the original.
+// ones in the original. A backslash before a backtick is kept, so an escaped
+// backtick opens no span here, as it opens none on GitHub.
 //
 // Every renderer that puts an error message into PR comment markdown goes
 // through this function, so a new one has one place to get mention handling
 // from (AV-8).
 func errorDetailMarkdown(sanitized string) string {
-	return mapOutsideCodeSpans(html.EscapeString(sanitized), codeMentionTags)
+	return mapOutsideCodeSpans(html.EscapeString(sanitized), true, codeMentionTags)
 }
 
 // quoteBlockLines keeps a multi-line message inside a Markdown blockquote by
