@@ -762,6 +762,23 @@ func IsNotFoundError(err error) bool {
 	return false
 }
 
+// IsRejectedRequestError reports whether GitHub answered the request with a
+// client error that repeating the same request will not change: a 4xx other
+// than 404, which callers handle as "gone", and other than the statuses
+// isTransientGitHubStatus counts as availability failures. Rate limits are
+// distinct error types and never match.
+func IsRejectedRequestError(err error) bool {
+	var ghErr *gh.ErrorResponse
+	if !errors.As(err, &ghErr) || ghErr.Response == nil {
+		return false
+	}
+	status := ghErr.Response.StatusCode
+	if status < http.StatusBadRequest || status >= http.StatusInternalServerError {
+		return false
+	}
+	return status != http.StatusNotFound && !isTransientGitHubStatus(ghErr)
+}
+
 // ErrGitHubUnavailable identifies GitHub API availability failures that should
 // be retried once GitHub becomes reachable again.
 var ErrGitHubUnavailable = errors.New("github unavailable")

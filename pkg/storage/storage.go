@@ -1733,11 +1733,25 @@ type ApplyCommentStore interface {
 	// superseded row is not an error.
 	Supersede(ctx context.Context, applyID int64, commentState string) error
 
-	// ClearPendingFreeze removes the pending-freeze marker for a single
-	// (apply_id, comment_state) once the superseded comment's frozen rendering
-	// has landed on GitHub. A missing row or an already-clear marker is not an
-	// error.
+	// ClearPendingFreeze removes the owed-freeze marker an earlier release
+	// wrote (PendingFreezeCommentID) for a single (apply_id, comment_state)
+	// once the superseded comment's frozen rendering has landed on GitHub. A
+	// missing row or an already-clear marker is not an error.
 	ClearPendingFreeze(ctx context.Context, applyID int64, commentState string) error
+
+	// RecordFrozenBody stores the frozen rendering owed to freezeCommentID,
+	// before the GitHub edit is attempted. It writes only while the row still
+	// owes that comment's freeze and has no body stored, and reports whether
+	// it wrote; false means a body is already stored or the freeze is no
+	// longer owed, and the caller reloads the row to see which.
+	RecordFrozenBody(ctx context.Context, applyID int64, commentState string, freezeCommentID int64, body string) (bool, error)
+
+	// ClearFreeze removes the owed freeze (FreezeCommentID and FrozenBody)
+	// for a single (apply_id, comment_state) once freezeCommentID's frozen
+	// rendering has landed on GitHub. It clears only a freeze owed to that
+	// comment, so a newer rotation's marker is never dropped. A missing row
+	// or an already-clear marker is not an error.
+	ClearFreeze(ctx context.Context, applyID int64, commentState string, freezeCommentID int64) error
 
 	// ClaimSummaryComment atomically claims the right to publish the terminal
 	// summary comment for an apply in terminalState by inserting the summary
