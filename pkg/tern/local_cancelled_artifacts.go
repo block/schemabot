@@ -230,10 +230,10 @@ func remainingConstraintMessage(constraint engine.EngineConstraint) string {
 }
 
 // preexistingConstraintMessage describes, for the apply log, a constraint the
-// release left because the schema change did not add it, what it does to
-// writes, and the statement that drops it.
+// release left because the schema change is not known to have added it, what
+// it does to writes, and the statement that drops it.
 func preexistingConstraintMessage(constraint engine.EngineConstraint) string {
-	return fmt.Sprintf("Constraint %s is still on %s. It was there before the cancelled schema change, so the cancel left it, and it %s until it is dropped. Drop it with: %s",
+	return fmt.Sprintf("Constraint %s is still on %s. No finished step of the cancelled schema change added it, so the cancel left it, and it %s until it is dropped. Drop it with: %s",
 		constraint.Name, constraint.Table, constraint.Effect, constraint.Removal)
 }
 
@@ -311,12 +311,14 @@ func (c *LocalClient) cancelledArtifactTables(apply *storage.Apply, tasks []*sto
 }
 
 // constraintsTaskAdded names the constraints a task's statement adds, when
-// the task ran. A task that never left pending added nothing, so a
-// constraint of the same name on its table is not the apply's to remove. A
+// the task completed. Only a completed task is known to have committed its
+// statement: one that failed, for example on a constraint someone else added
+// under the same name, added nothing, and neither did one that never left
+// pending. A constraint of that name is not the apply's to remove. A
 // statement that cannot be read attributes nothing, which leaves any
 // constraint in place rather than risk removing one the apply did not add.
 func (c *LocalClient) constraintsTaskAdded(apply *storage.Apply, task *storage.Task) []string {
-	if state.IsState(task.State, state.Task.Pending) {
+	if !state.IsState(task.State, state.Task.Completed) {
 		return nil
 	}
 	parser, err := c.statementParser()

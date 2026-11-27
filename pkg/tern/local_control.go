@@ -1025,7 +1025,7 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 	c.wakeDriveForControl(ctx, applyCancel, engine.ErrCancelledByOperator, targetApply, "cancel")
 
 	if targetApply != nil {
-		if err := c.releaseCancelledArtifacts(ctx, eng, targetApply, tasks); err != nil {
+		if err := c.releaseCancelledArtifacts(ctx, eng, targetApply, c.tasksAfterCancel(ctx, targetApply, tasks)); err != nil {
 			c.logSkippedArtifactRelease(ctx, targetApply, err)
 		}
 		// The cancel is consumed at a drive checkpoint, where no engine call
@@ -3491,4 +3491,31 @@ func (c *LocalClient) cutOverBoundOperation(ctx context.Context, apply *storage.
 		return false, fmt.Errorf("process pending cutover for apply %s operation %d: %s", apply.ApplyIdentifier, operationID, errorMessage)
 	}
 	return true, nil
+}
+
+// tasksAfterCancel re-reads tasks once the cancel has reached the engine and
+// woken the drive. A step the drive finished between the first read and the
+// cancel, such as a brief ADD CONSTRAINT, is then seen as finished, so the
+// release attributes what it added. A failed read keeps the earlier snapshot,
+// which attributes less and so leaves more in place.
+func (c *LocalClient) tasksAfterCancel(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) []*storage.Task {
+	fresh, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		c.logger.Warn("a cancel cannot re-read the apply's tasks, so the release reads them as they were before the cancel and removes only what those finished",
+			append(apply.LogAttrs(), "error", err)...)
+		return tasks
+	}
+	byIdentifier := make(map[string]*storage.Task, len(fresh))
+	for _, task := range fresh {
+		byIdentifier[task.TaskIdentifier] = task
+	}
+	reread := make([]*storage.Task, 0, len(tasks))
+	for _, task := range tasks {
+		if current, ok := byIdentifier[task.TaskIdentifier]; ok {
+			reread = append(reread, current)
+			continue
+		}
+		reread = append(reread, task)
+	}
+	return reread
 }

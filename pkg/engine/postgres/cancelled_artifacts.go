@@ -101,6 +101,8 @@ func releaseNotNullHelpers(ctx context.Context, pool *pgxpool.Pool, schema, tabl
 			// what is under the name now is not the helper the run left.
 			slog.Warn("left a constraint in place: it changed under a SET NOT NULL helper's name after the cancel read it, so it is not the helper",
 				"schema", schema, "table", table, "constraint", helper.Name, "error", err)
+			constraint.Removal = dropConstraintStatement(schema, table, helper.Name)
+			result.PreexistingConstraints = append(result.PreexistingConstraints, constraint)
 		default:
 			constraint.Removal = dropConstraintStatement(schema, table, helper.Name)
 			result.RemainingConstraints = append(result.RemainingConstraints, constraint)
