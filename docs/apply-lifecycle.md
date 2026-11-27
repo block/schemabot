@@ -8,6 +8,7 @@
 - [The one rule](#the-one-rule)
 - [State reference](#state-reference)
 - [The retry budget](#the-retry-budget)
+- [Refused at plan time](#refused-at-plan-time)
 - [Refused before an apply exists](#refused-before-an-apply-exists)
 - [Recovering from a failed apply](#recovering-from-a-failed-apply)
 - [What cleans up after a failed rollout](#what-cleans-up-after-a-failed-rollout)
@@ -238,6 +239,14 @@ Two things end the loop:
 Either way, the apply is then terminalized as permanent `failed`, and the
 normal recovery path applies: fix the cause, fresh plan, fresh apply. A new
 apply starts every operation with a full budget.
+
+## Refused at plan time
+
+`POST /api/plan` answers `422 schema_refused` when the engine cannot plan the
+schema files as written, or a schema file does not parse. The `error` says
+what to change in the files. Planning the same files again gets the same
+answer, so edit the files and plan again instead of retrying. A `5xx` is a
+server fault, and a retry may succeed.
 
 ## Refused before an apply exists
 

@@ -103,6 +103,7 @@ const (
 	ErrCodeRateLimited             = "rate_limited"              // Caller or target exceeded its request budget; retry after the advertised delay
 	ErrCodeUnsafeOptInRequired     = "unsafe_opt_in_required"    // Plan carries an unsafe change; retry with allow_unsafe=true to consent to it
 	ErrCodePlanBlocked             = "plan_blocked"              // Plan carries a change the engine refuses; no retry or option can apply it
+	ErrCodeSchemaRefused           = "schema_refused"            // Plan refused for the declared schema as written; change the schema files and plan again, since a retry gets the same answer
 	ErrCodeAlreadyStopped          = "already_stopped"           // Stop refused: the schema change is already stopped and no start is queued behind it
 	ErrCodeDeferredCutoverCapacity = "deferred_cutover_capacity" // --defer-cutover refused: the apply would hold more drivers at its cutover than are left for deferred work; apply without the flag
 	ErrCodeChangeGateRefused       = "change_gate_refused"       // Apply, start or cutover refused by a change gate, such as a freeze; the blockers say why

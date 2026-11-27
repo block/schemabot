@@ -191,43 +191,56 @@ func TestHandlePlanAnswersFixedMessageWhenRolloutMembersCannotBePlanned(t *testi
 
 // A plan the engine declines, and a plan SchemaBot refuses with the change to
 // make, keep their text: it tells the author what to change in the schema
-// files or in the deployment, and it carries no storage or engine cause.
+// files or in the deployment, and it carries no storage or engine cause. A
+// refusal of the schema files is 422 schema_refused, since planning the same
+// files again gets the same answer; a deployment that needs an upgrade is
+// still a server fault.
 func TestHandlePlanKeepsTextWrittenForTheReader(t *testing.T) {
 	const refusal = "the schema files drop table orders_seq; remove the drop or list the table under drop_tables"
 	withheld := redactionPlanRequest()
 	withheld.IgnoreTables = []string{"orders_archive"}
 
 	tests := []struct {
-		name    string
-		request PlanRequest
-		client  *mockTernClient
-		want    string
+		name       string
+		request    PlanRequest
+		client     *mockTernClient
+		want       string
+		wantStatus int
+		wantCode   string
 	}{
 		{
-			name:    "engine declines the plan",
-			request: redactionPlanRequest(),
-			client:  &mockTernClient{planErr: fmt.Errorf("plan namespace: %w", &engine.PlanRefusedError{Err: errors.New(refusal)})},
-			want:    "plan failed: " + refusal,
+			name:       "engine declines the plan",
+			request:    redactionPlanRequest(),
+			client:     &mockTernClient{planErr: fmt.Errorf("plan namespace: %w", &engine.PlanRefusedError{Err: errors.New(refusal)})},
+			want:       "plan failed: " + refusal,
+			wantStatus: http.StatusUnprocessableEntity,
+			wantCode:   apitypes.ErrCodeSchemaRefused,
 		},
 		{
 			name:    "engine declines the plan under a wrap that names an address",
 			request: redactionPlanRequest(),
 			client: &mockTernClient{planErr: fmt.Errorf("plan namespace payments via 10.0.0.5:3306: %w",
 				&engine.PlanRefusedError{Err: errors.New(refusal)})},
-			want: "plan failed: " + refusal,
+			want:       "plan failed: " + refusal,
+			wantStatus: http.StatusUnprocessableEntity,
+			wantCode:   apitypes.ErrCodeSchemaRefused,
 		},
 		{
-			name:    "remote data plane declines the plan",
-			request: redactionPlanRequest(),
-			client:  &mockTernClient{isRemote: true, planErr: status.Error(codes.FailedPrecondition, refusal)},
-			want:    "plan failed: " + refusal,
+			name:       "remote data plane declines the plan",
+			request:    redactionPlanRequest(),
+			client:     &mockTernClient{isRemote: true, planErr: status.Error(codes.FailedPrecondition, refusal)},
+			want:       "plan failed: " + refusal,
+			wantStatus: http.StatusUnprocessableEntity,
+			wantCode:   apitypes.ErrCodeSchemaRefused,
 		},
 		{
 			name:    "remote data plane declines the plan under a wrap that names an address",
 			request: redactionPlanRequest(),
 			client: &mockTernClient{isRemote: true, planErr: fmt.Errorf("plan via 10.0.0.5:3306: %w",
 				status.Error(codes.FailedPrecondition, refusal))},
-			want: "plan failed: " + refusal,
+			want:       "plan failed: " + refusal,
+			wantStatus: http.StatusUnprocessableEntity,
+			wantCode:   apitypes.ErrCodeSchemaRefused,
 		},
 		{
 			name:    "deployment plans a drop that ignore_tables withholds",
@@ -239,6 +252,7 @@ func TestHandlePlanKeepsTextWrittenForTheReader(t *testing.T) {
 			want: `plan failed: the plan from deployment "default" proposes dropping "orders_archive", which ignore_tables withholds. ` +
 				`That deployment's planner did not apply the exclusion, so the plan is refused rather than reviewed as a drop. ` +
 				`Upgrade that deployment to a build that supports ignore_tables`,
+			wantStatus: http.StatusInternalServerError,
 		},
 	}
 	for _, tt := range tests {
@@ -247,10 +261,11 @@ func TestHandlePlanKeepsTextWrittenForTheReader(t *testing.T) {
 
 			rec := postJSON(t, svc.handlePlan, "/api/plan", tt.request)
 
-			require.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
+			require.Equal(t, tt.wantStatus, rec.Code, rec.Body.String())
 			var resp apitypes.ErrorResponse
 			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
 			assert.Equal(t, tt.want, resp.Error)
+			assert.Equal(t, tt.wantCode, resp.ErrorCode)
 		})
 	}
 }
