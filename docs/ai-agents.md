@@ -56,7 +56,8 @@ Your agent does not need to be told what your schema looks like. It can ask.
 | What databases are there, on which engines and environments? | `databases` |
 | What is in this one right now? | `pull`, which returns the live schema as declarative files |
 | What is running against it at this moment? | `status`, and `locks` for what is held |
-| What changed recently, and what did that change do? | `list-plans`, then `logs` for one apply |
+| What has run against it, and what did one of those do? | `status -d <database>` for the apply history, then `status <apply_id>` and `logs <apply_id>` |
+| What DDL has been proposed for it? | `list-plans`, which returns stored plans whether or not they were applied |
 
 [Schema intelligence](schema-intelligence.md) walks through each of these,
 including structured columns and indexes, lint findings on the live schema,
@@ -76,8 +77,11 @@ pull request SchemaBot plans on its own and posts the same DDL as a comment.
 
 ### Follow a change
 
-Once a change is running, `progress` reports how far along it is, `logs`
-returns the lifecycle log for that apply, and `status` gives the current state.
+Once a change is running, `progress --no-watch` reports how far along it is,
+`logs` returns the lifecycle log for that apply, and `status` gives the current
+state. Bare `progress` opens the interactive watcher instead, and its keys stop
+or cancel the apply and run its cutover — an operator surface, not a read, so an
+agent following a change passes `--no-watch`.
 For a change that spans several targets or shards, each one reports separately,
 so an agent can tell you which shard is behind rather than only that something
 is.
@@ -94,9 +98,10 @@ meant for a terminal.
 
 `apply -o json` streams progress rather than returning one document, and
 `progress` has no JSON option of its own — use `status --json` for a structured
-snapshot. For anything beyond reads, use the API; the
-[schema intelligence guide](schema-intelligence.md) documents its endpoints and
-payloads.
+snapshot. [Using the CLI from scripts and agents](cli.md#use-the-cli-from-scripts-and-agents)
+has the rest of the output options, and the
+[schema intelligence guide](schema-intelligence.md) is the read-only API
+reference for the same answers over HTTP.
 
 ## Give it its own account
 
