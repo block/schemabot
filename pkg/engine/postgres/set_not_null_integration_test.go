@@ -107,10 +107,9 @@ func TestEngineApplySetNotNullOverANullRow(t *testing.T) {
 }
 
 // When the retries run out before the owner fixes the row, the helper the
-// failed validation left stays NOT VALID. A new plan would drop it and add it
-// again under the same name, which the apply refuses, so the owner drops the
-// helper outside SchemaBot first. The plan after that is the same four steps
-// as the first one, and it finishes the change.
+// failed validation left stays NOT VALID. An owner who drops the helper
+// outside SchemaBot gets the same four steps as the first plan, and they
+// finish the change.
 func TestEngineApplySetNotNullAfterTheHelperIsDropped(t *testing.T) {
 	db, dsn, eng, plan := failSetNotNullOverANullRow(t, "apply_set_not_null_helper_dropped_test")
 

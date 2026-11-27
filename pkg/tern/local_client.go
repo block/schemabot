@@ -3095,6 +3095,7 @@ func buildDispatchTasks(plan *storage.Plan, scope dispatchScope, environment, en
 			UpdatedAt:      now,
 		}
 	}
+	storage.AssignPlanChangeOrdinals(plan, tasks)
 	return tasks
 }
 

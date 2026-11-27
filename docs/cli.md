@@ -887,6 +887,17 @@ Pick the operation for the current state and engine:
 | `rollback` | Plan a new change toward the schema stored before an earlier apply |
 
 Support and timing differ by engine; see the [engine capability matrix](engines.md).
+
+`cancel` waits up to 30 seconds for the apply to end. It prints `Schema change
+cancelled` only once the apply is `cancelled`. If the apply is still running at
+the deadline, it prints `Cancel requested` and the `progress` command that
+watches it end. A new apply is refused until then. When the engine declines
+the cancel, for example a PostgreSQL step that commits or fails on its own, it
+prints `Cancel did not take effect` with the engine's reason: the change keeps
+running and finishes on its own. When another part of a rollout had already
+failed, the cancel ends the parts still running and the apply ends `failed`; it
+prints `Cancel took effect` and the `progress` command that shows what failed.
+The counts are tables, not steps.
 A request being accepted does not mean its effect has landed. `revert` and
 `skip-revert` say so directly: each reports the operation as requested, not
 done, and prints the `progress` command that follows it. Repeating a request

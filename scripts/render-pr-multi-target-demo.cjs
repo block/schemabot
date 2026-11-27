@@ -37,7 +37,7 @@ const scenarios=[
   checks:[[0,'#checks',['Apply in progress','Merging is blocked']],
    [10,'#stopped-body',['Schema Change Stopped','3 stopped','schemabot start apply-example-91 -e production']],
    [10,'#progress-body',['Stopped','shop-004']],[11,'#checks',['1 apply stopped','Merging is blocked']],
-   [20,'#progress-body',['Schema change resumed','a new progress comment']],[20,'#resumed-body',['Rolling out','shop-001']],
+   [20,'#progress-body',['Progress before the stop','a new progress comment']],[20,'#resumed-body',['Rolling out','shop-001']],
    [32,'#checks',['All checks have passed','Pull request successfully merged']]]},
 ];
 const fps=20,holdSeconds=2.5;

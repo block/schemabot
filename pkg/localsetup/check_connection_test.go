@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"syscall"
 	"testing"
@@ -38,6 +40,35 @@ func TestConnectionErrorRetainsCause(t *testing.T) {
 	err := &setupConnectionError{message: "Check the connection", cause: cause}
 	require.ErrorIs(t, err, cause)
 	require.EqualError(t, err, "Check the connection: connection could not be verified")
+}
+
+// A Vitess target is addressed over HTTP rather than a database connection, so
+// its check establishes that a healthy PlanetScale-compatible API answers at
+// the endpoint before anything is registered against it.
+func TestVitessConnectionChecksThePlanetScaleEndpoint(t *testing.T) {
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/health", r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(healthy.Close)
+	require.NoError(t, CheckConnection(t.Context(), "vitess", healthy.URL))
+	require.NoError(t, CheckConnection(t.Context(), "vitess", healthy.URL+"/"))
+
+	unhealthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(unhealthy.Close)
+	require.ErrorContains(t, CheckConnection(t.Context(), "vitess", unhealthy.URL), "not as a healthy PlanetScale-compatible API")
+
+	unreachable := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	endpoint := unreachable.URL
+	unreachable.Close()
+	require.ErrorContains(t, CheckConnection(t.Context(), "vitess", endpoint), "couldn’t reach that endpoint")
+
+	for _, malformed := range []string{"localhost:8080", "mysql://user@localhost:3306/shop", "://nope"} {
+		require.ErrorContains(t, CheckConnection(t.Context(), "vitess", malformed), "http://host:port", malformed)
+	}
+	require.ErrorContains(t, CheckConnection(t.Context(), "vitess", ""), "set a connection variable")
 }
 
 // Each failure SchemaBot can identify renders as one line naming the cause

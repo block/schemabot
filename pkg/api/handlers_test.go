@@ -639,6 +639,41 @@ func (s *memoryControlRequestStore) GetByOperation(_ context.Context, applyID in
 	return nil, nil
 }
 
+// ListPending and ListSettled return the latest request of each operation on
+// the apply, filtered by whether it is pending, ordered by operation.
+func (s *memoryControlRequestStore) ListPending(_ context.Context, applyID int64) ([]*storage.ApplyControlRequest, error) {
+	return s.latestByOperation(applyID, true), nil
+}
+
+func (s *memoryControlRequestStore) ListSettled(_ context.Context, applyID int64) ([]*storage.ApplyControlRequest, error) {
+	return s.latestByOperation(applyID, false), nil
+}
+
+func (s *memoryControlRequestStore) ListByApply(_ context.Context, applyID int64) ([]*storage.ApplyControlRequest, error) {
+	return append(s.latestByOperation(applyID, true), s.latestByOperation(applyID, false)...), nil
+}
+
+func (s *memoryControlRequestStore) latestByOperation(applyID int64, pending bool) []*storage.ApplyControlRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	latest := make(map[storage.ControlOperation]*storage.ApplyControlRequest)
+	for _, req := range s.requests {
+		if req.ApplyID == applyID {
+			latest[req.Operation] = req
+		}
+	}
+	var out []*storage.ApplyControlRequest
+	for _, req := range latest {
+		if (req.Status == storage.ControlRequestPending) == pending {
+			out = append(out, cloneControlRequest(req))
+		}
+	}
+	slices.SortFunc(out, func(a, b *storage.ApplyControlRequest) int {
+		return strings.Compare(string(a.Operation), string(b.Operation))
+	})
+	return out
+}
+
 func (s *memoryControlRequestStore) ListStrandedPending(context.Context, int) ([]*storage.StrandedControlRequest, error) {
 	return nil, nil
 }

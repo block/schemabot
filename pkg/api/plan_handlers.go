@@ -3284,7 +3284,7 @@ func buildApplyOperationGroups(
 		// A member planned on its own runs its own changes, not the apply plan's:
 		// its target holds a schema the apply plan never described.
 		memberChanges := applyTaskChanges(member.Plan)
-		tasks := buildApplyTasks(member.Plan, memberChanges, environment, applyOpts, "", now)
+		tasks := buildApplyTasks(member.Plan, storage.NewPlanChangeOrdinals(member.Plan), memberChanges, environment, applyOpts, "", now)
 		operationKey, err := keys.qualify(member, "")
 		if err != nil {
 			return nil, false, err
@@ -3564,6 +3564,7 @@ func buildShardedApplyOperationGroups(
 		// of a mirrored environment carries the apply's plan, so this is the same
 		// shard set for every member there.
 		shardsByNamespace := changingShardsByNamespace(member.Plan.Shards)
+		firstMemberGroup := len(groups)
 		namespaces := make([]string, 0, len(shardsByNamespace))
 		for namespace := range shardsByNamespace {
 			namespaces = append(namespaces, namespace)
@@ -3605,6 +3606,10 @@ func buildShardedApplyOperationGroups(
 					group.Tasks = append(group.Tasks, buildApplyTask(member.Plan, ddlChange, environment, applyOpts, shard.Shard, now))
 				}
 			}
+		}
+		ordinals := storage.NewPlanChangeOrdinals(member.Plan)
+		for _, group := range groups[firstMemberGroup:] {
+			ordinals.Assign(group.Tasks)
 		}
 		finalizers, err := buildNamespaceFinalizerOperations(applyPlan, member, keys, cutoverPolicy, onFailure, now)
 		if err != nil {
@@ -3727,6 +3732,7 @@ func newPendingApplyOperation(member applyMember, applyPlan *storage.Plan, opera
 
 func buildApplyTasks(
 	plan *storage.Plan,
+	ordinals *storage.PlanChangeOrdinals,
 	taskChanges []storage.TableChange,
 	environment string,
 	applyOpts storage.ApplyOptions,
@@ -3737,6 +3743,7 @@ func buildApplyTasks(
 	for _, ddlChange := range taskChanges {
 		tasks = append(tasks, buildApplyTask(plan, ddlChange, environment, applyOpts, shard, now))
 	}
+	ordinals.Assign(tasks)
 	return tasks
 }
 
