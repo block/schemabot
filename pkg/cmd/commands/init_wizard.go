@@ -33,13 +33,30 @@ func (cmd *InitCmd) missingInputs() []string {
 	return missing
 }
 
+// engineSupported reports whether init can register this target. A Vitess
+// target is reached through a PlanetScale-compatible API, and the organization
+// and service token that go with it come from sample setup, so it is offered
+// as a sample rather than as connections to name by hand.
+func (cmd *InitCmd) engineSupported() bool {
+	switch cmd.Type {
+	case "mysql", "postgres":
+		return true
+	case "vitess":
+		return cmd.Sample
+	}
+	return false
+}
+
 func (cmd *InitCmd) collectInputs(ctx context.Context, g *Globals) error {
 	return cmd.collectInputsWithTerminalState(ctx, g, ui.IsTerminal(os.Stdin), ui.IsTerminal(os.Stdout))
 }
 
 func (cmd *InitCmd) collectInputsWithTerminalState(ctx context.Context, g *Globals, stdinTerminal, stdoutTerminal bool) error {
 	cmd.interactive = !cmd.NonInteractive && !cmd.JSON && stdinTerminal && stdoutTerminal
-	if cmd.Type != "" && cmd.Type != "mysql" && cmd.Type != "postgres" {
+	if cmd.Type != "" && !cmd.engineSupported() {
+		if cmd.Type == "vitess" {
+			return fmt.Errorf("a Vitess target is set up as a sample; run init --sample --type vitess")
+		}
 		return fmt.Errorf("database engine must be mysql or postgres")
 	}
 	missing := cmd.missingInputs()

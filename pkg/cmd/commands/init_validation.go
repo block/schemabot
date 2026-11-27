@@ -45,3 +45,13 @@ func initSchemaReuse(path string) (bool, error) {
 	}
 	return true, nil
 }
+
+// storageDialect maps a target engine to the dialect SchemaBot's own storage
+// runs on. A Vitess target keeps its state in MySQL, since a PlanetScale
+// endpoint is not a database SchemaBot can hold tables in.
+func storageDialect(engine string) string {
+	if engine == "vitess" {
+		return "mysql"
+	}
+	return engine
+}
