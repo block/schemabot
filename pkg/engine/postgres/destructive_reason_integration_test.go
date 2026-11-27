@@ -54,8 +54,8 @@ func TestEnginePlanColumnRenameNamesTheDroppedColumn(t *testing.T) {
 	}
 	assert.Equal(t, map[string]string{
 		"DROP INDEX CONCURRENTLY public.notes_note_idx": `statement drops index "notes_note_idx" from table "notes": queries that use it lose it, and putting it back means building it again`,
-		"ALTER TABLE public.notes DROP note": `statement drops column "note" from table "notes": its values are deleted, and reverting the schema file adds the column back empty. ` +
-			`It also drops index notes_note_idx. ` +
+		"ALTER TABLE public.notes DROP note": `statement drops column "note" from table "notes": its values are deleted, and reverting the schema file does not bring them back. ` +
+			`It also drops index notes_note_idx: CREATE INDEX notes_note_idx ON public.notes USING btree (note). ` +
 			`This plan also adds a column to the table, and SchemaBot does not rename columns. To rename one, add the new column, copy the values into it, and drop the old column in a later change`,
 	}, byDDL, "the index the file no longer declares and the column are the plan's two drops")
 }

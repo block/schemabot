@@ -1847,6 +1847,7 @@ func destructiveReason(statement pgplan.Statement, table string, addsColumn bool
 	if !statement.Destructive {
 		return ""
 	}
+	table = oneFinding(table)
 	dropped := statement.Drops
 	if dropped == nil {
 		return fmt.Sprintf("statement removes live structure from table %q", table)
@@ -1865,10 +1866,8 @@ func destructiveReason(statement pgplan.Statement, table string, addsColumn bool
 	}
 	switch dropped.Kind {
 	case schemadiff.DroppedColumn:
-		reason := fmt.Sprintf("statement drops column %q from table %q: its values are deleted, and reverting the schema file adds the column back empty", name, table)
-		if deps := droppedDependents(dropped.Dependents); deps != "" {
-			reason += ". It also drops " + deps
-		}
+		reason := fmt.Sprintf("statement drops column %q from table %q: its values are deleted, and reverting the schema file does not bring them back", name, table)
+		reason += droppedDependents(dropped.Dependents)
 		if addsColumn {
 			reason += ". This plan also adds a column to the table, and SchemaBot does not rename columns. To rename one, add the new column, copy the values into it, and drop the old column in a later change"
 		}
@@ -1938,17 +1937,18 @@ func droppedConstraintReason(name, table, definition string) string {
 	}
 }
 
-// droppedDependents names the objects that go with a dropped column, each by
-// its kind and name as pg-sprite renders them ([schemadiff.Dependent.String]
-// writes "kind name: definition"), joined for the reason. The definitions are
-// left out: the plan's DDL is where a reviewer reads an object in full.
+// droppedDependents is one sentence per object that goes with a dropped
+// column, each quoting the entry pg-sprite renders for it
+// ([schemadiff.Dependent.String]) whole. The entry is not split into a name
+// and a definition: an object's name can hold the separator between them, so
+// a split could name the wrong object.
 func droppedDependents(dependents []string) string {
-	named := make([]string, 0, len(dependents))
+	var b strings.Builder
 	for _, d := range dependents {
-		kindAndName, _, _ := strings.Cut(d, ": ")
-		named = append(named, oneFinding(kindAndName))
+		b.WriteString(". It also drops ")
+		b.WriteString(oneFinding(sanitizeStatementText(d)))
 	}
-	return strings.Join(named, ", ")
+	return b.String()
 }
 
 // oneFinding is s on one line with the finding separator neutralized, so an

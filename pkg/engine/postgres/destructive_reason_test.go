@@ -14,7 +14,7 @@ import (
 // droppedReasonSentences is the unsafe reason each kind of dropped object
 // renders for an object named "note" on "users".
 var droppedReasonSentences = map[schemadiff.DroppedKind]string{
-	schemadiff.DroppedColumn:     `statement drops column "note" from table "users": its values are deleted, and reverting the schema file adds the column back empty`,
+	schemadiff.DroppedColumn:     `statement drops column "note" from table "users": its values are deleted, and reverting the schema file does not bring them back`,
 	schemadiff.DroppedNotNull:    `statement lets column "note" of table "users" hold NULL: once NULLs are written, making it NOT NULL again means fixing those rows first`,
 	schemadiff.DroppedConstraint: `statement drops constraint "note" from table "users": rows written after the drop are not checked against it`,
 	schemadiff.DroppedIndex:      `statement drops index "note" from table "users": queries that use it lose it, and putting it back means building it again`,
@@ -49,8 +49,8 @@ func TestDestructiveReasonCoversEveryDroppedKind(t *testing.T) {
 // losing them.
 func TestDestructiveReasonDroppedColumnBesideAnAddedColumn(t *testing.T) {
 	got := destructiveReason(droppedStatement(schemadiff.DroppedColumn, "note", "index users_note_idx: CREATE INDEX users_note_idx ON public.users USING btree (note)"), "users", true)
-	assert.Equal(t, `statement drops column "note" from table "users": its values are deleted, and reverting the schema file adds the column back empty. `+
-		`It also drops index users_note_idx. `+
+	assert.Equal(t, `statement drops column "note" from table "users": its values are deleted, and reverting the schema file does not bring them back. `+
+		`It also drops index users_note_idx: CREATE INDEX users_note_idx ON public.users USING btree (note). `+
 		`This plan also adds a column to the table, and SchemaBot does not rename columns. To rename one, add the new column, copy the values into it, and drop the old column in a later change`, got)
 	assert.Len(t, ui.LintReasons(got), 1, "the reason renders as one finding")
 }
@@ -59,6 +59,22 @@ func TestDestructiveReasonDroppedColumnBesideAnAddedColumn(t *testing.T) {
 func TestDestructiveReasonNeutralizesTheFindingSeparator(t *testing.T) {
 	got := destructiveReason(droppedStatement(schemadiff.DroppedIndex, "a; b"), "users", false)
 	assert.Equal(t, `statement drops index "a, b" from table "users": queries that use it lose it, and putting it back means building it again`, got)
+}
+
+// A table name that holds the finding separator does not split the reason.
+func TestDestructiveReasonNeutralizesTheFindingSeparatorInTheTableName(t *testing.T) {
+	got := destructiveReason(droppedStatement(schemadiff.DroppedColumn, "note"), "notes; audit", false)
+	assert.Equal(t, `statement drops column "note" from table "notes, audit": its values are deleted, and reverting the schema file does not bring them back`, got)
+	assert.Len(t, ui.LintReasons(got), 1, "the reason renders as one finding")
+}
+
+// An object that goes with a dropped column is quoted whole, so a name that
+// holds ": " still names the right object.
+func TestDestructiveReasonQuotesADependentWhole(t *testing.T) {
+	got := destructiveReason(droppedStatement(schemadiff.DroppedColumn, "note",
+		`index notes: archived_idx: CREATE INDEX "notes: archived_idx" ON public.notes USING btree (note)`), "notes", false)
+	assert.Equal(t, `statement drops column "note" from table "notes": its values are deleted, and reverting the schema file does not bring them back. `+
+		`It also drops index notes: archived_idx: CREATE INDEX "notes: archived_idx" ON public.notes USING btree (note)`, got)
 }
 
 // The drop that completes a replacement names the object it replaces by its
