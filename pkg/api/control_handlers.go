@@ -13,7 +13,6 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/caller"
-	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/presentation"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -1416,21 +1415,25 @@ func (s *Service) stopRefusalForEngine(ctx context.Context, apply *storage.Apply
 	return refusal(s, ctx, apply), true
 }
 
-// postgresStopRefusal gives the engine's own reason a stop is declined, so the
-// refusal and a stored stop's ErrorMessage say the same thing, followed by the
-// remedy the PR comment offers for this apply: cancel for a concurrent index
-// build that is its only statement, and waiting for anything else.
+// postgresStopRefusal says why PostgreSQL refuses a stop and names what the
+// operator can do instead, with this apply's ID and environment filled in:
+// cancel for a concurrent index build that is its only statement, which is
+// what the PR comment offers, and following its progress for anything else,
+// which finishes on its own.
 func (s *Service) postgresStopRefusal(ctx context.Context, apply *storage.Apply) string {
+	cancel := fmt.Sprintf("`schemabot cancel %s -e %s`", apply.ApplyIdentifier, apply.Environment)
+	progress := fmt.Sprintf("`schemabot progress %s -e %s`", apply.ApplyIdentifier, apply.Environment)
 	command, err := s.storedStopCommand(ctx, apply)
 	if err != nil {
 		s.logger.Warn("operator: could not read the apply's stored progress for a refused PostgreSQL stop; the refusal names the remedy for each kind of statement",
 			append(apply.LogAttrs(), "error", err)...)
-		return postgresengine.StopUnsupportedReason + ". Use cancel if this schema change is a single concurrent index build; otherwise wait for it to finish"
+		return "PostgreSQL can't pause a schema change. If it is a single index build, end it with " + cancel +
+			"; anything else finishes on its own. To follow it: " + progress
 	}
 	if command == presentation.StopCommandCancel {
-		return postgresengine.StopUnsupportedReason + ". Use cancel to end this concurrent index build"
+		return "PostgreSQL can't pause an index build. To end it: " + cancel
 	}
-	return postgresengine.StopUnsupportedReason + ". This schema change commits or fails on its own; wait for it to finish"
+	return "PostgreSQL can't pause this schema change, and it finishes on its own. To follow it: " + progress
 }
 
 // storedStopCommand names the command presentation.StopCommand offers for
