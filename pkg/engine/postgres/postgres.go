@@ -319,6 +319,10 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		schemaChange := engine.SchemaChange{Namespace: namespace}
 		files := sortedKeys(ns.Files)
 		desiredTables := make(map[string]bool, len(files))
+		// rowSecurityTables are the tables whose file declares row security,
+		// so the rollback baseline declares their live row security too, even
+		// when the live table has none.
+		rowSecurityTables := make(map[string]bool)
 		// Enum label additions lead the namespace's changes, whichever file
 		// sorts first. The apply runs the changes one at a time in this
 		// order, each committed before the next starts, so every label the
@@ -342,6 +346,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			var report pgplan.Report
 			var table string
 			if rowSecurity, ok := file.RowSecurity(); ok {
+				rowSecurityTables[rowSecurity.Table()] = true
 				// A file whose row security matches the live table plans its
 				// table definition like any other file, below. A row security
 				// delta, or a table that does not exist yet, is one reviewed
@@ -428,7 +433,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			// Only a namespace with changes needs a rollback baseline, so
 			// the render is paid once per changed namespace rather than for
 			// every namespace the schema files declare.
-			schemaChange.OriginalFiles, schemaChange.RollbackBlockers, err = captureOriginalFiles(ctx, pool, req.Database, namespace, desiredTables, ignored)
+			schemaChange.OriginalFiles, schemaChange.RollbackBlockers, err = captureOriginalFiles(ctx, pool, req.Database, namespace, desiredTables, rowSecurityTables, ignored)
 			schemaChange.OriginalFilesCaptured = len(schemaChange.RollbackBlockers) == 0
 			if err != nil {
 				return nil, err
@@ -490,8 +495,8 @@ func refuseTableDeclaredTwice(namespace string, files map[string]pgstatement.Des
 // not, so its cost grows with the namespace rather than with the change; the
 // introspections run concurrently within the pool's ceiling, so the wall
 // time grows more slowly than the table count does.
-func captureOriginalFiles(ctx context.Context, pool *pgxpool.Pool, database, namespace string, declared map[string]bool, ignored engine.IgnoredTables) (files map[string]string, blockers []engine.RollbackBlocker, err error) {
-	originalTables, renderErrors, err := renderPostgresTables(ctx, pool, database, namespace, rollbackBaseline(declared, ignored))
+func captureOriginalFiles(ctx context.Context, pool *pgxpool.Pool, database, namespace string, declared, rowSecurityDeclared map[string]bool, ignored engine.IgnoredTables) (files map[string]string, blockers []engine.RollbackBlocker, err error) {
+	originalTables, renderErrors, err := renderPostgresTables(ctx, pool, database, namespace, rollbackBaseline(declared, rowSecurityDeclared, ignored))
 	if err != nil {
 		return nil, nil, fmt.Errorf("capture original PostgreSQL schema in namespace %q: %w", namespace, err)
 	}

@@ -682,7 +682,7 @@ func TestRenderPostgresTablesReturnsCancellationAfterFiltering(t *testing.T) {
 			require.NoError(t, err)
 			defer pool.Close()
 
-			files, blockers, err := captureOriginalFiles(ctx, pool, tt.database, "public", nil, mustIgnoredTables(t, tt.ignored))
+			files, blockers, err := captureOriginalFiles(ctx, pool, tt.database, "public", nil, nil, mustIgnoredTables(t, tt.ignored))
 			require.ErrorIs(t, err, context.Canceled)
 			assert.Nil(t, blockers)
 			assert.Nil(t, files)
@@ -729,7 +729,7 @@ func TestCaptureOriginalFilesReturnsCancellationInsteadOfIncompleteBaseline(t *t
 	require.NoError(t, err)
 	defer pool.Close()
 
-	files, blockers, err := captureOriginalFiles(ctx, pool, "capture_cancel_test", "public", nil, engine.IgnoredTables{})
+	files, blockers, err := captureOriginalFiles(ctx, pool, "capture_cancel_test", "public", nil, nil, engine.IgnoredTables{})
 	require.ErrorIs(t, err, context.Canceled)
 	assert.Nil(t, blockers)
 	assert.Nil(t, files)
@@ -833,7 +833,7 @@ func TestRenderPostgresTablesHoldsTheConcurrencyCap(t *testing.T) {
 	require.NoError(t, err)
 	defer pool.Close()
 
-	rendered, renderErrors, err := renderPostgresTables(t.Context(), pool, "appdb", "app", rollbackBaseline(nil, engine.IgnoredTables{}))
+	rendered, renderErrors, err := renderPostgresTables(t.Context(), pool, "appdb", "app", rollbackBaseline(nil, nil, engine.IgnoredTables{}))
 	require.NoError(t, err)
 	assert.Empty(t, renderErrors)
 	assert.Len(t, rendered, baselineIntrospectionConcurrency*2)
@@ -943,7 +943,7 @@ func TestRenderPostgresTablesEndsOnIntrospectionFailureAndCancelsTheRest(t *test
 	require.NoError(t, err)
 	defer pool.Close()
 
-	rendered, renderErrors, err := renderPostgresTables(deadline, pool, "appdb", "app", rollbackBaseline(nil, engine.IgnoredTables{}))
+	rendered, renderErrors, err := renderPostgresTables(deadline, pool, "appdb", "app", rollbackBaseline(nil, nil, engine.IgnoredTables{}))
 	assert.False(t, dropped.timedOut.Load(),
 		"the sibling introspections must be cancelled by the failure; a render that lets them run holds them to the deadline")
 	require.ErrorIs(t, err, schemadiff.ErrTableNotFound)
@@ -3026,7 +3026,8 @@ func TestEnginePlanTableChangeBesideDeclaredRowSecurity(t *testing.T) {
 	_, err = planFile("CREATE POLICY readers ON documents FOR SELECT USING (id = 2);\n")
 	var refused *engine.PlanRefusedError
 	require.ErrorAs(t, err, &refused)
-	assert.ErrorContains(t, err, "row security")
+	assert.ErrorContains(t, err, `table "documents" changes its row security and its definition in one file, which SchemaBot cannot run as one reviewed change; change the row security in one pull request and the table in another`)
+	assert.NotContains(t, err.Error(), "migrate.", "the refusal names what the author does, not a library function")
 }
 
 // Forward structural planning remains available for RLS tables and siblings.

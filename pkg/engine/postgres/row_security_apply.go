@@ -36,6 +36,11 @@ func planRowSecurityOperation(ctx context.Context, pool *pgxpool.Pool, namespace
 	} else if !errors.Is(err, schemadiff.ErrUnsupportedChange) {
 		return nil, err
 	}
+	if mixed, err := tableDefinitionDiffers(namespace, live, wanted); err != nil {
+		return nil, err
+	} else if mixed {
+		return nil, fmt.Errorf("table %q changes its row security and its definition in one file, which SchemaBot cannot run as one reviewed change; change the row security in one pull request and the table in another: %w", desired.Table(), schemadiff.ErrUnsupportedChange)
+	}
 	// A delta still needs the executor's locked admission and fresh comparison.
 	preview, err := executor.PreviewRowSecurity(ctx, pool, namespace, desired, executor.Budget{
 		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
@@ -86,4 +91,18 @@ func validateRowSecurityApply(req *engine.ApplyRequest, operation statement.RowS
 	}
 	return nativeApply{namespace: namespace, table: tc.Table, sql: tc.DDL, steps: 1,
 		rowSecurity: found, reviewedSecurity: operation.Statements()}, nil
+}
+
+// tableDefinitionDiffers reports whether the file changes the table itself,
+// compared with its row security set aside on both sides. A row security
+// operation runs in one transaction that changes only the settings and
+// policies, so a table change beside a row security delta must be planned on
+// its own.
+func tableDefinitionDiffers(namespace string, live, wanted schemadiff.Model) (bool, error) {
+	live.RowSecurity, wanted.RowSecurity = schemadiff.RowSecurity{}, schemadiff.RowSecurity{}
+	changes, err := schemadiff.Diff(namespace, live, wanted)
+	if err != nil {
+		return false, fmt.Errorf("compare table %q.%q without its row security: %w", namespace, live.Table, err)
+	}
+	return len(changes) > 0, nil
 }
