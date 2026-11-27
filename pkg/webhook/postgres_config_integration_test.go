@@ -195,7 +195,7 @@ func TestPostgresConfigFixtureSurfacesBlockedPlan(t *testing.T) {
 	// The fixture's column type change routes to copy-and-swap; pin that cause
 	// so the test keeps proving the intended blocking reason, not just the
 	// fact of being blocked.
-	assert.Contains(t, plan.Changes[0].TableChanges[0].ModeReason, "copy-and-swap")
+	assert.Contains(t, plan.Changes[0].TableChanges[0].ModeReason, "needs a full copy of the table")
 
 	resp, applyID, err := svc.ExecuteApply(t.Context(), api.ApplyRequest{
 		PlanID:      plan.PlanID,

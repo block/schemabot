@@ -29,6 +29,7 @@ import (
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 const (
@@ -136,7 +137,20 @@ type nativeApply struct {
 	// statement drops whole, which pg-sprite checks under the table's lock.
 	droppedTable               string
 	concurrentIndexMaxDuration time.Duration
-	cancelRequested            func() bool
+	// validateMaxDuration bounds the scan of a statement that validates a
+	// constraint; it is set only for such a statement.
+	validateMaxDuration time.Duration
+	cancelRequested     func() bool
+}
+
+// durationBoundedValidation reports whether the change validates a NOT VALID
+// constraint. The scan takes SHARE UPDATE EXCLUSIVE and rewrites nothing, so
+// reads and writes continue through it however long it runs: it is bounded by
+// the validation duration instead of the per-statement limit, the table size
+// ceiling, and the optimistic apply ceiling. Its lock wait keeps the short
+// lock budget.
+func (c nativeApply) durationBoundedValidation() bool {
+	return c.validates != nil
 }
 
 // durationBoundedIndexBuild reports whether the change is an index build run
@@ -158,10 +172,33 @@ type buildShape struct {
 	// concurrent build per partition, so a signal to the build in flight
 	// does not reach the partitions after it.
 	partitioned bool
+	// haltable is set for the work a shutdown or a drive handing the apply
+	// back ends instead of waiting out: the changes bounded by a long
+	// duration rather than the per-statement limit. An index build leaves an
+	// invalid index the next driver recovers, and a constraint validation
+	// leaves the constraint NOT VALID for the next driver to validate, so
+	// neither leaves work half-applied.
+	haltable bool
+	// validationBound is set for a constraint validation: how long its scan
+	// may run before it is cut off, which a refused cancel names as when the
+	// validation ends on its own.
+	validationBound time.Duration
 }
 
-func (c nativeApply) buildShape() buildShape {
-	return buildShape{cancellable: c.durationBoundedIndexBuild(), partitioned: c.partitionedIndex}
+// buildShape records the change's shape when the apply is admitted, before
+// the drive sets the change's own bounds, so the validation bound comes from
+// the engine's configuration.
+func (c nativeApply) buildShape(validateMaxDuration time.Duration) buildShape {
+	var validationBound time.Duration
+	if c.durationBoundedValidation() {
+		validationBound = validateMaxDuration
+	}
+	return buildShape{
+		cancellable:     c.durationBoundedIndexBuild(),
+		partitioned:     c.partitionedIndex,
+		haltable:        c.durationBoundedIndexBuild() || c.durationBoundedValidation(),
+		validationBound: validationBound,
+	}
 }
 
 // targetConn carries one background apply's connection inputs: the raw DSN
@@ -217,7 +254,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// engine itself can end the drive — a cancel of last resort, and the
 	// halt on shutdown.
 	applyCtx, cancelApply := context.WithCancel(context.WithoutCancel(ctx))
-	done := e.claimProgress(key, progressResult(engine.StateRunning, "preflight", started, change, ""), tracker, logger, change.buildShape(), cancelApply, engine.WorkOwnerFromContext(ctx))
+	done := e.claimProgress(key, progressResult(engine.StateRunning, "preflight", started, change, ""), tracker, logger, change.buildShape(e.validateMaxDuration), cancelApply, engine.WorkOwnerFromContext(ctx))
 	conn := targetConn{dsn: req.Credentials.DSN, caCertPath: caPath}
 	e.wg.Go(func() {
 		defer close(done)
@@ -463,6 +500,13 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		ceiling = e.concurrentIndexMaxDuration + concurrentIndexHeadroom
 		change.concurrentIndexMaxDuration = e.concurrentIndexMaxDuration
 		change.cancelRequested = cancelRequested
+	}
+	if change.durationBoundedValidation() {
+		// The ceiling leaves room for the setup and the lock retries ahead of
+		// the scan, so the server's timer ends an over-long scan first and
+		// the outcome names the option.
+		ceiling = validationCeiling(e.validateMaxDuration)
+		change.validateMaxDuration = e.validateMaxDuration
 	}
 	ctx, cancel := context.WithTimeout(ctx, ceiling)
 	defer cancel()
@@ -1073,6 +1117,15 @@ func refusalForCause(err error, table string) *refusal {
 		return &refusal{reason: "concurrent-index-bound-exceeded", cause: boundErr.Error(),
 			remedy: fmt.Sprintf("raise %s and re-run", concurrentIndexBoundOption)}
 	}
+	// A validation that ran past its bound is refused: retrying unchanged
+	// spends the same bound on the same scan. The constraint stays NOT VALID
+	// and checks new writes, and the remedy names the option that grants
+	// more time.
+	var validationErr *validationBoundError
+	if errors.As(err, &validationErr) {
+		return &refusal{reason: "validation-bound-exceeded", cause: validationErr.Error(),
+			remedy: fmt.Sprintf("raise %s and re-run", validationBoundOption)}
+	}
 	// A partitioned build that ran past its bound without finishing a
 	// partition made no progress a retry could keep, so retrying unchanged
 	// spends the same bound on the same partition again. It is refused like
@@ -1106,11 +1159,7 @@ func refusalForCause(err error, table string) *refusal {
 	}
 	var sizeErr *preflight.SizeError
 	if errors.As(err, &sizeErr) {
-		// Name whose limit this is: read cold, the size text sounds like a
-		// property of PostgreSQL or of the change, when it is SchemaBot's
-		// own conservatism for the native-safe path.
-		return &refusal{reason: "table-too-large",
-			cause: sizeErr.Error() + "; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit"}
+		return tableTooLargeRefusal(sizeErr)
 	}
 	// Decided before the bare table sentinels below: the unverified-create
 	// wrap carries the read-back's own cause inside it, and a table no longer
@@ -1888,8 +1937,8 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	if _, err := preflight.CheckPrivileges(ctx, pool, change.namespace, change.table, preflight.Requirement{Tier: tier}); err != nil {
 		return fmt.Errorf("check privileges for PostgreSQL table %q: %w", change.table, err)
 	}
-	// Concurrent and partitioned index builds are bounded by the duration
-	// envelope rather than the rewrite ceiling. NoSizeLimit still proves the
+	// Concurrent and partitioned index builds and constraint validations are
+	// bounded by their duration envelopes rather than the rewrite ceiling. NoSizeLimit still proves the
 	// target exists and is an ordinary or partitioned table.
 	preflightLimit := applyTablePreflightLimit(change, tableSizeLimit)
 	table, err := checkTableUnlessCatalogOnly(ctx, pool, change, statement, preflightLimit, logger)
@@ -1951,10 +2000,17 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 		// pg-sprite reads the constraint again under the validation's lock
 		// and refuses with ErrValidatedConstraintDrift, validating nothing,
 		// when it no longer has the definition the plan recorded.
+		// The scan runs under the validation bound; its lock wait keeps a
+		// short lock budget, so queueing behind other DDL never holds the
+		// apply for the whole bound.
+		if change.validateMaxDuration <= 0 {
+			return fmt.Errorf("validate reviewed constraint %q on PostgreSQL table %q: validation bound is not set", change.validates.Constraint, change.table)
+		}
 		if err := executor.ExecuteNativeValidatingWithProgress(ctx, pool, table, statement, executor.Budget{
-			LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
+			LockTimeout: validationLockBudget(change.validateMaxDuration), StatementTimeout: change.validateMaxDuration,
 		}, executor.DefaultRetryPolicy(), *change.validates, tracker); err != nil {
-			return fmt.Errorf("validate reviewed constraint %q on PostgreSQL table %q: %w", change.validates.Constraint, change.table, err)
+			return fmt.Errorf("validate reviewed constraint %q on PostgreSQL table %q: %w", change.validates.Constraint, change.table,
+				nameValidationBound(err, change.validates.Constraint, change.validateMaxDuration))
 		}
 		return nil
 	}
@@ -2092,7 +2148,7 @@ func provenCatalogOnly(ctx context.Context, pool *pgxpool.Pool, statement pgstat
 }
 
 func applyTablePreflightLimit(change nativeApply, tableSizeLimit int64) int64 {
-	if change.durationBoundedIndexBuild() {
+	if change.durationBoundedIndexBuild() || change.durationBoundedValidation() {
 		return preflight.NoSizeLimit
 	}
 	if change.indexDrop {
@@ -2516,6 +2572,26 @@ func (e *indexRecoveryError) Error() string {
 
 func (e *indexRecoveryError) Unwrap() error { return e.err }
 
+// tableSizeLimitOption is the server option that sets the largest table a
+// native-safe apply changes.
+const tableSizeLimitOption = "postgres.native_safe_table_size_limit_bytes"
+
+// tableTooLargeRefusal says how big the table is against the limit, in units
+// a person reads, and names the option that sets it. It says whose limit this
+// is because, read cold, a size refusal sounds like a property of PostgreSQL
+// or of the change, when it is SchemaBot's own conservatism for the
+// native-safe path. Two sizes that round to the same figure are given in
+// bytes, so the table never reads as no larger than its limit.
+func tableTooLargeRefusal(sizeErr *preflight.SizeError) *refusal {
+	size, limit := ui.FormatBytesBinary(sizeErr.TotalBytes), ui.FormatBytesBinary(sizeErr.LimitBytes)
+	if size == limit {
+		size, limit = fmt.Sprintf("%d bytes", sizeErr.TotalBytes), fmt.Sprintf("%d bytes", sizeErr.LimitBytes)
+	}
+	return &refusal{reason: "table-too-large",
+		cause:  fmt.Sprintf("the table is %s with its indexes, over the %s limit SchemaBot sets for a native-safe apply, not a PostgreSQL limit", size, limit),
+		remedy: fmt.Sprintf("raise %s to change a table this size, then plan again", tableSizeLimitOption)}
+}
+
 // concurrentIndexBoundOption is the configuration key an operator changes
 // when a concurrent index build needs more time than the bound allows.
 const concurrentIndexBoundOption = "postgres.concurrent_index_max_duration"
@@ -2537,6 +2613,63 @@ func (e *concurrentIndexBoundError) Error() string {
 }
 
 func (e *concurrentIndexBoundError) Unwrap() error { return e.err }
+
+// validationBoundOption is the configuration key an operator changes when a
+// constraint validation needs more time than the bound allows.
+const validationBoundOption = "postgres.validate_max_duration"
+
+// validationBoundError reports that a VALIDATE CONSTRAINT scan ran past the
+// configured bound. Like concurrentIndexBoundError, it names the option the
+// operator changes instead of the per-statement budget pg-sprite's verdict
+// describes, and it says what the cancelled validation left live: the
+// constraint, still NOT VALID, which checks new writes and not existing rows.
+type validationBoundError struct {
+	constraint string
+	bound      time.Duration
+	err        error
+}
+
+// Error is the refusal's cause. The constraint name is held to the width of
+// a maximal identifier, so with the widest bound the cause and the remedy
+// that follows it fit inside the status listing's kept width and the listing
+// still says what to do.
+func (e *validationBoundError) Error() string {
+	return fmt.Sprintf("constraint %s ran past %s (%s); it stays NOT VALID and checks new writes only",
+		boundedQuote(e.constraint, quotedTableWidth), validationBoundOption, e.bound)
+}
+
+func (e *validationBoundError) Unwrap() error { return e.err }
+
+// validationLockBudget is the lock wait a validation under bound gets: the
+// short lock budget, or half the bound when the bound is shorter. The lock is
+// the first thing the statement waits for, so a wait behind other DDL always
+// ends at its lock budget before the bound's statement timer fires, and lock
+// contention is retried as contention instead of refused as an over-long scan.
+func validationLockBudget(bound time.Duration) time.Duration {
+	return min(optimisticLockTimeout, bound/2)
+}
+
+// validationCeiling is how long a validation apply may run in all: the
+// scan's bound, the setup headroom a concurrent index build also gets, and
+// the lock retries that can come before the scan starts. Each attempt but the
+// last can wait out its lock budget and then back off for at most the
+// policy's longest backoff, and only the attempt that gets the lock scans.
+func validationCeiling(bound time.Duration) time.Duration {
+	policy := executor.DefaultRetryPolicy()
+	lockRetries := time.Duration(policy.MaxAttempts-1) * (validationLockBudget(bound) + policy.MaxBackoff)
+	return bound + concurrentIndexHeadroom + lockRetries
+}
+
+// nameValidationBound wraps a validation failure caused by the bound's
+// statement timeout firing so the operator detail names the option; every
+// other failure, the lock budget among them, passes through unchanged.
+func nameValidationBound(err error, constraint string, bound time.Duration) error {
+	var budgetErr *executor.BudgetError
+	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
+		return &validationBoundError{constraint: constraint, bound: bound, err: err}
+	}
+	return err
+}
 
 // sqlstateQueryCanceled is the SQLSTATE the server raises when a statement
 // is cancelled, whether by its statement_timeout or by a cancel request.
@@ -2982,7 +3115,7 @@ func (e *Engine) claimProgress(key string, result *engine.ProgressResult, tracke
 	done := make(chan struct{})
 	e.progress[key] = &trackedApply{
 		result: result, tracker: tracker, logger: logger,
-		cancellableBuild: shape.cancellable, partitionedBuild: shape.partitioned, cancelApply: cancelApply, done: done,
+		cancellableBuild: shape.cancellable, partitionedBuild: shape.partitioned, haltable: shape.haltable, validationBound: shape.validationBound, cancelApply: cancelApply, done: done,
 		owner: owner,
 	}
 	return done

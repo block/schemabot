@@ -682,7 +682,7 @@ func TestRenderPostgresTablesReturnsCancellationAfterFiltering(t *testing.T) {
 			require.NoError(t, err)
 			defer pool.Close()
 
-			files, blockers, err := captureOriginalFiles(ctx, pool, tt.database, "public", nil, mustIgnoredTables(t, tt.ignored))
+			files, blockers, err := captureOriginalFiles(ctx, pool, tt.database, "public", nil, nil, mustIgnoredTables(t, tt.ignored))
 			require.ErrorIs(t, err, context.Canceled)
 			assert.Nil(t, blockers)
 			assert.Nil(t, files)
@@ -729,7 +729,7 @@ func TestCaptureOriginalFilesReturnsCancellationInsteadOfIncompleteBaseline(t *t
 	require.NoError(t, err)
 	defer pool.Close()
 
-	files, blockers, err := captureOriginalFiles(ctx, pool, "capture_cancel_test", "public", nil, engine.IgnoredTables{})
+	files, blockers, err := captureOriginalFiles(ctx, pool, "capture_cancel_test", "public", nil, nil, engine.IgnoredTables{})
 	require.ErrorIs(t, err, context.Canceled)
 	assert.Nil(t, blockers)
 	assert.Nil(t, files)
@@ -833,7 +833,7 @@ func TestRenderPostgresTablesHoldsTheConcurrencyCap(t *testing.T) {
 	require.NoError(t, err)
 	defer pool.Close()
 
-	rendered, renderErrors, err := renderPostgresTables(t.Context(), pool, "appdb", "app", rollbackBaseline(nil, engine.IgnoredTables{}))
+	rendered, renderErrors, err := renderPostgresTables(t.Context(), pool, "appdb", "app", rollbackBaseline(nil, nil, engine.IgnoredTables{}))
 	require.NoError(t, err)
 	assert.Empty(t, renderErrors)
 	assert.Len(t, rendered, baselineIntrospectionConcurrency*2)
@@ -943,7 +943,7 @@ func TestRenderPostgresTablesEndsOnIntrospectionFailureAndCancelsTheRest(t *test
 	require.NoError(t, err)
 	defer pool.Close()
 
-	rendered, renderErrors, err := renderPostgresTables(deadline, pool, "appdb", "app", rollbackBaseline(nil, engine.IgnoredTables{}))
+	rendered, renderErrors, err := renderPostgresTables(deadline, pool, "appdb", "app", rollbackBaseline(nil, nil, engine.IgnoredTables{}))
 	assert.False(t, dropped.timedOut.Load(),
 		"the sibling introspections must be cancelled by the failure; a render that lets them run holds them to the deadline")
 	require.ErrorIs(t, err, schemadiff.ErrTableNotFound)
@@ -1058,8 +1058,9 @@ func TestEnginePlanPrivilegeRefusal(t *testing.T) {
 	causes := engine.BlockedCauses(change.ModeReason)
 	require.Len(t, causes, 2, "the privilege gap and the size ceiling are independent causes")
 	assert.Contains(t, causes[0], "in-place changes that need ownership", "the privilege cause comes first")
-	assert.True(t, strings.HasPrefix(causes[1], `statement for table "users": table size`),
+	assert.True(t, strings.HasPrefix(causes[1], `statement for table "users": the table is `),
 		"the size cause follows the privilege cause: %q", causes[1])
+	assert.Contains(t, causes[1], "raise postgres.native_safe_table_size_limit_bytes", "the size cause names the option that sets the limit")
 }
 
 // TestEnginePlanPrivilegeRefusalPerTier proves a privilege gap blocks only
@@ -1136,8 +1137,8 @@ func TestEnginePlanTableSizeRefusal(t *testing.T) {
 	change := result.Changes[0].TableChanges[0]
 	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
 	assert.Contains(t, change.ModeReason, `statement for table "users":`)
-	assert.Contains(t, change.ModeReason, "1-byte threshold")
-	assert.Contains(t, change.ModeReason, "SchemaBot's ceiling for a native-safe apply")
+	assert.Contains(t, change.ModeReason, "over the 1 B limit")
+	assert.Contains(t, change.ModeReason, "limit SchemaBot sets for a native-safe apply")
 	// The blocked table still shows the size the ceiling measured. It has
 	// never been analyzed, so the row count is omitted rather than zero.
 	var size int64
@@ -1202,7 +1203,7 @@ func TestEnginePlanTableSizeRefusalKeepsTableNameVerbatim(t *testing.T) {
 	change := result.Changes[0].TableChanges[0]
 	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
 	assert.Contains(t, change.ModeReason, `statement for table "odd|users":`)
-	assert.Contains(t, change.ModeReason, "1-byte threshold")
+	assert.Contains(t, change.ModeReason, "over the 1 B limit")
 }
 
 // TestEnginePlanOversizedTableAdmitsConcurrentIndex proves the plan applies
@@ -1229,7 +1230,7 @@ func TestEnginePlanOversizedTableAdmitsConcurrentIndex(t *testing.T) {
 	alter := result.Changes[0].TableChanges[0]
 	index := result.Changes[0].TableChanges[1]
 	assert.Equal(t, engine.ExecutionModeBlocked, alter.ExecutionMode)
-	assert.Contains(t, alter.ModeReason, "1-byte threshold")
+	assert.Contains(t, alter.ModeReason, "over the 1 B limit")
 	assert.Empty(t, index.ExecutionMode)
 	assert.Contains(t, index.DDL, "CREATE INDEX CONCURRENTLY")
 }
@@ -1898,7 +1899,7 @@ func TestEngineApplyTableSizeRefusal(t *testing.T) {
 	assert.Equal(t, engine.StateFailed, progress.State)
 	assert.Equal(t, "refused", progress.Metadata["phase"])
 	assert.False(t, progress.Retryable, "a size refusal is permanent until the ceiling or target changes")
-	assert.Contains(t, progress.ErrorMessage, "1-byte threshold")
+	assert.Contains(t, progress.ErrorMessage, "over the 1 B limit")
 }
 
 // TestEngineApplyOversizedTableRunsCatalogOnlyChange proves apply re-proves a
@@ -1966,7 +1967,7 @@ func TestEngineApplyOversizedTableRefusesWhenTheLiveProofNoLongerHolds(t *testin
 	assert.Equal(t, engine.StateFailed, progress.State)
 	assert.Equal(t, "refused", progress.Metadata["phase"])
 	assert.False(t, progress.Retryable)
-	assert.Contains(t, progress.ErrorMessage, "1-byte threshold")
+	assert.Contains(t, progress.ErrorMessage, "over the 1 B limit")
 	assertColumnAbsent(t, db, "users", "plan")
 }
 
@@ -1987,7 +1988,7 @@ func TestEngineApplyOversizedTableFailsWhenTheLiveProofFails(t *testing.T) {
 	assert.Equal(t, engine.StateFailed, progress.State)
 	assert.Equal(t, "failed", progress.Metadata["phase"])
 	assert.True(t, progress.Retryable, "a failed proof is not a size verdict; a retry may prove the statement")
-	assert.NotContains(t, progress.ErrorMessage, "1-byte threshold")
+	assert.NotContains(t, progress.ErrorMessage, "over the 1 B limit")
 	assertColumnAbsent(t, db, "users", "plan")
 
 	// The failure renders only a fixed sentence, so check the failed proof
@@ -2030,7 +2031,7 @@ func TestEngineApplyOversizedTableNamesTheMissingTemporaryGrant(t *testing.T) {
 	assert.Equal(t, "refused", progress.Metadata["phase"])
 	assert.False(t, progress.Retryable, "the grant must be provisioned before a retry can succeed")
 	assert.Contains(t, progress.ErrorMessage, "grant TEMPORARY on the database to the engine role")
-	assert.NotContains(t, progress.ErrorMessage, "1-byte threshold")
+	assert.NotContains(t, progress.ErrorMessage, "over the 1 B limit")
 	assertColumnAbsent(t, db, "users", "email")
 }
 
@@ -2073,7 +2074,7 @@ func TestEngineApplyOversizedTableUsesKindSpecificBounds(t *testing.T) {
 	assert.Equal(t, engine.StateFailed, progress.State)
 	assert.Equal(t, "refused", progress.Metadata["phase"])
 	assert.False(t, progress.Retryable)
-	assert.Contains(t, progress.ErrorMessage, "1-byte threshold")
+	assert.Contains(t, progress.ErrorMessage, "over the 1 B limit")
 }
 
 // TestEngineApplyOperationalFailure proves an execution-path error — here an
@@ -2916,10 +2917,14 @@ func TestEnginePullSchemaLintsRenderedTables(t *testing.T) {
 	}, results)
 }
 
-// RLS namespaces remain rollback-incapable until complete security definitions
-// can be executed during recovery. Never drop policies from a partial baseline.
-func TestCaptureOriginalFilesWithRowSecurity(t *testing.T) {
-	dsn, db := testutil.StartPostgres(t, "capture_rls")
+// An operator adds a column to a table with row security in a namespace that
+// also holds a plain table. The plan captures both tables as rollback
+// originals, the documents table with its RLS setting and policy. Rolling
+// back drops only the new column: the policy diffs to nothing, stays on the
+// table, and a re-plan of the originals converges (RV-7).
+func TestEnginePlanRollbackCarriesRowSecurity(t *testing.T) {
+	const database = "rollback_rls"
+	dsn, db := testutil.StartPostgres(t, database)
 	ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
 	defer cancel()
 	_, err := db.ExecContext(ctx, `
@@ -2929,14 +2934,114 @@ func TestCaptureOriginalFilesWithRowSecurity(t *testing.T) {
   CREATE TABLE public.accounts (id bigint PRIMARY KEY);
  `)
 	require.NoError(t, err)
-	pool, err := pgxpool.New(ctx, dsn)
+
+	eng := New()
+	forward, err := eng.Plan(ctx, &engine.PlanRequest{
+		Database: database, Credentials: &engine.Credentials{DSN: dsn},
+		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+			"documents.sql": "CREATE TABLE documents (id bigint PRIMARY KEY, summary text);\n" +
+				"ALTER TABLE documents ENABLE ROW LEVEL SECURITY;\n" +
+				"CREATE POLICY readers ON documents FOR SELECT USING (id = 1);\n",
+			"accounts.sql": "CREATE TABLE accounts (id bigint PRIMARY KEY);",
+		}}},
+	})
 	require.NoError(t, err)
-	defer pool.Close()
-	files, blockers, err := captureOriginalFiles(ctx, pool, "capture_rls", "public", nil, engine.IgnoredTables{})
+	require.Len(t, forward.Changes, 1)
+	require.True(t, forward.Changes[0].OriginalFilesCaptured, "a namespace with row security keeps its rollback")
+	assert.Empty(t, forward.Changes[0].RollbackBlockers)
+	originals := forward.Changes[0].OriginalFiles
+	assert.Equal(t, map[string]string{
+		"accounts.sql": "CREATE TABLE \"accounts\" (\n    \"id\" bigint NOT NULL,\n    CONSTRAINT \"accounts_pkey\" PRIMARY KEY (id)\n);\n",
+		"documents.sql": "CREATE TABLE \"documents\" (\n    \"id\" bigint NOT NULL,\n    CONSTRAINT \"documents_pkey\" PRIMARY KEY (id)\n);\n" +
+			"\nALTER TABLE \"documents\" ENABLE ROW LEVEL SECURITY;\nALTER TABLE \"documents\" NO FORCE ROW LEVEL SECURITY;\n" +
+			"\nCREATE POLICY \"readers\" ON \"documents\"\n    AS PERMISSIVE FOR SELECT TO PUBLIC\n    USING ((id = 1));\n",
+	}, originals)
+	require.Len(t, forward.Changes[0].TableChanges, 1)
+	addition := forward.Changes[0].TableChanges[0]
+	require.Empty(t, addition.ExecutionMode, addition.ModeReason)
+	applied, err := eng.Apply(ctx, plannedApplyRequest(dsn, addition))
 	require.NoError(t, err)
-	assert.Equal(t, []engine.RollbackBlocker{{Table: "documents", Reason: schemadiff.ErrUnrenderableRowSecurity.Error()}}, blockers,
-		"only the table with row security blocks the capture, named with what its schema file cannot carry")
-	assert.Nil(t, files)
+	require.True(t, applied.Accepted)
+	require.Equal(t, engine.StateCompleted, awaitPostgresProgress(t, eng, addition.Table).State)
+
+	rollbackRequest := &engine.PlanRequest{
+		Database: database, Credentials: &engine.Credentials{DSN: dsn},
+		SchemaFiles: schema.SchemaFiles{"public": {Files: originals}},
+	}
+	rollback, err := eng.Plan(ctx, rollbackRequest)
+	require.NoError(t, err)
+	require.Len(t, rollback.Changes, 1)
+	require.Len(t, rollback.Changes[0].TableChanges, 1)
+	drop := rollback.Changes[0].TableChanges[0]
+	assert.Equal(t, "ALTER TABLE public.documents DROP summary", drop.DDL)
+	require.Empty(t, drop.ExecutionMode, drop.ModeReason)
+	rolledBack, err := eng.Apply(ctx, plannedApplyRequest(dsn, drop))
+	require.NoError(t, err)
+	require.True(t, rolledBack.Accepted)
+	require.Equal(t, engine.StateCompleted, awaitPostgresProgress(t, eng, drop.Table).State)
+
+	converged, err := eng.Plan(ctx, rollbackRequest)
+	require.NoError(t, err)
+	assert.True(t, converged.NoChanges)
+	var policy string
+	require.NoError(t, db.QueryRowContext(ctx,
+		"SELECT policyname FROM pg_policies WHERE schemaname = 'public' AND tablename = 'documents'").Scan(&policy))
+	assert.Equal(t, "readers", policy, "rollback leaves the policy it did not change in place")
+}
+
+// A schema file that adds a column to a table with row security plans the
+// column as in-place DDL and leaves the policy alone. A file that also
+// changes the policy is still refused at plan time, because the two cannot
+// run as one reviewed operation (RV-4).
+func TestEnginePlanTableChangeBesideDeclaredRowSecurity(t *testing.T) {
+	const database = "rls_table_change"
+	dsn, db := testutil.StartPostgres(t, database)
+	ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	_, err := db.ExecContext(ctx, `
+  CREATE TABLE public.documents (id bigint PRIMARY KEY);
+  ALTER TABLE public.documents ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON public.documents FOR SELECT USING (id = 1);
+ `)
+	require.NoError(t, err)
+	planFile := func(policy string) (*engine.PlanResult, error) {
+		return New().Plan(ctx, &engine.PlanRequest{
+			Database: database, Credentials: &engine.Credentials{DSN: dsn},
+			SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+				"documents.sql": "CREATE TABLE documents (id bigint PRIMARY KEY, summary text);\n" +
+					"ALTER TABLE documents ENABLE ROW LEVEL SECURITY;\n" + policy,
+			}}},
+		})
+	}
+
+	result, err := planFile("CREATE POLICY readers ON documents FOR SELECT USING (id = 1);\n")
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.Changes[0].TableChanges, 1)
+	change := result.Changes[0].TableChanges[0]
+	assert.Equal(t, "documents", change.Table)
+	assert.Equal(t, "ALTER TABLE public.documents ADD COLUMN summary text", change.DDL)
+	assert.False(t, change.IsUnsafe)
+	assert.Empty(t, change.ExecutionMode, change.ModeReason)
+
+	_, err = planFile("CREATE POLICY readers ON documents FOR SELECT USING (id = 2);\n")
+	var refused *engine.PlanRefusedError
+	require.ErrorAs(t, err, &refused)
+	const mixed = `table "documents" changes its row security and its definition in one file, which SchemaBot cannot run as one reviewed change; change the row security in one pull request and the table in another`
+	assert.True(t, strings.HasSuffix(err.Error(), mixed), "the refusal ends on the remedy: %s", err)
+	assert.ErrorIs(t, err, schemadiff.ErrUnsupportedChange)
+	assert.NotContains(t, err.Error(), "migrate.", "the refusal names what the author does, not a library function")
+
+	_, err = New().Plan(ctx, &engine.PlanRequest{
+		Database: database, Credentials: &engine.Credentials{DSN: dsn},
+		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+			"documents.sql": "CREATE UNLOGGED TABLE documents (id bigint PRIMARY KEY);\n" +
+				"ALTER TABLE documents ENABLE ROW LEVEL SECURITY;\n" +
+				"CREATE POLICY readers ON documents FOR SELECT USING (id = 2);\n",
+		}}},
+	})
+	require.ErrorAs(t, err, &refused)
+	assert.True(t, strings.HasSuffix(err.Error(), mixed), "a table change the planner refuses still reads as a mixed file: %s", err)
 }
 
 // Forward structural planning remains available for RLS tables and siblings.
@@ -2961,8 +3066,9 @@ func TestEngineForwardPlanWithRowSecurity(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, result.NoChanges)
 	require.Len(t, result.Changes, 1)
-	assert.False(t, result.Changes[0].OriginalFilesCaptured)
-	assert.Nil(t, result.Changes[0].OriginalFiles)
+	assert.True(t, result.Changes[0].OriginalFilesCaptured)
+	assert.Contains(t, result.Changes[0].OriginalFiles["documents.sql"], `CREATE POLICY "readers" ON "documents"`,
+		"the rollback baseline carries the policy the table-only files leave in place")
 	require.Len(t, result.Changes[0].TableChanges, 2)
 	for _, change := range result.Changes[0].TableChanges {
 		assert.Empty(t, change.ExecutionMode, change.ModeReason)

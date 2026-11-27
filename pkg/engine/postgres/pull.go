@@ -118,9 +118,16 @@ func (e *Engine) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) 
 // The two baselines SchemaBot renders answer those questions differently
 // because they are read by different parties.
 type baselinePolicy struct {
-	// includeRowSecurity exports access rules for pull. Rollback cannot yet
-	// execute these definitions and must not advertise a recoverable baseline.
+	// includeRowSecurity writes a table's row security settings and policies
+	// after its CREATE TABLE. The renderer writes all of them or refuses the
+	// table, so a baseline never carries part of a table's access rules.
 	includeRowSecurity bool
+	// declareRowSecurity names the tables whose row security the baseline
+	// writes even when the live table has none, as an explicit DISABLE and
+	// NO FORCE with no policies. A table-only file leaves row security
+	// unmanaged, so an original for a table the forward plan first secured
+	// must say "none" to take the security back off on rollback.
+	declareRowSecurity map[string]bool
 	// includeForeignKeys writes each table's own foreign keys, and refuses a
 	// referenced table whose incoming foreign key lives on a table the
 	// baseline does not write, since that key would be in no file.
@@ -167,9 +174,18 @@ var pulledBaseline = baselinePolicy{
 // forward plan did not touch diffs to nothing, and a key it added comes
 // back as a drop, which the re-plan shows blocked like any foreign key drop.
 // A key added NOT VALID cannot be carried as it is, so a namespace holding
-// one has no rollback baseline (RV-7).
-func rollbackBaseline(declared map[string]bool, ignored engine.IgnoredTables) baselinePolicy {
+// one has no rollback baseline (RV-7). Row security is carried the same way:
+// settings and policies the forward plan did not touch diff to nothing, and
+// one it changed comes back as the reverse change, which the re-plan admits
+// or refuses like any row security change. A table whose forward file
+// declares row security is written with its row security even when it has
+// none, so a rollback of the first ENABLE or the first policy removes it
+// rather than leaving the new access rules in place. Every other table
+// without row security keeps a table-only file.
+func rollbackBaseline(declared, rowSecurityDeclared map[string]bool, ignored engine.IgnoredTables) baselinePolicy {
 	return baselinePolicy{
+		includeRowSecurity:          true,
+		declareRowSecurity:          rowSecurityDeclared,
 		includeForeignKeys:          true,
 		refuseNotValidForeignKeys:   true,
 		skipUndeclaredArchiveTables: true,
@@ -440,7 +456,7 @@ func renderPostgresTable(ctx context.Context, pool *pgxpool.Pool, namespace, tab
 			}}, nil
 		}
 	}
-	opts := schemadiff.RenderOptions{ForeignKeys: policy.includeForeignKeys}
+	opts := schemadiff.RenderOptions{ForeignKeys: policy.includeForeignKeys, RowSecurity: policy.declareRowSecurity[table]}
 	content, err := schemadiff.RenderWith(model, opts)
 	if policy.includeRowSecurity && errors.Is(err, schemadiff.ErrUnrenderableRowSecurity) {
 		opts.RowSecurity = true
