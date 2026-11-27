@@ -8,6 +8,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/presentation"
 )
 
 // RollbackCmd rollbacks a database to its schema state before a specific apply.
@@ -71,7 +72,7 @@ func (cmd *RollbackCmd) Run(ctx context.Context, g *Globals) error {
 	// below the plan that shows the refused statement, before any prompt or
 	// lock.
 	if err := blockedPlanError("rollback", planResult, true); err != nil {
-		templates.WriteBlockedChanges(blockedChangeNotices(planResult))
+		templates.WriteBlockedChanges(blockedChangeNotices(planResult), presentation.RollbackBlockedChangesRemedy)
 		return err
 	}
 

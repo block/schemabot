@@ -10,6 +10,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -193,7 +194,8 @@ func TestRollbackShardOnlyUnsafeChangeRequiresAllowUnsafe(t *testing.T) {
 // A rollback whose plan carries a blocked execution verdict is refused below
 // the plan that shows the refused statement, before the prompt, any lock, or
 // the apply, whatever the consent flags. The refusal points at the list above
-// it, which names the table and the engine's reason.
+// it, which names the table and the engine's reason and ends on running the
+// rollback again.
 func TestRollbackCmd_BlockedPlanRefusesBeforeLock(t *testing.T) {
 	t.Setenv("SCHEMABOT_TOKEN", "fictional-rollback-test")
 	plan := apitypes.PlanResponse{PlanID: "plan-example-rollback", Database: "shop", DatabaseType: "mysql", Environment: "production",
@@ -210,6 +212,8 @@ func TestRollbackCmd_BlockedPlanRefusesBeforeLock(t *testing.T) {
 	assert.EqualError(t, runErr, "rollback refused: 1 change the engine refuses to execute (listed above)")
 	assert.Contains(t, output, "- orders: direct execution is enabled but the table's size is unavailable")
 	assert.Contains(t, output, "DROP INDEX `idx_status`")
+	assert.Contains(t, output, presentation.RollbackBlockedChangesRemedy, "the list ends on running the rollback again")
+	assert.NotContains(t, output, "An apply will fail", "a rollback's refusal names the rollback")
 	assert.NotContains(t, output, "Do you want to apply this rollback?")
 	assert.Equal(t, []string{"POST /api/rollback/plan", "GET /api/status"}, requests())
 	assert.Empty(t, applyOptions())

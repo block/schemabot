@@ -1,6 +1,9 @@
 package templates
 
-import "github.com/block/schemabot/pkg/schema"
+import (
+	"github.com/block/schemabot/pkg/presentation"
+	"github.com/block/schemabot/pkg/schema"
+)
 
 func previewPlanOutput() {
 	WritePlanHeader(PlanHeaderData{
@@ -119,7 +122,7 @@ func previewPostgresBlockedPlanOutput() {
 	WriteSQLChanges(changes, schema.DialectPostgres)
 	reason := `statement for table "events": the table is 1.4 GiB with its indexes, over the 1.0 GiB limit SchemaBot sets for a native-safe apply, not a PostgreSQL limit; raise postgres.native_safe_table_size_limit_bytes to change a table this size, then plan again`
 	WritePlanSummary(changes)
-	WriteBlockedChanges([]BlockedChange{{Table: "events", Causes: []string{reason}, Steps: len(changes)}})
+	WriteBlockedChanges([]BlockedChange{{Table: "events", Causes: []string{reason}, Steps: len(changes)}}, presentation.BlockedChangesRemedy)
 }
 
 func previewPlanNoChangesOutput() {

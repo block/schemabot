@@ -5,6 +5,11 @@ package presentation
 // end their list with it, so the two surfaces give one answer.
 const BlockedChangesRemedy = "An apply will fail on these statements. " + BlockedChangesFix
 
+// RollbackBlockedChangesRemedy closes a rollback's list of refused changes.
+// A rollback plans its own reversal each time it runs, so the next step is to
+// run the rollback again rather than to plan.
+const RollbackBlockedChangesRemedy = "A rollback will fail on these statements. Each reason names its fix: make it and run the rollback again, or contact your SchemaBot operators for help."
+
 // BlockedChangesFix is the next step for a refused change. The remedy differs
 // by cause (a rewrite, a grant, a smaller table), so each reason states its
 // own and this line only says to act on it. An apply refusal ends with it

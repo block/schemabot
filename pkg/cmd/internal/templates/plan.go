@@ -621,7 +621,8 @@ type BlockedChange struct {
 // heading the PR comment uses. Each cause after a change's first is its own
 // line, since each needs its own fix. An apply refuses these whatever its
 // flags, so the section names the refusal rather than asking for consent.
-func WriteBlockedChanges(changes []BlockedChange) {
+// remedy closes the list with the next step for the command that refused.
+func WriteBlockedChanges(changes []BlockedChange, remedy string) {
 	if len(changes) == 0 {
 		return
 	}
@@ -630,7 +631,7 @@ func WriteBlockedChanges(changes []BlockedChange) {
 		fmt.Printf("  %s\n", line)
 	}
 	fmt.Println()
-	fmt.Println(presentation.BlockedChangesRemedy)
+	fmt.Println(remedy)
 	fmt.Println()
 }
 
