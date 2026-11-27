@@ -1987,6 +1987,18 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 		}
 		return nil
 	}
+	if statement.Kind() == pgstatement.KindRenameIndex {
+		// ALTER INDEX ... RENAME TO names the index, not its table, so it
+		// takes pg-sprite's index rename: under the table's lock it checks
+		// that the name still resolves to a plain index of this table, and
+		// after the rename it confirms the renamed relation is that index.
+		if err := executor.ExecuteIndexRenameWithProgress(ctx, pool, table, statement, executor.Budget{
+			LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
+		}, executor.DefaultRetryPolicy(), tracker); err != nil {
+			return fmt.Errorf("rename index on PostgreSQL table %q: %w", change.table, err)
+		}
+		return nil
+	}
 	if err := executor.ExecuteNativeWithProgress(ctx, pool, table, statement, executor.Budget{
 		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
 	}, executor.DefaultRetryPolicy(), tracker); err != nil {

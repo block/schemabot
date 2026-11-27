@@ -207,6 +207,7 @@ If your tables belong to a dedicated owner role, read
 | `CREATE INDEX` on an existing table | Runs as `CREATE INDEX CONCURRENTLY`, bounded by `postgres.concurrent_index_max_duration` (24 hours by default). It can be cancelled |
 | `CREATE INDEX` on a partitioned table | Built one partition at a time, each concurrently, under the same bound. It can be cancelled, and applying again resumes from the partitions already built. See [Partitioned index builds](#partitioned-index-builds) |
 | Dropping an index | Runs as `DROP INDEX CONCURRENTLY` after you approve it with `--allow-unsafe`, on a table of any size. Reads and writes continue while it waits for open transactions, up to 4 minutes. See [Dropping an index](#dropping-an-index) |
+| Changing an index's definition | Replaced in three steps: the new definition is built concurrently as `<name>_new`, the old index is dropped, and the new one takes its name. The old index keeps serving until the new one is valid. The drop needs `--allow-unsafe`. See [Changing an index](#changing-an-index) |
 | A new table, with its indexes | Runs together: the table, then its indexes, built without `CONCURRENTLY` because nothing reads the table yet. See [Greenfield tables](#greenfield-tables) |
 | A new label on an existing enum type | Runs as `ALTER TYPE ... ADD VALUE`, one label per step, before the table changes. Creating a type or removing a label fails the plan. See [Enum types](#enum-types) |
 | Row-level security policies on an existing table | Run in one transaction, after you explicitly approve them, because they change who can read rows. See [Row-level security](#row-level-security) |
@@ -763,6 +764,33 @@ one if it should stay.
 An index of a partitioned table is blocked, because PostgreSQL cannot drop it
 concurrently. Drop it outside SchemaBot when a lock on every partition is
 acceptable, then plan again.
+
+### Changing an index
+
+An index whose definition changes under the same name is replaced, never
+dropped first. The plan has three steps:
+
+1. `CREATE INDEX CONCURRENTLY <name>_new` builds the new definition. The old
+   index keeps serving reads and, for a unique index, keeps rejecting
+   duplicates.
+2. `DROP INDEX CONCURRENTLY <name>` removes the old index once the new one is
+   valid. This step needs `--allow-unsafe`, because the old definition stops
+   applying.
+3. `ALTER INDEX <name>_new RENAME TO <name>` gives the new index its name. It
+   changes only the catalog, so the size limit does not apply.
+
+If the rows break the new definition, the build fails and the apply stops
+there. The old index is untouched. The failure names the invalid `<name>_new`
+to drop before you apply again.
+
+An apply that stopped part-way picks up where it stopped. A valid `<name>_new`
+with the new definition is not built again, and when the old index is
+already gone, the plan is the rename alone. If another index or a
+constraint already holds `<name>_new`, the plan is refused: rename that
+object first.
+
+An index on a partitioned table, and an index on a table whose plan also
+drops or changes the type of a column, is still dropped and built again.
 
 ### Dropping a column or constraint
 

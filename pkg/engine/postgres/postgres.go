@@ -694,7 +694,7 @@ func tableChanges(report pgplan.Report, crossNamespaceForeignKeys []string, pars
 				Operation:     operation,
 				DDL:           sql,
 				IsUnsafe:      statement.Destructive,
-				UnsafeReason:  destructiveReason(statement.Destructive, table),
+				UnsafeReason:  destructiveReason(statement, table),
 				ExecutionMode: stepMode,
 				ModeReason:    engine.SanitizeBlockedCause(stepReason),
 				Metadata:      metadata,
@@ -1776,9 +1776,18 @@ func generatedExpressionRefusalReason(table string) string {
 	return fmt.Sprintf("statement for table %q changes a stored generated column's expression, which rewrites every row under a lock that blocks reads and writes, so SchemaBot does not apply it; to keep the live expression, declare it in the schema file and re-plan; to change it, declare the live expression to apply the rest of the plan first, then run this statement (PostgreSQL 17 or later) outside SchemaBot through a separately reviewed process and put the new expression back in the file", table)
 }
 
-func destructiveReason(destructive bool, table string) string {
-	if !destructive {
+// destructiveReason is the reviewer-facing reason a destructive step needs
+// --allow-unsafe. The drop that completes an index replacement names the
+// index that replaces it: the new definition is built and valid before the
+// old index goes, so the table keeps the index throughout, and what the
+// reviewer accepts is the change of definition, not its removal.
+func destructiveReason(statement pgplan.Statement, table string) string {
+	if !statement.Destructive {
 		return ""
+	}
+	if replaced := statement.Drops; statement.ReplacedBy != "" && replaced != nil {
+		return fmt.Sprintf("statement replaces index %q on table %q: it is dropped only once its new definition, built as %q, is valid, so the table keeps the index throughout",
+			replaced.Name, table, statement.ReplacedBy)
 	}
 	return fmt.Sprintf("statement removes live structure from table %q", table)
 }
