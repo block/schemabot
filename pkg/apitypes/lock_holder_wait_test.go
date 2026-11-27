@@ -46,4 +46,24 @@ func TestParseBuildWorkLockHolderWait(t *testing.T) {
 			assert.Equal(t, BuildWork{}, work)
 		})
 	}
+
+	// A malformed value costs only its own part, so one bad field does not
+	// hide a build's progress or the session it waits on.
+	t.Run("a malformed wait keeps the build's counters", func(t *testing.T) {
+		work, err := ParseBuildWork(map[string]string{
+			"executor_operation": "concurrent-index-build", "blocks_done": "2500", "blocks_total": "10000",
+			LockHolderPIDMetadataKey: "session",
+		})
+		require.Error(t, err)
+		assert.Equal(t, BuildWork{Operation: "concurrent-index-build", BlocksDone: 2500, BlocksTotal: 10000}, work)
+	})
+
+	t.Run("a malformed counter keeps the wait and the operation", func(t *testing.T) {
+		work, err := ParseBuildWork(map[string]string{
+			"executor_operation": "concurrent-index-build", "server_phase": "building index: scanning table", "blocks_done": "many",
+			LockHolderPIDMetadataKey: "12",
+		})
+		require.Error(t, err)
+		assert.Equal(t, BuildWork{Operation: "concurrent-index-build", ServerPhase: "building index: scanning table", HolderWait: LockHolderWait{PID: 12}}, work)
+	})
 }

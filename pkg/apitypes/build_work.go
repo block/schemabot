@@ -1,6 +1,7 @@
 package apitypes
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -49,22 +50,36 @@ func (w BuildWork) IsConcurrentIndexBuild() bool {
 
 // ParseBuildWork decodes the current operation's work from progress display
 // metadata, with the lock holder the step waits on, if any. It returns the
-// zero value with a nil error when the engine publishes neither, and an
-// error when a published counter is not a non-negative integer, so a
-// renderer can log the malformed value and omit the work rather than show a
-// wrong value. A counter is published when its
+// zero value with a nil error when the engine publishes neither.
+//
+// A malformed value costs only its own part: counters that are not
+// non-negative integers, or a percent outside 0 to 100, leave the counters
+// and percent zero, and a malformed lock holder wait leaves the wait zero.
+// The operation, its server phase and the other part are still returned,
+// alongside the error, so a renderer can log the malformed value and show the
+// rest rather than a wrong value or nothing. A counter is published when its
 // key is present, whatever the value: an absent key means the engine has no
 // reading, while a present empty value is malformed.
 func ParseBuildWork(metadata map[string]string) (BuildWork, error) {
-	wait, err := parseLockHolderWait(metadata)
-	if err != nil {
-		return BuildWork{}, err
-	}
+	wait, waitErr := parseLockHolderWait(metadata)
 	operation := metadata[buildOperationMetadataKey]
 	if operation == "" {
-		return BuildWork{HolderWait: wait}, nil
+		return BuildWork{HolderWait: wait}, waitErr
 	}
-	work := BuildWork{Operation: operation, ServerPhase: metadata[buildServerPhaseMetadataKey], HolderWait: wait}
+	work := BuildWork{Operation: operation, ServerPhase: metadata[buildServerPhaseMetadataKey]}
+	counters, countersErr := parseBuildCounters(metadata)
+	if countersErr == nil {
+		work = counters
+		work.Operation, work.ServerPhase = operation, metadata[buildServerPhaseMetadataKey]
+	}
+	work.HolderWait = wait
+	return work, errors.Join(countersErr, waitErr)
+}
+
+// parseBuildCounters decodes the build's counters and percent, or returns
+// an error naming the first malformed one.
+func parseBuildCounters(metadata map[string]string) (BuildWork, error) {
+	var work BuildWork
 	fields := []struct {
 		key   string
 		value *int64

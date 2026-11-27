@@ -28,7 +28,7 @@ const taskColumns = `id, task_identifier, apply_id, apply_operation_id, plan_id,
 	namespace, table_name, shard, ddl, ddl_action,
 	engine, repository, pull_request, environment, state, error_message, options, attempt,
 	rows_copied, rows_total, estimated_bytes, estimated_rows, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, execution_mode, mode_reason, cutover_attempts,
-	is_instant, engine_migration_id,
+	is_instant, engine_migration_id, plan_change_ordinal,
 	started_at, completed_at, created_at, updated_at`
 
 func prefixedTaskColumns(alias string) string {
@@ -85,16 +85,16 @@ func insertTask(ctx context.Context, exec queryExecer, identity identityInserter
 			namespace, table_name, shard, ddl, ddl_action,
 			engine, repository, pull_request, environment, state, error_message, options, attempt,
 			rows_copied, rows_total, estimated_bytes, estimated_rows, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, execution_mode, mode_reason, cutover_attempts,
-			is_instant, engine_migration_id,
+			is_instant, engine_migration_id, plan_change_ordinal,
 			started_at, completed_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		task.TaskIdentifier, task.ApplyID, nullInt64Ptr(task.ApplyOperationID), task.PlanID, task.Database, task.DatabaseType,
 		task.Namespace, nullString(task.TableName), task.Shard, nullString(task.DDL), nullString(task.DDLAction),
 		task.Engine, task.Repository, task.PullRequest, task.Environment,
 		task.State, nullString(storedMessage(ctx, "tasks.error_message", task.ErrorMessage, task.LogAttrs)), string(options), task.Attempt,
 		task.RowsCopied, task.RowsTotal, nullInt64Ptr(task.EstimatedBytes), nullInt64Ptr(task.EstimatedRows), task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
-		task.IsInstant, nullString(task.EngineMigrationID),
+		task.IsInstant, nullString(task.EngineMigrationID), task.PlanChangeOrdinal,
 		task.StartedAt, task.CompletedAt, task.CreatedAt, task.UpdatedAt,
 	)
 	if err != nil {
@@ -502,7 +502,7 @@ const shardTaskInsertColumns = `
 	namespace, table_name, shard, ddl, ddl_action,
 	engine, repository, pull_request, environment, state, error_message, options, attempt,
 	rows_copied, rows_total, estimated_bytes, estimated_rows, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, execution_mode, mode_reason, cutover_attempts,
-	is_instant, engine_migration_id,
+	is_instant, engine_migration_id, plan_change_ordinal,
 	started_at, completed_at, created_at, updated_at`
 
 // shardTaskInsertValues returns the placeholder list and value args for a
@@ -515,14 +515,14 @@ func shardTaskInsertValues(ctx context.Context, task *storage.Task) (string, []a
 	if len(options) == 0 {
 		options = []byte("{}")
 	}
-	return `?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`,
+	return `?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`,
 		[]any{
 			task.TaskIdentifier, task.ApplyID, nullInt64Ptr(task.ApplyOperationID), task.PlanID, task.Database, task.DatabaseType,
 			task.Namespace, nullString(task.TableName), task.Shard, nullString(task.DDL), nullString(task.DDLAction),
 			task.Engine, task.Repository, task.PullRequest, task.Environment,
 			task.State, nullString(storedMessage(ctx, "tasks.error_message", task.ErrorMessage, task.LogAttrs)), string(options), task.Attempt,
 			task.RowsCopied, task.RowsTotal, nullInt64Ptr(task.EstimatedBytes), nullInt64Ptr(task.EstimatedRows), task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
-			task.IsInstant, nullString(task.EngineMigrationID),
+			task.IsInstant, nullString(task.EngineMigrationID), task.PlanChangeOrdinal,
 			task.StartedAt, task.CompletedAt, task.CreatedAt, task.UpdatedAt,
 		}
 }
@@ -1370,6 +1370,7 @@ func scanTaskInto(s scanner) (*storage.Task, error) {
 		&task.CutoverAttempts,
 		&task.IsInstant,
 		&engineMigrationID,
+		&task.PlanChangeOrdinal,
 		&startedAt,
 		&completedAt,
 		&task.CreatedAt,

@@ -231,7 +231,7 @@ func TestApplyCommentsLeaveRoomForAppendedSections(t *testing.T) {
 		})
 		assert.LessOrEqual(t, len(body), limit)
 		assert.Greater(t, len(body), limit-256, "the DDL takes the room the reserve leaves")
-		assert.Contains(t, body, "To retry:", "the footer after the table list still renders")
+		assert.Contains(t, body, presentation.RetryLabel+":", "the footer after the table list still renders")
 	})
 
 	t.Run("a greenfield apply renders every table's DDL", func(t *testing.T) {
@@ -277,7 +277,7 @@ func TestShardedApplyCommentsLeaveRoomForAppendedSections(t *testing.T) {
 			assert.Greater(t, len(body), limit-512, "the DDL takes the room the reserve leaves")
 			assert.Contains(t, body, ddlTruncatedMarker)
 			assert.Contains(t, body, "CREATE TABLE `events_000`", "the first table's DDL renders")
-			assert.Contains(t, body, "To retry:", "the footer after the keyspace sections still renders")
+			assert.Contains(t, body, presentation.RetryLabel+":", "the footer after the keyspace sections still renders")
 		})
 	}
 }

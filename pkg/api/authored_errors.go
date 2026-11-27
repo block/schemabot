@@ -74,3 +74,7 @@ func (e *operatorMessageError) AuthoredText() (string, bool) { return e.message,
 // AuthoredText is the parser's complaint about a schema file, which can quote
 // the statement it rejected.
 func (e *schemaFileParseError) AuthoredText() (string, bool) { return e.message, true }
+
+// AuthoredText is a remote data plane's plan refusal, which, like a local
+// engine's, can quote a statement from the schema files.
+func (e *RemotePlanRefusalError) AuthoredText() (string, bool) { return e.Error(), true }

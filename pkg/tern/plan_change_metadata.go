@@ -13,8 +13,12 @@ import (
 // change a task runs, so the engine applies the change against the record it
 // made when the operator reviewed the plan (RV-1).
 //
-// A task is matched to the change in its namespace that names its table and
-// carries its statement. The statement is compared in the dialect's canonical
+// A task is matched to the change at its plan change ordinal: the position,
+// among the plan's changes to its namespace and table, recorded when the task
+// was created. A plan can carry the same statement twice on one table with
+// different metadata, and the ordinal is what tells those changes apart. A
+// task written without an ordinal is matched to the change in its namespace
+// that names its table and carries its statement. The statement is compared in the dialect's canonical
 // form when a canonicalizer is available, because a task's DDL can take a
 // deployment's rendering of the reviewed statement on resume or progress sync
 // while the stored plan keeps the reviewed text. A statement that matches no
@@ -35,22 +39,9 @@ type planChangeMetadata struct {
 // plan yields an index that answers every task with no metadata, and a nil
 // canon compares statements by their trimmed text.
 func newPlanChangeMetadata(plan *storage.Plan, canon StatementCanonicalizer) planChangeMetadata {
-	ix := planChangeMetadata{byTable: map[string][]storage.TableChange{}, canon: canon}
-	if plan == nil {
-		return ix
-	}
-	ix.planIdentifier = plan.PlanIdentifier
-	for namespace, data := range plan.Namespaces {
-		if data == nil {
-			continue
-		}
-		for _, change := range data.Tables {
-			if change.Namespace == "" {
-				change.Namespace = namespace
-			}
-			key := progressTableKey(change.Namespace, change.Table)
-			ix.byTable[key] = append(ix.byTable[key], change)
-		}
+	ix := planChangeMetadata{byTable: storage.PlanChangesByTable(plan), canon: canon}
+	if plan != nil {
+		ix.planIdentifier = plan.PlanIdentifier
 	}
 	return ix
 }
@@ -77,16 +68,32 @@ func (ix planChangeMetadata) statementKey(ddl string) string {
 }
 
 // forTask returns a copy of the metadata of the change task runs, or nil when
-// no change matches or the match carries none. Two matching changes that
-// carry different metadata are an error, because either could be the one the
-// task was created from.
+// no change matches or the match carries none.
+//
+// A task with an ordinal reads the change at that position. The change must
+// still carry the task's statement: a change that does not is not the one the
+// task was created from, and is an error rather than a record borrowed from
+// another statement. A task without an ordinal is matched by statement, and two
+// matching changes that carry different metadata are an error, because either
+// could be the one the task was created from.
 func (ix planChangeMetadata) forTask(task *storage.Task) (map[string]string, error) {
 	want := ix.statementKey(task.DDL)
+	changes := ix.byTable[storage.PlanChangeTableKey(task.Namespace, task.TableName)]
+	if task.PlanChangeOrdinal > 0 {
+		if task.PlanChangeOrdinal > len(changes) {
+			return nil, fmt.Errorf("plan %s has %d change(s) to table %q in namespace %q, but the task runs change %d", ix.planIdentifier, len(changes), task.TableName, task.Namespace, task.PlanChangeOrdinal)
+		}
+		change := changes[task.PlanChangeOrdinal-1]
+		if ix.statementKey(change.DDL) != want {
+			return nil, fmt.Errorf("plan %s change %d to table %q in namespace %q carries a different statement than the task", ix.planIdentifier, task.PlanChangeOrdinal, task.TableName, task.Namespace)
+		}
+		return maps.Clone(change.Metadata), nil
+	}
 	var (
 		found    bool
 		metadata map[string]string
 	)
-	for _, change := range ix.byTable[progressTableKey(task.Namespace, task.TableName)] {
+	for _, change := range changes {
 		if ix.statementKey(change.DDL) != want {
 			continue
 		}

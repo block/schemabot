@@ -347,6 +347,11 @@ func progressFingerprint(ops []*storage.ApplyOperation) string {
 		if work := progress.BuildWork; work != (apitypes.BuildWork{}) {
 			fmt.Fprintf(&sb, " %s@%s#%d b%d/%d t%d/%d l%d/%d", work.Operation, work.ServerPhase, work.Attempt,
 				work.BlocksDone, work.BlocksTotal, work.TuplesDone, work.TuplesTotal, work.LockersDone, work.LockersTotal)
+			if wait := work.HolderWait; wait.Waiting() {
+				// The comment reads the waited time in whole seconds, so a
+				// tick of it is movement, and so is the wait ending.
+				fmt.Fprintf(&sb, " w%d@%ds", wait.PID, int64(wait.Waited/time.Second))
+			}
 		}
 		sb.WriteString(";")
 	}

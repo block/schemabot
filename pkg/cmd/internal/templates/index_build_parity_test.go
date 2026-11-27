@@ -86,7 +86,7 @@ func TestLockHolderWaitReadsTheSameOnEverySurface(t *testing.T) {
 		"lock_holder_waited_ms": "7944", "lock_holder_limit_ms": "30000",
 	})
 	const label = "⏳ Waiting for session 9433 to release its lock (7s of 30s)"
-	const note = "Reads and writes continue. The step runs once session 9433 commits or rolls back."
+	const note = "Reads and writes continue. The step runs once session 9433 commits or rolls back, or when the wait runs out."
 
 	cli := renderRollout(t, ParseProgressResponse(resp))
 	pr := webhooktemplates.RenderApplyStatusComment(webhooktemplates.ApplyStatusFromProgress(resp, "octocat"))

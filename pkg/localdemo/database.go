@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -32,11 +33,22 @@ const NamePrefix = "schemabot-sample-"
 
 const ownerLabel = "com.block.schemabot.sample"
 
+// Database describes a provisioned sample and how to reach it. A SQL sample
+// carries a DSN; a Vitess sample carries the PlanetScale-compatible endpoint
+// its engine addresses instead, along with the organization and token that
+// endpoint expects.
 type Database struct {
 	Name       string
 	DSN        string
 	StorageDSN string
 	Namespace  string
+
+	// Set for a Vitess sample only. APIURL is the PlanetScale-compatible
+	// endpoint, Organization the organization holding the sample database, and
+	// Token the service token credential in PlanetScale's name:value form.
+	APIURL       string
+	Organization string
+	Token        string
 }
 
 type container struct {
@@ -52,15 +64,52 @@ type container struct {
 	NetworkSettings struct {
 		Ports map[string][]struct{ HostIP, HostPort string }
 	}
+	// HostConfig holds the bindings the container was created with, which
+	// Docker reports before the container first starts.
+	HostConfig struct {
+		PortBindings map[string][]struct{ HostIP, HostPort string }
+	}
 }
 
 // Ensure starts or reuses a sample owned by this project and engine. Docker keeps
 // its data across restarts; retrying setup never re-seeds an existing database.
-func Ensure(ctx context.Context, project, engine string, progress ...func(string)) (Database, error) {
-	if engine != "mysql" && engine != "postgres" {
-		return Database{}, fmt.Errorf("sample databases support mysql or postgres")
+func Ensure(ctx context.Context, project, engine, version string, progress ...func(string)) (Database, error) {
+	report := func(stage string) {
+		for _, notify := range progress {
+			if notify != nil {
+				notify(stage)
+			}
+		}
 	}
-	name, err := sampleName(project, engine)
+	switch engine {
+	case "mysql", "postgres":
+		return ensureSQL(ctx, sqlSample{
+			project: project, engine: engine, label: engine,
+			seed: seedSQL(engine), seedStage: "Preparing sample tables",
+		}, report)
+	case "vitess":
+		return ensureVitess(ctx, project, version, report)
+	}
+	return Database{}, fmt.Errorf("sample databases support mysql, postgres, or vitess")
+}
+
+// sqlSample describes one SQL container to provision. engine picks the image
+// and connection-string shape; label is the container's identity, which differs
+// from the engine when the container is one component of a larger sample rather
+// than the sample itself.
+type sqlSample struct {
+	project   string
+	engine    string
+	label     string
+	seed      string
+	seedStage string
+}
+
+// ensureSQL provisions one SQL container: the engine's own server, seeded on
+// first creation and reused on every later run.
+func ensureSQL(ctx context.Context, sample sqlSample, report func(string)) (Database, error) {
+	engine := sample.engine
+	name, err := sampleName(sample.project, sample.label)
 	if err != nil {
 		return Database{}, err
 	}
@@ -70,27 +119,9 @@ func Ensure(ctx context.Context, project, engine string, progress ...func(string
 		image, port, passwordKey = "postgres:17", "5432/tcp", "POSTGRES_PASSWORD"
 		env = []string{"POSTGRES_DB=shop"}
 	}
-	report := func(stage string) {
-		for _, notify := range progress {
-			if notify != nil {
-				notify(stage)
-			}
-		}
-	}
 	report("Checking Docker")
-	endpoint := os.Getenv("DOCKER_HOST")
-	if endpoint == "" || os.Getenv("DOCKER_CONTEXT") != "" {
-		value, err := run(ctx, nil, "context", "inspect", "--format", "{{.Endpoints.docker.Host}}")
-		if err != nil {
-			return Database{}, err
-		}
-		endpoint = strings.TrimSpace(string(value))
-	}
-	if !localDockerEndpoint(endpoint) {
-		return Database{}, fmt.Errorf("sample setup needs a local Docker context; your current Docker endpoint is remote")
-	}
-	if _, err = run(ctx, nil, "info", "--format", "{{.ServerVersion}}"); err != nil {
-		return Database{}, fmt.Errorf("start Docker, then try sample setup again: %w", err)
+	if err = requireLocalDocker(ctx); err != nil {
+		return Database{}, err
 	}
 	// Listing distinguishes an absent container from a broken Docker connection.
 	listed, err := run(ctx, nil, "container", "ls", "-a", "--filter", "name=^/"+name+"$", "--format", "{{.ID}}")
@@ -103,27 +134,15 @@ func Ensure(ctx context.Context, project, engine string, progress ...func(string
 		if _, err = rand.Read(password); err != nil {
 			return Database{}, err
 		}
-		images, err := run(ctx, nil, "image", "ls", "--quiet", image)
+		if err = ensureImage(ctx, image); err != nil {
+			return Database{}, err
+		}
+		hostPort, err := reserveHostPort(ctx)
 		if err != nil {
-			return Database{}, fmt.Errorf("inspect sample image %s: %w", image, err)
-		}
-		if strings.TrimSpace(string(images)) == "" {
-			if _, err := run(ctx, nil, "pull", image); err != nil {
-				return Database{}, fmt.Errorf("pull sample image %s: %w", image, err)
-			}
-		}
-		// Pin Docker's host port so stop/start and daemon restarts keep saved DSNs valid.
-		// Docker claims the port after the listener closes; a race fails startup safely.
-		listener, err := new(net.ListenConfig).Listen(ctx, "tcp4", "127.0.0.1:0")
-		if err != nil {
-			return Database{}, fmt.Errorf("choose sample port: %w", err)
-		}
-		hostPort := listener.Addr().(*net.TCPAddr).Port
-		if err := listener.Close(); err != nil {
 			return Database{}, err
 		}
 		keyValue := passwordKey + "=" + hex.EncodeToString(password)
-		args := []string{"create", "--name", name, "--label", ownerLabel + "=" + name, "--label", "com.block.schemabot.engine=" + engine, "--restart", "unless-stopped", "-p", fmt.Sprintf("127.0.0.1:%d:%s", hostPort, strings.TrimSuffix(port, "/tcp")), "-e", passwordKey}
+		args := []string{"create", "--name", name, "--label", ownerLabel + "=" + name, "--label", "com.block.schemabot.engine=" + sample.label, "--restart", "unless-stopped", "-p", fmt.Sprintf("127.0.0.1:%d:%s", hostPort, strings.TrimSuffix(port, "/tcp")), "-e", passwordKey}
 		for _, v := range env {
 			args = append(args, "-e", v)
 		}
@@ -136,11 +155,11 @@ func Ensure(ctx context.Context, project, engine string, progress ...func(string
 	if err != nil {
 		return Database{}, err
 	}
-	if c.Config.Labels[ownerLabel] != name || c.Config.Labels["com.block.schemabot.engine"] != engine {
+	if c.Config.Labels[ownerLabel] != name || c.Config.Labels["com.block.schemabot.engine"] != sample.label {
 		return Database{}, fmt.Errorf("container %s is not this project's sample; refusing to use it", name)
 	}
 	if c.State.Status == "created" {
-		report("Preparing sample tables")
+		report(sample.seedStage)
 		dir, err := os.MkdirTemp("", "schemabot-sample-")
 		if err != nil {
 			return Database{}, err
@@ -151,7 +170,7 @@ func Ensure(ctx context.Context, project, engine string, progress ...func(string
 			}
 		}()
 		seed := filepath.Join(dir, "sample.sql")
-		if err = os.WriteFile(seed, []byte(seedSQL(engine)), 0644); err != nil {
+		if err = os.WriteFile(seed, []byte(sample.seed), 0644); err != nil {
 			return Database{}, err
 		}
 		if _, err = run(ctx, nil, "cp", seed, name+":/docker-entrypoint-initdb.d/01-sample.sql"); err != nil {
@@ -225,6 +244,99 @@ func Ensure(ctx context.Context, project, engine string, progress ...func(string
 		case <-ticker.C:
 		}
 	}
+}
+
+// requireLocalDocker refuses a remote Docker endpoint before anything is
+// created. A sample publishes its ports on loopback and is reached there, so a
+// remote daemon would produce a container nothing on this machine can connect
+// to.
+func requireLocalDocker(ctx context.Context) error {
+	endpoint := os.Getenv("DOCKER_HOST")
+	if endpoint == "" || os.Getenv("DOCKER_CONTEXT") != "" {
+		value, err := run(ctx, nil, "context", "inspect", "--format", "{{.Endpoints.docker.Host}}")
+		if err != nil {
+			return err
+		}
+		endpoint = strings.TrimSpace(string(value))
+	}
+	if !localDockerEndpoint(endpoint) {
+		return fmt.Errorf("sample setup needs a local Docker context; your current Docker endpoint is remote")
+	}
+	if _, err := run(ctx, nil, "info", "--format", "{{.ServerVersion}}"); err != nil {
+		return fmt.Errorf("start Docker, then try sample setup again: %w", err)
+	}
+	return nil
+}
+
+// ensureImage pulls an image only when the daemon does not already hold it, so
+// repeated setup on a machine that is offline still works.
+func ensureImage(ctx context.Context, image string) error {
+	images, err := run(ctx, nil, "image", "ls", "--quiet", image)
+	if err != nil {
+		return fmt.Errorf("inspect sample image %s: %w", image, err)
+	}
+	if strings.TrimSpace(string(images)) != "" {
+		return nil
+	}
+	if _, err := run(ctx, nil, "pull", image); err != nil {
+		return fmt.Errorf("pull sample image %s: %w", image, err)
+	}
+	return nil
+}
+
+// reserveHostPort picks a free loopback port and releases it for Docker to
+// claim. Pinning the port keeps a saved connection valid across stop, start,
+// and daemon restarts. Docker claims it after the listener closes; losing that
+// race fails startup rather than binding something else.
+func reserveHostPort(ctx context.Context) (int, error) {
+	listener, err := new(net.ListenConfig).Listen(ctx, "tcp4", "127.0.0.1:0")
+	if err != nil {
+		return 0, fmt.Errorf("choose sample port: %w", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		return 0, err
+	}
+	return port, nil
+}
+
+// reserveHostPortRange picks a block of count consecutive free loopback ports.
+// The kernel assigns ports one at a time, so a block is found by holding one
+// and testing the rest beside it; a block that cannot be completed is retried
+// from a different starting port rather than returned part-formed.
+func reserveHostPortRange(ctx context.Context, count int) (int, error) {
+	const attempts = 20
+	var lastErr error
+	for range attempts {
+		start, err := reserveHostPort(ctx)
+		if err != nil {
+			return 0, err
+		}
+		if start+count-1 > 65535 {
+			lastErr = fmt.Errorf("port %d leaves no room for %d ports", start, count)
+			continue
+		}
+		held := make([]net.Listener, 0, count)
+		var cfg net.ListenConfig
+		for port := start; port < start+count; port++ {
+			listener, err := cfg.Listen(ctx, "tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+			if err != nil {
+				lastErr = err
+				break
+			}
+			held = append(held, listener)
+		}
+		taken := len(held)
+		for _, listener := range held {
+			if err := listener.Close(); err != nil {
+				return 0, err
+			}
+		}
+		if taken == count {
+			return start, nil
+		}
+	}
+	return 0, fmt.Errorf("choose %d consecutive sample ports: %w", count, lastErr)
 }
 
 func ready(ctx context.Context, engine, dsn string) error {

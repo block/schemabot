@@ -920,6 +920,42 @@ func TestControlRequests(t *testing.T, h Harness) {
 		assert.Equal(t, storage.ControlRequestCompleted, settled[1].Status)
 	})
 
+	// ListByApply verifies the read progress reports command outcomes from:
+	// every request of the apply, whatever its status, once each, ordered by
+	// operation, and none of another apply's.
+	t.Run("ListByApply", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		applyID := createControlRequestApply(t, store, "control_by_apply_db", "apply_control_by_apply")
+		otherID := createControlRequestApply(t, store, "control_by_apply_other_db", "apply_control_by_apply_other")
+
+		requests, err := store.ControlRequests().ListByApply(ctx, applyID)
+		require.NoError(t, err)
+		assert.Empty(t, requests)
+
+		for _, op := range []storage.ControlOperation{storage.ControlOperationStop, storage.ControlOperationCancel} {
+			_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+				ApplyID: applyID, Operation: op, Status: storage.ControlRequestPending, Metadata: []byte(`{}`),
+			})
+			require.NoError(t, err)
+		}
+		require.NoError(t, store.ControlRequests().FailPending(ctx, applyID, storage.ControlOperationCancel, "cancel declined"))
+		_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID: otherID, Operation: storage.ControlOperationStart, Status: storage.ControlRequestPending, Metadata: []byte(`{}`),
+		})
+		require.NoError(t, err)
+
+		requests, err = store.ControlRequests().ListByApply(ctx, applyID)
+		require.NoError(t, err)
+		require.Len(t, requests, 2, "a pending and a settled request, and none of another apply's")
+		assert.Equal(t, storage.ControlOperationCancel, requests[0].Operation)
+		assert.Equal(t, storage.ControlRequestFailed, requests[0].Status)
+		assert.Equal(t, "cancel declined", requests[0].ErrorMessage)
+		assert.Equal(t, storage.ControlOperationStop, requests[1].Operation)
+		assert.Equal(t, storage.ControlRequestPending, requests[1].Status)
+	})
+
 	// ListPending verifies the read a drive makes on every poll: an apply with
 	// nothing pending returns an empty result, only pending rows are included,
 	// another apply's pending request is not, and rows come back ordered by
@@ -1274,6 +1310,12 @@ func TestControlRequests(t *testing.T, h Harness) {
 	t.Run("ListSettled_DBError", func(t *testing.T) {
 		store := h.NewUnreachableStorage(t)
 		_, err := store.ControlRequests().ListSettled(t.Context(), 1)
+		require.Error(t, err)
+	})
+
+	t.Run("ListByApply_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.ControlRequests().ListByApply(t.Context(), 1)
 		require.Error(t, err)
 	})
 

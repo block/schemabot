@@ -547,14 +547,14 @@ func TestHandleSchemaRequestErrorFallbackUsesTheSharedErrorLines(t *testing.T) {
 		assert.Contains(t, logBuf.String(), "10.1.2.3:3306")
 	})
 
-	t.Run("a gRPC unavailable error passed along as text gets the generic unreachable line", func(t *testing.T) {
+	t.Run("a gRPC unavailable error passed along as text gets the fixed line", func(t *testing.T) {
 		h, comments, logBuf := newHandler(t)
 		requestErr := errors.New("plan orders/staging: " + status.Error(codes.Unavailable, dialFailure).Error())
 
 		assert.False(t, h.handleSchemaRequestError("octocat/hello-world", 1, 12345, "staging", "orders", "hubot", "plan", requestErr, false))
 
 		body := requireComment(t, comments, "flattened gRPC unavailable comment")
-		assert.Contains(t, body, userFacingRemoteUnavailableError("", ""))
+		assert.Contains(t, body, unexpectedFailureMessage)
 		assert.NotContains(t, body, "rpc error")
 		assert.Contains(t, logBuf.String(), "10.1.2.3:3306")
 	})

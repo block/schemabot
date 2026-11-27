@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/localsetup"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/stretchr/testify/require"
 )
@@ -66,16 +67,66 @@ func TestInitStartChoiceCancelKeyExitsInterrupted(t *testing.T) {
 }
 
 func TestSampleRejectsExistingConnections(t *testing.T) {
-	for _, cmd := range []InitCmd{{Sample: true, DSN: "env:DATABASE_URL"}, {Sample: true, StorageDSN: "env:STATE"}, {Sample: true, Database: "real"}, {Sample: true, Integrated: true}, {Sample: true, Namespaces: []string{"real"}}, {Sample: true, Type: "vitess"}, {Sample: true, Environment: "production"}} {
+	for _, cmd := range []InitCmd{{Sample: true, DSN: "env:DATABASE_URL"}, {Sample: true, StorageDSN: "env:STATE"}, {Sample: true, Database: "real"}, {Sample: true, Integrated: true}, {Sample: true, Namespaces: []string{"real"}}, {Sample: true, Type: "sqlite"}, {Sample: true, Environment: "production"}} {
 		message := "--sample creates its own database and connections"
-		if cmd.Type == "vitess" {
-			message = "choose --type mysql or --type postgres"
+		if cmd.Type == "sqlite" {
+			message = "choose --type mysql, --type postgres, or --type vitess"
 		}
 		if cmd.Environment == "production" {
 			message = "sample databases use the development environment"
 		}
 		require.ErrorContains(t, cmd.prepareSample(t.Context(), &Globals{}), message)
 	}
+}
+
+// The engine screen offers every engine a sample can be provisioned for, and
+// the arrow keys wrap around that list rather than a fixed pair, so the last
+// engine is reachable from the first with one press in either direction.
+func TestSampleEngineChoiceWrapsAroundEveryEngine(t *testing.T) {
+	m := &initStartChoice{}
+	m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	require.True(t, m.choosingEngine)
+	require.Len(t, sampleEngines, m.choices())
+
+	seen := []string{m.engine()}
+	for range sampleEngines[1:] {
+		m.Update(tea.KeyMsg{Type: tea.KeyDown})
+		seen = append(seen, m.engine())
+	}
+	require.Equal(t, []string{"mysql", "postgres", "vitess"}, seen)
+
+	m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	require.Equal(t, "mysql", m.engine(), "down from the last engine returns to the first")
+	m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	require.Equal(t, "vitess", m.engine(), "up from the first engine reaches the last")
+
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	require.True(t, m.confirmed)
+	require.True(t, m.sample)
+	require.Equal(t, "vitess", m.engine())
+}
+
+// Sample setup keeps SchemaBot's own state in a database it can hold tables
+// in. A Vitess target is reached through a PlanetScale-compatible API, so its
+// state goes to MySQL rather than to the target.
+func TestStorageDialectForTargetEngine(t *testing.T) {
+	require.Equal(t, "mysql", storageDialect("mysql"))
+	require.Equal(t, "postgres", storageDialect("postgres"))
+	require.Equal(t, "mysql", storageDialect("vitess"))
+}
+
+// The state database is checked before anything is registered, and for a
+// Vitess target that database is MySQL. Checking it with the target's own
+// engine reads a connection string as an API endpoint and refuses it, which
+// would fail every Vitess sample after both its containers were already up.
+func TestVitessStateConnectionIsCheckedAsMySQL(t *testing.T) {
+	const stateDSN = "root@tcp(127.0.0.1:1)/schemabot"
+	asTarget := localsetup.CheckConnection(t.Context(), "vitess", stateDSN)
+	require.ErrorContains(t, asTarget, "endpoint")
+	asStorage := localsetup.CheckConnection(t.Context(), storageDialect("vitess"), stateDSN)
+	require.Error(t, asStorage)
+	require.NotContains(t, asStorage.Error(), "endpoint")
 }
 
 func TestInitAfterSampleUsesIndependentProfile(t *testing.T) {

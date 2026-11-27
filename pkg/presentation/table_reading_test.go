@@ -43,5 +43,5 @@ func TestReadInFlightTableNamesTheLockHolderAStepWaitsOn(t *testing.T) {
 		HolderWait: apitypes.LockHolderWait{PID: 9433, Table: "public.t", Waited: 7944 * time.Millisecond, Limit: 30 * time.Second},
 	}})
 	assert.Equal(t, "⏳ Waiting for session 9433 to release its lock (7s of 30s)", r.Headline())
-	assert.Equal(t, []TableDetail{{Text: "Reads and writes continue. The step runs once session 9433 commits or rolls back.", Note: true}}, r.Details)
+	assert.Equal(t, []TableDetail{{Text: "Reads and writes continue. The step runs once session 9433 commits or rolls back, or when the wait runs out.", Note: true}}, r.Details)
 }

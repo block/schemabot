@@ -209,3 +209,48 @@ func TestLogRolloutShape_NamesTheLayoutTheRolloutRuns(t *testing.T) {
 		})
 	}
 }
+
+// A plan that drops the same constraint twice on `stations`, around its other
+// changes, gives every task the position of the change it runs, whether the
+// rollout keeps a member's changes in one operation or runs them table by
+// table across targets.
+func TestBuildApplyOperationGroups_TasksRecordWhichChangeEachRuns(t *testing.T) {
+	const drop = "ALTER TABLE `stations` DROP CHECK `stations_capacity`"
+	repeatedDropPlan := func(id int64, target string) *storage.Plan {
+		plan := primaryPlanRow(target)
+		plan.ID = id
+		plan.Namespaces = map[string]*storage.NamespacePlanData{"bikeshare": {Tables: []storage.TableChange{
+			{Namespace: "bikeshare", Table: "stations", DDL: drop, Operation: "alter"},
+			{Namespace: "bikeshare", Table: "docks", DDL: "ALTER TABLE `docks` ADD COLUMN `note` varchar(64)", Operation: "alter"},
+			{Namespace: "bikeshare", Table: "stations", DDL: "ALTER TABLE `stations` ADD COLUMN `note` varchar(64)", Operation: "alter"},
+			{Namespace: "bikeshare", Table: "stations", DDL: drop, Operation: "alter"},
+		}}}
+		return plan
+	}
+	ordinals := func(groups []*storage.ApplyOperationWithTasks) map[string][]int {
+		got := map[string][]int{}
+		for _, group := range groups {
+			for _, task := range group.Tasks {
+				key := group.Operation.Target + "/" + task.TableName
+				got[key] = append(got[key], task.PlanChangeOrdinal)
+			}
+		}
+		return got
+	}
+
+	t.Run("one operation per member", func(t *testing.T) {
+		applyPlan := repeatedDropPlan(10, "bikeshare")
+		groups := buildSteps(t, applyPlan, applyMember{Target: routing.ExecutionTarget{Deployment: "eu"}, Plan: applyPlan})
+		assert.Equal(t, map[string][]int{"/stations": {1, 2, 3}, "/docks": {1}}, ordinals(groups))
+	})
+
+	t.Run("table by table across targets", func(t *testing.T) {
+		applyPlan := repeatedDropPlan(10, "bikeshare-001")
+		other := repeatedDropPlan(11, "bikeshare-002")
+		groups := buildSteps(t, applyPlan, stepMember("bikeshare-001", applyPlan), stepMember("bikeshare-002", other))
+		assert.Equal(t, map[string][]int{
+			"bikeshare-001/stations": {1, 2, 3}, "bikeshare-001/docks": {1},
+			"bikeshare-002/stations": {1, 2, 3}, "bikeshare-002/docks": {1},
+		}, ordinals(groups))
+	})
+}
