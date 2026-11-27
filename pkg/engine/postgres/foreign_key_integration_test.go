@@ -237,6 +237,48 @@ func TestEngineApplyForeignKeyOverABrokenRow(t *testing.T) {
 	assert.True(t, foreignKeyValidated(t, db, "orders_user_id_fkey"))
 }
 
+// An owner adds a foreign key to a table whose validation scan outlasts the
+// deployment's validation bound. The apply adds the key, then the scan is
+// cancelled at the bound and the step is refused, naming the option that
+// grants more time. The key stays in place unvalidated and checks new writes.
+// Once the bound is raised, the next plan is only the validation, and
+// applying it completes.
+func TestEngineApplyForeignKeyValidationPastItsBound(t *testing.T) {
+	const database = "apply_foreign_key_bound_test"
+	dsn, db := testutil.StartPostgres(t, database)
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint NOT NULL);
+		INSERT INTO public.users SELECT g FROM generate_series(1, 1000) g;
+		INSERT INTO public.orders SELECT g, 1 + g % 1000 FROM generate_series(1, 300000) g`)
+	require.NoError(t, err)
+	files := map[string]string{
+		"users.sql":  "CREATE TABLE users (id bigint PRIMARY KEY)",
+		"orders.sql": "CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint NOT NULL REFERENCES users (id))",
+	}
+	eng := New().WithValidateMaxDuration(MinConcurrentIndexMaxDuration)
+
+	outcomes := applyPlannedSteps(t, eng, dsn, planForeignKeyFiles(t, eng, database, dsn, files))
+	require.Len(t, outcomes, 2, "the add completes and the validation is refused")
+	assert.Equal(t, engine.StateCompleted, outcomes[0].State, outcomes[0].ErrorMessage)
+	assert.Equal(t, engine.StateFailed, outcomes[1].State)
+	assert.Contains(t, outcomes[1].ErrorMessage, `validating constraint "orders_user_id_fkey" ran past postgres.validate_max_duration (1ms)`)
+	assert.Contains(t, outcomes[1].ErrorMessage, "raise postgres.validate_max_duration and re-run")
+	assert.False(t, foreignKeyValidated(t, db, "orders_user_id_fkey"), "the key stays in place, unvalidated")
+	_, err = db.ExecContext(t.Context(), `INSERT INTO public.orders VALUES (300001, 5000)`)
+	require.Error(t, err, "new writes are checked before the key is validated")
+
+	raised := New()
+	replan := planForeignKeyFiles(t, raised, database, dsn, files)
+	require.Len(t, replan.Changes, 1)
+	require.Len(t, replan.Changes[0].TableChanges, 1)
+	assert.Equal(t, "ALTER TABLE public.orders VALIDATE CONSTRAINT orders_user_id_fkey", replan.Changes[0].TableChanges[0].DDL)
+	outcomes = applyPlannedSteps(t, raised, dsn, replan)
+	require.Len(t, outcomes, 1)
+	assert.Equal(t, engine.StateCompleted, outcomes[0].State, outcomes[0].ErrorMessage)
+	assert.True(t, foreignKeyValidated(t, db, "orders_user_id_fkey"))
+}
+
 // A plan validates a live foreign key left NOT VALID. Before the apply runs,
 // another session replaces the key with a different one under the same name.
 // The apply reads the key again under the validation's lock, finds it is not

@@ -62,6 +62,7 @@ type Engine struct {
 	// the production value.
 	optimisticApplyCeiling     time.Duration
 	concurrentIndexMaxDuration time.Duration
+	validateMaxDuration        time.Duration
 
 	// execute is a test seam standing in for executeOptimistic, so the apply
 	// drive — accept, claim, execute, terminal publish — can be exercised
@@ -144,6 +145,11 @@ const DefaultConcurrentIndexMaxDuration = 24 * time.Hour
 // is not a build anyone waits for; it is the absence of a bound.
 const MaxConcurrentIndexMaxDuration = time.Duration(math.MaxInt32) * time.Millisecond
 
+// DefaultValidateMaxDuration bounds one VALIDATE CONSTRAINT scan. The scan
+// takes SHARE UPDATE EXCLUSIVE, so reads and writes continue through it, and
+// on a large table it is long by design, like a concurrent index build.
+const DefaultValidateMaxDuration = 24 * time.Hour
+
 // MinConcurrentIndexMaxDuration is the smallest bound the engine accepts for
 // one concurrent index build: statement_timeout is an integer millisecond
 // count, so anything shorter rounds to zero on the server, which disables
@@ -193,7 +199,27 @@ func NewWithOptions(tableSizeLimit int64, concurrentIndexMaxDuration time.Durati
 		tableSizeLimit:             tableSizeLimit,
 		optimisticApplyCeiling:     optimisticApplyCeiling,
 		concurrentIndexMaxDuration: concurrentIndexMaxDuration,
+		validateMaxDuration:        DefaultValidateMaxDuration,
 	}
+}
+
+// WithValidateMaxDuration sets the bound one VALIDATE CONSTRAINT scan runs
+// under. It is normalized as NewWithOptions normalizes the concurrent index
+// bound: a bound that is not positive adopts DefaultValidateMaxDuration, and
+// one outside what the server's statement_timeout can hold is clamped into
+// range. Server config validation refuses those values before they reach
+// here.
+func (e *Engine) WithValidateMaxDuration(d time.Duration) *Engine {
+	switch {
+	case d <= 0:
+		d = DefaultValidateMaxDuration
+	case d < MinConcurrentIndexMaxDuration:
+		d = MinConcurrentIndexMaxDuration
+	case d > MaxConcurrentIndexMaxDuration:
+		d = MaxConcurrentIndexMaxDuration
+	}
+	e.validateMaxDuration = d
+	return e
 }
 
 // NewForTarget creates a PostgreSQL engine with the target information needed
@@ -221,6 +247,12 @@ func (e *Engine) TableSizeLimit() int64 {
 // runs under, for wiring verification and observability.
 func (e *Engine) ConcurrentIndexMaxDuration() time.Duration {
 	return e.concurrentIndexMaxDuration
+}
+
+// ValidateMaxDuration exposes the bound one VALIDATE CONSTRAINT scan runs
+// under, for wiring verification and observability.
+func (e *Engine) ValidateMaxDuration() time.Duration {
+	return e.validateMaxDuration
 }
 
 // Name returns the engine identifier.

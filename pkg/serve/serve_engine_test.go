@@ -113,7 +113,7 @@ func TestGRPCLocalClientFactoryConfiguresPostgresTableSizeLimit(t *testing.T) {
 // the default.
 func TestGRPCLocalClientFactoryConfiguresPostgresConcurrentIndexMaxDuration(t *testing.T) {
 	factory := grpcLocalClientFactory(&api.ServerConfig{
-		Postgres: api.PostgresConfig{ConcurrentIndexMaxDuration: "36h"},
+		Postgres: api.PostgresConfig{ConcurrentIndexMaxDuration: "36h", ValidateMaxDuration: "12h"},
 	}, nil, nil)
 
 	client, err := factory(tern.LocalConfig{
@@ -128,6 +128,7 @@ func TestGRPCLocalClientFactoryConfiguresPostgresConcurrentIndexMaxDuration(t *t
 	eng, ok := lc.Engine().(*postgresengine.Engine)
 	require.True(t, ok)
 	assert.Equal(t, 36*time.Hour, eng.ConcurrentIndexMaxDuration())
+	assert.Equal(t, 12*time.Hour, eng.ValidateMaxDuration())
 }
 
 // Without a registered engine, the data-plane client factory fails closed for a

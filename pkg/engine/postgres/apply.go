@@ -132,7 +132,20 @@ type nativeApply struct {
 	// statement drops whole, which pg-sprite checks under the table's lock.
 	droppedTable               string
 	concurrentIndexMaxDuration time.Duration
-	cancelRequested            func() bool
+	// validateMaxDuration bounds the scan of a statement that validates a
+	// constraint; it is set only for such a statement.
+	validateMaxDuration time.Duration
+	cancelRequested     func() bool
+}
+
+// durationBoundedValidation reports whether the change validates a NOT VALID
+// constraint. The scan takes SHARE UPDATE EXCLUSIVE and rewrites nothing, so
+// reads and writes continue through it however long it runs: it is bounded by
+// the validation duration instead of the per-statement limit, the table size
+// ceiling, and the optimistic apply ceiling. Its lock wait keeps the short
+// lock budget.
+func (c nativeApply) durationBoundedValidation() bool {
+	return c.validates != nil
 }
 
 // durationBoundedIndexBuild reports whether the change is an index build run
@@ -455,6 +468,13 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		ceiling = e.concurrentIndexMaxDuration + concurrentIndexHeadroom
 		change.concurrentIndexMaxDuration = e.concurrentIndexMaxDuration
 		change.cancelRequested = cancelRequested
+	}
+	if change.durationBoundedValidation() {
+		// The headroom covers the setup ahead of the scan, as it does for a
+		// build, so the server's timer ends an over-long scan first and the
+		// outcome names the option.
+		ceiling = e.validateMaxDuration + concurrentIndexHeadroom
+		change.validateMaxDuration = e.validateMaxDuration
 	}
 	ctx, cancel := context.WithTimeout(ctx, ceiling)
 	defer cancel()
@@ -1034,6 +1054,15 @@ func refusalForCause(err error, table string) *refusal {
 	if errors.As(err, &boundErr) {
 		return &refusal{reason: "concurrent-index-bound-exceeded", cause: boundErr.Error(),
 			remedy: fmt.Sprintf("raise %s and re-run", concurrentIndexBoundOption)}
+	}
+	// A validation that ran past its bound is refused: retrying unchanged
+	// spends the same bound on the same scan. The constraint stays NOT VALID
+	// and checks new writes, and the remedy names the option that grants
+	// more time.
+	var validationErr *validationBoundError
+	if errors.As(err, &validationErr) {
+		return &refusal{reason: "validation-bound-exceeded", cause: validationErr.Error(),
+			remedy: fmt.Sprintf("raise %s and re-run", validationBoundOption)}
 	}
 	// A partitioned build that ran past its bound without finishing a
 	// partition made no progress a retry could keep, so retrying unchanged
@@ -1790,8 +1819,8 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	if _, err := preflight.CheckPrivileges(ctx, pool, change.namespace, change.table, preflight.Requirement{Tier: tier}); err != nil {
 		return fmt.Errorf("check privileges for PostgreSQL table %q: %w", change.table, err)
 	}
-	// Concurrent and partitioned index builds are bounded by the duration
-	// envelope rather than the rewrite ceiling. NoSizeLimit still proves the
+	// Concurrent and partitioned index builds and constraint validations are
+	// bounded by their duration envelopes rather than the rewrite ceiling. NoSizeLimit still proves the
 	// target exists and is an ordinary or partitioned table.
 	preflightLimit := applyTablePreflightLimit(change, tableSizeLimit)
 	table, err := checkTableUnlessCatalogOnly(ctx, pool, change, statement, preflightLimit, logger)
@@ -1848,10 +1877,17 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 		// pg-sprite reads the constraint again under the validation's lock
 		// and refuses with ErrValidatedConstraintDrift, validating nothing,
 		// when it no longer has the definition the plan recorded.
+		// The scan runs under the validation bound; its lock wait keeps the
+		// short lock budget, so queueing behind other DDL never holds the
+		// apply for the whole bound.
+		if change.validateMaxDuration <= 0 {
+			return fmt.Errorf("validate reviewed constraint %q on PostgreSQL table %q: validation bound is not set", change.validates.Constraint, change.table)
+		}
 		if err := executor.ExecuteNativeValidatingWithProgress(ctx, pool, table, statement, executor.Budget{
-			LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
+			LockTimeout: optimisticLockTimeout, StatementTimeout: change.validateMaxDuration,
 		}, executor.DefaultRetryPolicy(), *change.validates, tracker); err != nil {
-			return fmt.Errorf("validate reviewed constraint %q on PostgreSQL table %q: %w", change.validates.Constraint, change.table, err)
+			return fmt.Errorf("validate reviewed constraint %q on PostgreSQL table %q: %w", change.validates.Constraint, change.table,
+				nameValidationBound(err, change.validates.Constraint, change.validateMaxDuration))
 		}
 		return nil
 	}
@@ -1989,7 +2025,7 @@ func provenCatalogOnly(ctx context.Context, pool *pgxpool.Pool, statement pgstat
 }
 
 func applyTablePreflightLimit(change nativeApply, tableSizeLimit int64) int64 {
-	if change.durationBoundedIndexBuild() {
+	if change.durationBoundedIndexBuild() || change.durationBoundedValidation() {
 		return preflight.NoSizeLimit
 	}
 	return tableSizeLimit
@@ -2429,6 +2465,39 @@ func (e *concurrentIndexBoundError) Error() string {
 }
 
 func (e *concurrentIndexBoundError) Unwrap() error { return e.err }
+
+// validationBoundOption is the configuration key an operator changes when a
+// constraint validation needs more time than the bound allows.
+const validationBoundOption = "postgres.validate_max_duration"
+
+// validationBoundError reports that a VALIDATE CONSTRAINT scan ran past the
+// configured bound. Like concurrentIndexBoundError, it names the option the
+// operator changes instead of the per-statement budget pg-sprite's verdict
+// describes, and it says what the cancelled validation left live: the
+// constraint, still NOT VALID, which checks new writes and not existing rows.
+type validationBoundError struct {
+	constraint string
+	bound      time.Duration
+	err        error
+}
+
+func (e *validationBoundError) Error() string {
+	return fmt.Sprintf("validating constraint %q ran past %s (%s) and was cancelled; the constraint stays NOT VALID: it checks new writes, not existing rows",
+		e.constraint, validationBoundOption, e.bound)
+}
+
+func (e *validationBoundError) Unwrap() error { return e.err }
+
+// nameValidationBound wraps a validation failure caused by the bound's
+// statement timeout firing so the operator detail names the option; every
+// other failure, the lock budget among them, passes through unchanged.
+func nameValidationBound(err error, constraint string, bound time.Duration) error {
+	var budgetErr *executor.BudgetError
+	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
+		return &validationBoundError{constraint: constraint, bound: bound, err: err}
+	}
+	return err
+}
 
 // sqlstateQueryCanceled is the SQLSTATE the server raises when a statement
 // is cancelled, whether by its statement_timeout or by a cancel request.

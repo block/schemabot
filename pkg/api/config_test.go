@@ -6304,6 +6304,50 @@ postgres:
 	})
 }
 
+// postgres.validate_max_duration bounds one VALIDATE CONSTRAINT scan. It
+// defaults to a day, as the index build bound does, and is held to the same
+// range the server's statement_timeout can carry.
+func TestPostgresValidateMaxDuration(t *testing.T) {
+	t.Run("unset uses default", func(t *testing.T) {
+		assert.Equal(t, 24*time.Hour, (PostgresConfig{}).ValidateMaxDurationOrDefault())
+	})
+
+	t.Run("configured duration", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(`
+databases:
+  mydb:
+    type: postgres
+    environments:
+      staging:
+        dsn: postgres://localhost/mydb
+postgres:
+  validate_max_duration: 36h
+`), 0o600))
+
+		cfg, err := LoadServerConfigFromFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, 36*time.Hour, cfg.Postgres.ValidateMaxDurationOrDefault())
+	})
+
+	tests := []struct {
+		value string
+		want  string
+	}{
+		{"0", "must be positive"},
+		{"tomorrow", "is not a valid duration"},
+		{"500us", "below the smallest bound the engine can honor (1ms"},
+		{(postgresengine.MaxConcurrentIndexMaxDuration + time.Millisecond).String(), "exceeds the largest bound the engine can honor"},
+	}
+	for _, tt := range tests {
+		t.Run("refuses "+tt.value, func(t *testing.T) {
+			err := PostgresConfig{ValidateMaxDuration: tt.value}.validate()
+			require.ErrorContains(t, err, "postgres.validate_max_duration")
+			require.ErrorContains(t, err, tt.want)
+		})
+	}
+}
+
 // postgres.statement_timeout bounds ordinary storage queries. Unlike the pool
 // durations, zero is a meaningful setting rather than "use the default": it
 // disables the budget explicitly so the connection states that it has no

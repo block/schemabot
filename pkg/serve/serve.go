@@ -1453,6 +1453,7 @@ func grpcLocalClientFactory(config *api.ServerConfig, wakeOperator func(applyIde
 		cfg.Metadata = metadata
 		cfg.PostgresNativeSafeTableSizeLimitBytes = config.Postgres.NativeSafeTableSizeLimit()
 		cfg.PostgresConcurrentIndexMaxDuration = config.Postgres.ConcurrentIndexMaxDurationOrDefault()
+		cfg.PostgresValidateMaxDuration = config.Postgres.ValidateMaxDurationOrDefault()
 		if cfg.WakeOperator == nil {
 			cfg.WakeOperator = wakeOperator
 		}

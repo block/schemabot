@@ -3,6 +3,7 @@ package postgres
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -323,6 +324,23 @@ func TestClassifyRefusal(t *testing.T) {
 			wantNotDetail: []string{"statement budget", replanRemedy},
 		},
 		{
+			name: "validation that ran past its bound is a refusal naming the option and what stays live",
+			err: fmt.Errorf("validate reviewed constraint %q on PostgreSQL table %q: %w", "orders_user_id_fkey", "orders",
+				nameValidationBound(&executor.BudgetError{Cause: executor.CauseStatement, Budget: 36 * time.Hour}, "orders_user_id_fkey", 36*time.Hour)),
+			wantReason: "validation-bound-exceeded",
+			wantDetail: []string{
+				`validating constraint "orders_user_id_fkey" ran past postgres.validate_max_duration (36h0m0s) and was cancelled`,
+				"the constraint stays NOT VALID: it checks new writes, not existing rows",
+				"raise postgres.validate_max_duration and re-run",
+			},
+			wantNotDetail: []string{"statement budget", replanRemedy},
+		},
+		{
+			name: "validation that lost its lock budget stays operational",
+			err: fmt.Errorf("validate reviewed constraint %q on PostgreSQL table %q: %w", "orders_user_id_fkey", "orders",
+				nameValidationBound(&executor.BudgetError{Cause: executor.CauseLock, Budget: 3 * time.Second}, "orders_user_id_fkey", 36*time.Hour)),
+		},
+		{
 			name: "lock budget exhaustion is operational",
 			err:  fmt.Errorf("execute: %w", &executor.BudgetError{Cause: executor.CauseLock, Budget: time.Second}),
 		},
@@ -436,6 +454,9 @@ func TestApplyTablePreflightLimitFollowsStatementCost(t *testing.T) {
 
 	assert.Equal(t, preflight.NoSizeLimit, applyTablePreflightLimit(nativeApply{concurrentIndex: true}, configuredLimit))
 	assert.Equal(t, preflight.NoSizeLimit, applyTablePreflightLimit(nativeApply{partitionedIndex: true}, configuredLimit))
+	key := reviewedUserKey()
+	assert.Equal(t, preflight.NoSizeLimit, applyTablePreflightLimit(nativeApply{validates: &key}, configuredLimit),
+		"a validation scan rewrites nothing, so its cost is bounded by time, not table size")
 	assert.Equal(t, configuredLimit, applyTablePreflightLimit(nativeApply{}, configuredLimit))
 }
 
@@ -2909,6 +2930,56 @@ func TestConcurrentIndexApplyCeilingLeavesSetupHeadroom(t *testing.T) {
 	assert.Equal(t, bound, env.change.concurrentIndexMaxDuration)
 	assert.Greater(t, granted, bound, "the ceiling must outlast the build bound it wraps")
 	assert.LessOrEqual(t, granted, bound+concurrentIndexHeadroom)
+}
+
+// TestValidationApplyRunsUnderTheValidationBound proves the drive runs a
+// VALIDATE CONSTRAINT under a ceiling above the configured validation bound,
+// so the scan's own statement_timeout ends an over-long validation and the
+// outcome names the option, and stamps that bound on the change the executor
+// receives instead of the per-statement limit.
+func TestValidationApplyRunsUnderTheValidationBound(t *testing.T) {
+	const bound = 5 * time.Hour
+	scripted := newScriptedExecutor(func(*progress.Tracker) error { return nil })
+	eng := NewWithOptions(0, 3*time.Hour).WithValidateMaxDuration(bound)
+	eng.execute = scripted.execute
+	t.Cleanup(eng.Drain)
+	t.Cleanup(scripted.release)
+	record, err := json.Marshal(reviewedUserKey())
+	require.NoError(t, err)
+	accepted, err := eng.Apply(t.Context(), &engine.ApplyRequest{
+		Database: "app",
+		Changes: []engine.SchemaChange{{Namespace: "public", TableChanges: []engine.TableChange{{
+			Table: "orders", DDL: reviewedValidationSQL,
+			Metadata: map[string]string{reviewedValidationMetadataKey: string(record)},
+		}}}},
+		Credentials: &engine.Credentials{DSN: "postgres://schemabot:secret@db.invalid/app?sslmode=disable"},
+		ResumeState: &engine.ResumeState{MigrationContext: "task-validate"},
+		Logger:      slog.New(slog.DiscardHandler),
+	})
+	require.NoError(t, err)
+	require.True(t, accepted.Accepted)
+
+	env := scripted.envelope(t)
+	granted := env.deadline.Sub(env.observed)
+	require.NotNil(t, env.change.validates)
+	assert.Equal(t, bound, env.change.validateMaxDuration)
+	assert.Zero(t, env.change.concurrentIndexMaxDuration, "the build bound is stamped only on a concurrent index apply")
+	assert.Greater(t, granted, bound, "the ceiling must outlast the validation bound it wraps")
+	assert.LessOrEqual(t, granted, bound+concurrentIndexHeadroom)
+}
+
+// TestValidateMaxDurationIsNormalizedLikeTheBuildBound pins the validation
+// bound to the range statement_timeout can hold, as the build bound is: a
+// bound that is not positive adopts the default, and one outside the range
+// is clamped into it.
+func TestValidateMaxDurationIsNormalizedLikeTheBuildBound(t *testing.T) {
+	assert.Equal(t, DefaultValidateMaxDuration, New().ValidateMaxDuration())
+	assert.Equal(t, 24*time.Hour, DefaultValidateMaxDuration)
+	assert.Equal(t, DefaultValidateMaxDuration, New().WithValidateMaxDuration(0).ValidateMaxDuration())
+	assert.Equal(t, DefaultValidateMaxDuration, New().WithValidateMaxDuration(-time.Second).ValidateMaxDuration())
+	assert.Equal(t, MinConcurrentIndexMaxDuration, New().WithValidateMaxDuration(500*time.Microsecond).ValidateMaxDuration())
+	assert.Equal(t, MaxConcurrentIndexMaxDuration, New().WithValidateMaxDuration(MaxConcurrentIndexMaxDuration+1).ValidateMaxDuration())
+	assert.Equal(t, 36*time.Hour, New().WithValidateMaxDuration(36*time.Hour).ValidateMaxDuration())
 }
 
 // TestConcurrentIndexHeadroomCoversSessionSetup pins the headroom to what it

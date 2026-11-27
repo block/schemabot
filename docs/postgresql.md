@@ -420,10 +420,11 @@ unsafe to leave in place.
 | `ALTER TABLE` | Each attempt gets a 3-second lock budget, retried on contention, and a 30-second statement budget | Fixed |
 | `CREATE INDEX CONCURRENTLY` | Build duration, enforced as the server-side `statement_timeout`. 24 hours by default | `postgres.concurrent_index_max_duration` |
 | Index on a partitioned table | The same duration, for each partition and for the whole build | `postgres.concurrent_index_max_duration` |
+| `VALIDATE CONSTRAINT` | Scan duration, enforced as the server-side `statement_timeout`. 24 hours by default. Each attempt gets the same 3-second lock budget as `ALTER TABLE` | `postgres.validate_max_duration` |
 | `CREATE TABLE` | No size limit, since the table starts empty | None |
 
-The size limit bounds work that grows with existing data, so index builds and
-new tables are bounded by duration instead. The duration starts when the build
+The size limit bounds work that grows with existing data, so index builds,
+validations, and new tables are bounded by duration instead. The duration starts when the build
 starts: session setup has its own allowance, so the build gets the full bound.
 [Configuration](configuration.md) covers the trade-offs of raising either
 setting.
@@ -855,7 +856,7 @@ creates does not count: create the referenced table first, then add the key.
 | Step | Locks | Takes |
 |---|---|---|
 | `ADD CONSTRAINT ... NOT VALID` | `SHARE ROW EXCLUSIVE` on both tables, under the 3-second `lock_timeout` | Milliseconds. From here on, new writes are checked |
-| `VALIDATE CONSTRAINT` | `SHARE UPDATE EXCLUSIVE` on the table and `ROW SHARE` on the referenced table. Reads and writes continue on both | Up to the 30-second statement budget. A longer scan is refused, and the key stays `NOT VALID` |
+| `VALIDATE CONSTRAINT` | `SHARE UPDATE EXCLUSIVE` on the table and `ROW SHARE` on the referenced table. Reads and writes continue on both | Up to `postgres.validate_max_duration`, 24 hours by default. A longer scan is cancelled and refused, and the key stays `NOT VALID` |
 
 A new table's `REFERENCES` takes the same brief `SHARE ROW EXCLUSIVE` on each
 referenced table. On a busy referenced table, the step times out and the apply
@@ -914,16 +915,18 @@ applying the same plan again meets the same refusal.
 | The role lacks a privilege the statement needs | Refused before any DDL runs. The failure includes the `GRANT` that fixes it |
 | A statement waited past its 3-second lock budget | Retryable once the lock contention clears |
 | A statement ran past its 30-second budget | Refused. The statement is rolled back |
+| A `VALIDATE CONSTRAINT` ran past `postgres.validate_max_duration` | Refused. The constraint stays `NOT VALID` and checks new writes. Raise the setting, then apply again |
 | An apply ran past the 5-minute ceiling | Retryable |
 | A new table's name is taken, its schema is missing, or its shape is refused | Refused. See [Greenfield tables](#greenfield-tables) |
 | A later step of a new table's set failed | Refused. The earlier steps stay committed. Follow the failure's fix, or plan again |
 | An index build failed | See [When a build fails](#when-a-build-fails) |
 | Any other failure, such as a dropped connection | Retryable. The message is sanitized; connection and server details stay in the server logs |
 
-**The 5-minute ceiling** applies to every apply except an index build, and
-cannot be changed. It makes sure a hung connection still ends in a final
-state. The lock and statement budgets bound the real work. Index builds use
-`postgres.concurrent_index_max_duration` instead.
+**The 5-minute ceiling** applies to every apply except an index build or a
+validation, and cannot be changed. It makes sure a hung connection still ends
+in a final state. The lock and statement budgets bound the real work. Index
+builds use `postgres.concurrent_index_max_duration` instead, and validations
+use `postgres.validate_max_duration`.
 
 ## Unsupported workflow features
 
