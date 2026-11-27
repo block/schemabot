@@ -642,7 +642,7 @@ func (s *Service) controlTarget(ctx context.Context, operation, applyIdentifier,
 		s.logger.Error("control request apply is missing stored deployment metadata",
 			append(apply.LogAttrs(),
 				"operation", operation, "error", err)...)
-		return nil, apply, "", err
+		return nil, apply, "", &terminalControlError{err: err, shown: controlMissingDeploymentMessage(operation, applyIdentifier)}
 	}
 	client, err := s.TernClient(deployment, apply.Environment)
 	if err != nil {

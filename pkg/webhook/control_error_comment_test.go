@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	grpccodes "google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
@@ -70,7 +72,7 @@ func TestControlCommandInternalFailureKeepsErrorOutOfComment(t *testing.T) {
 	h.handleStopCommand("octocat/hello-world", 1, 12345, "testuser", planControlCommandResult())
 
 	body := requireComment(t, comments, "control operation failure comment")
-	assert.Contains(t, body, "SchemaBot could not complete the stop command for apply `apply-123`. "+planControlRetryLine)
+	assert.Contains(t, body, controlFailureLine("stop"))
 	requireNoInfrastructureDetail(t, body)
 	assert.NotContains(t, body, "10.1.2.3")
 	assert.NotContains(t, body, "failed to look up apply")
@@ -104,10 +106,10 @@ func TestControlCommandAuthoredRefusalShowsItsText(t *testing.T) {
 // A control command's failure line keeps an untyped failure's text, and any
 // wrap around it, out of the comment.
 func TestControlOperationFailureMessage(t *testing.T) {
-	t.Run("an untyped failure asks for another attempt", func(t *testing.T) {
+	t.Run("an untyped failure asks to check the apply before another attempt", func(t *testing.T) {
 		got := controlOperationFailureMessage(errors.New(rawInfrastructureError), "cutover", "apply-123")
 
-		assert.Equal(t, "SchemaBot could not complete the cutover command for apply `apply-123`. "+planControlRetryLine, got)
+		assert.Equal(t, controlFailureLine("cutover"), got)
 	})
 
 	t.Run("a wrapped untyped failure keeps the wrap out of the line", func(t *testing.T) {
@@ -116,6 +118,76 @@ func TestControlOperationFailureMessage(t *testing.T) {
 		got := controlOperationFailureMessage(wrapped, "skip-revert", "apply-123")
 
 		assert.NotContains(t, got, "10.1.2.3")
-		assert.Equal(t, "SchemaBot could not complete the skip-revert command for apply `apply-123`. "+planControlRetryLine, got)
+		assert.Equal(t, controlFailureLine("skip-revert"), got)
 	})
+
+	t.Run("a remote data plane that did not answer is named as such", func(t *testing.T) {
+		err := fmt.Errorf("check remote apply apply-123 before cutover: %w",
+			grpcstatus.Error(grpccodes.Unavailable, rawInfrastructureError))
+
+		got := controlOperationFailureMessage(err, "cutover", "apply-123")
+
+		assert.Equal(t, userFacingRemoteUnavailableError("", ""), got)
+		requireNoInfrastructureDetail(t, got)
+	})
+}
+
+// controlFailureLine is the PR comment line for a control command whose
+// operation failed inside SchemaBot on apply-123.
+func controlFailureLine(command string) string {
+	return "SchemaBot could not complete the " + command + " command for apply `apply-123`. " +
+		"It may already be recorded, so check the progress comment for this apply before running the command again; " +
+		"the SchemaBot server logs have the cause."
+}
+
+// Each control command whose operation fails inside SchemaBot names itself in
+// the fixed line and keeps the failure's own text out of the PR comment.
+func TestEveryControlCommandNamesItselfInFailureLine(t *testing.T) {
+	const repo, pr, installation, requester = "octocat/hello-world", 1, int64(12345), "testuser"
+	commands := map[string]func(h *Handler, r CommandResult){
+		"stop":        func(h *Handler, r CommandResult) { h.handleStopCommand(repo, pr, installation, requester, r) },
+		"cancel":      func(h *Handler, r CommandResult) { h.handleCancelCommand(repo, pr, installation, requester, r) },
+		"start":       func(h *Handler, r CommandResult) { h.handleStartCommand(repo, pr, installation, requester, r) },
+		"release":     func(h *Handler, r CommandResult) { h.handleReleaseCommand(repo, pr, installation, requester, r) },
+		"cutover":     func(h *Handler, r CommandResult) { h.handleCutoverCommand(repo, pr, installation, requester, r) },
+		"skip-revert": func(h *Handler, r CommandResult) { h.handleSkipRevertCommand(repo, pr, installation, requester, r) },
+		"revert":      func(h *Handler, r CommandResult) { h.handleRevertCommand(repo, pr, installation, requester, r) },
+	}
+	for name, run := range commands {
+		t.Run(name, func(t *testing.T) {
+			client, mux := setupGitHubServer(t)
+			comments := recordComments(t, mux)
+			st := &planControlStorage{applies: &controlOperationApplyStore{
+				apply:   controlOperationTestApply(storage.EngineSpirit),
+				loadErr: errors.New(rawInfrastructureError),
+			}}
+			h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+			run(h, planControlCommandResult())
+
+			body := requireComment(t, comments, name+" failure comment")
+			assert.Contains(t, body, controlFailureLine(name))
+			requireNoInfrastructureDetail(t, body)
+		})
+	}
+}
+
+// A control command on an apply with no deployment recorded says that
+// running it again fails the same way, rather than asking for another attempt.
+func TestControlCommandOnApplyWithoutDeploymentSaysRetryWillNotHelp(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := recordComments(t, mux)
+	apply := controlOperationTestApply(storage.EngineSpirit)
+	apply.Deployment = ""
+	st := &planControlStorage{applies: &controlOperationApplyStore{apply: apply}}
+	h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+	h.handleCutoverCommand("octocat/hello-world", 1, 12345, "testuser", planControlCommandResult())
+
+	body := requireComment(t, comments, "missing deployment comment")
+	assert.Contains(t, body, "The cutover was not attempted for apply")
+	assert.Contains(t, body, "because SchemaBot has no deployment recorded for it, so nothing was changed.")
+	assert.Contains(t, body, "Sending it again will fail the same way.")
+	assert.NotContains(t, body, "missing stored deployment metadata")
+	assert.NotContains(t, body, "running the command again")
 }
