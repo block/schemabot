@@ -1504,8 +1504,8 @@ func singleLine(s string) string {
 
 // executionVerdict maps one planned statement to the verdict the operator
 // reviews. A planner value outside the vocabulary this mapping knows — a plan
-// contract, a disposition, a create shape cause, or a guidance code the planner
-// added after the mapping was written — still renders a blocked placeholder,
+// contract, a disposition, a create shape cause, a refusal reason, or a
+// guidance code the planner added after the mapping was written — still renders a blocked placeholder,
 // and is reported on the verdict so the caller can log it with the
 // identifiers this function does not have.
 func executionVerdict(formatVersion int, statement pgplan.Statement, table string, crossNamespaceForeignKeys []string) stepVerdict {
@@ -1564,10 +1564,7 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 		if statement.Kind == schemadiff.ChangeSetGeneratedExpression {
 			return blocked(generatedExpressionRefusalReason(table))
 		}
-		if reason, ok := dependentObjectRefusalReason(statement.Decisions, table); ok {
-			return blocked(reason)
-		}
-		reason, unknownReason, ok := plannerRefusalReason(statement.Decisions, table)
+		reason, unknownReason, ok := operationRefusalReason(statement.Decisions, table)
 		if ok {
 			return blocked(reason)
 		}

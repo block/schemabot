@@ -6,13 +6,15 @@ import (
 	"strings"
 
 	"github.com/block/pg-sprite/pkg/planner"
+
+	"github.com/block/schemabot/pkg/engine"
 )
 
 // plannerRefusalClauses holds, for each planner reason that refuses an
 // operation outright, the clause that says why in SchemaBot's words and what
 // the operator does instead. The reasons that name the objects in the way —
 // the dependent views, policies, triggers, and generated columns, and the
-// partition key — render through dependentObjectRefusalReason, which lists
+// partition key — render through dependentObjectCauses, which lists
 // those objects, so they are not here.
 var plannerRefusalClauses = map[planner.Reason]string{
 	planner.ReasonNotNullWithoutDefault: "it adds a NOT NULL column with no default to a table that holds rows, which PostgreSQL refuses because every existing row would hold NULL; " +
@@ -26,7 +28,7 @@ var plannerRefusalClauses = map[planner.Reason]string{
 }
 
 // dependentRefusalReasons are the planner reasons whose refusal names the
-// objects in the way, which dependentObjectRefusalReason renders.
+// objects in the way, which dependentObjectCauses renders.
 var dependentRefusalReasons = []planner.Reason{
 	planner.ReasonDependentView,
 	planner.ReasonDependentPolicy,
@@ -35,29 +37,48 @@ var dependentRefusalReasons = []planner.Reason{
 	planner.ReasonPartitionKey,
 }
 
-// plannerRefusalReason renders the planner's refusal of a statement's
-// operations: each refused operation's reason as a clause, joined into one
-// sentence, so the operator reads both why the change cannot run and what to
-// do instead. A refused operation whose reason has no clause here is
-// returned as unknown, so the caller renders the generic refusal and reports
-// the reason as planner vocabulary that moved. It reports false when no
-// operation was refused for a reason this function renders.
-func plannerRefusalReason(decisions []planner.Decision, table string) (reason string, unknown planner.Reason, ok bool) {
-	var clauses []string
+// operationRefusalReason renders the refusal of a statement's operations as
+// one sentence: first the objects in the way of a column change, then each
+// other refused operation's reason as a clause, so the operator reads every
+// fix the statement needs at once rather than one per plan. A refused
+// operation whose reason has no clause here is returned as unknown, even
+// beside reasons that render, since a sentence naming only the known fixes
+// would tell the operator that following them is enough; the caller renders
+// the generic refusal and reports the reason as planner vocabulary that
+// moved. It reports false when no operation names a cause this function
+// renders.
+//
+// Dependent object names come from the catalog, so the composed reason is
+// collapsed to one line and its blocked-cause separator neutralized, as for
+// every other reason built from a database identifier.
+func operationRefusalReason(decisions []planner.Decision, table string) (reason string, unknown planner.Reason, ok bool) {
+	clauses, unknown := plannerRefusalClauseList(decisions)
+	if unknown != "" {
+		return "", unknown, false
+	}
+	causes := append(dependentObjectCauses(decisions), clauses...)
+	if len(causes) == 0 {
+		return "", "", false
+	}
+	reason = fmt.Sprintf("statement for table %q is refused: %s, then plan again", table, strings.Join(causes, "; and "))
+	return engine.SanitizeBlockedCause(singleLine(reason)), "", true
+}
+
+// plannerRefusalClauseList returns the clause for each distinct reason the
+// planner refused an operation for, leaving out the reasons that name the
+// objects in the way, or the first refused reason that has no clause.
+func plannerRefusalClauseList(decisions []planner.Decision) (clauses []string, unknown planner.Reason) {
 	for _, d := range decisions {
 		if d.Route != planner.RouteRefuse || slices.Contains(dependentRefusalReasons, d.Reason) {
 			continue
 		}
 		clause, known := plannerRefusalClauses[d.Reason]
 		if !known {
-			return "", d.Reason, false
+			return nil, d.Reason
 		}
 		if !slices.Contains(clauses, clause) {
 			clauses = append(clauses, clause)
 		}
 	}
-	if len(clauses) == 0 {
-		return "", "", false
-	}
-	return fmt.Sprintf("statement for table %q is refused: %s, then plan again", table, strings.Join(clauses, "; and ")), "", true
+	return clauses, ""
 }

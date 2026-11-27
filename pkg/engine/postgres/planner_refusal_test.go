@@ -104,3 +104,34 @@ func TestPlannerRefusalReasonSkipsOperationsNotRefused(t *testing.T) {
 		reason: `statement for table "users" is refused: it cannot be executed safely as written`,
 	}, executionVerdict(pgplan.FormatVersion, st, "users", nil))
 }
+
+// A statement that retypes a column a view reads and adds a NOT NULL column
+// with no default names both fixes in one sentence, the object in the way
+// first, so the operator does not fix one, plan again, and only then learn
+// of the other.
+func TestPlannerRefusalReasonJoinsDependentObjectsAndOtherReasons(t *testing.T) {
+	st := refusedStatement(planner.ReasonNotNullWithoutDefault)
+	st.Decisions = append(st.Decisions, planner.Decision{
+		Route: planner.RouteRefuse, Reason: planner.ReasonDependentView, DependentViews: []string{`"public"."user_emails"`},
+	})
+	assert.Equal(t, stepVerdict{
+		mode: engine.ExecutionModeBlocked,
+		reason: `statement for table "users" is refused: it changes or drops a column that view "public"."user_emails" reads; drop or redefine the view outside SchemaBot; and ` +
+			`it adds a NOT NULL column with no default to a table that holds rows, which PostgreSQL refuses because every existing row would hold NULL; give the column a default, or add it without NOT NULL, fill every row, then declare NOT NULL in a later change, which SchemaBot runs online, then plan again`,
+	}, executionVerdict(pgplan.FormatVersion, st, "users", nil))
+}
+
+// A refusal reason this build has no sentence for is reported even beside a
+// dependent object, and the generic sentence stands in for both: naming only
+// the view would tell the operator that redefining it is enough.
+func TestPlannerRefusalReasonUnknownReasonBesideADependentObject(t *testing.T) {
+	st := refusedStatement(planner.Reason("future-reason"))
+	st.Decisions = append(st.Decisions, planner.Decision{
+		Route: planner.RouteRefuse, Reason: planner.ReasonDependentView, DependentViews: []string{`"public"."user_emails"`},
+	})
+	assert.Equal(t, stepVerdict{
+		mode:         engine.ExecutionModeBlocked,
+		reason:       `statement for table "users" is refused: it cannot be executed safely as written`,
+		unrecognized: &unrecognizedPlannerVocabulary{kind: "refusal_reason", value: "future-reason"},
+	}, executionVerdict(pgplan.FormatVersion, st, "users", nil))
+}
