@@ -49,9 +49,12 @@ type namespaceArtifacts struct {
 	// validatedConstraints names, per table, the constraints the apply's plan
 	// validates in a step of its own.
 	validatedConstraints map[string][]string
-	// replacedConstraints names, per table, the constraints a task drops and
-	// adds again under the same name in one statement.
-	replacedConstraints map[string][]string
+	// droppedConstraints names, per table, the constraints the apply's plan
+	// drops.
+	droppedConstraints map[string][]string
+	// unreadTables names the tables with a statement the release could not
+	// read, on which it removes no constraint.
+	unreadTables []string
 }
 
 // releaseCancelledArtifacts reclaims the artifacts the cancelled apply left on
@@ -373,7 +376,10 @@ func (c *LocalClient) cancelledArtifactTables(apply *storage.Apply, tasks []*sto
 		constraints := c.taskConstraintChanges(apply, task)
 		entry.addedConstraints = appendTableNames(entry.addedConstraints, task.TableName, constraints.added)
 		entry.validatedConstraints = appendTableNames(entry.validatedConstraints, task.TableName, constraints.validated)
-		entry.replacedConstraints = appendTableNames(entry.replacedConstraints, task.TableName, constraints.replaced)
+		entry.droppedConstraints = appendTableNames(entry.droppedConstraints, task.TableName, constraints.dropped)
+		if constraints.unread && !slices.Contains(entry.unreadTables, task.TableName) {
+			entry.unreadTables = append(entry.unreadTables, task.TableName)
+		}
 	}
 	for _, entry := range byNamespace {
 		c.withholdReplacedConstraints(apply, entry)
@@ -381,19 +387,28 @@ func (c *LocalClient) cancelledArtifactTables(apply *storage.Apply, tasks []*sto
 	return byNamespace
 }
 
-// withholdReplacedConstraints takes the constraints a task replaced in place
-// out of the ones the release may drop. The replacement dropped the old rule
-// and added the new one NOT VALID in one statement, so the unvalidated rule a
-// failed or cancelled validation leaves is the only one checking the table's
-// writes. Dropping it would leave the table with neither.
+// withholdReplacedConstraints takes the constraints the plan replaces under
+// the same name out of the ones the release may drop. A replacement drops the
+// old rule and adds the new one NOT VALID, in one statement or in steps of
+// their own, so once the old rule is gone the unvalidated rule a failed or
+// cancelled validation leaves is the only one checking the table's writes.
+// Dropping it would leave the table with neither. A name the plan drops and
+// never adds again is not in either list, so withholding it changes nothing.
 func (c *LocalClient) withholdReplacedConstraints(apply *storage.Apply, entry *namespaceArtifacts) {
-	for table, replaced := range entry.replacedConstraints {
-		for _, name := range replaced {
-			c.logger.Info("a release keeps a constraint the schema change replaced in place: it is the only rule on the table",
+	for table, dropped := range entry.droppedConstraints {
+		for _, name := range dropped {
+			if !slices.Contains(entry.addedConstraints[table], name) && !slices.Contains(entry.validatedConstraints[table], name) {
+				continue
+			}
+			c.logger.Info("a release keeps a constraint the schema change replaced under the same name: it is the only rule on the table",
 				append(apply.LogAttrs(), "namespace", entry.task.Namespace, "table", table, "constraint", name)...)
 		}
-		entry.addedConstraints[table] = withoutNames(entry.addedConstraints[table], replaced)
-		entry.validatedConstraints[table] = withoutNames(entry.validatedConstraints[table], replaced)
+		entry.addedConstraints[table] = withoutNames(entry.addedConstraints[table], dropped)
+		entry.validatedConstraints[table] = withoutNames(entry.validatedConstraints[table], dropped)
+	}
+	for _, table := range entry.unreadTables {
+		delete(entry.addedConstraints, table)
+		delete(entry.validatedConstraints, table)
 	}
 }
 
@@ -426,39 +441,39 @@ type constraintChanges struct {
 	// its own, whether or not the task ran: the plan's intent is what makes
 	// an unvalidated constraint of that name an unfinished step.
 	validated []string
-	// replaced names the constraints the statement drops and adds again.
-	replaced []string
+	// dropped names the constraints the statement drops, whether or not the
+	// task ran: a plan that drops a name and adds it again replaces that
+	// rule, whichever step a failure or cancel stops at.
+	dropped []string
+	// unread is set when the statement could not be read.
+	unread bool
 }
 
 // taskConstraintChanges reads which constraints a task's statement adds,
-// validates and replaces. A task that never left pending added nothing, so a
+// validates and drops. A task that never left pending added nothing, so a
 // constraint of the same name on its table is not the apply's to remove. A
-// statement that cannot be read attributes nothing, which leaves any
-// constraint in place rather than risk removing one the apply did not add.
+// statement that cannot be read marks its table unread, and the release then
+// removes no constraint there: it cannot tell whether the statement dropped
+// the rule an unvalidated one replaces.
 func (c *LocalClient) taskConstraintChanges(apply *storage.Apply, task *storage.Task) constraintChanges {
 	parser, err := c.statementParser()
 	if err != nil {
 		c.logger.Warn("a release cannot read which constraints the task added, so it removes none of them",
 			append(task.LogAttrs(), "database", apply.Database, "error", err)...)
-		return constraintChanges{}
+		return constraintChanges{unread: true}
 	}
 	changes, err := parser.ObjectChanges(task.DDL)
 	if err != nil {
 		c.logger.Warn("a release cannot read which constraints the task added, so it removes none of them",
 			append(task.LogAttrs(), "database", apply.Database, "error", err)...)
-		return constraintChanges{}
+		return constraintChanges{unread: true}
 	}
-	dropped := constraintNames(changes.Dropped)
-	var result constraintChanges
-	result.validated = constraintNames(changes.Validated)
-	for _, name := range constraintNames(changes.Added) {
-		if slices.Contains(dropped, name) {
-			result.replaced = append(result.replaced, name)
-			continue
-		}
-		if !state.IsState(task.State, state.Task.Pending) {
-			result.added = append(result.added, name)
-		}
+	result := constraintChanges{
+		validated: constraintNames(changes.Validated),
+		dropped:   constraintNames(changes.Dropped),
+	}
+	if !state.IsState(task.State, state.Task.Pending) {
+		result.added = constraintNames(changes.Added)
 	}
 	return result
 }
