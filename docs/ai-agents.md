@@ -87,7 +87,8 @@ or cancel the apply, run its cutover, and close its revert window — an operato
 surface, not a read, so an agent following a change passes `--no-watch`.
 For a change that spans several targets or shards, each one reports separately,
 so an agent can tell you which shard is behind rather than only that something
-is.
+is. `logs --target` and `--shard` narrow the log to one of them; see
+[Read the logs](cli.md#read-the-logs).
 
 ### Read all of it as data
 
