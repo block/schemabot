@@ -20,8 +20,9 @@ keyspace is split across two shards, so an apply reports progress per shard, and
 it needs no PlanetScale account.
 
 The first Vitess sample downloads a multi-gigabyte cluster image, so allow several
-minutes on a machine that has never run one. Docker keeps the image, and later
-samples start in seconds. The cluster is rebuilt from the seed schema whenever the
+minutes on a machine that has never run one. Docker keeps the image, so later
+samples skip the download, but the cluster still takes a minute or so to come
+up. The cluster is rebuilt from the seed schema whenever the
 container restarts, while the state database keeps what was applied, so restart it
 to start the demonstration over rather than to carry work forward. See
 [Vitess on PlanetScale](vitess.md#quick-start).

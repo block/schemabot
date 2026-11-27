@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -30,8 +31,8 @@ const (
 	// The change the docs' worked example makes: a column on a table sharded
 	// on customer_id, so every shard runs its own copy.
 	addColumn = "ALTER TABLE `orders` ADD COLUMN `note` varchar(255) DEFAULT NULL"
-	// deployRequest is the PlanetScale deploy request the apply drives. It is
-	// fictional, on the documentation org PlanetScale reserves for examples.
+	// deployRequest is the PlanetScale deploy request the apply drives. The
+	// org, database and number are fictional.
 	deployRequest = "https://app.planetscale.com/example-org/shop/deploy-requests/118"
 	// percentStep is how far the copy advances between progress updates.
 	percentStep = 4
@@ -98,15 +99,26 @@ func clampPercent(p int) int {
 	return p
 }
 
-// shards is the per-shard breakdown when the table's copy is percent of the
-// way through, each shard carrying its own share of the rows.
-func shards(percent int, status string) []templates.ShardProgressData {
+// copyClock maps a recording frame, 0 to 100, onto the copy's own clock, which
+// runs on until the slowest shard is done: at frame 100 every shard has copied
+// its rows, so the last copy frame never shows a shard still behind.
+func copyClock(frame int) int {
+	slowest := 0
+	for _, lead := range shardLead {
+		slowest = min(slowest, lead)
+	}
+	return frame * (100 - slowest) / 100
+}
+
+// shards is the per-shard breakdown at a frame of the copy, each shard
+// carrying its own share of the rows.
+func shards(frame int, status string) []templates.ShardProgressData {
 	out := make([]templates.ShardProgressData, 0, len(recordedShards))
 	for i, s := range recordedShards {
-		shardPercent := percent
+		shardPercent := frame
 		shardStatus := status
 		if status == state.Task.Running {
-			shardPercent = clampPercent(percent + shardLead[i])
+			shardPercent = clampPercent(copyClock(frame) + shardLead[i])
 			if shardPercent == 100 {
 				shardStatus = state.Task.Completed
 			}
@@ -123,16 +135,24 @@ func shards(percent int, status string) []templates.ShardProgressData {
 }
 
 // apply is the progress comment for one apply state, with the table's shards
-// at percent. It carries the deploy request link on every state, since that is
-// the operator's entry point into PlanetScale's own view of the same change.
-func apply(applyState, taskState string, percent int) templates.ApplyStatusCommentData {
+// at frame. The table's rows and percent are its shards' added up, so the
+// table reads 100% only once every shard has finished. It carries the deploy
+// request link on every state, since that is the operator's entry point into
+// PlanetScale's own view of the same change.
+func apply(applyState, taskState string, frame int) templates.ApplyStatusCommentData {
 	total := rowsTotal()
+	perShard := shards(frame, taskState)
+	var copied int64
+	for _, s := range perShard {
+		copied += s.RowsCopied
+	}
+	percent := int(copied * 100 / total)
 	return templates.ApplyStatusCommentData{
 		Database:         database,
 		Environment:      environment,
 		RequestedBy:      requestedBy,
 		State:            applyState,
-		Engine:           "vitess",
+		Engine:           storage.EnginePlanetScale,
 		ApplyID:          applyID,
 		StartedAt:        startedAt.Format(time.RFC3339),
 		DeployRequestURL: deployRequest,
@@ -144,10 +164,10 @@ func apply(applyState, taskState string, percent int) templates.ApplyStatusComme
 			ChangeType:      "alter",
 			Started:         true,
 			PercentComplete: percent,
-			RowsCopied:      total * int64(percent) / 100,
+			RowsCopied:      copied,
 			RowsTotal:       total,
 			PlannedShards:   len(recordedShards),
-			Shards:          shards(percent, taskState),
+			Shards:          perShard,
 		}},
 	}
 }

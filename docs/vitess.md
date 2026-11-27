@@ -169,8 +169,9 @@ deploy branch and asks for that branch's password. The DDL itself runs over a
 MySQL connection to the host the password names, so the apply needs no vtgate
 DSN. Where the DSN is set, it is read-only: shards and schema, never DDL.
 
-Self-hosted Vitess that does not answer the PlanetScale API is a different
-engine; see [Strata](strata-engine.md).
+This engine needs the PlanetScale API, so it does not drive a self-hosted
+Vitess cluster that lacks one. Sharded MySQL outside PlanetScale is the
+[Strata](strata-engine.md) engine's, which runs through a remote deployment.
 
 ## How a change runs
 
@@ -496,7 +497,7 @@ runs.
 | An agent may | An agent hands it to a person |
 |---|---|
 | Run `plan`, `status`, `progress --no-watch`, and `pull` | `apply`, `cutover`, and `cancel` wherever the command policy says to hand them over, which includes production |
-| Rewrite a blocked change into a form the plan accepts, then plan again | `revert` and `skip-revert` |
+| Rewrite a blocked change into a form the plan accepts, then plan again | `revert` and `skip-revert` in production, and outside it unless the user says yes when the agent asks |
 | Tell the user why a change was blocked or refused, in SchemaBot's words | Any DDL run against the cluster outside SchemaBot, and anything done in the PlanetScale console |
 | Report a failure SchemaBot will retry, and check on it again | Deleting a branch, or approving a deploy request |
 
@@ -519,7 +520,7 @@ You can copy this into your agent's instructions:
 > - If SchemaBot blocks or refuses a Vitess change, stop. Tell me the reason it
 >   gave.
 > - You may rewrite the schema files and plan again. Show me the new plan.
-> - Never cancel a deploy request, run a cutover, revert, or close a revert
->   window without asking me first.
+> - Follow the SchemaBot command policy for `cancel`, `cutover`, `revert`, and
+>   `skip-revert`. In production, give me the command instead of posting it.
 > - Never run DDL against the cluster yourself or act in the PlanetScale
 >   console. Give me the command instead.
