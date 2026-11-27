@@ -378,9 +378,10 @@ func tableChangeSignature(tables []TableProgress) string {
 // matches on DDL as well as table, so a table changed by two statements rolls
 // up once per statement. The change reads as instant only when every target
 // that ran it reports it instant: an engine decides that per target, so one
-// target's instant ALTER says nothing about how another applied it. Once no
-// target is working on the change and one has halted, those rows no longer
-// speak for the table, which renders as its halt (formatHaltedAcrossTargets).
+// target's instant ALTER says nothing about how another applied it. Once a
+// target has halted, its status speaks for the table even while another
+// target is still working on the change, and the table renders as that halt
+// (formatHaltedAcrossTargets) whenever no bar is drawn for it.
 func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProgress, members []int, table TableProgress) TableProgress {
 	rolled := TableProgress{
 		TableName:     table.TableName,
@@ -478,7 +479,7 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 			break
 		}
 	}
-	rolled.Status = rollupTaskStatus(statuses)
+	rolled.Status = presentation.RollupTaskStatus(statuses)
 	rolled.IsInstant = reported > 0 && allInstant
 	if allPlanned && reported > 0 {
 		rolled.EstimatedRows = &plannedAll
@@ -603,9 +604,10 @@ func stoppedRowsAcrossTargets(targets []ShardProgress) (copied, total int64) {
 }
 
 // isHaltedAcrossTargets reports whether a table rolled up across targets has
-// halted: no target is still working on the change, and one failed, is
-// retrying, was stopped or was cancelled. Its rolled-up rows cover only the
-// targets that finished, so no one bar or percentage speaks for the table.
+// halted: a target failed, is retrying, was stopped or was cancelled, even
+// while another target is still working on the change. Its rolled-up rows
+// cover only the targets that reported them, so no one bar or percentage
+// speaks for the table.
 func isHaltedAcrossTargets(t TableProgress) bool {
 	return t.AcrossTargets && state.IsState(t.Status,
 		state.Task.Failed, state.Task.FailedRetryable, state.Task.Stopped, state.Task.Cancelled)
@@ -834,38 +836,6 @@ func anyTargetStarted(targets []ShardProgress) bool {
 func countsTowardRolledRows(status string) bool {
 	return state.IsInFlightTaskState(status) ||
 		state.IsState(status, state.Task.Completed, state.Task.RevertWindow)
-}
-
-// inFlightRollupOrder is every in-flight task state, copying first and the
-// rest in the order a target passes through them.
-var inFlightRollupOrder = []string{
-	state.Task.Running,
-	state.Task.WaitingForDeploy,
-	state.Task.Recovering,
-	state.Task.CatchingUp,
-	state.Task.Checksumming,
-	state.Task.PostChecksum,
-	state.Task.WaitingForCutover,
-	state.Task.CuttingOver,
-	state.Task.Reverting,
-}
-
-// rollupTaskStatus is a table's status across targets. While any target is
-// still working on the change the table reads as in flight, never as failed:
-// copying first, so the bar keeps showing the rows still moving, otherwise
-// the earliest phase any target is in, so the table never reads further along
-// than its slowest target. The targets that failed are named in the
-// per-target lines and the attention list beneath it. With nothing in
-// flight, presentation.RollupTaskStatus decides, as it does for the PR
-// comment. Reading in-flight work ahead of a failure is the one place this
-// differs from the PR comment, which puts a failure first.
-func rollupTaskStatus(statuses []string) string {
-	for _, phase := range inFlightRollupOrder {
-		if slices.Contains(statuses, phase) {
-			return phase
-		}
-	}
-	return presentation.RollupTaskStatus(statuses)
 }
 
 // writeTargetAttention names each failed or retrying target with its error

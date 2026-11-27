@@ -69,16 +69,16 @@ func TestInitReuseRefusesSkippedTableTheConfigStillManages(t *testing.T) {
 	require.NoError(t, err)
 
 	withheld := []skippedTableGroup{{Namespace: "public", Tables: []apitypes.SkippedTable{
-		{Table: "audit_log", Reason: "schema files cannot describe its trigger"},
-		{Table: "tmp_import", Reason: "schema files cannot describe its trigger"},
+		{Table: "audit_log", Reason: "schema files cannot describe its table inheritance"},
+		{Table: "tmp_import", Reason: "schema files cannot describe its table inheritance"},
 	}}}
 	require.NoError(t, requireReusedConfigWithholdsSkipped(exclusions, withheld))
 
 	triggered := []skippedTableGroup{{Namespace: "public", Tables: append(withheld[0].Tables,
-		apitypes.SkippedTable{Table: "orders", Reason: "schema files cannot describe its trigger"})}}
+		apitypes.SkippedTable{Table: "orders", Reason: "schema files cannot describe its table inheritance"})}}
 	err = requireReusedConfigWithholdsSkipped(exclusions, triggered)
 	require.ErrorContains(t, err, "Add each table to ignore_tables")
-	require.ErrorContains(t, err, "public.orders (schema files cannot describe its trigger)")
+	require.ErrorContains(t, err, "public.orders (schema files cannot describe its table inheritance)")
 	require.NotContains(t, err.Error(), "audit_log")
 	require.NotContains(t, err.Error(), "tmp_import")
 }

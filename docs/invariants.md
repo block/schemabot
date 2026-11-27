@@ -330,8 +330,8 @@ Sanitizing is a property of the rendering boundary rather than of each call site
 makes it hold: the callers that pass an error through to a comment do not individually decide to
 be careful. The unredacted error goes to the server log next to the repo, PR, environment,
 database, and command, so nothing is lost for triage. Inbound webhook payloads are size-bounded
-before decode. *Enforced:* the comment and table-cell sanitizers in
-`pkg/webhook/templates/common.go`, applied by the error renderers themselves
+before decode. *Enforced:* the comment and table-cell sanitizers and the error-detail
+escaper (`errorDetailMarkdown`) in `pkg/webhook/templates/common.go`, applied by the error renderers themselves
 (`pkg/webhook/templates/errors.go`); the code fences sized past any backtick run in their
 content, DDL fences drawing on a budget shared across the comment, and the code span that holds
 an identifier read from the PR's schema files, its `schemabot.yaml`, or a command's `-d` flag —
@@ -1784,10 +1784,14 @@ While a rollout is copying a table on several targets, the table has one reading
 the percent beside its bar, the rows copied of the rows to copy, how many targets those rows cover,
 its planned size, and whether its ETA is a floor. That reading is derived once from the targets'
 progress and rendered by the CLI and the PR comment alike, so the two never disagree about how far
-one rollout has got. *Enforced:* the shared derivation (`SumTargetRows`, `PercentAcrossTargets`,
-`AcrossTargetsPercent`, and `TargetsTableSizeClause` in `pkg/presentation`), and a test that
-renders the same rollouts through both surfaces and fails when they read differently
-(`TestRolledUpTableReadsTheSameInTheCLIAndThePRComment` in `pkg/cmd/internal/templates`).
+one rollout has got. The table's state across its targets is likewise derived once, failure first and otherwise the
+least finished state any target is in (`RollupTaskStatus`), so a table that failed on one target
+never reads as in flight on one surface and failed on the other, and a table never reads further
+along than its slowest target. *Enforced:* the shared derivation (`SumTargetRows`, `PercentAcrossTargets`,
+`AcrossTargetsPercent`, `TargetsTableSizeClause`, and `RollupTaskStatus` in `pkg/presentation`), and
+tests that render the same rollouts through both surfaces and fail when they read differently
+(`TestRolledUpTableReadsTheSameInTheCLIAndThePRComment` and
+`TestRolledUpTableStatusReadsTheSameInTheCLIAndThePRComment` in `pkg/cmd/internal/templates`).
 
 ### UX-8: A table in flight reads the same on every surface, whichever engine runs it
 
@@ -1999,7 +2003,7 @@ Unsafe changes (error-severity lint findings such as table and column drops) blo
 unfinished row copy, require the operator to confirm the specific consequences disclosed to
 them. The re-plan that runs just before execution re-checks that verdict, so a plan that changed
 after the confirmation stops rather than running something the operator never saw. *Enforced:* lint gates and the pull request apply flow, for both `apply` and `apply-confirm`
-(`pkg/api/plan_handlers.go`, `pkg/webhook/apply_gating.go`, `pkg/webhook/apply_execute.go`), including the refusal, at plan and again at apply creation, of a `drop_tables` entry that names a working table of an apply on the same database and environment that has not settled, a stopped one included, since a drop discloses no copy it discards (`refuseDropsOfUnsettledApplyWorkTables` in `pkg/api/drop_tables_work_tables.go`), the re-check that the work of every rollout member, the
+(`pkg/api/plan_handlers.go`, `pkg/webhook/apply_gating.go`, `pkg/webhook/apply_execute.go`), including the refusal, at plan and again at apply creation, of a `drop_tables` entry that names a working table of an apply on the same database and environment that has not settled, a stopped one included, since a drop discloses no copy it discards (`refuseDropsOfUnsettledApplyWorkTables` in `pkg/api/drop_tables_work_tables.go`), and the refusal, at plan and again at apply creation, of a `drop_tables` entry that names the cutover sentinel table, since dropping it runs a deferred cutover nobody requested (`NewDroppedTables` in `pkg/engine/drop_tables.go`, re-checked by `createStoredApply` in `pkg/api/plan_handlers.go`), the re-check that the work of every rollout member, the
 primary target's included, is what the confirmation, or the comment an automatic apply posted,
 was given against and carries no consequence it did not disclose (`confirmedConvergedTargetRound`, `confirmationCoversPrimaryTarget`, `confirmationCoversMemberWork` and `memberWorkRefusal` in
 `pkg/webhook/apply_member_work.go`), with an automatic apply running other members' work only once that comment has landed (`applyCommandCore` in `pkg/webhook/apply_handlers.go`), where every member's discarded copies take the same two-step confirm as the primary plan's, consent being recorded copy by copy with the target each is on and a copy the confirmation did not name stopping the apply again (`rolloutDiscardedCopies`, `rolloutDisclosedCopies` and `undisclosedDiscards` in `pkg/webhook/apply_member_work.go`, recorded on the lock as `DisclosedCopies`, disclosed under each target's plan by `writeTargetDiscardedCopies` in `pkg/webhook/templates/plan.go`) and a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopiesUnreported` and `MemberDiscardedCopies` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`); every rollout
