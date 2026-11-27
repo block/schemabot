@@ -128,7 +128,7 @@ func TestRollbackPlanAnswersForTernClientFailure(t *testing.T) {
 			require.Error(t, err)
 			assert.Nil(t, resp)
 			assert.Equal(t, tc.wantStatus, ControlOperationHTTPStatus(err))
-			assert.Equal(t, tc.wantCode, controlOperationErrorCode(err))
+			assert.Equal(t, tc.wantCode, ControlOperationErrorCode(err))
 			assert.Equal(t, tc.wantTerminal, IsTerminalControlError(err), "whether a durable caller stops retrying")
 			assert.Equal(t, tc.wantMessage, err.Error())
 			assertNoRollbackPlanDSNFragment(t, err.Error())
@@ -197,7 +197,7 @@ func TestRollbackPlanMisconfiguredEngineClientIsTerminal(t *testing.T) {
 			require.Error(t, err)
 			assert.True(t, IsTerminalControlError(err), "a configuration error repeats on every attempt")
 			assert.Equal(t, http.StatusInternalServerError, ControlOperationHTTPStatus(err))
-			assert.Empty(t, controlOperationErrorCode(err), "no code tells a client to retry")
+			assert.Empty(t, ControlOperationErrorCode(err), "no code tells a client to retry")
 			assert.Contains(t, err.Error(), "fix the configuration")
 		})
 	}

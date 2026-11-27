@@ -25,7 +25,7 @@ func TestPreviewCommentPostgresMultiStatement(t *testing.T) {
 		assert.NotContains(t, out, "3 tables")
 		assert.Contains(t, out, "**`users`** — Failed")
 		assert.Contains(t, out, "**`users`** — Completed")
-		assert.Contains(t, out, "**`sessions`** — Cancelled")
+		assert.Contains(t, out, "**`sessions`** — Not run")
 	})
 }
 

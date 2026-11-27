@@ -37,7 +37,7 @@ require (
 	github.com/aws/smithy-go v1.28.9 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/block/mysql v0.0.0-20261122231317-2d9dfd496f60 // indirect
-	github.com/block/pg-sprite v0.5.7-0.20261127054114-8e2257559dda // indirect
+	github.com/block/pg-sprite v0.5.7-0.20261127204311-f64ceb4244c9 // indirect
 	github.com/block/spirit v0.20.1-0.20261122162747-cc0fa5849d1f // indirect
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
@@ -128,4 +128,4 @@ replace github.com/block/schemabot => ../..
 
 // Mirror the parent module's replace directives; replaces do not propagate
 // across module boundaries.
-replace vitess.io/vitess => github.com/block/vitess v0.0.0-20261112160743-c58a2176754c
+replace vitess.io/vitess => github.com/block/vitess v0.0.0-20261127151041-736af1367a3e

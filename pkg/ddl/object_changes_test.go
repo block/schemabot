@@ -182,6 +182,11 @@ func TestPostgresObjectChanges(t *testing.T) {
 			},
 		},
 		{
+			name: "a constraint validated in a step of its own",
+			stmt: "ALTER TABLE orders VALIDATE CONSTRAINT orders_customer_fk",
+			want: ObjectChanges{Modified: objs(tbl("orders")), Validated: objs(cons("orders_customer_fk"))},
+		},
+		{
 			name: "create index",
 			stmt: "CREATE INDEX CONCURRENTLY idx_created_at ON events (created_at) INCLUDE (kind)",
 			want: ObjectChanges{Added: objs(idx("idx_created_at")), Referenced: objs(col("created_at"), col("kind"))},

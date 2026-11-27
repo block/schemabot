@@ -370,6 +370,13 @@ type ReleaseArtifactsRequest struct {
 	// it, since a constraint of the same name that was already on the table
 	// belongs to whatever put it there.
 	AddedConstraints map[string][]string
+	// ValidatedConstraints names, per table, the constraints the apply's plan
+	// validates in a step of its own, whether or not that step ran. A
+	// constraint the schema change added unvalidated to check it apart from
+	// the add is one of these, and a release drops it only when it is also
+	// in AddedConstraints. One the schema change wanted left unvalidated is
+	// in neither, and stays.
+	ValidatedConstraints map[string][]string
 }
 
 // ReleaseArtifactsResult reports what a release reclaimed and what it left
@@ -441,6 +448,42 @@ func ReleaseCancelledArtifacts(ctx context.Context, eng Engine, req *ReleaseArti
 		return false, nil, nil
 	}
 	result, err = releaser.ReleaseCancelledArtifacts(ctx, req)
+	return true, result, err
+}
+
+// FailedArtifactReleaser is an optional capability for engines that add a
+// constraint of their own to a live table as a step of a change and remove it
+// in a later step. When a drive ends the apply failed between the two,
+// nothing is left to drive the change, and the constraint goes on checking
+// the application's writes, the same cost a cancel would leave. The release
+// removes the constraints the failed apply added, as a cancel does.
+//
+// The release runs only where a drive settles the failure. An apply that
+// stops retrying because its retries or its freshness window ran out is
+// settled without a drive and keeps its constraints. Each is a step the
+// next apply's plan resumes from: it validates what the desired schema
+// keeps and drops what it does not.
+//
+// Row copies are out of scope: an engine may resume a failed apply's copy
+// from them, so a failure keeps them. Callers hold the same claim and
+// apply-target lock a cancelled release needs.
+type FailedArtifactReleaser interface {
+	// ReleaseFailedArtifacts removes the constraints req.AddedConstraints
+	// names that the failed schema change left on req.Tables, and reports
+	// what it removed and what it left.
+	ReleaseFailedArtifacts(ctx context.Context, req *ReleaseArtifactsRequest) (*ReleaseArtifactsResult, error)
+}
+
+// ReleaseFailedArtifacts removes eng's constraints a failed apply left on the
+// target when eng owns any, and reports whether the engine implements the
+// capability at all. An engine that does not leaves nothing a failure
+// strands, so there is nothing to release and nothing to report.
+func ReleaseFailedArtifacts(ctx context.Context, eng Engine, req *ReleaseArtifactsRequest) (supported bool, result *ReleaseArtifactsResult, err error) {
+	releaser, ok := eng.(FailedArtifactReleaser)
+	if !ok {
+		return false, nil, nil
+	}
+	result, err = releaser.ReleaseFailedArtifacts(ctx, req)
 	return true, result, err
 }
 

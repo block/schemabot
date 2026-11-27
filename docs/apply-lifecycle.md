@@ -159,6 +159,11 @@ so in its reply, and a `stop` sent from anywhere else gets a "Start Withdrawn"
 comment on the PR.
 A `stop` on a `stopped` apply with no `start` waiting is refused with
 `409 already_stopped`.
+A `stop` on an apply whose engine has no paused phase, such as PostgreSQL, is
+refused with `400` before anything is recorded. The error code names the next
+step: `stop_unsupported_cancel` when `cancel` ends it, `stop_unsupported_finishes`
+when it finishes on its own and `progress` follows it, and `stop_unsupported`
+when SchemaBot can't tell which.
 
 ## The retry budget
 

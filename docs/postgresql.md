@@ -72,7 +72,7 @@ early release.
 - Dropping a table whose schema file was deleted, after you approve the drop
   with `--allow-unsafe`. See [Tables with no schema file](#tables-with-no-schema-file).
 - Adding labels to an existing enum type. See [Enum types](#enum-types).
-- Row-level security policies on an existing table.
+- Row-level security policies on an existing table, or on a new table.
 - `schemabot init` and `schemabot pull` for an existing database.
 - PostgreSQL as the database that stores SchemaBot's own state.
 
@@ -86,7 +86,7 @@ early release.
 | Creating an enum type, or removing or reordering its labels | Blocked |
 | `stop`, `start`, `cutover`, deferred cutover, `revert`, `skip-revert` | Not available. Only an index build can be cancelled. See [Unsupported workflow features](#unsupported-workflow-features) |
 | Some changes to a partitioned table's parent | Refused when the apply runs. See [Partitioned tables](#partitioned-tables) |
-| Row-level security on a new table, or an RLS change and a structural change to one table in the same plan | Blocked. See [Row-level security](#row-level-security) |
+| Row-level security changes and structural changes to one existing table in the same plan | Blocked. See [Row-level security](#row-level-security) |
 | Pulling every table shape | `pull` skips a table it cannot write completely and names it, rather than writing a partial file. `onboard` and `init` add it to `ignore_tables`. See [Schema pull](#schema-pull) |
 | Detailed catalog output from the schema intelligence API | Not available |
 
@@ -207,12 +207,15 @@ If your tables belong to a dedicated owner role, read
 | `CREATE INDEX` on an existing table | Runs as `CREATE INDEX CONCURRENTLY`, bounded by `postgres.concurrent_index_max_duration` (24 hours by default). It can be cancelled |
 | `CREATE INDEX` on a partitioned table | Built one partition at a time, each concurrently, under the same bound. It can be cancelled, and applying again resumes from the partitions already built. See [Partitioned index builds](#partitioned-index-builds) |
 | Dropping an index | Runs as `DROP INDEX CONCURRENTLY` after you approve it with `--allow-unsafe`, on a table of any size. Reads and writes continue while it waits for open transactions, up to 4 minutes. See [Dropping an index](#dropping-an-index) |
+| Changing an index's definition | Replaced in three steps: the new definition is built concurrently as `<name>_new`, the old index is dropped, and the new one takes its name. The old index keeps serving until the new one is valid. The drop needs `--allow-unsafe`. See [Changing an index](#changing-an-index) |
+| Changing a constraint's definition | Replaced so the old rule keeps enforcing until the new one is in place. A primary key or unique constraint builds its new index concurrently, then swaps it in. A `CHECK` or foreign key is swapped to the new rule `NOT VALID`, then validated. The swap needs `--allow-unsafe`. See [Changing a constraint](#changing-a-constraint) |
 | A new table, with its indexes | Runs together: the table, then its indexes, built without `CONCURRENTLY` because nothing reads the table yet. See [Greenfield tables](#greenfield-tables) |
 | A new label on an existing enum type | Runs as `ALTER TYPE ... ADD VALUE`, one label per step, before the table changes. Creating a type or removing a label fails the plan. See [Enum types](#enum-types) |
 | Row-level security policies on an existing table | Run in one transaction, after you explicitly approve them, because they change who can read rows. See [Row-level security](#row-level-security) |
+| A new table with row-level security | Runs in one transaction: the table, its RLS setting, and its policies, so the table never exists without them. It holds no rows, so it needs no approval. See [Row-level security](#row-level-security) |
 | Adding a foreign key | Runs in two steps: `ADD CONSTRAINT ... NOT VALID`, then `VALIDATE CONSTRAINT`, which checks existing rows while writes continue. See [Foreign keys](#foreign-keys) |
 | Dropping a foreign key | Shown in the plan, but blocked. See [Foreign keys](#foreign-keys) |
-| Making a column `NOT NULL` | Runs in four steps on a table up to the size limit: a helper `CHECK (column IS NOT NULL) NOT VALID`, `VALIDATE CONSTRAINT`, which checks existing rows while writes continue, `SET NOT NULL`, which uses the validated check instead of scanning, and the helper's drop. If a row holds `NULL`, the validation fails and names the helper. Fix those rows and SchemaBot retries the validation on its own. If its retries run out first, fix the rows, then plan and apply again: the plan starts at the helper's validation. Until the change finishes, the helper rejects writes that leave the column `NULL`. Cancelling the apply removes a helper the apply added, and leaves one that was already on the table |
+| Making a column `NOT NULL` | Runs in four steps on a table up to the size limit: a helper `CHECK (column IS NOT NULL) NOT VALID`, `VALIDATE CONSTRAINT`, which checks existing rows while writes continue, `SET NOT NULL`, which uses the validated check instead of scanning, and the helper's drop. If a row holds `NULL`, the validation fails, names the helper, and ends the apply without retrying: a retry cannot pass until the rows change. SchemaBot then removes the helper the apply added, so writes are not checked for `NULL` meanwhile. Fix those rows, then plan and apply again. A helper that was already on the table stays, and the plan starts at its validation. Cancelling the apply removes a helper the apply added the same way. Two cases keep the helper: a plan that also drops a constraint the table had, where SchemaBot keeps every constraint on the table so it never ends up with no rule, and an apply that ran out of retries. The apply log names a kept helper and the statement that drops it |
 | A table with no schema file, or a deleted file | Runs as `DROP TABLE` after you approve it with `--allow-unsafe`, as on MySQL. Archive tables and `ignore_tables` entries are left alone. See [Tables with no schema file](#tables-with-no-schema-file) |
 
 Once a statement starts, it runs until it commits or its timeout ends it; it
@@ -593,7 +596,10 @@ locked.
 
 **Stop is not supported.** A concurrent build has no midpoint to resume from,
 so a stop would be a cancel under another name. Other statements have nothing
-to pause.
+to pause. SchemaBot refuses the stop before recording it. The refusal names
+the cancel command when a lone index build is running, and otherwise
+`schemabot progress <apply-id> -e <env> --no-watch`, or the apply's progress
+comment on a pull request.
 
 ### Greenfield tables
 
@@ -764,6 +770,63 @@ An index of a partitioned table is blocked, because PostgreSQL cannot drop it
 concurrently. Drop it outside SchemaBot when a lock on every partition is
 acceptable, then plan again.
 
+### Changing an index
+
+An index whose definition changes under the same name is replaced, never
+dropped first. The plan has three steps:
+
+1. `CREATE INDEX CONCURRENTLY <name>_new` builds the new definition. The old
+   index keeps serving reads and, for a unique index, keeps rejecting
+   duplicates.
+2. `DROP INDEX CONCURRENTLY <name>` removes the old index once the new one is
+   valid. This step needs `--allow-unsafe`, because the old definition stops
+   applying. Right before the drop, the apply checks that `<name>_new` is
+   still valid with the definition it built. If it is not, the old index is
+   kept and the apply stops: plan again.
+3. `ALTER INDEX <name>_new RENAME TO <name>` gives the new index its name. It
+   changes only the catalog, so the size limit does not apply.
+
+If the rows break the new definition, the build fails and the apply stops
+there. The old index is untouched and keeps enforcing its definition. Fix the
+rows and apply again: the next apply removes the invalid `<name>_new`, once no
+build still holds it, and builds it again.
+
+An apply that stopped part-way picks up where it stopped. A valid `<name>_new`
+with the new definition is not built again, and when the old index is
+already gone, the plan is the rename alone. If another index or a
+constraint already holds `<name>_new`, the plan is refused: rename that
+object first.
+
+An index on a partitioned table, and an index on a table whose plan also
+drops or changes the type of a column, is still dropped and built again.
+
+A unique index that a foreign key references is refused, whether the plan
+would change it or drop it. The refusal names the foreign key: drop or change
+it first, or keep the index.
+
+### Changing a constraint
+
+A constraint whose definition changes under the same name is replaced in
+place, never dropped in a step of its own.
+
+A primary key or unique constraint takes two steps:
+
+1. `CREATE UNIQUE INDEX CONCURRENTLY <name>_new` builds the new index. The old
+   constraint keeps rejecting duplicates.
+2. `ALTER TABLE ... DROP CONSTRAINT <name>, ADD CONSTRAINT <name> ... USING
+   INDEX <name>_new` swaps it in, in one statement that needs
+   `--allow-unsafe`. Under the table's lock, the apply first checks that
+   `<name>_new` still has the definition the plan built. If it does not,
+   nothing is swapped and the old constraint stays: plan again.
+
+A `CHECK` or foreign key also takes two steps. One statement drops the old
+rule and adds the new one `NOT VALID`, so every new write is checked by one
+rule or the other. `VALIDATE CONSTRAINT` then checks the existing rows while
+writes continue.
+
+A partitioned table, and a table whose plan also drops or changes the type of
+a column, still drops the constraint and adds it again.
+
 ### Dropping a column or constraint
 
 A statement that drops a column, a constraint, or a column's `NOT NULL` runs
@@ -896,16 +959,24 @@ creates does not count: create the referenced table first, then add the key.
 | Step | Locks | Takes |
 |---|---|---|
 | `ADD CONSTRAINT ... NOT VALID` | `SHARE ROW EXCLUSIVE` on both tables, under the 3-second `lock_timeout` | Milliseconds. From here on, new writes are checked |
-| `VALIDATE CONSTRAINT` | `SHARE UPDATE EXCLUSIVE` on the table and `ROW SHARE` on the referenced table. Reads and writes continue on both | Up to `postgres.validate_max_duration`, 24 hours by default. A longer scan is cancelled and refused, and the key stays `NOT VALID` |
+| `VALIDATE CONSTRAINT` | `SHARE UPDATE EXCLUSIVE` on the table and `ROW SHARE` on the referenced table. Reads and writes continue on both | Up to `postgres.validate_max_duration`, 24 hours by default. A longer scan is cancelled and refused, the apply fails, and SchemaBot drops the `NOT VALID` constraint the apply added. One the table already had stays |
 
 A new table's `REFERENCES` takes the same brief `SHARE ROW EXCLUSIVE` on each
 referenced table. On a busy referenced table, the step times out and the apply
 retries.
 
 **When existing rows break the key.** The validation fails and names the key.
-The key stays in place, not yet validated, and keeps checking new writes. Fix
-the rows that reference missing keys, then retry. The next plan shows only the
-`VALIDATE CONSTRAINT`.
+The apply ends there without retrying, since a retry cannot pass until the
+rows change.
+
+SchemaBot then removes the key the apply added, so writes are checked as they
+were before the apply. The apply log names the key it removed. Fix the rows
+that reference missing keys, then plan and apply again.
+
+A key that was already on the table `NOT VALID` stays, and the apply log names
+it with the statement that drops it. The next plan shows only its
+`VALIDATE CONSTRAINT`. Cancelling the apply during the validation removes a key
+the apply added the same way.
 
 **To remove a foreign key.** A dropped foreign key is usually one the file left
 out. To keep it, declare it in the file. To remove it, run the
@@ -981,8 +1052,11 @@ PostgreSQL targets do not support:
 - **`cancel` of anything but an index build.** See
   [Control operations](#control-operations).
 
-SchemaBot records a `stop`, or a `cancel` of a statement that is not an index
-build, and then declines it. The apply runs on until it completes or fails.
+SchemaBot refuses a `stop` before recording anything, and names what to do
+instead: `cancel` for a lone index build, or following the apply's progress
+for anything else. It records a `cancel` of a statement that is not an index
+build and then declines it. Either way, the apply runs on until it completes
+or fails.
 
 To interrupt a running statement yourself, find its backend in
 `pg_stat_activity` and run `pg_cancel_backend` from your own database session.
@@ -1191,6 +1265,19 @@ are one operation:
   a busy table refuses rather than waits. Keep policy changes small. A plan
   with no RLS change takes no exclusive lock and needs no ownership.
 
+**A new table with RLS.** A file that declares a new table with RLS clauses
+plans as one change: the `CREATE TABLE`, then its RLS setting, policies, and
+comments. Planning runs the create on the target and rolls it back, so the
+plan shows the exact SQL the apply runs. The apply derives that SQL again
+from the reviewed file and runs it in one transaction only if the two match.
+A mismatch, or a table of that name created since the plan, refuses the
+apply; plan again.
+
+Because planning runs the create on the target, a policy can read only a
+table the target already has. A policy that reads a table the same pull
+request creates refuses the plan and names that table: apply it first, then
+add the table with the policy in a later pull request.
+
 **Structural changes on a table with RLS.** A file that declares RLS can also
 change the table's columns and indexes. When the file's RLS matches the live
 table, the plan runs those changes as ordinary in-place DDL that leaves the
@@ -1218,7 +1305,6 @@ keeps the rule above.
 
 **Not supported yet:**
 
-- RLS on a new table
 - RLS changes and structural changes to an existing table in the same plan
 - Running a reviewed RLS change on a target whose physical schema name
   differs. That target needs its own plan and review
@@ -1597,6 +1683,7 @@ A declined operation is refused at one of two layers:
 | `engine.ExternallyAuthoritativeProgress.ProgressIsExternallyAuthoritative` | Not applicable; not implemented | Progress is held in the engine instance's in-memory apply map, not in an external service that every instance can query authoritatively. | [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go) |
 | `engine.SynchronousWorkRegistration.RegistersWorkSynchronously` | Implemented; returns `true` | `Apply` claims the tracked progress entry before returning and has no remote provisioning phase. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
 | `engine.CancelledArtifactReleaser.ReleaseCancelledArtifacts` | Implemented | PostgreSQL creates no copy tables. A cancelled `SET NOT NULL` can leave the helper `CHECK` its first step added, which rejects NULL writes until it is dropped, so the release drops each helper pg-sprite recognizes on the apply's tables that a task of the apply that ran added, through the checked drop, and names any it cannot drop with the statement that does. A helper the apply took over from an earlier run stays. An invalid concurrent index is removed by the cancel itself before it settles. | [`pkg/engine/postgres/cancelled_artifacts.go`](../pkg/engine/postgres/cancelled_artifacts.go), [`pkg/engine/postgres/cancel.go`](../pkg/engine/postgres/cancel.go) |
+| `engine.FailedArtifactReleaser.ReleaseFailedArtifacts` | Implemented | When rows break a validation and the apply fails for good, the `SET NOT NULL` helper `CHECK` that a task of the apply added stays on the table and rejects NULL writes. The release drops it the same way a cancel does, and leaves a helper that was there before the apply. A foreign key or `CHECK` the apply added `NOT VALID` and was still validating is dropped the same way, and one that was there before stays. | [`pkg/engine/postgres/cancelled_artifacts.go`](../pkg/engine/postgres/cancelled_artifacts.go) |
 | `engine.CancelledResumeStateReclaimer.ReclaimCancelledResumeState` | Not applicable; not implemented | Each statement runs in this process against the target directly; nothing is set up in a remote service ahead of the work that owns its teardown, so a cancel that lands between drives finds no stored resume state naming work to reclaim. | [`pkg/engine/engine.go`](../pkg/engine/engine.go), [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go) |
 | `engine.ControlResumeValidator.ValidateControlResumeState` | Not applicable; not implemented | Control requests use `ResumeState.MigrationContext` only as the in-memory apply key and have no opaque, operation-specific remote state to validate. | [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go), [`pkg/engine/postgres/cancel.go`](../pkg/engine/postgres/cancel.go) |
 | `engine.ShardKeyedPlanning.PlansEachShard` | Not applicable; not implemented | A PostgreSQL target is not sharded, so its tasks carry no shard and the plan never needs to speak for one. | [`pkg/engine/engine.go`](../pkg/engine/engine.go) |

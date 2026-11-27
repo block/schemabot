@@ -106,6 +106,9 @@ const (
 	ErrCodePlanBlocked             = "plan_blocked"              // Plan carries a change the engine refuses; no retry or option can apply it
 	ErrCodeSchemaRefused           = "schema_refused"            // Plan refused for the declared schema as written; follow the remedy the error names, then plan again, since an immediate retry gets the same answer
 	ErrCodeAlreadyStopped          = "already_stopped"           // Stop refused: the schema change is already stopped and no start is queued behind it
+	ErrCodeStopUnsupportedCancel   = "stop_unsupported_cancel"   // Stop refused: the engine can't pause this schema change; cancel ends it
+	ErrCodeStopUnsupportedFinishes = "stop_unsupported_finishes" // Stop refused: the engine can't pause this schema change, which finishes on its own; follow its progress
+	ErrCodeStopUnsupported         = "stop_unsupported"          // Stop refused: the engine can't pause this schema change; cancel ends it, and progress follows it if it finishes on its own
 	ErrCodeDeferredCutoverCapacity = "deferred_cutover_capacity" // --defer-cutover refused: the apply would hold more drivers at its cutover than are left for deferred work; apply without the flag
 	ErrCodeChangeGateRefused       = "change_gate_refused"       // Apply, start or cutover refused by a change gate, such as a freeze; the blockers say why
 	ErrCodeChangeGateUnavailable   = "change_gate_unavailable"   // SchemaBot could not check the change gates, so nothing started; retry

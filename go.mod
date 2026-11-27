@@ -12,7 +12,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sqs v1.52.0
 	github.com/aws/aws-sdk-go-v2/service/sts v1.53.0
 	github.com/block/mysql v0.0.0-20261122231317-2d9dfd496f60
-	github.com/block/pg-sprite v0.5.7-0.20261127054114-8e2257559dda
+	github.com/block/pg-sprite v0.5.7-0.20261127204311-f64ceb4244c9
 	github.com/block/spirit v0.20.1-0.20261122162747-cc0fa5849d1f
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0
 	github.com/charmbracelet/bubbles v1.0.0
@@ -277,4 +277,4 @@ require (
 )
 
 // needed for Strata and vtcombo OnlineDDL suppport
-replace vitess.io/vitess => github.com/block/vitess v0.0.0-20261112160743-c58a2176754c
+replace vitess.io/vitess => github.com/block/vitess v0.0.0-20261127151041-736af1367a3e

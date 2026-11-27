@@ -405,7 +405,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 					return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
 				}
 				if !matched {
-					rlsChanges, err := planRowSecurityOperation(ctx, pool, namespace, rowSecurity)
+					rlsChanges, err := planRowSecurityOperation(ctx, pool, namespace, rowSecurity, tableOwner)
 					if err != nil {
 						return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
 					}
@@ -679,16 +679,22 @@ func tableChanges(report pgplan.Report, crossNamespaceForeignKeys []string, pars
 			if err != nil {
 				return nil, nil, nil, fmt.Errorf("record the reviewed validation for table %q: %w", report.Table, err)
 			}
-			if validationMetadata != nil {
-				if metadata == nil {
-					metadata = validationMetadata
-				} else {
-					maps.Copy(metadata, validationMetadata)
-				}
+			adoptionMetadata, unrecordedAdoption, err := stepAdoptionMetadata(statement, sql)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("record the reviewed index adoption for table %q: %w", report.Table, err)
 			}
+			replacementMetadata, err := stepReplacementMetadata(statement, sql)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("record the replacement index for table %q: %w", report.Table, err)
+			}
+			metadata = mergeStepMetadata(metadata, validationMetadata, adoptionMetadata, replacementMetadata)
 			if unrecordedDrop && stepMode == "" {
 				stepMode = engine.ExecutionModeBlocked
 				stepReason = fmt.Sprintf("statement for table %q drops an object the planner did not record, so the apply cannot check that it is still the object this plan reviewed; make the change outside SchemaBot", table)
+			}
+			if unrecordedAdoption && stepMode == "" {
+				stepMode = engine.ExecutionModeBlocked
+				stepReason = fmt.Sprintf("statement for table %q makes a constraint take over an index the planner did not record, so the apply cannot check that it is still the index this plan reviewed; make the change outside SchemaBot", table)
 			}
 			if unrecordedValidation && stepMode == "" {
 				stepMode = engine.ExecutionModeBlocked
@@ -702,7 +708,7 @@ func tableChanges(report pgplan.Report, crossNamespaceForeignKeys []string, pars
 				Operation:     operation,
 				DDL:           sql,
 				IsUnsafe:      statement.Destructive,
-				UnsafeReason:  destructiveReason(statement.Destructive, table),
+				UnsafeReason:  destructiveReason(statement, table),
 				ExecutionMode: stepMode,
 				ModeReason:    engine.SanitizeBlockedCause(stepReason),
 				Metadata:      metadata,
@@ -1829,9 +1835,18 @@ func generatedExpressionRefusalReason(table string) string {
 	return fmt.Sprintf("statement for table %q changes a stored generated column's expression, which rewrites every row under a lock that blocks reads and writes, so SchemaBot does not apply it; to keep the live expression, declare it in the schema file and re-plan; to change it, declare the live expression to apply the rest of the plan first, then run this statement (PostgreSQL 17 or later) outside SchemaBot through a separately reviewed process and put the new expression back in the file", table)
 }
 
-func destructiveReason(destructive bool, table string) string {
-	if !destructive {
+// destructiveReason is the reviewer-facing reason a destructive step needs
+// --allow-unsafe. The drop that completes an index replacement names the
+// index that replaces it: the old index goes only while the new definition is
+// built and valid, so what the reviewer accepts is that the old definition
+// stops applying, not that the table loses the index.
+func destructiveReason(statement pgplan.Statement, table string) string {
+	if !statement.Destructive {
 		return ""
+	}
+	if replaced := statement.Drops; statement.ReplacedBy != "" && replaced != nil {
+		return fmt.Sprintf("statement replaces index %q on table %q with the definition built as %q: the old index is dropped only while that index is valid, and from then on its old definition no longer applies",
+			replaced.Name, table, statement.ReplacedBy)
 	}
 	return fmt.Sprintf("statement removes live structure from table %q", table)
 }
@@ -2020,17 +2035,17 @@ func (e *Engine) haltLongRunningWorkLocked(selected func(*trackedApply) bool) in
 	return halted
 }
 
-// StopUnsupportedReason is why PostgreSQL declines every stop. The control
-// plane refuses a stop with the same text, so the refusal and a stored stop's
-// ErrorMessage agree.
-const StopUnsupportedReason = "stop is not supported for PostgreSQL schema changes: concurrent index builds have no resumable midpoint, and other statements commit or fail on their own"
+// stopUnsupportedReason is why PostgreSQL declines a stop that reaches the
+// engine. The control plane refuses a stop before recording it, with the
+// command to use instead, so this is the record for a stop that got past it.
+const stopUnsupportedReason = "PostgreSQL can't pause a schema change: an index build has no point to resume from, and other statements commit or fail on their own"
 
 // Stop declines: a concurrent index build has no resumable midpoint, so stop
 // would be a permanent cancel under a misleading name. Other PostgreSQL DDL
 // also has no engine phase to pause. The typed decline lets the control path
 // resolve a durable stop request terminally instead of retrying it.
 func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, engine.NewUnsupportedOperationError(StopUnsupportedReason)
+	return nil, engine.NewUnsupportedOperationError(stopUnsupportedReason)
 }
 
 // Start declines: PostgreSQL schema changes cannot be stopped, so there is

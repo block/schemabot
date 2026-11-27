@@ -71,6 +71,8 @@ func indexDropForApply(database, namespace, table, sql string, dropped *schemadi
 // index drop. Right before the drop, pg-sprite checks the index is still a
 // valid plain index of the table with the definition the plan recorded and is
 // not the table's replica identity, and drops nothing when it is not. The
+// drop of a changed index's old definition also checks that the index the
+// plan built to replace it is still valid with the definition it built. The
 // table's size does not bound the drop, which scans no rows.
 func executeIndexDrop(ctx context.Context, pool *pgxpool.Pool, change nativeApply, tracker *progress.Tracker, logger *slog.Logger) (err error) {
 	if tracker == nil {
@@ -78,8 +80,14 @@ func executeIndexDrop(ctx context.Context, pool *pgxpool.Pool, change nativeAppl
 	}
 	tracker.Start(1, progress.OperationOptimistic)
 	defer func() { tracker.Finish(err) }()
-	dropped, err := executor.ExecuteDropIndexConcurrently(ctx, pool, change.namespace, change.table, change.dropped.Name, change.dropped.Definition,
-		executor.ConcurrentBudget{Overall: indexDropLimit})
+	budget := executor.ConcurrentBudget{Overall: indexDropLimit}
+	var dropped executor.DroppedIndex
+	if change.replacement != nil {
+		dropped, err = executor.ExecuteReplacedIndexDropConcurrently(ctx, pool, change.namespace, change.table, change.dropped.Name, change.dropped.Definition,
+			*change.replacement, budget)
+	} else {
+		dropped, err = executor.ExecuteDropIndexConcurrently(ctx, pool, change.namespace, change.table, change.dropped.Name, change.dropped.Definition, budget)
+	}
 	if err != nil {
 		return fmt.Errorf("drop reviewed index %q on PostgreSQL table %q.%q: %w", change.dropped.Name, change.namespace, change.table,
 			nameInterruptedIndexDrop(err, change.namespace, change.dropped.Name, indexDropLimit))

@@ -184,20 +184,7 @@ func WriteProgress(data ProgressData) {
 	// Table progress (sorted: failed and halted first, then active, sharded before unsharded, finished last)
 	// Hide tables during branch setup phases (all tables are Queued, not meaningful)
 	if len(activeTables) > 0 && !state.IsSetupPhase(data.State) {
-		sort.SliceStable(activeTables, func(i, j int) bool {
-			pi := ui.TableStatePriority(state.NormalizeTaskStatus(activeTables[i].Status))
-			pj := ui.TableStatePriority(state.NormalizeTaskStatus(activeTables[j].Status))
-			if pi != pj {
-				return pi < pj
-			}
-			// Within the same priority, sharded tables (have shards) sort first
-			si := len(activeTables[i].Shards) > 0
-			sj := len(activeTables[j].Shards) > 0
-			if si != sj {
-				return si
-			}
-			return false
-		})
+		sortActiveTables(activeTables)
 
 		// Show keyspace headers for Vitess tables (any table with a namespace)
 		hasNamespaces := false
@@ -729,13 +716,16 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		b.WriteString(formatTableParts(t))
 		return b.String()
 	case state.Apply.Cancelled:
-		if t.PercentComplete > 0 || t.RowsCopied > 0 {
+		cancelled := presentation.ReadCancelledTask(tableFacts(t), t.Started, t.ApplyFailed)
+		switch {
+		case t.PercentComplete > 0 || t.RowsCopied > 0:
 			cancelledPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 			bar := ui.ProgressBar(cancelledPercent, ui.ColorOrange)
-			writeTableLine(&b, t, "%s 🚫 Cancelled at %s%s", bar,
-				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), presentation.ShardCoverageSuffix(tableFacts(t)))
-		} else {
-			writeTableLine(&b, t, "🚫 Cancelled (not started)")
+			writeTableLine(&b, t, "%s 🚫 %s", bar, cancelled.Label)
+		case cancelled.NotRun:
+			writeTableLine(&b, t, "⏭️ %s", cancelled.Label)
+		default:
+			writeTableLine(&b, t, "🚫 %s", cancelled.Label)
 		}
 		if t.DDL != "" {
 			b.WriteString(formatTableDDL(t))

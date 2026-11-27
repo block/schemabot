@@ -191,6 +191,7 @@ check-docs-toc: ## Fail if a Table of Contents behind TOC markers is stale
 docs-assets: templates ## Re-render the PR mock-ups and animations the docs embed (needs gh, Chrome, ImageMagick, Node.js/Playwright)
 	@python3 scripts/prepare-pr-demo.py
 	@python3 scripts/prepare-pr-postgres-demo.py
+	@python3 scripts/prepare-pr-vitess-demo.py
 	@python3 scripts/prepare-pr-multi-target-demo.py
 	@python3 scripts/render-pr-mockups.py --prepared
 	@bash scripts/render-pr-demo.sh
@@ -701,7 +702,9 @@ build-localscale-image: ## Build LocalScale Docker image
 test-localscale: build-localscale-image ## Run LocalScale integration tests
 	$(GOTEST) -tags=integration -timeout=10m ./pkg/localscale/...
 
-# Start LocalScale for testing the PlanetScale engine via CLI
+# Start a Vitess environment to drive from the CLI yourself. Unlike demo-full,
+# it applies no schema and seeds no data: the commands it prints at the end are
+# the demonstration.
 #   make demo-vitess              # Start LocalScale + SchemaBot
 #   make demo-vitess KEEP_DATA=1  # Restart without wiping data
 demo-vitess: build build-localscale-image ## Start LocalScale demo environment
@@ -710,7 +713,13 @@ ifeq ($(KEEP_DATA),1)
 else
 	docker compose -f deploy/local/docker-compose.yml down -v -t 10 2>/dev/null || true
 endif
-	docker compose -f deploy/local/docker-compose.yml up --build -d localscale
+	@# The commands below talk to the SchemaBot server, so start it beside
+	@# LocalScale. The container runs a Linux binary, which the host build is not.
+	CGO_ENABLED=0 GOOS=linux go build -ldflags "$(LDFLAGS)" -o bin/schemabot-linux ./pkg/cmd
+	cp bin/schemabot-linux deploy/local/schemabot-dev
+	docker compose -f deploy/local/docker-compose.yml up --build -d localscale schemabot
+	@rm -f deploy/local/schemabot-dev
+	@$(MAKE) wait-healthy
 	@$(MAKE) wait-localscale
 	@echo ""
 	@echo "============================================"
