@@ -1029,7 +1029,7 @@ func blockRewriteSteps(changes []engine.TableChange, reason string, partitionedB
 		if catalogOnly[changes[i].DDL] {
 			continue
 		}
-		if fullCopy[changes[i].DDL] {
+		if fullCopyKeepsItsVerdict(changes[i], fullCopy) {
 			continue
 		}
 		if changes[i].ExecutionMode == engine.ExecutionModeBlocked {
@@ -1043,6 +1043,15 @@ func blockRewriteSteps(changes []engine.TableChange, reason string, partitionedB
 		changes[i].ModeReason = reason
 	}
 	return nil
+}
+
+// fullCopyKeepsItsVerdict reports whether a step is one the planner routed to
+// a full copy and already carries a blocked verdict, which is the only case
+// the size cause skips. A full-copy step that reaches the size check without
+// one takes the size verdict like any other step, so the exemption never
+// leaves a step on an oversized table runnable.
+func fullCopyKeepsItsVerdict(change engine.TableChange, fullCopy map[string]bool) bool {
+	return fullCopy[change.DDL] && change.ExecutionMode == engine.ExecutionModeBlocked
 }
 
 // fullCopySteps returns the planned steps of every statement the planner

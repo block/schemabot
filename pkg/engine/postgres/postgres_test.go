@@ -1204,7 +1204,8 @@ func TestBlockRewriteStepsKeepsConcurrentIndexDrops(t *testing.T) {
 // A step that needs a full copy of the table is blocked at any size, so an
 // oversized table adds no size cause to it: raising the limit alone would not
 // let it run. Another blocked step on the same table still gains the size
-// cause beside its own.
+// cause beside its own, and a full-copy step that carries no verdict yet takes
+// the size verdict rather than running.
 func TestBlockRewriteStepsLeavesAFullCopyStepItsOwnCause(t *testing.T) {
 	copyDDL := "ALTER TABLE public.orders ALTER COLUMN total TYPE numeric(12,2)"
 	report := pgplan.NewReport(pgplan.SourceDiff)
@@ -1222,6 +1223,11 @@ func TestBlockRewriteStepsLeavesAFullCopyStepItsOwnCause(t *testing.T) {
 	require.NoError(t, blockRewriteSteps(changes, "size verdict", nil, nil, fullCopy))
 	assert.Equal(t, "needs a full copy", changes[0].ModeReason)
 	assert.Equal(t, []string{"rewrite it", "size verdict"}, engine.BlockedCauses(changes[1].ModeReason))
+
+	unblocked := []engine.TableChange{{Table: "orders", DDL: copyDDL}}
+	require.NoError(t, blockRewriteSteps(unblocked, "size verdict", nil, nil, fullCopy))
+	assert.Equal(t, engine.ExecutionModeBlocked, unblocked[0].ExecutionMode, "a full-copy step that carries no verdict yet is still blocked on an oversized table")
+	assert.Equal(t, "size verdict", unblocked[0].ModeReason)
 }
 
 // TestTableChangesRendersAnIndexDropAsUnsafe proves a planned index drop on
