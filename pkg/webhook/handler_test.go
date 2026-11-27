@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -544,6 +545,43 @@ func TestHandleSchemaRequestErrorFallbackUsesTheSharedErrorLines(t *testing.T) {
 		assert.Contains(t, body, userFacingRemoteUnavailableError("", ""))
 		assert.NotContains(t, body, "10.1.2.3")
 		assert.Contains(t, logBuf.String(), "10.1.2.3:3306")
+	})
+
+	t.Run("a gRPC unavailable error passed along as text gets the generic unreachable line", func(t *testing.T) {
+		h, comments, logBuf := newHandler(t)
+		requestErr := errors.New("plan orders/staging: " + status.Error(codes.Unavailable, dialFailure).Error())
+
+		assert.False(t, h.handleSchemaRequestError("octocat/hello-world", 1, 12345, "staging", "orders", "hubot", "plan", requestErr, false))
+
+		body := requireComment(t, comments, "flattened gRPC unavailable comment")
+		assert.Contains(t, body, userFacingRemoteUnavailableError("", ""))
+		assert.NotContains(t, body, "rpc error")
+		assert.Contains(t, logBuf.String(), "10.1.2.3:3306")
+	})
+
+	t.Run("a drop_tables check that could not read the applies says to run the command again", func(t *testing.T) {
+		h, comments, logBuf := newHandler(t)
+		requestErr := fmt.Errorf("plan orders/staging: %w", &api.DropTablesCheckError{Database: "orders", Environment: "staging", Err: errors.New("storage read: " + dialFailure)})
+
+		assert.False(t, h.handleSchemaRequestError("octocat/hello-world", 1, 12345, "staging", "orders", "hubot", "plan", requestErr, false))
+
+		body := requireComment(t, comments, "drop_tables check comment")
+		assert.Contains(t, body, "SchemaBot could not check whether an apply that may still resume needs a table listed under")
+		assert.NotContains(t, body, "storage read")
+		assert.Contains(t, logBuf.String(), "storage read: dial tcp 10.1.2.3:3306")
+	})
+
+	t.Run("a namespace resolution failure names the target and not the data plane error", func(t *testing.T) {
+		h, comments, logBuf := newHandler(t)
+		requestErr := fmt.Errorf("plan shop/staging: %w", &api.NamespaceResolutionError{Database: "shop", Environment: "staging", Deployment: "east", Target: "shop-001", Namespaces: []string{"shop"}, Cause: errors.New("resolve: " + dialFailure)})
+
+		assert.False(t, h.handleSchemaRequestError("octocat/hello-world", 1, 12345, "staging", "shop", "hubot", "plan", requestErr, false))
+
+		body := requireComment(t, comments, "namespace resolution comment")
+		assert.Contains(t, body, "shares with other databases on target")
+		assert.Contains(t, body, "shop-001")
+		assert.NotContains(t, body, "resolve: ")
+		assert.Contains(t, logBuf.String(), "resolve: dial tcp 10.1.2.3:3306")
 	})
 
 	t.Run("an environment that is not configured keeps its text and is the command's answer", func(t *testing.T) {
