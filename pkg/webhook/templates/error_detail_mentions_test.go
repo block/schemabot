@@ -81,6 +81,16 @@ func TestErrorDetailMarkdown(t *testing.T) {
 			want: `\\<code>@octocat</code>`,
 		},
 		{
+			name: "backticks a blank line apart form no span",
+			in:   "a `x\n\n@octocat y` b",
+			want: "a `x\n\n<code>@octocat</code> y` b",
+		},
+		{
+			name: "a span across one line break is kept",
+			in:   "a `x\n@octocat y` b",
+			want: "a `x\n@octocat y` b",
+		},
+		{
 			name: "text with no mention is only escaped",
 			in:   "failed to fetch repository contents",
 			want: "failed to fetch repository contents",
@@ -107,6 +117,15 @@ func TestRenderGenericErrorWritesMentionsAsCode(t *testing.T) {
 		"> SchemaBot could not reach `pie`.")
 	assert.NotContains(t, body, " @octocat")
 	assert.NotContains(t, body, "\"@acme")
+}
+
+// Backticks a blank line apart look like a code span around a mention, but
+// Markdown never carries a span across a blank line, so the mention is prose
+// and the comment writes it as code.
+func TestRenderGenericErrorWritesMentionsAsCodeAcrossABlankLine(t *testing.T) {
+	body := RenderGenericError(SchemaErrorData{Timestamp: "2026-07-16 18:56:00", CommandName: "plan", ErrorDetail: "statement `a\n\n@octocat b` failed"})
+
+	assert.Contains(t, body, "> statement `a\n> \n> <code>@octocat</code> b` failed")
 }
 
 // Every renderer that puts an error message into comment markdown writes the

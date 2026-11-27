@@ -654,11 +654,13 @@ func startsHTML(r rune) bool {
 
 // mapOutsideCodeSpans applies rewrite to the parts of text a Markdown renderer
 // reads as prose and keeps each code span as written. A span is a backtick run
-// closed by the next run of the same length; a run with no such closer is
-// prose, so its backticks reach rewrite. A kept span begins and ends a maximal
-// backtick run, so the prose beside it never does; when rewrite writes a code
-// span of its own at that edge, a space keeps its delimiter apart from the
-// kept span's, since joined they would be one longer run that closes neither.
+// closed by the next run of the same length before a blank line, since
+// Markdown carries a span across a line break but never across a blank line;
+// a run with no such closer is prose, so its backticks reach rewrite. A kept
+// span begins and ends a maximal backtick run, so the prose beside it never
+// does; when rewrite writes a code span of its own at that edge, a space keeps
+// its delimiter apart from the kept span's, since joined they would be one
+// longer run that closes neither.
 func mapOutsideCodeSpans(text string, rewrite func(string) string) string {
 	var b strings.Builder
 	proseStart := 0
@@ -695,9 +697,13 @@ func mapOutsideCodeSpans(text string, rewrite func(string) string) string {
 }
 
 // endOfCodeSpan returns the index just past the first run of exactly delimiter
-// backticks at or after from, or -1 when the text has none.
+// backticks at or after from, or -1 when a blank line or the end of the text
+// comes first.
 func endOfCodeSpan(text string, from, delimiter int) int {
 	for i := from; i < len(text); {
+		if startsBlankLine(text, i) {
+			return -1
+		}
 		if text[i] != '`' {
 			i++
 			continue
@@ -711,4 +717,14 @@ func endOfCodeSpan(text string, from, delimiter int) int {
 		}
 	}
 	return -1
+}
+
+// startsBlankLine reports whether text has a line break at i that is followed
+// by a line holding only spaces or tabs, which ends a Markdown paragraph.
+func startsBlankLine(text string, i int) bool {
+	if text[i] != '\n' {
+		return false
+	}
+	rest := strings.TrimLeft(text[i+1:], " \t")
+	return rest == "" || rest[0] == '\n'
 }
