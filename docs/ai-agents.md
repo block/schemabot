@@ -22,6 +22,8 @@ JSON output to parse.
 The first half of this page covers what to give your agent so it can do that
 work well. The second half covers the decisions that stay with you.
 
+<a id="install-the-schemabot-agent-skill"></a>
+
 ## Install the agent skill
 
 [`skills/schemabot`](../skills/schemabot/SKILL.md) is a ready-made agent skill,
