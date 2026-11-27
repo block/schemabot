@@ -1956,3 +1956,56 @@ func TestPlanRefusesDropTablesBeforeConnecting(t *testing.T) {
 	require.EqualError(t, err, `plan PostgreSQL database "app": drop_tables is supported only on MySQL, and this is a PostgreSQL target. Remove drop_tables from schemabot.yaml`)
 	assert.Nil(t, result)
 }
+
+// A column change PostgreSQL refuses because other objects read the column
+// names those objects and what to do with them, so the operator does not
+// have to search the catalog for what blocks the change.
+func TestExecutionVerdictNamesTheObjectsThatBlockAColumnChange(t *testing.T) {
+	refused := func(d planner.Decision) pgplan.Statement {
+		return pgplan.Statement{Disposition: router.DispositionRefuse, Decisions: []planner.Decision{d}}
+	}
+	cases := []struct {
+		name     string
+		decision planner.Decision
+		want     string
+	}{
+		{
+			name:     "a view",
+			decision: planner.Decision{Reason: planner.ReasonDependentView, DependentViews: []string{`"public"."order_remarks"`}},
+			want:     `statement for table "orders" is refused: it changes or drops a column that view "public"."order_remarks" reads; drop or redefine the view outside SchemaBot, then plan again`,
+		},
+		{
+			name:     "two views",
+			decision: planner.Decision{Reason: planner.ReasonDependentView, DependentViews: []string{`"public"."a"`, `"public"."b"`}},
+			want:     `statement for table "orders" is refused: it changes or drops a column that views "public"."a", "public"."b" read; drop or redefine the views outside SchemaBot, then plan again`,
+		},
+		{
+			name:     "a policy",
+			decision: planner.Decision{Reason: planner.ReasonDependentPolicy, DependentPolicies: []string{`"owner_only" ON "public"."orders"`}},
+			want:     `statement for table "orders" is refused: it changes or drops a column that row security policy "owner_only" ON "public"."orders" reads; drop the policy before the change and recreate it after it, then plan again`,
+		},
+		{
+			name:     "a trigger",
+			decision: planner.Decision{Reason: planner.ReasonDependentTrigger, DependentTriggers: []string{`"audit" ON "public"."orders"`}},
+			want:     `statement for table "orders" is refused: it changes or drops a column that trigger "audit" ON "public"."orders" names in UPDATE OF or WHEN; drop or redefine the trigger, then plan again`,
+		},
+		{
+			name:     "a generated column",
+			decision: planner.Decision{Reason: planner.ReasonDependentGeneratedColumn, DependentGeneratedColumns: []string{`"public"."orders"."total"`}},
+			want:     `statement for table "orders" is refused: it changes or drops a column that generated column "public"."orders"."total" reads; change the generated column first, then plan again`,
+		},
+		{
+			name:     "a partition key",
+			decision: planner.Decision{Reason: planner.ReasonPartitionKey, PartitionKeyTables: []string{`"public"."orders"`}},
+			want:     `statement for table "orders" is refused: it changes or drops a column in the partition key of "public"."orders", which PostgreSQL never allows; create a new partitioned table with the new key and move the rows into it, then plan again`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := executionVerdict(pgplan.FormatVersion, refused(tc.decision), "orders", nil)
+			assert.Equal(t, engine.ExecutionModeBlocked, got.mode)
+			assert.Equal(t, tc.want, got.reason)
+			assert.Nil(t, got.unrecognized)
+		})
+	}
+}

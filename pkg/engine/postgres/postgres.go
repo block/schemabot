@@ -1476,6 +1476,9 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 		if statement.Kind == schemadiff.ChangeSetGeneratedExpression {
 			return blocked(generatedExpressionRefusalReason(table))
 		}
+		if reason, ok := dependentObjectRefusalReason(statement.Decisions, table); ok {
+			return blocked(reason)
+		}
 		refused := blocked(fmt.Sprintf("statement for table %q is refused: it cannot be executed safely as written", table))
 		// An absent cause is a refusal from outside the create path and the
 		// generic sentence is the right one; only a cause the mapping has no
