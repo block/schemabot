@@ -272,19 +272,36 @@ func MarkResuming(tables []TableProgress, memberState string) {
 	}
 }
 
+// sortActiveTables orders tables failed and halted first, then active, then
+// finished, sharded before unsharded within a state. A table changed in
+// several steps sorts by its most urgent step, and its steps stay together in
+// the order they run, as the PR comment lists them: a completed step never
+// drops below the failed step that came after it.
 func sortActiveTables(tables []TableProgress) {
+	type tableRank struct{ priority, firstIndex int }
+	ranks := make(map[string]tableRank, len(tables))
+	for i, t := range tables {
+		key := t.Namespace + "." + t.TableName
+		p := ui.TableStatePriority(state.NormalizeTaskStatus(t.Status))
+		if rank, seen := ranks[key]; !seen {
+			ranks[key] = tableRank{priority: p, firstIndex: i}
+		} else if p < rank.priority {
+			rank.priority = p
+			ranks[key] = rank
+		}
+	}
 	sort.SliceStable(tables, func(i, j int) bool {
-		pi := ui.TableStatePriority(state.NormalizeTaskStatus(tables[i].Status))
-		pj := ui.TableStatePriority(state.NormalizeTaskStatus(tables[j].Status))
-		if pi != pj {
-			return pi < pj
+		ri := ranks[tables[i].Namespace+"."+tables[i].TableName]
+		rj := ranks[tables[j].Namespace+"."+tables[j].TableName]
+		if ri.priority != rj.priority {
+			return ri.priority < rj.priority
 		}
 		si := len(tables[i].Shards) > 0
 		sj := len(tables[j].Shards) > 0
 		if si != sj {
 			return si
 		}
-		return false
+		return ri.firstIndex < rj.firstIndex
 	})
 }
 

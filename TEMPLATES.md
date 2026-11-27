@@ -6806,18 +6806,18 @@ step 2 of 3 · `CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON public.users
 
 **Schema `public`**
 
+**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE users ADD COLUMN last_seen_at timestamptz;
+```
+
 **`users`**: 🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 10.42%
 
 ```sql
 CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON users USING btree (last_seen_at);
 ```
 - Building index: 2,500 of 10,000 blocks
-
-**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
-
-```sql
-ALTER TABLE users ADD COLUMN last_seen_at timestamptz;
-```
 
 **`sessions`**: ⏳ Queued
 
@@ -8172,7 +8172,7 @@ ALTER TABLE `users`
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`products`** — Cancelled
+**`products`** — Not run
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
@@ -8332,17 +8332,17 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 
 ### ❌ public
 
-**`users`** — Failed
-```sql
-CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON users USING btree (last_seen_at);
-```
-
 **`users`** — Completed
 ```sql
 ALTER TABLE users ADD COLUMN last_seen_at timestamptz;
 ```
 
-**`sessions`** — Cancelled
+**`users`** — Failed
+```sql
+CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON users USING btree (last_seen_at);
+```
+
+**`sessions`** — Not run
 ```sql
 ALTER TABLE sessions ADD COLUMN payload jsonb;
 ```
@@ -8524,17 +8524,17 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ALTER TABLE `payments` ADD INDEX `idx_order_id`(`order_id`);
 ```
 
-**`sessions`** — Cancelled
+**`sessions`** — Not run
 ```sql
 ALTER TABLE `sessions` ADD INDEX `idx_expires_at`(`expires_at`);
 ```
 
-**`audit_logs`** — Cancelled
+**`audit_logs`** — Not run
 ```sql
 ALTER TABLE `audit_logs` ADD INDEX `idx_created_at`(`created_at`);
 ```
 
-**`notifications`** — Cancelled
+**`notifications`** — Not run
 ```sql
 ALTER TABLE `notifications` ADD INDEX `idx_user_status`(`user_id`, `status`);
 ```
@@ -8605,7 +8605,7 @@ ALTER TABLE `payments` ADD INDEX `idx_order_id`(`order_id`);
 
 ### 🚫 analytics
 
-**`events`** — Cancelled
+**`events`** — Not run
 ```sql
 ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
 ```
@@ -11433,7 +11433,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`products`** — Cancelled
+**`products`** — Not run
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```

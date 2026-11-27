@@ -2943,6 +2943,10 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	if failed := c.failedTaskDecidingResume(apply, tasks, options); failed != nil {
 		logger.Warn("a failed task decides the outcome of an apply that is still active; recording the apply failed from its tasks",
 			append(apply.MutableLogAttrs(), "failed_task_id", failed.TaskIdentifier)...)
+		// The drive that failed the task may have stopped before its release,
+		// so this one releases before the outcome is stored, as that drive
+		// would have. A release that finds nothing left does nothing.
+		c.releaseFailedApplyArtifacts(ctx, apply, tasks, failed)
 		return c.failApplyAndNotify(ctx, apply, tasks, settledTaskFailureMessage(failed))
 	}
 	// Before consuming a pending stop/cancel, learn whether the engine's
