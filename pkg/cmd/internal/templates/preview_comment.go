@@ -553,6 +553,7 @@ func previewCLILockingAllOutput() {
 		{"LOCK RELEASED", previewLockReleasedOutput},
 		{"LOCK KEPT (YIELD)", previewLockKeptOutput},
 		{"LOCK KEPT (NOTHING SUBMITTED)", previewUnsubmittedLockNotReleasedOutput},
+		{"LOCK ACQUIRE GOT NO ANSWER", previewAcquireUnknownOutput},
 		{"LOCK KEPT (AN APPLY RUNS UNDER IT)", previewLockInUseOutput},
 		{"LOCK LEFT IN PLACE (TAKEN AGAIN SINCE)", previewLockReplacedOutput},
 		{"LOCK KEPT (SERVER REPORTED NO LOCK ID)", previewLockKeptWithoutIDOutput},

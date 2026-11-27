@@ -686,6 +686,59 @@ func releaseUnsubmittedLock(ep, database, dbType, owner string, lockID int64, ca
 	}
 }
 
+// reportUnansweredLockAcquire is called when the request to take the database
+// lock failed after the server may have received it, so the lock may or may
+// not have been taken. It looks the lock up, tells the operator the one case
+// that applies, and returns the acquire failure, joined with the lookup
+// failure if there was one. The command submits nothing either way.
+//
+// before is the lock the command saw held before it sent the acquire, or nil.
+// A lock under this owner that is that same row was not taken by this
+// command: it may guard an apply an earlier command started, so it is left
+// alone. Any other row under this owner may be this acquire's, or one another
+// command of the same user on the same host took or reused, since they share
+// the owner. So it is released through the row-pinned release, which keeps a
+// lock an apply runs under, as for a lock a command took and never submitted
+// under. A lookup that reports no row ID gives neither the comparison nor a
+// row to release, so that lock is left in place and no unlock is offered.
+func reportUnansweredLockAcquire(ep, database, dbType, owner string, before *client.LockInfo, showLoading bool, acquireErr error) error {
+	cause := fmt.Errorf("acquire lock: %w", acquireErr)
+	var lock *client.LockInfo
+	err := withLoading("Checking database lock...", showLoading, func() error {
+		var lockErr error
+		lock, lockErr = client.GetLock(ep, database, dbType)
+		return lockErr
+	})
+	if err != nil {
+		templates.WriteAcquireUnknownLockUnchecked(database, dbType)
+		return errors.Join(cause, fmt.Errorf("look up lock for %s after the acquire failed: %w", database, err))
+	}
+	// The lookup answered and the message below says what it found, so the
+	// error does not repeat the request's advice to go and check.
+	cause = client.WithoutCheckAdvice(cause)
+	switch {
+	case lock == nil:
+		templates.WriteAcquireUnknownLockFree(database, dbType)
+	case lock.Owner != owner:
+		templates.WriteAcquireUnknownLockHeldByAnotherOwner(database, dbType, lock.Owner)
+	case lock.ID == 0:
+		templates.WriteAcquireUnknownLockWithoutID(database, dbType)
+	case sameLockHeldBefore(before, lock):
+		templates.WriteAcquireUnknownLockHeldBefore(database, dbType)
+	default:
+		templates.WriteAcquireUnknownLockHeldByOwner(database, dbType)
+		return releaseUnsubmittedLock(ep, database, dbType, owner, lock.ID, cause)
+	}
+	return cause
+}
+
+// sameLockHeldBefore reports whether lock, held under the command's owner and
+// carrying a row ID, is the row the command saw held under that owner before
+// it sent the acquire.
+func sameLockHeldBefore(before, lock *client.LockInfo) bool {
+	return before != nil && before.Owner == lock.Owner && before.ID == lock.ID
+}
+
 func buildApplyOptions(planResult *apitypes.PlanResponse, deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat) map[string]string {
 	options := make(map[string]string)
 	isPlanetScale := planResult != nil && state.IsPlanetScaleEngine(planResult.Engine)

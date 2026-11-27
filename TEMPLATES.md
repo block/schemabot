@@ -4738,6 +4738,87 @@ Options:
 </details>
 
 <details>
+<summary><a name="lock-acquire-got-no-answer"></a><strong>Lock Acquire Got No Answer</strong></summary>
+
+```
+
+🔒 Lock for testapp (mysql) is held under your owner, though the acquire request failed.
+   Nothing was submitted, so it is released unless an apply runs under it.
+🔓 Lock released for testapp (mysql)
+
+```
+</details>
+
+<details>
+<summary><a name="lock-under-your-owner-an-apply-runs-under-it"></a><strong>Lock Under Your Owner, An Apply Runs Under It</strong></summary>
+
+```
+
+🔒 Lock for testapp (mysql) is held under your owner, though the acquire request failed.
+   Nothing was submitted, so it is released unless an apply runs under it.
+🔒 Lock kept for testapp (mysql): apply apply-b2c3d4e5 (running) runs under it.
+   Watch that apply: schemabot progress apply-b2c3d4e5 -e staging
+
+```
+</details>
+
+<details>
+<summary><a name="lock-under-your-owner-server-reported-no-lock-id"></a><strong>Lock Under Your Owner, Server Reported No Lock ID</strong></summary>
+
+```
+
+🔒 Lock for testapp (mysql) is held under your owner, but the server did not say which lock it is, so it was left in place.
+   Nothing was submitted. See who holds it: schemabot locks
+
+```
+</details>
+
+<details>
+<summary><a name="lock-is-the-one-you-already-held"></a><strong>Lock Is The One You Already Held</strong></summary>
+
+```
+
+🔒 Lock for testapp (mysql) is the one you already held, so the failed acquire took nothing.
+   Nothing was submitted. Run the command again to retry.
+
+```
+</details>
+
+<details>
+<summary><a name="lock-held-by-another-owner"></a><strong>Lock Held By Another Owner</strong></summary>
+
+```
+
+🔒 Lock for testapp (mysql) is held by block/schemabot#123, so the failed acquire took nothing.
+   Nothing was submitted. Run the command again once that lock is released.
+
+```
+</details>
+
+<details>
+<summary><a name="lock-not-held"></a><strong>Lock Not Held</strong></summary>
+
+```
+
+🔓 Lock for testapp (mysql) is not held now, though the acquire request failed.
+   Nothing was submitted. It is safe to run the command again.
+
+```
+</details>
+
+<details>
+<summary><a name="lock-could-not-be-checked"></a><strong>Lock Could Not Be Checked</strong></summary>
+
+```
+
+🔒 Lock for testapp (mysql) may have been taken: the acquire request failed, and the lock could not be checked.
+   Nothing was submitted. See who holds it: schemabot locks
+   If you hold it and no apply of yours runs under it, release it: schemabot unlock -d testapp -t mysql
+
+```
+</details>
+
+<details>
 <summary><a name="lock-kept-an-apply-runs-under-it"></a><strong>Lock Kept (An Apply Runs Under It)</strong></summary>
 
 ```

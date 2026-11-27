@@ -212,6 +212,11 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 		return blockUnsafeApply(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir, cmd.Target, cmd.Output)
 	}
 
+	// lockBefore is the lock this command saw held before it sent the
+	// acquire, which tells a lock it took apart from one its owner already
+	// held when the acquire gets no answer.
+	var lockBefore *client.LockInfo
+
 	// Check lock availability before showing plan (unless --force will break it anyway or --no-lock skips locking)
 	if !cmd.NoLock && !cmd.Force {
 		var existingLock *client.LockInfo
@@ -234,6 +239,7 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 			})
 			return fmt.Errorf("database is locked")
 		}
+		lockBefore = existingLock
 	}
 
 	// Step 2: Show the plan
@@ -298,7 +304,9 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 					return fmt.Errorf("force release lock: %w", err)
 				}
 				templates.WriteLockForceReleased(cfg.Database, cfg.Type, existingLock.Owner)
+				existingLock = nil
 			}
+			lockBefore = existingLock
 		}
 
 		// Acquire the lock
@@ -327,6 +335,9 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 				CreatedAt:    existingLock.CreatedAt,
 			})
 			return fmt.Errorf("database is locked")
+		}
+		if client.ServerMayHaveActed(err) {
+			return reportUnansweredLockAcquire(ep, cfg.Database, cfg.Type, owner, lockBefore, cmd.Output != OutputFormatJSON, err)
 		}
 		if err != nil {
 			return fmt.Errorf("acquire lock: %w", err)

@@ -53,6 +53,36 @@ func previewUnsubmittedLockNotReleasedOutput() {
 	WriteUnsubmittedLockHeldByAnotherOwner("testapp", "mysql")
 }
 
+func previewAcquireUnknownOutput() {
+	WriteAcquireUnknownLockHeldByOwner("testapp", "mysql")
+	WriteLockReleased("testapp", "mysql")
+	fmt.Println()
+	fmt.Println("--- Lock under your owner, an apply runs under it ---")
+	fmt.Println()
+	WriteAcquireUnknownLockHeldByOwner("testapp", "mysql")
+	WriteLockInUse("testapp", "mysql", "apply-b2c3d4e5", "running", "staging")
+	fmt.Println()
+	fmt.Println("--- Lock under your owner, server reported no lock ID ---")
+	fmt.Println()
+	WriteAcquireUnknownLockWithoutID("testapp", "mysql")
+	fmt.Println()
+	fmt.Println("--- Lock is the one you already held ---")
+	fmt.Println()
+	WriteAcquireUnknownLockHeldBefore("testapp", "mysql")
+	fmt.Println()
+	fmt.Println("--- Lock held by another owner ---")
+	fmt.Println()
+	WriteAcquireUnknownLockHeldByAnotherOwner("testapp", "mysql", "block/schemabot#123")
+	fmt.Println()
+	fmt.Println("--- Lock not held ---")
+	fmt.Println()
+	WriteAcquireUnknownLockFree("testapp", "mysql")
+	fmt.Println()
+	fmt.Println("--- Lock could not be checked ---")
+	fmt.Println()
+	WriteAcquireUnknownLockUnchecked("testapp", "mysql")
+}
+
 func previewLockInUseOutput() {
 	WriteLockInUse("testapp", "mysql", "apply-b2c3d4e5", "running", "staging")
 }
