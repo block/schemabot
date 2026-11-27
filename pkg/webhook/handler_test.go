@@ -13,11 +13,14 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
@@ -490,6 +493,93 @@ func TestHandleSchemaRequestErrorRendersMultipleConfigs(t *testing.T) {
 		assert.NotContains(t, body, "dial tcp")
 		assert.Contains(t, logBuf.String(), "dial tcp 10.1.2.3:3306: refused")
 		assert.Contains(t, logBuf.String(), "repo=octocat/hello-world")
+	})
+}
+
+// An unexpected failure is answered with the same written lines as every other
+// PR error comment. A remote data plane that did not answer is named by
+// deployment and target, the transport error behind it stays in the server
+// log, and the failure stays retryable for a durable driver.
+func TestHandleSchemaRequestErrorFallbackUsesTheSharedErrorLines(t *testing.T) {
+	const dialFailure = "dial tcp 10.1.2.3:3306: connect: connection refused"
+
+	newHandler := func(t *testing.T) (*Handler, chan string, *bytes.Buffer) {
+		t.Helper()
+		client, mux := setupGitHubServer(t)
+		comments := make(chan string, 1)
+		mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+		var logBuf bytes.Buffer
+		return &Handler{
+			service:   api.New(nil, &api.ServerConfig{}, nil, testLogger()),
+			ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+			logger:    slog.New(slog.NewTextHandler(&logBuf, nil)),
+		}, comments, &logBuf
+	}
+
+	t.Run("an unreachable remote deployment names the deployment and not the transport error", func(t *testing.T) {
+		h, comments, logBuf := newHandler(t)
+		requestErr := fmt.Errorf("plan orders/staging: %w", &api.RemoteDeploymentUnavailableError{
+			Deployment: "pie",
+			Target:     "orders-staging",
+			Err:        status.Error(codes.Unavailable, dialFailure),
+		})
+
+		assert.False(t, h.handleSchemaRequestError("octocat/hello-world", 1, 12345, "staging", "orders", "hubot", "plan", requestErr, false))
+
+		body := requireComment(t, comments, "remote unavailable comment")
+		assert.Contains(t, body, userFacingRemoteUnavailableError("pie", "orders-staging"))
+		assert.NotContains(t, body, "10.1.2.3")
+		assert.NotContains(t, body, "dial tcp")
+		assert.Contains(t, logBuf.String(), "10.1.2.3:3306")
+		assert.Contains(t, logBuf.String(), "repo=octocat/hello-world")
+	})
+
+	t.Run("a gRPC unavailable status gets the generic unreachable line", func(t *testing.T) {
+		h, comments, logBuf := newHandler(t)
+		requestErr := fmt.Errorf("plan orders/staging: %w", status.Error(codes.Unavailable, dialFailure))
+
+		assert.False(t, h.handleSchemaRequestError("octocat/hello-world", 1, 12345, "staging", "orders", "hubot", "plan", requestErr, false))
+
+		body := requireComment(t, comments, "gRPC unavailable comment")
+		assert.Contains(t, body, userFacingRemoteUnavailableError("", ""))
+		assert.NotContains(t, body, "10.1.2.3")
+		assert.Contains(t, logBuf.String(), "10.1.2.3:3306")
+	})
+
+	t.Run("an environment that is not configured keeps its text and is the command's answer", func(t *testing.T) {
+		h, comments, _ := newHandler(t)
+		requestErr := &environmentNotConfiguredError{Database: "orders", Environment: "staging"}
+
+		assert.True(t, h.handleSchemaRequestError("octocat/hello-world", 1, 12345, "staging", "orders", "hubot", "plan", requestErr, false))
+
+		body := requireComment(t, comments, "environment not configured comment")
+		assert.Contains(t, body, "is not configured on this server")
+		assert.Contains(t, body, "orders")
+		assert.Contains(t, body, "staging")
+	})
+
+	t.Run("a durable attempt posts nothing for the unexpected failure", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		var posts atomic.Int32
+		mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+			posts.Add(1)
+			w.WriteHeader(http.StatusCreated)
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 99}))
+		})
+		h := &Handler{
+			service:   api.New(nil, &api.ServerConfig{}, nil, testLogger()),
+			ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+			logger:    testLogger(),
+		}
+		requestErr := &api.RemoteDeploymentUnavailableError{
+			Deployment: "pie",
+			Target:     "orders-staging",
+			Err:        status.Error(codes.Unavailable, dialFailure),
+		}
+
+		assert.False(t, h.handleSchemaRequestError("octocat/hello-world", 1, 12345, "staging", "orders", "hubot", "plan", requestErr, true))
+
+		assert.Zero(t, posts.Load())
 	})
 }
 
