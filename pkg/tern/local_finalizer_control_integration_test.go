@@ -607,13 +607,19 @@ func (f *finalizerControlFixture) finalizerOperation(t *testing.T) *storage.Appl
 }
 
 // redispatch plays the rest of a retry the way the operator does it: the
-// rollout projection has moved the parent to failed_retryable, so the claim
-// re-leases the paused finalizer under the parent's retry budget and moves it
-// back to running. It returns a context carrying the new lease, the one the
-// re-drive writes under.
+// finished drive hands back its lease, the rollout projection has moved the
+// parent to failed_retryable, and the claim re-leases the paused finalizer
+// under the parent's retry budget and moves it back to running. It returns a
+// context carrying the new lease, the one the re-drive writes under.
 func (f *finalizerControlFixture) redispatch(t *testing.T) context.Context {
 	t.Helper()
-	_, err := f.leaseDB.ExecContext(t.Context(), `UPDATE applies SET state = ? WHERE id = ?`,
+	lease, ok := storage.OperationLeaseFromContext(f.opCtx)
+	require.True(t, ok, "the fixture's drive context carries the finalizer's lease")
+	released, err := f.stor.ApplyOperations().ReleaseFinishedClaim(t.Context(), lease)
+	require.NoError(t, err)
+	require.True(t, released, "the paused finalizer's drive hands back its lease, as the operator does when a drive ends")
+
+	_, err = f.leaseDB.ExecContext(t.Context(), `UPDATE applies SET state = ? WHERE id = ?`,
 		state.Apply.FailedRetryable, f.apply.ID)
 	require.NoError(t, err)
 
