@@ -56,7 +56,7 @@ Your agent does not need to be told what your schema looks like. It can ask.
 |---|---|
 | What databases are there, on which engines and environments? | `databases` |
 | What is in this one right now? | `pull`, which returns the live schema as SQL or JSON. `onboard` writes it into a new declarative schema directory |
-| What is running at this moment? | `status`, which lists active applies across every database, and `locks` for what is held |
+| What is running at this moment? | `status`, which lists every active apply above the most recent finished ones, and `locks` for what is held |
 | What has run against it, and what did one of those do? | `status -d <database>` for the apply history, then `status <apply_id>` and `logs <apply_id>` |
 | What DDL has been proposed for it? | `list-plans`, which returns stored plans whether or not they were applied |
 
@@ -83,8 +83,8 @@ from a stored plan it finds with `list-plans`.
 Once a change is running, `progress --no-watch` reports how far along it is,
 `logs` returns the lifecycle log for that apply, and `status` gives the current
 state. Bare `progress` opens the interactive watcher instead, and its keys stop
-or cancel the apply and run its cutover — an operator surface, not a read, so an
-agent following a change passes `--no-watch`.
+or cancel the apply, run its cutover, and close its revert window — an operator
+surface, not a read, so an agent following a change passes `--no-watch`.
 For a change that spans several targets or shards, each one reports separately,
 so an agent can tell you which shard is behind rather than only that something
 is.
@@ -140,9 +140,9 @@ your agent is about to do with your credentials.
 | Run a production command such as `apply`, `apply-confirm`, `cutover`, or `rollback` | You run it yourself, even if you previously asked the agent to do it |
 | Run a command with `--allow-unsafe`, in any environment | You review the destructive change and run the command yourself |
 | Ask to override a freeze with `--override`, in any environment | You decide whether to ask, write the reason, and run the command yourself. See [guidance for agents](freeze.md#guidance-for-agents) |
-| Apply to a shared staging database or one that other teams depend on | Your agent asks first |
+| Apply to a shared staging database or one that other teams depend on | Your agent hands you the command |
 | Apply to a new or isolated staging database with little impact on others | Your agent explains what it will do, then proceeds |
-| Apply when it is unclear who depends on the database | Your agent asks first |
+| Apply when it is unclear who depends on the database | Your agent hands you the command |
 | Inspect status, progress, history, a stored plan, or the live schema | Your agent can use its read access without asking each time |
 
 If you prefer to run every write command yourself, say so in your agent's
@@ -150,8 +150,8 @@ instructions. That takes precedence over the staging defaults above.
 
 Staging changes can affect other people too. A change can disrupt their tests
 or hold a database lock while it runs. Use your team's service criticality
-ratings if you have them; otherwise, ask before changing any shared staging
-database. Any configured approval requirements still apply.
+ratings if you have them; otherwise, treat any staging database you cannot
+confirm is isolated as shared. Any configured approval requirements still apply.
 
 ## Give your agent clear instructions
 
@@ -163,12 +163,15 @@ You can copy this into your agent's instructions:
 >   command so I can decide and run it myself.
 > - Do not ask to override a freeze with `--override`. Tell me what is frozen
 >   and give me the command.
-> - Before applying to staging, check who depends on the database. Ask me first
->   if it is shared, critical, or unclear. For a new or isolated database with
->   little impact on others, explain what you will do before proceeding.
+> - Before applying to staging, check who depends on the database. If it is
+>   shared, critical, or unclear, give me the command instead of running it. For
+>   a new or isolated database with little impact on others, explain what you
+>   will do before proceeding.
 > - If I say I will run all write commands myself, follow that preference.
 > - Use your read access to inspect status, progress, stored plans, history,
->   and live schemas. Creating a new plan requires write access.
+>   and live schemas. Follow a change with `status` or `progress --no-watch`,
+>   because the interactive watcher's keys change the apply. Creating a new
+>   plan requires write access.
 > - If a request returns `403`, explain the missing permission. Do not try other
 >   credentials or disable authentication to get around it. Ask an operator to
 >   check whether the account should have access.
