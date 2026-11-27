@@ -621,12 +621,13 @@ type BlockedChange struct {
 // heading the PR comment uses. Each cause after a change's first is its own
 // line, since each needs its own fix. An apply refuses these whatever its
 // flags, so the section names the refusal rather than asking for consent.
-// remedy closes the list with the next step for the command that refused.
-func WriteBlockedChanges(changes []BlockedChange, remedy string) {
+// heading names what the refused command cannot do, and remedy closes the
+// list with that command's next step.
+func WriteBlockedChanges(changes []BlockedChange, heading, remedy string) {
 	if len(changes) == 0 {
 		return
 	}
-	fmt.Printf("%s Cannot apply: %s the engine refuses to execute\n", glyph.Refused, BlockedChangeCount(changes))
+	fmt.Printf("%s %s: %s the engine refuses to execute\n", glyph.Refused, heading, BlockedChangeCount(changes))
 	for _, line := range BlockedChangeLines(changes) {
 		fmt.Printf("  %s\n", line)
 	}

@@ -213,6 +213,8 @@ func TestRollbackCmd_BlockedPlanRefusesBeforeLock(t *testing.T) {
 	assert.Contains(t, output, "- orders: direct execution is enabled but the table's size is unavailable")
 	assert.Contains(t, output, "DROP INDEX `idx_status`")
 	assert.Contains(t, output, presentation.RollbackBlockedChangesRemedy, "the list ends on running the rollback again")
+	assert.Contains(t, output, "Cannot roll back: 1 change the engine refuses to execute")
+	assert.NotContains(t, output, "Cannot apply", "a rollback's refusal names the rollback")
 	assert.NotContains(t, output, "An apply will fail", "a rollback's refusal names the rollback")
 	assert.NotContains(t, output, "Do you want to apply this rollback?")
 	assert.Equal(t, []string{"POST /api/rollback/plan", "GET /api/status"}, requests())

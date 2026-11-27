@@ -1,9 +1,16 @@
 package presentation
 
+// BlockedChangesHeading heads the CLI plan's and apply's list of changes an
+// engine refuses to run.
+const BlockedChangesHeading = "Cannot apply"
+
 // BlockedChangesRemedy closes every list of changes an engine refuses to run
 // with what the operator does next. The CLI plan and the PR plan comment both
 // end their list with it, so the two surfaces give one answer.
 const BlockedChangesRemedy = "An apply will fail on these statements. " + BlockedChangesFix
+
+// RollbackBlockedChangesHeading heads a rollback's list of refused changes.
+const RollbackBlockedChangesHeading = "Cannot roll back"
 
 // RollbackBlockedChangesRemedy closes a rollback's list of refused changes.
 // A rollback plans its own reversal each time it runs, so the next step is to

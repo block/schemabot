@@ -398,7 +398,7 @@ func writeRolloutPlanBody(result *apitypes.PlanResponse, isApply bool) {
 		writeChangeDetail(plans[i], work[i], isApply)
 		// Under its group's heading, a blocked change names the members it
 		// is refused on.
-		templates.WriteBlockedChanges(blockedChangeNotices(plans[i]), presentation.BlockedChangesRemedy)
+		templates.WriteBlockedChanges(blockedChangeNotices(plans[i]), presentation.BlockedChangesHeading, presentation.BlockedChangesRemedy)
 		rolloutWork = append(rolloutWork, work[i])
 	}
 	if lint := result.LintNonErrors(); len(lint) > 0 {
@@ -639,7 +639,7 @@ func writeChangesBody(result *apitypes.PlanResponse, isApply bool) {
 	// The plan closes on its verdict: a blocked change is refused whatever
 	// the apply's flags, so the last thing read is that it cannot apply and
 	// why, in plan and in apply's preview before its refusal.
-	templates.WriteBlockedChanges(blockedChangeNotices(result), presentation.BlockedChangesRemedy)
+	templates.WriteBlockedChanges(blockedChangeNotices(result), presentation.BlockedChangesHeading, presentation.BlockedChangesRemedy)
 }
 
 // writePlanGuidance links the guides for the lint findings the output shows.

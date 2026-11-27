@@ -72,7 +72,7 @@ func (cmd *RollbackCmd) Run(ctx context.Context, g *Globals) error {
 	// below the plan that shows the refused statement, before any prompt or
 	// lock.
 	if err := blockedPlanError("rollback", planResult, true); err != nil {
-		templates.WriteBlockedChanges(blockedChangeNotices(planResult), presentation.RollbackBlockedChangesRemedy)
+		templates.WriteBlockedChanges(blockedChangeNotices(planResult), presentation.RollbackBlockedChangesHeading, presentation.RollbackBlockedChangesRemedy)
 		return err
 	}
 
