@@ -294,3 +294,48 @@ func TestPlanChangeMetadataRefusesAnOrdinalThatNamesAnotherChange(t *testing.T) 
 	require.NoError(t, err)
 	assert.Equal(t, metadataTestRecord(), got, "a deployment's rendering of the change's statement still matches")
 }
+
+// A sharded plan keeps one change per table in its namespace, so a shard
+// whose change list repeats a statement with a different record is found only
+// in that shard's own list. Shard -80 drops only the new helper, while 80-
+// drops a leftover helper first and the new one after. Each task gets the
+// record of the change its own shard planned, and an unsharded task is still
+// matched within the namespace.
+func TestPlanChangeMetadataMatchesAShardTaskWithinItsShard(t *testing.T) {
+	const dropHelper = `ALTER TABLE "ks"."notes" DROP CONSTRAINT "notes_body_not_null"`
+	leftover := map[string]string{"helper": "leftover"}
+	fresh := map[string]string{"helper": "new"}
+	first := storage.TableChange{Table: "notes", DDL: dropHelper, Metadata: leftover}
+	second := storage.TableChange{Table: "notes", DDL: dropHelper, Metadata: fresh}
+	plan := &storage.Plan{
+		ID: 7, PlanIdentifier: "plan-7",
+		Namespaces: map[string]*storage.NamespacePlanData{"ks": {Tables: []storage.TableChange{first}}},
+		Shards: []storage.ShardPlan{
+			{Namespace: "ks", Shard: "-80", Changes: []storage.TableChange{second}},
+			{Namespace: "ks", Shard: "80-", Changes: []storage.TableChange{first, second}},
+		},
+	}
+	index := newPlanChangeMetadata(plan, nil)
+	task := func(shard string, ordinal int) *storage.Task {
+		return &storage.Task{Namespace: "ks", TableName: "notes", Shard: shard, DDL: dropHelper, PlanChangeOrdinal: ordinal}
+	}
+
+	for _, tc := range []struct {
+		name string
+		task *storage.Task
+		want map[string]string
+	}{
+		{"-80 change 1", task("-80", 1), fresh},
+		{"80- change 1", task("80-", 1), leftover},
+		{"80- change 2", task("80-", 2), fresh},
+		{"unsharded change 1", task("", 1), leftover},
+	} {
+		got, err := index.forTask(tc.task)
+		require.NoError(t, err, tc.name)
+		assert.Equal(t, tc.want, got, tc.name)
+	}
+
+	_, err := index.forTask(task("-80", 2))
+	require.Error(t, err)
+	assert.Equal(t, `plan plan-7 has 1 change(s) to table "notes" in namespace "ks", but the task runs change 2`, err.Error())
+}

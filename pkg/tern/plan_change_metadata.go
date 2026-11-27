@@ -15,11 +15,15 @@ import (
 //
 // A task is matched to the change at its plan change ordinal: the position,
 // among the plan's changes to its namespace and table, recorded when the task
-// was created. A plan can carry the same statement twice on one table with
-// different metadata, and the ordinal is what tells those changes apart. A
-// task written without an ordinal is matched to the change in its namespace
-// that names its table and carries its statement. The statement is compared in the dialect's canonical
-// form when a canonicalizer is available, because a task's DDL can take a
+// was created. A shard's task is matched within its shard's own changes, which
+// the plan keeps per shard: the namespace keeps one change per table, so a
+// shard that needs a second copy of a statement, with its own record, is
+// found only in its shard's list. A plan can carry the same statement twice
+// on one table with different metadata, and the ordinal is what tells those
+// changes apart. A task written without an ordinal is matched to the change
+// in its namespace that names its table and carries its statement. The
+// statement is compared in the dialect's canonical form when a canonicalizer
+// is available, because a task's DDL can take a
 // deployment's rendering of the reviewed statement on resume or progress sync
 // while the stored plan keeps the reviewed text. A statement that matches no
 // change gets no metadata, and the engine decides whether the change can run
@@ -32,6 +36,7 @@ import (
 type planChangeMetadata struct {
 	planIdentifier string
 	byTable        map[string][]storage.TableChange
+	byShard        map[string][]storage.TableChange
 	canon          StatementCanonicalizer
 }
 
@@ -39,7 +44,7 @@ type planChangeMetadata struct {
 // plan yields an index that answers every task with no metadata, and a nil
 // canon compares statements by their trimmed text.
 func newPlanChangeMetadata(plan *storage.Plan, canon StatementCanonicalizer) planChangeMetadata {
-	ix := planChangeMetadata{byTable: storage.PlanChangesByTable(plan), canon: canon}
+	ix := planChangeMetadata{byTable: storage.PlanChangesByTable(plan), byShard: storage.PlanShardChangesByTable(plan), canon: canon}
 	if plan != nil {
 		ix.planIdentifier = plan.PlanIdentifier
 	}
@@ -78,7 +83,7 @@ func (ix planChangeMetadata) statementKey(ddl string) string {
 // could be the one the task was created from.
 func (ix planChangeMetadata) forTask(task *storage.Task) (map[string]string, error) {
 	want := ix.statementKey(task.DDL)
-	changes := ix.byTable[storage.PlanChangeTableKey(task.Namespace, task.TableName)]
+	changes := ix.changesFor(task)
 	if task.PlanChangeOrdinal > 0 {
 		if task.PlanChangeOrdinal > len(changes) {
 			return nil, fmt.Errorf("plan %s has %d change(s) to table %q in namespace %q, but the task runs change %d", ix.planIdentifier, len(changes), task.TableName, task.Namespace, task.PlanChangeOrdinal)
@@ -104,6 +109,19 @@ func (ix planChangeMetadata) forTask(task *storage.Task) (map[string]string, err
 		metadata = change.Metadata
 	}
 	return maps.Clone(metadata), nil
+}
+
+// changesFor returns the changes a task is matched within: its shard's own
+// changes to its table when the plan records them, and its namespace's
+// changes to its table otherwise, for an unsharded task or a plan stored
+// without per-shard changes.
+func (ix planChangeMetadata) changesFor(task *storage.Task) []storage.TableChange {
+	if task.Shard != "" {
+		if changes, ok := ix.byShard[storage.PlanShardChangeTableKey(task.Namespace, task.Shard, task.TableName)]; ok {
+			return changes
+		}
+	}
+	return ix.byTable[storage.PlanChangeTableKey(task.Namespace, task.TableName)]
 }
 
 // planMetadataCache holds the planChangeMetadata index of each plan one

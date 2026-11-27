@@ -205,20 +205,80 @@ func TestLocalClientPostgresCancelOfPlainDDLIsDeclined(t *testing.T) {
 	assert.Equal(t, 1, columns, "the change the cancel declined is applied")
 }
 
-// An operator cancels a PostgreSQL SET NOT NULL whose validation keeps
-// failing on a NULL row. The sequence's first step added a helper CHECK NOT
-// VALID, which rejects every NULL write the application makes. The cancel
-// drops that helper, so the application's writes behave as they did before
-// the apply, and the apply log names the constraint it removed.
-func TestLocalClientPostgresCancelRemovesTheSetNotNullHelper(t *testing.T) {
+// An owner makes a PostgreSQL column NOT NULL while a row still holds NULL.
+// The sequence's first step adds a helper CHECK NOT VALID, which rejects
+// every NULL write the application makes, and the helper's validation fails
+// on the row. A retry cannot pass until someone fixes the row, so the apply
+// fails at once, says to fix the rows and apply again, and does not run the
+// steps after the validation. The drive drops the helper the apply added, so
+// the application's writes behave as they did before the apply, and the apply
+// log names the constraint it removed.
+func TestLocalClientPostgresFailedValidationRemovesTheSetNotNullHelper(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
 
 	const (
-		database = "cancel_not_null"
+		database = "fail_not_null"
 		helper   = "users_name_not_null_check"
 	)
+	stor, targetDB, applyID := applySetNotNullOverANullRow(t, database, "", true)
+
+	apply := waitForTerminalApply(t, stor, applyID)
+	assert.Equal(t, state.Apply.Failed, apply.State, "a broken check ends the apply instead of retrying it")
+	assert.Contains(t, apply.ErrorMessage, `existing rows in "users" break check constraint "users_name_not_null_check"; fix those rows, then apply again`)
+	tasks, err := stor.Tasks().GetByApplyID(t.Context(), apply.ID)
+	require.NoError(t, err)
+	require.Len(t, tasks, 4)
+	assert.Equal(t, []string{state.Task.Completed, state.Task.Failed, state.Task.Cancelled, state.Task.Cancelled}, taskStates(tasks),
+		"the steps after the failed validation never run")
+
+	assert.Zero(t, checkConstraintCount(t, targetDB, helper), "the failure drops the helper the apply added")
+	_, err = targetDB.ExecContext(t.Context(), `INSERT INTO public.users VALUES (3, NULL)`)
+	require.NoError(t, err, "a NULL write lands again, as it did before the apply")
+
+	logs, err := stor.ApplyLogs().GetByApply(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, countLogMessagesContaining(logs,
+		`Removed constraint users_name_not_null_check from public.users. The failed schema change added it, and it rejects writes that break CHECK ((name IS NOT NULL))`),
+		"the apply log names the constraint the failure removed")
+}
+
+// A table already carries a SET NOT NULL helper an earlier run left, and a
+// row still holds NULL. The plan takes the helper over and starts at its
+// validation, which fails on the row and ends the apply. The apply did not
+// add the helper, so the drive leaves it, and the apply log says it still
+// checks writes and how to drop it.
+func TestLocalClientPostgresFailedValidationLeavesAHelperTheApplyDidNotAdd(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	const (
+		database = "fail_adopted_not_null"
+		helper   = "users_name_not_null_check"
+	)
+	stor, targetDB, applyID := applySetNotNullOverANullRow(t, database,
+		`ALTER TABLE public.users ADD CONSTRAINT users_name_not_null_check CHECK (name IS NOT NULL) NOT VALID`, false)
+
+	apply := waitForTerminalApply(t, stor, applyID)
+	assert.Equal(t, state.Apply.Failed, apply.State, apply.ErrorMessage)
+
+	assert.Equal(t, 1, checkConstraintCount(t, targetDB, helper), "the helper the apply found stays")
+	logs, err := stor.ApplyLogs().GetByApply(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.Zero(t, countLogMessagesContaining(logs, "Removed constraint"), "the drive removed nothing the apply did not add")
+	assert.Equal(t, 1, countLogMessagesContaining(logs,
+		`Constraint users_name_not_null_check is still on public.users. No finished step of the failed schema change added it, so SchemaBot left it, and it rejects writes that break CHECK ((name IS NOT NULL)) until it is dropped. Drop it with: ALTER TABLE "public"."users" DROP CONSTRAINT "users_name_not_null_check"`),
+		"the apply log says the helper still checks writes and how to drop it")
+}
+
+// applySetNotNullOverANullRow creates public.users with a NULL name, runs
+// setup on the target when it is set, plans users.name NOT NULL, and starts
+// the apply. addsHelper says whether the plan's first step adds the helper or
+// takes over one setup left.
+func applySetNotNullOverANullRow(t *testing.T, database, setup string, addsHelper bool) (storage.Storage, *sql.DB, string) {
+	t.Helper()
 	_, storageDSN := setupMySQLContainer(t)
 	setupStorageSchema(t, storageDSN)
 	cleanupTasks(t, storageDSN)
@@ -227,6 +287,10 @@ func TestLocalClientPostgresCancelRemovesTheSetNotNullHelper(t *testing.T) {
 		CREATE TABLE public.users (id bigint PRIMARY KEY, name text);
 		INSERT INTO public.users VALUES (1, 'ada'), (2, NULL)`)
 	require.NoError(t, err)
+	if setup != "" {
+		_, err = targetDB.ExecContext(t.Context(), setup)
+		require.NoError(t, err)
+	}
 
 	stor := createStorage(t, storageDSN)
 	t.Cleanup(func() { utils.CloseAndLog(stor) })
@@ -241,111 +305,32 @@ func TestLocalClientPostgresCancelRemovesTheSetNotNullHelper(t *testing.T) {
 		}}}})
 	require.NoError(t, err)
 	require.Len(t, plan.Changes, 1)
-
-	result, err := client.Apply(t.Context(), &ternv1.ApplyRequest{PlanId: plan.PlanId, Environment: localClientTestEnvironment,
-		DdlChanges: plan.Changes[0].TableChanges})
-	require.NoError(t, err)
-	require.True(t, result.Accepted, result.ErrorMessage)
-	startTestOperator(t, stor, client, result.ApplyId)
-
-	apply := resolveDispatchedApply(t, stor, result.ApplyId)
-	require.Eventually(t, func() bool {
-		apply = resolveDispatchedApply(t, stor, result.ApplyId)
-		return state.IsState(apply.State, state.Apply.FailedRetryable)
-	}, postgresCancelDeadline, 50*time.Millisecond, "the validation never failed on the NULL row")
-	require.Equal(t, 1, checkConstraintCount(t, targetDB, helper), "the sequence's first step added the helper")
-	_, err = targetDB.ExecContext(t.Context(), `INSERT INTO public.users VALUES (3, NULL)`)
-	require.Error(t, err, "the helper rejects a NULL write while it stays")
-
-	cancelResp, err := client.Cancel(t.Context(), &ternv1.CancelRequest{ApplyId: result.ApplyId, Environment: localClientTestEnvironment})
-	require.NoError(t, err)
-	require.True(t, cancelResp.Accepted, cancelResp.ErrorMessage)
-
-	require.Eventually(t, func() bool {
-		apply = resolveDispatchedApply(t, stor, result.ApplyId)
-		return state.IsTerminalApplyState(apply.State)
-	}, postgresCancelDeadline, 50*time.Millisecond, "the cancelled apply never settled")
-	assert.Equal(t, state.Apply.Cancelled, apply.State, apply.ErrorMessage)
-
-	assert.Zero(t, checkConstraintCount(t, targetDB, helper), "the cancel drops the helper")
-	_, err = targetDB.ExecContext(t.Context(), `INSERT INTO public.users VALUES (3, NULL)`)
-	require.NoError(t, err, "a NULL write lands again, as it did before the apply")
-
-	logs, err := stor.ApplyLogs().GetByApply(t.Context(), apply.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 1, countLogMessagesContaining(logs,
-		`Removed constraint users_name_not_null_check from public.users. The cancelled schema change added it, and it rejects writes that break CHECK ((name IS NOT NULL))`),
-		"the apply log names the constraint the cancel removed")
-}
-
-// A table already carries a SET NOT NULL helper an earlier run left, and a
-// row still holds NULL. The plan takes the helper over and starts at its
-// validation, which fails on the row, and the operator cancels. The apply did
-// not add the helper, so the cancel leaves it, and the table is as the apply
-// found it.
-func TestLocalClientPostgresCancelLeavesAHelperTheApplyDidNotAdd(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
+	require.NotEmpty(t, plan.Changes[0].TableChanges)
+	first := plan.Changes[0].TableChanges[0].Ddl
+	if addsHelper {
+		require.Contains(t, first, "ADD CONSTRAINT", "the plan's first step adds the helper")
+	} else {
+		require.Equal(t, `ALTER TABLE "public"."users" VALIDATE CONSTRAINT "users_name_not_null_check"`, first,
+			"the plan takes the helper over instead of adding it")
 	}
 
-	const (
-		database = "cancel_adopted_not_null"
-		helper   = "users_name_not_null_check"
-	)
-	_, storageDSN := setupMySQLContainer(t)
-	setupStorageSchema(t, storageDSN)
-	cleanupTasks(t, storageDSN)
-	targetDSN, targetDB := testutil.StartPostgres(t, database)
-	_, err := targetDB.ExecContext(t.Context(), `
-		CREATE TABLE public.users (id bigint PRIMARY KEY, name text);
-		INSERT INTO public.users VALUES (1, 'ada'), (2, NULL);
-		ALTER TABLE public.users ADD CONSTRAINT users_name_not_null_check CHECK (name IS NOT NULL) NOT VALID`)
-	require.NoError(t, err)
-
-	stor := createStorage(t, storageDSN)
-	t.Cleanup(func() { utils.CloseAndLog(stor) })
-	client, err := NewLocalClient(LocalConfig{Database: database, Type: storage.DatabaseTypePostgres, TargetDSN: targetDSN}, stor, slog.Default())
-	require.NoError(t, err)
-	t.Cleanup(func() { utils.CloseAndLog(client) })
-
-	plan, err := client.Plan(t.Context(), &ternv1.PlanRequest{Database: database, Type: storage.DatabaseTypePostgres,
-		SchemaFiles: map[string]*ternv1.SchemaFiles{"public": {Files: map[string]string{
-			"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, name text NOT NULL);",
-		}}}})
-	require.NoError(t, err)
-	require.Len(t, plan.Changes, 1)
-	require.NotEmpty(t, plan.Changes[0].TableChanges)
-	require.Equal(t, `ALTER TABLE "public"."users" VALIDATE CONSTRAINT "users_name_not_null_check"`, plan.Changes[0].TableChanges[0].Ddl,
-		"the plan takes the helper over instead of adding it")
-
 	result, err := client.Apply(t.Context(), &ternv1.ApplyRequest{PlanId: plan.PlanId, Environment: localClientTestEnvironment,
 		DdlChanges: plan.Changes[0].TableChanges})
 	require.NoError(t, err)
 	require.True(t, result.Accepted, result.ErrorMessage)
 	startTestOperator(t, stor, client, result.ApplyId)
+	return stor, targetDB, result.ApplyId
+}
 
-	apply := resolveDispatchedApply(t, stor, result.ApplyId)
+// waitForTerminalApply waits for the apply to settle and returns it.
+func waitForTerminalApply(t *testing.T, stor storage.Storage, applyID string) *storage.Apply {
+	t.Helper()
+	apply := resolveDispatchedApply(t, stor, applyID)
 	require.Eventually(t, func() bool {
-		apply = resolveDispatchedApply(t, stor, result.ApplyId)
-		return state.IsState(apply.State, state.Apply.FailedRetryable)
-	}, postgresCancelDeadline, 50*time.Millisecond, "the validation never failed on the NULL row")
-
-	cancelResp, err := client.Cancel(t.Context(), &ternv1.CancelRequest{ApplyId: result.ApplyId, Environment: localClientTestEnvironment})
-	require.NoError(t, err)
-	require.True(t, cancelResp.Accepted, cancelResp.ErrorMessage)
-	require.Eventually(t, func() bool {
-		apply = resolveDispatchedApply(t, stor, result.ApplyId)
+		apply = resolveDispatchedApply(t, stor, applyID)
 		return state.IsTerminalApplyState(apply.State)
-	}, postgresCancelDeadline, 50*time.Millisecond, "the cancelled apply never settled")
-	assert.Equal(t, state.Apply.Cancelled, apply.State, apply.ErrorMessage)
-
-	assert.Equal(t, 1, checkConstraintCount(t, targetDB, helper), "the helper the apply found stays")
-	logs, err := stor.ApplyLogs().GetByApply(t.Context(), apply.ID)
-	require.NoError(t, err)
-	assert.Zero(t, countLogMessagesContaining(logs, "Removed constraint"), "the cancel removed nothing it did not add")
-	assert.Equal(t, 1, countLogMessagesContaining(logs,
-		`Constraint users_name_not_null_check is still on public.users. No finished step of the cancelled schema change added it, so the cancel left it, and it rejects writes that break CHECK ((name IS NOT NULL)) until it is dropped. Drop it with: ALTER TABLE "public"."users" DROP CONSTRAINT "users_name_not_null_check"`),
-		"the apply log says the helper still checks writes and how to drop it")
+	}, postgresCancelDeadline, 50*time.Millisecond, "the apply never settled")
+	return apply
 }
 
 // checkConstraintCount counts the constraints named name on public.users.
@@ -355,4 +340,75 @@ func checkConstraintCount(t *testing.T, db *sql.DB, name string) int {
 	require.NoError(t, db.QueryRowContext(t.Context(),
 		`SELECT count(*) FROM pg_catalog.pg_constraint WHERE conrelid = 'public.users'::regclass AND conname = $1`, name).Scan(&count))
 	return count
+}
+
+// An owner adds a foreign key from orders to users while an order still
+// points at a user that does not exist. The key is added NOT VALID, which
+// checks every write the application makes from then on, and its validation
+// fails on the orphan row. A retry cannot pass until someone fixes the row,
+// so the apply fails at once. The drive drops the key the apply added, so
+// the application's writes behave as they did before the apply, and the
+// apply log names the key it removed.
+func TestLocalClientPostgresFailedValidationRemovesTheForeignKey(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	const (
+		database = "fail_foreign_key"
+		key      = "orders_user_id_fkey"
+	)
+	_, storageDSN := setupMySQLContainer(t)
+	setupStorageSchema(t, storageDSN)
+	cleanupTasks(t, storageDSN)
+	targetDSN, targetDB := testutil.StartPostgres(t, database)
+	_, err := targetDB.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint);
+		INSERT INTO public.users VALUES (1);
+		INSERT INTO public.orders VALUES (1, 1), (2, 99)`)
+	require.NoError(t, err)
+
+	stor := createStorage(t, storageDSN)
+	t.Cleanup(func() { utils.CloseAndLog(stor) })
+	client, err := NewLocalClient(LocalConfig{Database: database, Type: storage.DatabaseTypePostgres, TargetDSN: targetDSN,
+		SchemaOverrides: map[string]string{"logical": "public"}}, stor, slog.Default())
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(client) })
+
+	plan, err := client.Plan(t.Context(), &ternv1.PlanRequest{Database: database, Type: storage.DatabaseTypePostgres,
+		SchemaFiles: map[string]*ternv1.SchemaFiles{"logical": {Files: map[string]string{
+			"users.sql":  "CREATE TABLE users (id bigint PRIMARY KEY);",
+			"orders.sql": "CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint, CONSTRAINT orders_user_id_fkey FOREIGN KEY (user_id) REFERENCES users (id));",
+		}}}})
+	require.NoError(t, err)
+	require.Len(t, plan.Changes, 1)
+	require.Len(t, plan.Changes[0].TableChanges, 2)
+	require.Contains(t, plan.Changes[0].TableChanges[0].Ddl, "NOT VALID", "the plan adds the key without checking existing rows")
+
+	result, err := client.Apply(t.Context(), &ternv1.ApplyRequest{PlanId: plan.PlanId, Environment: localClientTestEnvironment,
+		DdlChanges: plan.Changes[0].TableChanges})
+	require.NoError(t, err)
+	require.True(t, result.Accepted, result.ErrorMessage)
+	startTestOperator(t, stor, client, result.ApplyId)
+
+	apply := waitForTerminalApply(t, stor, result.ApplyId)
+	assert.Equal(t, state.Apply.Failed, apply.State, "an orphan row ends the apply instead of retrying it")
+	assert.Contains(t, apply.ErrorMessage, `"orders"`)
+	assert.Contains(t, apply.ErrorMessage, key)
+	tasks, err := stor.Tasks().GetByApplyID(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []string{state.Task.Completed, state.Task.Failed}, taskStates(tasks))
+
+	var keys int
+	require.NoError(t, targetDB.QueryRowContext(t.Context(),
+		`SELECT count(*) FROM pg_catalog.pg_constraint WHERE conrelid = 'public.orders'::regclass AND conname = $1`, key).Scan(&keys))
+	assert.Zero(t, keys, "the failure drops the key the apply added")
+	_, err = targetDB.ExecContext(t.Context(), `INSERT INTO public.orders VALUES (3, 98)`)
+	require.NoError(t, err, "an orphan write lands again, as it did before the apply")
+
+	logs, err := stor.ApplyLogs().GetByApply(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, countLogMessagesContaining(logs, `Removed constraint orders_user_id_fkey from public.orders. The failed schema change added it`),
+		"the apply log names the key the failure removed")
 }

@@ -671,16 +671,22 @@ func tableChanges(report pgplan.Report, crossNamespaceForeignKeys []string, pars
 			if err != nil {
 				return nil, nil, nil, fmt.Errorf("record the reviewed validation for table %q: %w", report.Table, err)
 			}
-			if validationMetadata != nil {
-				if metadata == nil {
-					metadata = validationMetadata
-				} else {
-					maps.Copy(metadata, validationMetadata)
-				}
+			adoptionMetadata, unrecordedAdoption, err := stepAdoptionMetadata(statement, sql)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("record the reviewed index adoption for table %q: %w", report.Table, err)
 			}
+			replacementMetadata, err := stepReplacementMetadata(statement, sql)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("record the replacement index for table %q: %w", report.Table, err)
+			}
+			metadata = mergeStepMetadata(metadata, validationMetadata, adoptionMetadata, replacementMetadata)
 			if unrecordedDrop && stepMode == "" {
 				stepMode = engine.ExecutionModeBlocked
 				stepReason = fmt.Sprintf("statement for table %q drops an object the planner did not record, so the apply cannot check that it is still the object this plan reviewed; make the change outside SchemaBot", table)
+			}
+			if unrecordedAdoption && stepMode == "" {
+				stepMode = engine.ExecutionModeBlocked
+				stepReason = fmt.Sprintf("statement for table %q makes a constraint take over an index the planner did not record, so the apply cannot check that it is still the index this plan reviewed; make the change outside SchemaBot", table)
 			}
 			if unrecordedValidation && stepMode == "" {
 				stepMode = engine.ExecutionModeBlocked
@@ -694,7 +700,7 @@ func tableChanges(report pgplan.Report, crossNamespaceForeignKeys []string, pars
 				Operation:     operation,
 				DDL:           sql,
 				IsUnsafe:      statement.Destructive,
-				UnsafeReason:  destructiveReason(statement.Destructive, table),
+				UnsafeReason:  destructiveReason(statement, table),
 				ExecutionMode: stepMode,
 				ModeReason:    engine.SanitizeBlockedCause(stepReason),
 				Metadata:      metadata,
@@ -1821,9 +1827,18 @@ func generatedExpressionRefusalReason(table string) string {
 	return fmt.Sprintf("statement for table %q changes a stored generated column's expression, which rewrites every row under a lock that blocks reads and writes, so SchemaBot does not apply it; to keep the live expression, declare it in the schema file and re-plan; to change it, declare the live expression to apply the rest of the plan first, then run this statement (PostgreSQL 17 or later) outside SchemaBot through a separately reviewed process and put the new expression back in the file", table)
 }
 
-func destructiveReason(destructive bool, table string) string {
-	if !destructive {
+// destructiveReason is the reviewer-facing reason a destructive step needs
+// --allow-unsafe. The drop that completes an index replacement names the
+// index that replaces it: the old index goes only while the new definition is
+// built and valid, so what the reviewer accepts is that the old definition
+// stops applying, not that the table loses the index.
+func destructiveReason(statement pgplan.Statement, table string) string {
+	if !statement.Destructive {
 		return ""
+	}
+	if replaced := statement.Drops; statement.ReplacedBy != "" && replaced != nil {
+		return fmt.Sprintf("statement replaces index %q on table %q with the definition built as %q: the old index is dropped only while that index is valid, and from then on its old definition no longer applies",
+			replaced.Name, table, statement.ReplacedBy)
 	}
 	return fmt.Sprintf("statement removes live structure from table %q", table)
 }

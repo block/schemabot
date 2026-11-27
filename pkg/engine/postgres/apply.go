@@ -130,6 +130,13 @@ type nativeApply struct {
 	// indexDrop is set for a DROP INDEX CONCURRENTLY of the index dropped
 	// names, which runs through pg-sprite's concurrent index drop.
 	indexDrop bool
+	// adopts is the plan's record of the index the statement's constraint
+	// takes over, which the apply checks under the table's lock before the
+	// constraint attaches it.
+	adopts *schemadiff.IndexAdoption
+	// replacement is the plan's record of the index that replaces the one
+	// the statement drops, which the apply checks right before the drop.
+	replacement *schemadiff.IndexReplacement
 	// validates is the plan's record of the live NOT VALID constraint the
 	// statement validates, which the apply checks under the validation's
 	// lock before validating it.
@@ -367,6 +374,14 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 			return nativeApply{}, err
 		}
 		change.validates, err = reviewedValidationForApply(req.Database, tc, statements[0])
+		if err != nil {
+			return nativeApply{}, err
+		}
+		change.adopts, err = reviewedAdoptionForApply(req.Database, tc, statements[0])
+		if err != nil {
+			return nativeApply{}, err
+		}
+		change.replacement, err = indexReplacementForApply(req.Database, tc, change.dropped)
 		if err != nil {
 			return nativeApply{}, err
 		}
@@ -670,11 +685,20 @@ func classifyApplyFailure(err error, table string, validates *schemadiff.Constra
 			lockBudget: true,
 		}
 	}
+	// Rows that break a constraint keep breaking it until someone changes
+	// them, which takes a person far longer than the drive's retries do, so
+	// the failure ends the apply at once rather than spending its retries on
+	// an answer that cannot change. A constraint the apply added is then
+	// dropped, so the re-apply after the data fix plans it again; one the
+	// table already had stays, and the re-apply resumes at its validation.
 	if detail, ok := brokenForeignKeyDetail(err, table); ok {
-		return applyFailure{detail: detail, retryable: true}
+		return applyFailure{detail: detail}
 	}
 	if detail, ok := brokenCheckDetail(err, table, validates); ok {
-		return applyFailure{detail: detail, retryable: true}
+		return applyFailure{detail: detail}
+	}
+	if detail, ok := duplicateKeyDetail(err, table); ok {
+		return applyFailure{detail: detail}
 	}
 	if detail, ok := missingGrantDetail(err, table); ok {
 		return applyFailure{detail: detail, retryable: true}
@@ -704,17 +728,19 @@ func missingGrantDetail(err error, table string) (string, bool) {
 const sqlstateForeignKeyViolation = "23503"
 
 // brokenForeignKeyDetail names the foreign key whose validation failed on
-// existing rows. The key was added NOT VALID in an earlier step, so it stays
-// in place and checks new writes; the apply can finish once the owner fixes
-// the rows. The detail is built from the server's typed fields, never its
-// message, because the message quotes the offending row's values.
+// existing rows. A new apply finishes it once the owner fixes the rows. The
+// drive removes the key when this apply added it NOT VALID, and leaves one
+// that was already on the table, so the detail does not say the key stays:
+// the apply log says what became of it. The detail is built from the server's
+// typed fields, never its message, because the message quotes the offending
+// row's values.
 func brokenForeignKeyDetail(err error, table string) (string, bool) {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateForeignKeyViolation {
 		return "", false
 	}
 	return sanitizeReasonText(fmt.Sprintf(
-		"existing rows in %q break foreign key %q; the key is in place and checks new writes; fix those rows, then retry",
+		"existing rows in %q break foreign key %q; fix those rows, then apply again",
 		table, pgErr.ConstraintName)), true
 }
 
@@ -725,13 +751,12 @@ const sqlstateCheckViolation = "23514"
 
 // brokenCheckDetail names the check constraint whose validation failed on
 // existing rows. It applies only when the failed step validates the
-// constraint the server names. That constraint is NOT VALID on the table,
-// whether the plan added it in an earlier step or found it live, so it stays
-// in place and checks new writes, and the apply can finish once the owner
-// fixes the rows. For the helper check a SET NOT NULL validates, those are
-// the rows that hold NULL in the column. The detail is built from the
-// server's typed fields, never its message, because the message can quote
-// row values.
+// constraint the server names. A new apply finishes it once the owner fixes
+// the rows. For the helper check a SET NOT NULL validates, those are the rows
+// that hold NULL in the column, and the drive removes the helper when this
+// apply added it, so the detail does not say the constraint stays: the apply
+// log says what became of it. The detail is built from the server's typed
+// fields, never its message, because the message can quote row values.
 func brokenCheckDetail(err error, table string, validates *schemadiff.ConstraintValidation) (string, bool) {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateCheckViolation {
@@ -741,7 +766,27 @@ func brokenCheckDetail(err error, table string, validates *schemadiff.Constraint
 		return "", false
 	}
 	return sanitizeReasonText(fmt.Sprintf(
-		"existing rows in %q break check constraint %q; the constraint is in place and checks new writes; fix those rows, then retry",
+		"existing rows in %q break check constraint %q; fix those rows, then apply again",
+		table, pgErr.ConstraintName)), true
+}
+
+// sqlstateUniqueViolation is the SQLSTATE the server raises when rows hold
+// duplicate values a unique key does not allow, which for a schema change
+// means adding a unique constraint that existing rows break.
+const sqlstateUniqueViolation = "23505"
+
+// duplicateKeyDetail names the unique key that existing rows break. The
+// statement that adds the key runs in one transaction, so it leaves nothing
+// behind, and a new apply adds the key once the owner removes or merges the
+// duplicates. The detail is built from the server's typed fields, never its
+// message or detail, because those quote the duplicated values.
+func duplicateKeyDetail(err error, table string) (string, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateUniqueViolation {
+		return "", false
+	}
+	return sanitizeReasonText(fmt.Sprintf(
+		"existing rows in %q hold duplicate values that unique key %q does not allow; remove or merge the duplicates, then apply again",
 		table, pgErr.ConstraintName)), true
 }
 
@@ -1466,6 +1511,14 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return &refusal{reason: "planned-object-drift",
 			cause:  fmt.Sprintf("the index or constraint the planned statement for %s names changed after planning", quotedTable(table)),
 			remedy: replanRemedy}, true
+	case executor.CodeReplacementIndexDrift:
+		// The index the plan built to replace the one it drops is gone,
+		// invalid, or rebuilt with another definition, read again right
+		// before the drop; nothing was dropped, so the old index still
+		// enforces its definition. A re-plan builds the replacement again.
+		return &refusal{reason: "planned-object-drift",
+			cause:  fmt.Sprintf("the index the plan built on %s to replace the one it drops changed before the drop, so the old index was kept", quotedTable(table)),
+			remedy: replanRemedy}, true
 	case executor.CodeDroppedObjectDrift:
 		// The table, column, constraint, or NOT NULL the planned drop removes
 		// no longer has the definition the plan recorded, read again under the
@@ -2003,6 +2056,29 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 		}
 		return nil
 	}
+	if change.adopts != nil {
+		// pg-sprite reads the index again under the table's lock and
+		// refuses with ErrAdoptedIndexDrift, attaching nothing, when it no
+		// longer has the definition the plan matched.
+		if err := executor.ExecuteNativeAdoptingWithProgress(ctx, pool, table, statement, executor.Budget{
+			LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
+		}, executor.DefaultRetryPolicy(), *change.adopts, tracker); err != nil {
+			return fmt.Errorf("attach reviewed index %q on PostgreSQL table %q: %w", change.adopts.Index, change.table, err)
+		}
+		return nil
+	}
+	if statement.Kind() == pgstatement.KindRenameIndex {
+		// ALTER INDEX ... RENAME TO names the index, not its table, so it
+		// takes pg-sprite's index rename: under the table's lock it checks
+		// that the name still resolves to a plain index of this table, and
+		// after the rename it confirms the renamed relation is that index.
+		if err := executor.ExecuteIndexRenameWithProgress(ctx, pool, table, statement, executor.Budget{
+			LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
+		}, executor.DefaultRetryPolicy(), tracker); err != nil {
+			return fmt.Errorf("rename index on PostgreSQL table %q: %w", change.table, err)
+		}
+		return nil
+	}
 	if err := executor.ExecuteNativeWithProgress(ctx, pool, table, statement, executor.Budget{
 		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
 	}, executor.DefaultRetryPolicy(), tracker); err != nil {
@@ -2031,7 +2107,7 @@ func executeReviewedDrop(ctx context.Context, pool *pgxpool.Pool, table prefligh
 		Concurrent: executor.ConcurrentBudget{Overall: optimisticStatementLimit},
 		Validate:   executor.ValidateBudget{LockTimeout: optimisticLockTimeout, Overall: optimisticStatementLimit},
 	}
-	if _, err := executor.RunSequenceAsStep(ctx, pool, table, []string{statement}, budget, executor.DefaultRetryPolicy(), nil, nil, change.dropped, at); err != nil {
+	if _, err := executor.RunSequenceAsStep(ctx, pool, table, []string{statement}, budget, executor.DefaultRetryPolicy(), change.adopts, nil, change.dropped, at); err != nil {
 		return fmt.Errorf("drop reviewed %s %q on PostgreSQL table %q: %w", change.dropped.Kind, change.dropped.Name, change.table, err)
 	}
 	return nil

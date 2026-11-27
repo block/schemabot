@@ -1744,8 +1744,9 @@ func TestClassifyApplyFailureCommittedCreatePrefix(t *testing.T) {
 	assert.Equal(t, 1, strings.Count(failure.detail, "re-plan"))
 }
 
-// A validation that existing rows fail names the key and the fix, and leaves
-// the row values the server quotes in its message out of the detail.
+// A validation that existing rows fail names the key and the fix, ends the
+// apply rather than retrying it, and leaves the row values the server quotes
+// in its message out of the detail.
 func TestClassifyApplyFailureBrokenForeignKey(t *testing.T) {
 	err := fmt.Errorf("validate: %w", &pgconn.PgError{
 		Code:           "23503",
@@ -1756,9 +1757,47 @@ func TestClassifyApplyFailureBrokenForeignKey(t *testing.T) {
 
 	failure := classifyApplyFailure(err, "orders", nil)
 
-	assert.True(t, failure.retryable)
-	assert.Equal(t, `existing rows in "orders" break foreign key "orders_user_id_fkey"; the key is in place and checks new writes; fix those rows, then retry`, failure.detail)
+	assert.False(t, failure.retryable, "rows that break the key keep breaking it until someone fixes them")
+	assert.Equal(t, `existing rows in "orders" break foreign key "orders_user_id_fkey"; fix those rows, then apply again`, failure.detail)
 	assert.NotContains(t, failure.detail, "99")
+}
+
+func TestClassifyApplyFailureDuplicateKey(t *testing.T) {
+	err := fmt.Errorf("add unique: %w", &pgconn.PgError{
+		Code:           "23505",
+		Message:        `could not create unique index "users_email_key"`,
+		Detail:         `Key (email)=(ada@example.com) is duplicated.`,
+		ConstraintName: "users_email_key",
+	})
+
+	failure := classifyApplyFailure(err, "users", nil)
+
+	assert.False(t, failure.retryable, "duplicates stay until someone removes or merges them")
+	assert.Equal(t, `existing rows in "users" hold duplicate values that unique key "users_email_key" does not allow; remove or merge the duplicates, then apply again`, failure.detail)
+	assert.NotContains(t, failure.detail, "ada@example.com")
+}
+
+// Only a failure that a retry cannot clear ends the apply at once. Rows that
+// break a validated constraint stay broken until someone changes them, so
+// the apply fails for good and says to apply again. A lost lock budget and a
+// dropped connection can clear on their own, so the drive keeps retrying them.
+func TestClassifyApplyFailureRetriesOnlyWhatARetryCanClear(t *testing.T) {
+	validates := &schemadiff.ConstraintValidation{Constraint: "users_name_not_null_check"}
+	brokenCheck := fmt.Errorf("validate: %w", &pgconn.PgError{Code: sqlstateCheckViolation, ConstraintName: "users_name_not_null_check"})
+	lockBudget := fmt.Errorf("validate: %w", &executor.BudgetError{Cause: executor.CauseLock, Budget: 3 * time.Second, Attempts: 3})
+	connection := fmt.Errorf("validate: %w", &pgconn.ConnectError{})
+
+	check := classifyApplyFailure(brokenCheck, "users", validates)
+	assert.False(t, check.retryable, "rows that break the check do not change between retries")
+	assert.Equal(t, `existing rows in "users" break check constraint "users_name_not_null_check"; fix those rows, then apply again`, check.detail)
+
+	budget := classifyApplyFailure(lockBudget, "users", validates)
+	assert.True(t, budget.retryable, "lock contention can subside before the next retry")
+	assert.True(t, budget.lockBudget)
+
+	dropped := classifyApplyFailure(connection, "users", validates)
+	assert.True(t, dropped.retryable, "a connection can come back before the next retry")
+	assert.Equal(t, "PostgreSQL schema change failed; see server logs", dropped.detail)
 }
 
 // A statement the server refuses for a missing grant, such as a foreign key
@@ -4386,7 +4425,7 @@ func TestBrokenCheckDetailNamesOnlyTheValidatedConstraint(t *testing.T) {
 
 	detail, ok := brokenCheckDetail(fmt.Errorf("validate: %w", violation), "accounts", validates)
 	require.True(t, ok)
-	assert.Equal(t, `existing rows in "accounts" break check constraint "accounts_display_name_not_null_check"; the constraint is in place and checks new writes; fix those rows, then retry`, detail)
+	assert.Equal(t, `existing rows in "accounts" break check constraint "accounts_display_name_not_null_check"; fix those rows, then apply again`, detail)
 	assert.NotContains(t, detail, "Failing row")
 
 	_, ok = brokenCheckDetail(violation, "accounts", nil)

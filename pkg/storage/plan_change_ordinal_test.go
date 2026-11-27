@@ -49,3 +49,26 @@ func TestAssignPlanChangeOrdinals(t *testing.T) {
 	AssignPlanChangeOrdinals(nil, []*Task{unplanned})
 	assert.Zero(t, unplanned.PlanChangeOrdinal)
 }
+
+// A sharded keyspace keeps one change per table in its namespace, while each
+// shard keeps its own. A shard's changes to a table are listed in the shard's
+// order, under the shard's key, so a shard that needs the same statement twice
+// with different engine records keeps both.
+func TestPlanShardChangesByTableKeepsEachShardsOwnChanges(t *testing.T) {
+	const drop = `ALTER TABLE notes DROP CONSTRAINT notes_body_not_null`
+	first := TableChange{Table: "notes", DDL: drop, Metadata: map[string]string{"helper": "leftover"}}
+	second := TableChange{Table: "notes", DDL: drop, Metadata: map[string]string{"helper": "new"}}
+	plan := &Plan{
+		Namespaces: map[string]*NamespacePlanData{"ks": {Tables: []TableChange{first}}},
+		Shards: []ShardPlan{
+			{Namespace: "ks", Shard: "-80", Changes: []TableChange{second}},
+			{Namespace: "ks", Shard: "80-", Changes: []TableChange{first, second}},
+		},
+	}
+
+	byShard := PlanShardChangesByTable(plan)
+	assert.Equal(t, []TableChange{second}, byShard[PlanShardChangeTableKey("ks", "-80", "notes")])
+	assert.Equal(t, []TableChange{first, second}, byShard[PlanShardChangeTableKey("ks", "80-", "notes")])
+	assert.Len(t, byShard, 2)
+	assert.Empty(t, PlanShardChangesByTable(nil))
+}
