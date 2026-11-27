@@ -1298,8 +1298,9 @@ func TestTableChangesRendersAnIndexDropAsUnsafe(t *testing.T) {
 // built under a temporary name, the old index is dropped, and the new one is
 // renamed to the old name. All three are executable. The drop still needs
 // --allow-unsafe, since the old definition stops applying, and its reason
-// names the index that replaces it rather than calling it a removal, since
-// the table keeps the index throughout.
+// names the index that replaces it rather than calling it a removal. The drop
+// carries the plan's record of the replacement, which the apply checks before
+// dropping the old index.
 func TestTableChangesRendersAnIndexReplacement(t *testing.T) {
 	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
 	require.NoError(t, err)
@@ -1312,6 +1313,10 @@ func TestTableChangesRendersAnIndexReplacement(t *testing.T) {
 		Kind:       schemadiff.DroppedIndex,
 		Name:       "orders_email_key",
 		Definition: "CREATE UNIQUE INDEX orders_email_key ON public.orders USING btree (email)",
+	}
+	replacement := schemadiff.IndexReplacement{
+		Index: "orders_email_key_new",
+		Def:   "CREATE UNIQUE INDEX orders_email_key_new ON public.orders USING btree (lower(email))",
 	}
 	native := func(s pgplan.Statement) pgplan.Statement {
 		s.Route, s.Backend, s.Disposition = planner.RouteNative, router.BackendNative, router.DispositionExecute
@@ -1330,6 +1335,7 @@ func TestTableChangesRendersAnIndexReplacement(t *testing.T) {
 			Destructive: true,
 			Drops:       &dropped,
 			ReplacedBy:  "orders_email_key_new",
+			Replacement: &replacement,
 		}),
 		native(pgplan.Statement{
 			SQL:     "ALTER INDEX public.orders_email_key_new RENAME TO orders_email_key",
@@ -1354,11 +1360,17 @@ func TestTableChangesRendersAnIndexReplacement(t *testing.T) {
 	drop := changes[1]
 	assert.Equal(t, ddl.StatementDropIndex, drop.Operation)
 	assert.True(t, drop.IsUnsafe)
-	assert.Equal(t, `statement replaces index "orders_email_key" on table "orders": it is dropped only once its new definition, built as "orders_email_key_new", is valid, so the table keeps the index throughout`, drop.UnsafeReason)
+	assert.Equal(t, `statement replaces index "orders_email_key" on table "orders" with the definition built as "orders_email_key_new": the old index is dropped only while that index is valid, and from then on its old definition no longer applies`, drop.UnsafeReason)
 	recorded, err := reviewedDropFromMetadata(drop.Metadata)
 	require.NoError(t, err)
 	require.NotNil(t, recorded)
 	assert.Equal(t, dropped, *recorded, "the apply still checks the old index before dropping it")
+	admitted, err := indexReplacementForApply("app", drop, recorded)
+	require.NoError(t, err)
+	require.NotNil(t, admitted)
+	assert.Equal(t, replacement, *admitted, "the apply checks the replacement before dropping the old index")
+	assert.NotContains(t, changes[0].Metadata, indexReplacementMetadataKey, "only the drop carries the replacement record")
+	assert.NotContains(t, changes[2].Metadata, indexReplacementMetadataKey, "only the drop carries the replacement record")
 
 	rename := changes[2]
 	assert.Equal(t, ddl.StatementAlterTable, rename.Operation)

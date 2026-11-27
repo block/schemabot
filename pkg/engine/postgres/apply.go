@@ -130,6 +130,13 @@ type nativeApply struct {
 	// indexDrop is set for a DROP INDEX CONCURRENTLY of the index dropped
 	// names, which runs through pg-sprite's concurrent index drop.
 	indexDrop bool
+	// adopts is the plan's record of the index the statement's constraint
+	// takes over, which the apply checks under the table's lock before the
+	// constraint attaches it.
+	adopts *schemadiff.IndexAdoption
+	// replacement is the plan's record of the index that replaces the one
+	// the statement drops, which the apply checks right before the drop.
+	replacement *schemadiff.IndexReplacement
 	// validates is the plan's record of the live NOT VALID constraint the
 	// statement validates, which the apply checks under the validation's
 	// lock before validating it.
@@ -367,6 +374,14 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 			return nativeApply{}, err
 		}
 		change.validates, err = reviewedValidationForApply(req.Database, tc, statements[0])
+		if err != nil {
+			return nativeApply{}, err
+		}
+		change.adopts, err = reviewedAdoptionForApply(req.Database, tc, statements[0])
+		if err != nil {
+			return nativeApply{}, err
+		}
+		change.replacement, err = indexReplacementForApply(req.Database, tc, change.dropped)
 		if err != nil {
 			return nativeApply{}, err
 		}
@@ -1470,6 +1485,14 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return &refusal{reason: "planned-object-drift",
 			cause:  fmt.Sprintf("the index or constraint the planned statement for %s names changed after planning", quotedTable(table)),
 			remedy: replanRemedy}, true
+	case executor.CodeReplacementIndexDrift:
+		// The index the plan built to replace the one it drops is gone,
+		// invalid, or rebuilt with another definition, read again right
+		// before the drop; nothing was dropped, so the old index still
+		// enforces its definition. A re-plan builds the replacement again.
+		return &refusal{reason: "planned-object-drift",
+			cause:  fmt.Sprintf("the index the plan built on %s to replace the one it drops changed before the drop, so the old index was kept", quotedTable(table)),
+			remedy: replanRemedy}, true
 	case executor.CodeDroppedObjectDrift:
 		// The table, column, constraint, or NOT NULL the planned drop removes
 		// no longer has the definition the plan recorded, read again under the
@@ -2007,6 +2030,17 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 		}
 		return nil
 	}
+	if change.adopts != nil {
+		// pg-sprite reads the index again under the table's lock and
+		// refuses with ErrAdoptedIndexDrift, attaching nothing, when it no
+		// longer has the definition the plan matched.
+		if err := executor.ExecuteNativeAdoptingWithProgress(ctx, pool, table, statement, executor.Budget{
+			LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
+		}, executor.DefaultRetryPolicy(), *change.adopts, tracker); err != nil {
+			return fmt.Errorf("attach reviewed index %q on PostgreSQL table %q: %w", change.adopts.Index, change.table, err)
+		}
+		return nil
+	}
 	if statement.Kind() == pgstatement.KindRenameIndex {
 		// ALTER INDEX ... RENAME TO names the index, not its table, so it
 		// takes pg-sprite's index rename: under the table's lock it checks
@@ -2047,7 +2081,7 @@ func executeReviewedDrop(ctx context.Context, pool *pgxpool.Pool, table prefligh
 		Concurrent: executor.ConcurrentBudget{Overall: optimisticStatementLimit},
 		Validate:   executor.ValidateBudget{LockTimeout: optimisticLockTimeout, Overall: optimisticStatementLimit},
 	}
-	if _, err := executor.RunSequenceAsStep(ctx, pool, table, []string{statement}, budget, executor.DefaultRetryPolicy(), nil, nil, change.dropped, at); err != nil {
+	if _, err := executor.RunSequenceAsStep(ctx, pool, table, []string{statement}, budget, executor.DefaultRetryPolicy(), change.adopts, nil, change.dropped, at); err != nil {
 		return fmt.Errorf("drop reviewed %s %q on PostgreSQL table %q: %w", change.dropped.Kind, change.dropped.Name, change.table, err)
 	}
 	return nil
