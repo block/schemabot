@@ -446,10 +446,10 @@ func PreviewCommentPlanBlocked() string {
 				},
 			},
 		},
-		BlockedChanges: []BlockedChangeData{
-			{Table: "users", Reason: "dropping primary key is not supported"},
-			{Table: "orders", Reason: "adding foreign key constraints is not supported"},
-		},
+		BlockedChanges: previewBlockedChanges(
+			previewBlockedChange("users", "dropping primary key is not supported"),
+			previewBlockedChange("orders", "adding foreign key constraints is not supported"),
+		),
 	})
 }
 
@@ -476,12 +476,10 @@ func PreviewCommentPlanBlockedPostgres() string {
 				},
 			},
 		},
-		BlockedChanges: []BlockedChangeData{
-			{Table: "users", Reason: engine.JoinBlockedCauses([]string{
-				`statement for table "users" adds a column together with a constraint, which builds or checks the constraint while the table is locked; add the column without the constraint and apply it, then add the constraint with a name as its own change`,
-				`statement for table "users": the table is 2.0 GiB with its indexes, over the 1.0 GiB limit SchemaBot sets for a native-safe apply, not a PostgreSQL limit; raise postgres.native_safe_table_size_limit_bytes to change a table this size, then plan again`,
-			})},
-		},
+		BlockedChanges: previewBlockedChanges(previewBlockedChange("users", engine.JoinBlockedCauses([]string{
+			`statement for table "users": adds a column together with a constraint, which builds or checks the constraint while the table is locked; add the column without the constraint and apply it, then add the constraint with a name as its own change`,
+			`statement for table "users": the table is 2.0 GiB with its indexes, over the 1.0 GiB limit SchemaBot sets for a native-safe apply, not a PostgreSQL limit; raise postgres.native_safe_table_size_limit_bytes to change a table this size, then plan again`,
+		}))),
 	})
 }
 
@@ -879,12 +877,10 @@ func PreviewCommentApplyBlockedRejected() string {
 				},
 			},
 		},
-		BlockedChanges: []BlockedChangeData{
-			{Table: "users", Reason: engine.JoinBlockedCauses([]string{
-				`statement for table "users" adds a column together with a constraint, which builds or checks the constraint while the table is locked; add the column without the constraint and apply it, then add the constraint with a name as its own change`,
-				`statement for table "users": the table is 2.0 GiB with its indexes, over the 1.0 GiB limit SchemaBot sets for a native-safe apply, not a PostgreSQL limit; raise postgres.native_safe_table_size_limit_bytes to change a table this size, then plan again`,
-			})},
-		},
+		BlockedChanges: previewBlockedChanges(previewBlockedChange("users", engine.JoinBlockedCauses([]string{
+			`statement for table "users": adds a column together with a constraint, which builds or checks the constraint while the table is locked; add the column without the constraint and apply it, then add the constraint with a name as its own change`,
+			`statement for table "users": the table is 2.0 GiB with its indexes, over the 1.0 GiB limit SchemaBot sets for a native-safe apply, not a PostgreSQL limit; raise postgres.native_safe_table_size_limit_bytes to change a table this size, then plan again`,
+		}))),
 	})
 }
 
@@ -4337,4 +4333,20 @@ func PreviewCommentFreezeApplyConfirmRefused() string {
 		Freezes:   []RefusingFreeze{{ID: "frz-91c2", Reason: "Holiday change freeze", EndsAt: &previewFreezeEnds}},
 		Approvers: previewFreezeApprovers,
 	})
+}
+
+// previewBlockedChanges lists a sample plan's refused changes through the
+// derivation a real plan's comment uses, so a preview reads the way the
+// comment does.
+func previewBlockedChanges(changes ...*apitypes.TableChangeResponse) []BlockedChangeData {
+	return BlockedChangesData(&apitypes.PlanResponse{
+		Database: "testapp",
+		Changes:  []*apitypes.SchemaChangeResponse{{Namespace: "testapp", TableChanges: changes}},
+	})
+}
+
+// previewBlockedChange is a sample planned statement its engine refuses for
+// the given reason.
+func previewBlockedChange(table, reason string) *apitypes.TableChangeResponse {
+	return &apitypes.TableChangeResponse{TableName: table, ExecutionMode: engine.ExecutionModeBlocked, ModeReason: reason}
 }

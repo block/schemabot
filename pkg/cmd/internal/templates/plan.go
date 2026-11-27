@@ -11,6 +11,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/cliname"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/lintguidance"
 	"github.com/block/schemabot/pkg/presentation"
@@ -615,6 +616,28 @@ type BlockedChange struct {
 	Steps       int
 	Shards      []string
 	TotalShards int
+}
+
+// BlockedChangeNotices is the plan's blocked changes, each with its engine's
+// reason split into causes, from the same derivation the PR comment lists.
+func BlockedChangeNotices(result *apitypes.PlanResponse) []BlockedChange {
+	var notices []BlockedChange
+	for _, bc := range result.BlockedChanges() {
+		var causes []string
+		for _, cause := range engine.BlockedCauses(bc.Reason) {
+			if cause = presentation.InlineError(cause); cause != "" {
+				causes = append(causes, cause)
+			}
+		}
+		notices = append(notices, BlockedChange{
+			Table:       bc.Table,
+			Causes:      causes,
+			Steps:       bc.Steps,
+			Shards:      bc.Shards,
+			TotalShards: bc.TotalShards,
+		})
+	}
+	return notices
 }
 
 // WriteBlockedChanges lists the changes the engine refuses to run, under the

@@ -1538,21 +1538,23 @@ func (r *PlanResponse) BlockedChanges() []BlockedChange {
 		if sc == nil {
 			continue
 		}
-		if shards, sharded := shardsByNamespace[sc.Namespace]; sharded {
-			if read[sc.Namespace] {
-				continue
-			}
+		shards, sharded := shardsByNamespace[sc.Namespace]
+		if sharded && !read[sc.Namespace] {
 			read[sc.Namespace] = true
-			// A refusal the shard rows do not carry is still the namespace's,
-			// and the apply gate refuses it, so the list must name it.
-			if grouped.addShards(cmp.Or(sc.Namespace, r.Database), shards) {
+			grouped.addShards(cmp.Or(sc.Namespace, r.Database), shards)
+		}
+		// A refusal the shard rows do not carry is still the namespace's, and
+		// the apply gate refuses it, so the list names it beside the shards'.
+		// A namespace listed twice is read each time.
+		for _, t := range sc.TableChanges {
+			if !t.EngineBlocked() {
 				continue
 			}
-		}
-		for _, t := range sc.TableChanges {
-			if t.EngineBlocked() {
-				grouped.add(cmp.Or(sc.Namespace, t.Namespace, r.Database), t).Steps++
+			namespace := cmp.Or(sc.Namespace, t.Namespace, r.Database)
+			if sharded && grouped.carriedByShards(namespace, t) {
+				continue
 			}
+			grouped.add(namespace, t).Steps++
 		}
 	}
 	// Shard rows for a namespace the namespace-level changes do not list are
@@ -1588,27 +1590,34 @@ func (g *blockedChangeGroups) add(namespace string, t *TableChangeResponse) *Blo
 	return bc
 }
 
-// withoutTableSubject drops the engine's "statement for table "t": " lead-in
+// carriedByShards reports whether a shard row already lists the change's
+// refusal, so the namespace-level copy of it is not counted twice.
+func (g *blockedChangeGroups) carriedByShards(namespace string, t *TableChangeResponse) bool {
+	bc := g.byKey[[3]string{namespace, t.TableName, t.ModeReason}]
+	return bc != nil && len(bc.Shards) > 0
+}
+
+// withoutTableSubject drops the engine's "statement for table "t"" lead-in
 // from each cause of a blocked reason. Every surface that lists blocked
 // changes names the table beside its reason, so the lead-in would say it
-// twice.
+// twice. A cause whose sentence continues from the lead-in, rather than after
+// a colon, keeps "the statement" as its subject.
 func withoutTableSubject(table, reason string) string {
-	return strings.ReplaceAll(reason, fmt.Sprintf("statement for table %q: ", table), "")
+	subject := fmt.Sprintf("statement for table %q", table)
+	reason = strings.ReplaceAll(reason, subject+": ", "")
+	return strings.ReplaceAll(reason, subject+" ", "the statement ")
 }
 
 // addShards groups one namespace's blocked per-shard changes by table and
 // reason, so a change refused on several shards is listed once with them. Its
-// step count is the most statements any one shard carries for it. It reports
-// whether any shard carries a refusal.
-func (g *blockedChangeGroups) addShards(namespace string, shards []*ShardPlanResponse) bool {
-	found := false
+// step count is the most statements any one shard carries for it.
+func (g *blockedChangeGroups) addShards(namespace string, shards []*ShardPlanResponse) {
 	for _, sp := range shards {
 		stepsOnShard := make(map[*BlockedChange]int)
 		for _, t := range sp.Changes {
 			if !t.EngineBlocked() {
 				continue
 			}
-			found = true
 			bc := g.add(namespace, t)
 			bc.TotalShards = len(shards)
 			if stepsOnShard[bc] == 0 {
@@ -1618,7 +1627,6 @@ func (g *blockedChangeGroups) addShards(namespace string, shards []*ShardPlanRes
 			bc.Steps = max(bc.Steps, stepsOnShard[bc])
 		}
 	}
-	return found
 }
 
 // list returns the groups in first-seen order, each table qualified with its

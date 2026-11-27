@@ -78,8 +78,12 @@ type UnsafeChangeData struct {
 // BlockedChangeData is a planned change the engine deterministically refuses:
 // an apply will fail on it, so the plan comment discloses it up front.
 type BlockedChangeData struct {
-	Table  string
-	Reason string
+	// Namespace is the change's namespace, so a change read from several
+	// targets' plans is matched on its namespace and table rather than on how
+	// each target's own list qualified the name. Empty when unknown.
+	Namespace string
+	Table     string
+	Reason    string
 	// Steps is how many of the table's statements the reason refuses, so
 	// several refused for one reason are named once. Zero reads as one.
 	Steps int
@@ -104,8 +108,10 @@ type BlockedChangeData struct {
 // routes to native MySQL DDL instead of the schema change engine. The plan
 // comment discloses what running it that way does to the table.
 type DirectChangeData struct {
-	Table  string
-	Reason string
+	// Namespace mirrors BlockedChangeData.Namespace.
+	Namespace string
+	Table     string
+	Reason    string
 	// Steps mirrors BlockedChangeData.Steps, so the two disclosures keep one
 	// shape and convert into each other. Zero reads as one.
 	Steps int
@@ -3394,6 +3400,7 @@ func BlockedChangesData(plan *apitypes.PlanResponse) []BlockedChangeData {
 	var out []BlockedChangeData
 	for _, bc := range plan.BlockedChanges() {
 		out = append(out, BlockedChangeData{
+			Namespace:   bc.Namespace,
 			Table:       bc.Table,
 			Reason:      bc.Reason,
 			Steps:       bc.Steps,

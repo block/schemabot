@@ -286,6 +286,8 @@ func deploymentPlanGroups(rollup api.PlanRollup) []templates.DeploymentPlanGroup
 	// A change every target in the group carries needs no names beside it: the
 	// group heading already lists them.
 	for gi := range groups {
+		qualifyModeTables(groups[gi].BlockedChanges)
+		qualifyModeTables(groups[gi].DirectChanges)
 		members := len(groups[gi].Members)
 		for bi := range groups[gi].BlockedChanges {
 			trimModeTargets(&groups[gi].BlockedChanges[bi].Targets, &groups[gi].BlockedChanges[bi].TotalTargets, members)
@@ -369,7 +371,7 @@ func memberModeChanges(cs tern.ChangeSet, mode string) []templates.BlockedChange
 				if !strings.EqualFold(tc.GetExecutionMode(), mode) {
 					continue
 				}
-				out = mergeModeShard(out, tc.GetTableName(), tc.GetModeReason(), sp.GetShard())
+				out = mergeModeShard(out, sp.GetNamespace(), tc.GetTableName(), tc.GetModeReason(), sp.GetShard())
 			}
 		}
 		for i := range out {
@@ -381,7 +383,7 @@ func memberModeChanges(cs tern.ChangeSet, mode string) []templates.BlockedChange
 	for _, sc := range cs.Changes {
 		for _, tc := range sc.GetTableChanges() {
 			if strings.EqualFold(tc.GetExecutionMode(), mode) {
-				out = append(out, templates.BlockedChangeData{Table: tc.GetTableName(), Reason: tc.GetModeReason()})
+				out = append(out, templates.BlockedChangeData{Namespace: sc.GetNamespace(), Table: tc.GetTableName(), Reason: tc.GetModeReason()})
 			}
 		}
 	}
@@ -422,15 +424,15 @@ func memberBlockedChanges(cs tern.ChangeSet) []templates.BlockedChangeData {
 }
 
 // mergeModeShard records a shard's verdict on a table change, folding it into
-// the entry for the same table and reason when one exists.
-func mergeModeShard(out []templates.BlockedChangeData, table, reason, shard string) []templates.BlockedChangeData {
+// the entry for the same namespace, table and reason when one exists.
+func mergeModeShard(out []templates.BlockedChangeData, namespace, table, reason, shard string) []templates.BlockedChangeData {
 	for i := range out {
-		if out[i].Table == table && out[i].Reason == reason {
+		if out[i].Namespace == namespace && out[i].Table == table && out[i].Reason == reason {
 			out[i].Shards = append(out[i].Shards, shard)
 			return out
 		}
 	}
-	return append(out, templates.BlockedChangeData{Table: table, Reason: reason, Shards: []string{shard}})
+	return append(out, templates.BlockedChangeData{Namespace: namespace, Table: table, Reason: reason, Shards: []string{shard}})
 }
 
 // modeChange is a disclosure of how a target's engine runs one of its changes,
@@ -445,11 +447,18 @@ type modeChange interface {
 // fold into the entry, such as the same table in two namespaces: the list is
 // compared against the group's size to decide whether every target carries
 // the verdict, so a repeated name would credit it to targets that do not.
+//
+// Two targets carry the same verdict when it names the same table in the same
+// namespace, for the same reason, over the same number of statements and the
+// same shards. The table is compared without the namespace qualifier, which
+// each target's list adds only when its own refusals span namespaces;
+// qualifyModeTables qualifies the group's list once every target is in.
 func addModeTarget[T modeChange](list *[]T, change T, target string) {
 	bc := templates.BlockedChangeData(change)
+	bc.Table = bareModeTable(bc)
 	for i := range *list {
 		existing := templates.BlockedChangeData((*list)[i])
-		if existing.Table == bc.Table && existing.Reason == bc.Reason && slices.Equal(existing.Shards, bc.Shards) {
+		if sameModeVerdict(existing, bc) {
 			if slices.Contains(existing.Targets, target) {
 				slog.Debug("target already carries this verdict in its group; not listing it twice",
 					"target", target, "table", bc.Table)
@@ -462,6 +471,46 @@ func addModeTarget[T modeChange](list *[]T, change T, target string) {
 	}
 	bc.Targets = []string{target}
 	*list = append(*list, T(bc))
+}
+
+// sameModeVerdict reports whether two targets' disclosures are the same
+// verdict on the same work, both tables already bare.
+func sameModeVerdict(a, b templates.BlockedChangeData) bool {
+	return a.Namespace == b.Namespace &&
+		a.Table == b.Table &&
+		a.Reason == b.Reason &&
+		max(a.Steps, 1) == max(b.Steps, 1) &&
+		slices.Equal(a.Shards, b.Shards)
+}
+
+// bareModeTable is the disclosure's table without the namespace qualifier its
+// target's list may have added.
+func bareModeTable(bc templates.BlockedChangeData) string {
+	if bc.Namespace == "" {
+		return bc.Table
+	}
+	return strings.TrimPrefix(bc.Table, bc.Namespace+".")
+}
+
+// qualifyModeTables qualifies each table in a group's disclosures with its
+// namespace when they span more than one namespace, as
+// apitypes.PlanResponse.BlockedChanges does for one plan, so two tables that
+// share a name read apart and every target's copy reads the same.
+func qualifyModeTables[T modeChange](list []T) {
+	namespaces := make(map[string]bool)
+	for _, c := range list {
+		namespaces[templates.BlockedChangeData(c).Namespace] = true
+	}
+	if len(namespaces) < 2 {
+		return
+	}
+	for i := range list {
+		bc := templates.BlockedChangeData(list[i])
+		if bc.Namespace != "" {
+			bc.Table = bc.Namespace + "." + bc.Table
+		}
+		list[i] = T(bc)
+	}
 }
 
 // memberUnsafeChanges lists the table changes in one member's plan that need

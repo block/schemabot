@@ -18,7 +18,6 @@ import (
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
-	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/schema"
@@ -398,7 +397,7 @@ func writeRolloutPlanBody(result *apitypes.PlanResponse, isApply bool) {
 		writeChangeDetail(plans[i], work[i], isApply)
 		// Under its group's heading, a blocked change names the members it
 		// is refused on.
-		templates.WriteBlockedChanges(blockedChangeNotices(plans[i]), presentation.BlockedChangesHeading, presentation.BlockedChangesRemedy)
+		templates.WriteBlockedChanges(templates.BlockedChangeNotices(plans[i]), presentation.BlockedChangesHeading, presentation.BlockedChangesRemedy)
 		rolloutWork = append(rolloutWork, work[i])
 	}
 	if lint := result.LintNonErrors(); len(lint) > 0 {
@@ -639,7 +638,7 @@ func writeChangesBody(result *apitypes.PlanResponse, isApply bool) {
 	// The plan closes on its verdict: a blocked change is refused whatever
 	// the apply's flags, so the last thing read is that it cannot apply and
 	// why, in plan and in apply's preview before its refusal.
-	templates.WriteBlockedChanges(blockedChangeNotices(result), presentation.BlockedChangesHeading, presentation.BlockedChangesRemedy)
+	templates.WriteBlockedChanges(templates.BlockedChangeNotices(result), presentation.BlockedChangesHeading, presentation.BlockedChangesRemedy)
 }
 
 // writePlanGuidance links the guides for the lint findings the output shows.
@@ -694,28 +693,6 @@ func writeChangeDetail(result *apitypes.PlanResponse, w planWork, isApply bool) 
 	if len(unsafeChanges) > 0 && !isApply {
 		templates.WriteUnsafeChangesWarning(unsafeChanges)
 	}
-}
-
-// blockedChangeNotices is the plan's blocked changes, each with its engine's
-// reason split into causes, from the same derivation the PR comment lists.
-func blockedChangeNotices(result *apitypes.PlanResponse) []templates.BlockedChange {
-	var notices []templates.BlockedChange
-	for _, bc := range result.BlockedChanges() {
-		var causes []string
-		for _, cause := range engine.BlockedCauses(bc.Reason) {
-			if cause = presentation.InlineError(cause); cause != "" {
-				causes = append(causes, cause)
-			}
-		}
-		notices = append(notices, templates.BlockedChange{
-			Table:       bc.Table,
-			Causes:      causes,
-			Steps:       bc.Steps,
-			Shards:      bc.Shards,
-			TotalShards: bc.TotalShards,
-		})
-	}
-	return notices
 }
 
 // directChangeNotices lists the plan's direct-execution changes one per

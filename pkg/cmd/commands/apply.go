@@ -690,7 +690,7 @@ func blockUnsafeApply(planResult *apitypes.PlanResponse, database, environment, 
 // there rather than repeat the first. Otherwise (JSON output) it lists every
 // refused table with its engine's reason, since it is all the reader sees.
 func blockedPlanError(command string, plan *apitypes.PlanResponse, listed bool) error {
-	changes := blockedChangeNotices(plan)
+	changes := templates.BlockedChangeNotices(plan)
 	if len(changes) == 0 {
 		return nil
 	}
