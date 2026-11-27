@@ -629,6 +629,9 @@ func tableChanges(report pgplan.Report, crossNamespaceForeignKeys []string, pars
 		return []engine.TableChange{change}, []preflight.Tier{tier}, unrecognized, nil
 	}
 
+	addsColumn := slices.ContainsFunc(report.Statements, func(st pgplan.Statement) bool {
+		return st.Kind == schemadiff.ChangeAddColumn
+	})
 	changes := make([]engine.TableChange, 0, len(report.Statements))
 	tiers := make([]preflight.Tier, 0, len(report.Statements))
 	for i, statement := range report.Statements {
@@ -700,7 +703,7 @@ func tableChanges(report pgplan.Report, crossNamespaceForeignKeys []string, pars
 				Operation:     operation,
 				DDL:           sql,
 				IsUnsafe:      statement.Destructive,
-				UnsafeReason:  destructiveReason(statement, table),
+				UnsafeReason:  destructiveReason(statement, table, addsColumn),
 				ExecutionMode: stepMode,
 				ModeReason:    engine.SanitizeBlockedCause(stepReason),
 				Metadata:      metadata,
@@ -1828,19 +1831,73 @@ func generatedExpressionRefusalReason(table string) string {
 }
 
 // destructiveReason is the reviewer-facing reason a destructive step needs
-// --allow-unsafe. The drop that completes an index replacement names the
-// index that replaces it: the old index goes only while the new definition is
-// built and valid, so what the reviewer accepts is that the old definition
-// stops applying, not that the table loses the index.
-func destructiveReason(statement pgplan.Statement, table string) string {
+// --allow-unsafe. It names what the step removes and what that costs, so a
+// reviewer can tell a dropped column's lost values from a swapped index. The
+// drop that completes a replacement names the index that replaces it: the old
+// object goes only while the new definition is built and valid, so what the
+// reviewer accepts is that the old definition stops applying, not that the
+// table loses it. addsColumn reports that the table's plan also adds a
+// column, which beside a dropped column is how a rename in the schema file
+// plans.
+//
+// The comment renders each "; "-separated part of a reason as its own
+// finding, so a reason is written as one finding and the identifiers in it
+// cannot split it.
+func destructiveReason(statement pgplan.Statement, table string, addsColumn bool) string {
 	if !statement.Destructive {
 		return ""
 	}
-	if replaced := statement.Drops; statement.ReplacedBy != "" && replaced != nil {
-		return fmt.Sprintf("statement replaces index %q on table %q with the definition built as %q: the old index is dropped only while that index is valid, and from then on its old definition no longer applies",
-			replaced.Name, table, statement.ReplacedBy)
+	dropped := statement.Drops
+	if dropped == nil {
+		return fmt.Sprintf("statement removes live structure from table %q", table)
 	}
-	return fmt.Sprintf("statement removes live structure from table %q", table)
+	name := oneFinding(dropped.Name)
+	if statement.ReplacedBy != "" {
+		noun := "index"
+		if dropped.Kind == schemadiff.DroppedConstraint {
+			noun = "constraint"
+		}
+		return fmt.Sprintf("statement replaces %s %q on table %q with the definition built as %q: the old %s is dropped only while that index is valid, and from then on its old definition no longer applies",
+			noun, name, table, oneFinding(statement.ReplacedBy), noun)
+	}
+	switch dropped.Kind {
+	case schemadiff.DroppedColumn:
+		reason := fmt.Sprintf("statement drops column %q from table %q: its values are deleted, and reverting the schema file adds the column back empty", name, table)
+		if deps := droppedDependents(dropped.Dependents); deps != "" {
+			reason += ". It also drops " + deps
+		}
+		if addsColumn {
+			reason += ". This plan also adds a column to the table, and SchemaBot does not rename columns. To rename one, add the new column, copy the values into it, and drop the old column in a later change"
+		}
+		return reason
+	case schemadiff.DroppedNotNull:
+		return fmt.Sprintf("statement lets column %q of table %q hold NULL: once NULLs are written, making it NOT NULL again means fixing those rows first", name, table)
+	case schemadiff.DroppedConstraint:
+		return fmt.Sprintf("statement drops constraint %q from table %q: the rule it enforces stops applying, and rows written after the drop are not checked against it", name, table)
+	case schemadiff.DroppedIndex:
+		return fmt.Sprintf("statement drops index %q from table %q: queries that use it lose it, and putting it back means building it again", name, table)
+	default:
+		return fmt.Sprintf("statement removes live structure from table %q", table)
+	}
+}
+
+// droppedDependents names the objects that go with a dropped column, each by
+// its kind and name as pg-sprite renders them ([schemadiff.Dependent.String]
+// writes "kind name: definition"), joined for the reason. The definitions are
+// left out: the plan's DDL is where a reviewer reads an object in full.
+func droppedDependents(dependents []string) string {
+	named := make([]string, 0, len(dependents))
+	for _, d := range dependents {
+		kindAndName, _, _ := strings.Cut(d, ": ")
+		named = append(named, oneFinding(kindAndName))
+	}
+	return strings.Join(named, ", ")
+}
+
+// oneFinding is s on one line with the finding separator neutralized, so an
+// identifier quoted in an unsafe reason cannot split it into two findings.
+func oneFinding(s string) string {
+	return strings.ReplaceAll(singleLine(s), "; ", ", ")
 }
 
 func sortedKeys[V any](values map[string]V) []string {

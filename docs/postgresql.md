@@ -216,6 +216,8 @@ If your tables belong to a dedicated owner role, read
 | Adding a foreign key | Runs in two steps: `ADD CONSTRAINT ... NOT VALID`, then `VALIDATE CONSTRAINT`, which checks existing rows while writes continue. See [Foreign keys](#foreign-keys) |
 | Dropping a foreign key | Shown in the plan, but blocked. See [Foreign keys](#foreign-keys) |
 | Making a column `NOT NULL` | Runs in four steps on a table up to the size limit: a helper `CHECK (column IS NOT NULL) NOT VALID`, `VALIDATE CONSTRAINT`, which checks existing rows while writes continue, `SET NOT NULL`, which uses the validated check instead of scanning, and the helper's drop. If a row holds `NULL`, the validation fails, names the helper, and ends the apply without retrying: a retry cannot pass until the rows change. SchemaBot then removes the helper the apply added, so writes are not checked for `NULL` meanwhile. Fix those rows, then plan and apply again. A helper that was already on the table stays, and the plan starts at its validation. Cancelling the apply removes a helper the apply added the same way. Two cases keep the helper: a plan that also drops a constraint the table had, where SchemaBot keeps every constraint on the table so it never ends up with no rule, and an apply that ran out of retries. The apply log names a kept helper and the statement that drops it |
+| Dropping a column, or a column's `NOT NULL` | Runs after you approve it with `--allow-unsafe`, and the plan names the column. A dropped column's values are deleted, and reverting the file adds it back empty. A dropped `NOT NULL` lets the column hold `NULL`, so putting it back means fixing those rows first. See [Dropping a column or constraint](#dropping-a-column-or-constraint) |
+| Renaming a column in the schema file | Plans as a drop of the old column and an add of the new one, so the old column's values are deleted. To keep them, add the new column, copy the values, and drop the old column in a later change. See [Renaming a column or table](pre-merge-workflow.md#renaming-a-column-or-table) |
 | A table with no schema file, or a deleted file | Runs as `DROP TABLE` after you approve it with `--allow-unsafe`, as on MySQL. Archive tables and `ignore_tables` entries are left alone. See [Tables with no schema file](#tables-with-no-schema-file) |
 
 Once a statement starts, it runs until it commits or its timeout ends it; it
@@ -1098,6 +1100,11 @@ When SchemaBot blocks or refuses a change, the agent:
 4. Tells the user when no safe form exists, such as for a column type change
    that rewrites the table. That change needs a separately reviewed process
    that a person runs.
+
+A plan that drops a column and adds one on the same table is almost always a
+rename, and it deletes the old column's values. The agent says so before
+anyone applies it with `--allow-unsafe`, and offers the add, copy, and
+drop-later steps instead.
 
 A failed index build can leave an invalid index behind. Leave it in place: the
 next apply removes it once it proves no build still holds it. Dropping it by
