@@ -8,7 +8,8 @@ import (
 
 // Progress metadata keys describing a step that waits outside the database's
 // lock queue for a conflicting session to end before it requests its lock:
-// the waiting session's process ID, the table, how long the step has waited,
+// the process ID of the session that holds the conflicting lock, not the
+// engine's own, the table, how long the step has waited,
 // and how long it waits at most, both in milliseconds. The keys are absent
 // while no step waits.
 const (

@@ -2084,11 +2084,11 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 	} else {
 		data.Step, data.StepsTotal, data.Statement = step.Step, step.StepsTotal, step.Statement
 	}
-	if work, err := apitypes.ParseBuildWork(resp.Metadata); err != nil {
-		slog.Warn("progress comment omits build work because the progress metadata is malformed", "apply_id", resp.ApplyID, "error", err)
-	} else {
-		data.BuildWork = work
+	work, err := apitypes.ParseBuildWork(resp.Metadata)
+	if err != nil {
+		slog.Warn("progress comment omits part of the build work because the progress metadata is malformed", "apply_id", resp.ApplyID, "error", err)
 	}
+	data.BuildWork = work
 
 	if changes, err := apitypes.ParseVSchemaChanges(resp.Metadata); err != nil {
 		slog.Warn("failed to parse VSchema changes from progress metadata", "apply_id", resp.ApplyID, "error", err)

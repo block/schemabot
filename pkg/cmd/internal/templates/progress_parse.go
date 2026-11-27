@@ -206,21 +206,21 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 	} else {
 		data.Step, data.StepsTotal, data.Statement = step.Step, step.StepsTotal, step.Statement
 	}
-	if work, err := apitypes.ParseBuildWork(result.Metadata); err != nil {
-		slog.Warn("progress output omits build work because the progress metadata is malformed", "apply_id", result.ApplyID, "error", err)
-	} else {
-		data.BuildWork = work
+	work, err := apitypes.ParseBuildWork(result.Metadata)
+	if err != nil {
+		slog.Warn("progress output omits part of the build work because the progress metadata is malformed", "apply_id", result.ApplyID, "error", err)
 	}
+	data.BuildWork = work
 	dialect := schema.DialectForDatabaseType(result.DatabaseType)
 
 	workByOperation := make(map[presentation.OperationRef]apitypes.BuildWork, len(result.Operations))
 	for _, op := range result.Operations {
-		if work, err := apitypes.ParseBuildWork(op.Metadata); err != nil {
-			slog.Warn("progress output omits an operation's build work because its progress metadata is malformed",
+		work, err := apitypes.ParseBuildWork(op.Metadata)
+		if err != nil {
+			slog.Warn("progress output omits part of an operation's build work because its progress metadata is malformed",
 				"apply_id", result.ApplyID, "deployment", op.Deployment, "operation_key", op.OperationKey, "error", err)
-		} else {
-			workByOperation[presentation.OperationRef{Deployment: op.Deployment, OperationKey: op.OperationKey}] = work
 		}
+		workByOperation[presentation.OperationRef{Deployment: op.Deployment, OperationKey: op.OperationKey}] = work
 		data.Operations = append(data.Operations, ProgressOperation{
 			Deployment:          op.Deployment,
 			OperationKey:        op.OperationKey,

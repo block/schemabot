@@ -233,7 +233,7 @@ func readHolderWait(w apitypes.LockHolderWait) TableReading {
 	}
 	label += ")"
 	return TableReading{Label: label, Details: []TableDetail{{
-		Text: fmt.Sprintf("Reads and writes continue. The step runs once session %d commits or rolls back.", w.PID),
+		Text: fmt.Sprintf("Reads and writes continue. The step runs once session %d commits or rolls back, or when the wait runs out.", w.PID),
 		Note: true,
 	}}}
 }
