@@ -380,7 +380,8 @@ func applyPrompt() string {
 }
 
 // followLogView uses the actual logs command, API client, and colored formatter.
-// Cancel after the initial fetch so each selected tail view is deterministic.
+// The tail ends on its first poll, after the initial window has printed, so
+// each selected tail view is deterministic.
 func followLogView(count int) string {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -417,17 +418,30 @@ func followLogView(count int) string {
 	// The tail reads the initial window, then polls. End it on the first poll
 	// rather than inside the initial read: the client abandons a read whose
 	// context is cancelled, so cancelling there would print no entries.
+	// A request the fixture does not expect ends the tail too, and the
+	// generator fails once the command returns: a panic inside the handler
+	// would only drop the connection, which the tail retries.
+	var mu sync.Mutex
 	requests := 0
+	unexpected := ""
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		requests++
+		poll := requests > 1
+		mu.Unlock()
 		wantLimit := "50"
-		if requests > 1 {
+		if poll {
 			wantLimit = "500"
 		}
 		if r.Method != http.MethodGet || r.URL.Path != "/api/logs" || r.URL.Query().Get("apply_id") != "apply-example-73" || r.URL.Query().Get("limit") != wantLimit {
-			panic("unexpected logs request")
+			mu.Lock()
+			unexpected = fmt.Sprintf("unexpected logs request: %s %s (want limit %s)", r.Method, r.URL.RequestURI(), wantLimit)
+			mu.Unlock()
+			cancel()
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
 		}
-		if requests > 1 {
+		if poll {
 			cancel()
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -442,6 +456,12 @@ func followLogView(count int) string {
 			panic(err)
 		}
 	})
+	mu.Lock()
+	failure := unexpected
+	mu.Unlock()
+	if failure != "" {
+		panic(failure)
+	}
 	// Keep the most recent terminal lines in view as the tail scrolls.
 	lines := strings.Split(strings.TrimRight(output, "\n"), "\n")
 	if len(lines) > 14 {
