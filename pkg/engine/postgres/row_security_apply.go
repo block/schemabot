@@ -11,6 +11,7 @@ import (
 	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/schemadiff"
 	"github.com/block/pg-sprite/pkg/statement"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/block/schemabot/pkg/ddl"
@@ -84,6 +85,9 @@ func planCreateWithRowSecurity(ctx context.Context, pool *pgxpool.Pool, namespac
 		// provision instead of failing.
 		return []engine.TableChange{blockedCreateWithRowSecurity(desired, r.detail)}, nil
 	}
+	if missing, ok := readsMissingTable(err, desired.Table()); ok {
+		return nil, &engine.PlanRefusedError{Err: missing}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("preview creating table %q.%q with its row security: %w", namespace, desired.Table(), err)
 	}
@@ -91,6 +95,21 @@ func planCreateWithRowSecurity(ctx context.Context, pool *pgxpool.Pool, namespac
 		Table: desired.Table(), Operation: ddl.StatementCreateTable,
 		DDL: strings.Join(preview.Statements, ";\n"),
 	}}, nil
+}
+
+// readsMissingTable reports a preview that failed because the file reads a
+// table the target does not have, most often a policy that reads a table the
+// same plan creates. The preview runs the file's statements on the target,
+// where that table does not exist yet, so the create cannot be proven. The
+// server's message names the relation the file itself named.
+func readsMissingTable(err error, table string) (error, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateUndefinedTable {
+		return nil, false
+	}
+	return errors.New(sanitizeReasonText(fmt.Sprintf(
+		"table %q reads a table the target does not have yet (%s). The plan proves the create on the target, so a table its statements read must already exist there: apply that table first, then add %q in a later change",
+		table, pgErr.Message, table))), true
 }
 
 // blockedCreateWithRowSecurity is the create of desired, shown as the file

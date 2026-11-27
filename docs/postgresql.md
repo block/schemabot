@@ -1200,6 +1200,11 @@ from the reviewed file and runs it in one transaction only if the two match.
 A mismatch, or a table of that name created since the plan, refuses the
 apply; plan again.
 
+Because planning runs the create on the target, a policy can read only a
+table the target already has. A policy that reads a table the same pull
+request creates refuses the plan and names that table: apply it first, then
+add the table with the policy in a later pull request.
+
 **Structural changes on a table with RLS.** A file that declares RLS can also
 change the table's columns and indexes. When the file's RLS matches the live
 table, the plan runs those changes as ordinary in-place DDL that leaves the

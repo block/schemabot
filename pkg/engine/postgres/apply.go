@@ -2085,6 +2085,10 @@ func checkTableUnlessCatalogOnly(ctx context.Context, pool *pgxpool.Pool, change
 // role lacks a privilege the statement needs.
 const sqlstateInsufficientPrivilege = "42501"
 
+// sqlstateUndefinedTable is undefined_table: a statement names a relation
+// the database does not have.
+const sqlstateUndefinedTable = "42P01"
+
 // catalogOnlyProofError reports a table over the size limit whose statement
 // went unproven because the proof itself failed, not because the statement
 // rewrites or scans rows. It is not a size verdict: a retry, or a grant the

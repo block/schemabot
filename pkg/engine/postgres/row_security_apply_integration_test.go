@@ -303,6 +303,39 @@ func TestEngineCreateWithRowSecurityInAMissingSchemaIsBlocked(t *testing.T) {
 	assert.Contains(t, withRowSecurity.DDL, "CREATE POLICY readers ON documents")
 }
 
+// An owner's first pull request adds two tables: documents, and shares with
+// row security whose policy reads documents. The plan proves each create on
+// the target, where documents does not exist yet, so it refuses the create of
+// shares, naming the table its policy reads and to apply that table first,
+// rather than failing as an internal error. With documents applied, the same
+// file plans as one create with its row security.
+func TestEngineCreateWithRowSecurityRefusesAPolicyReadingATableTheTargetLacks(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "rls_create_reads_new")
+	const documents = `CREATE TABLE documents (id bigint PRIMARY KEY, owner text NOT NULL);`
+	const shares = `
+  CREATE TABLE shares (id bigint PRIMARY KEY, document_id bigint NOT NULL);
+  ALTER TABLE shares ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON shares FOR SELECT USING (EXISTS (SELECT 1 FROM public.documents d WHERE d.id = document_id));
+ `
+	eng := New()
+	_, err := eng.Plan(t.Context(), &engine.PlanRequest{Database: "rls_create_reads_new", Credentials: &engine.Credentials{DSN: dsn},
+		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{"documents.sql": documents, "shares.sql": shares}}}})
+	var refused *engine.PlanRefusedError
+	require.ErrorAs(t, err, &refused, "a policy reading a table the target lacks is the file author's to fix: %v", err)
+	assert.Contains(t, err.Error(), `table "shares" reads a table the target does not have yet (relation "public.documents" does not exist)`)
+	assert.Contains(t, err.Error(), `apply that table first, then add "shares" in a later change`)
+
+	_, err = db.ExecContext(t.Context(), `CREATE TABLE public.documents (id bigint PRIMARY KEY, owner text NOT NULL)`)
+	require.NoError(t, err)
+	plan, err := eng.Plan(t.Context(), &engine.PlanRequest{Database: "rls_create_reads_new", Credentials: &engine.Credentials{DSN: dsn},
+		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{"documents.sql": documents, "shares.sql": shares}}}})
+	require.NoError(t, err)
+	require.Len(t, plan.Changes, 1)
+	require.Len(t, plan.Changes[0].TableChanges, 1)
+	assert.Equal(t, "shares", plan.Changes[0].TableChanges[0].Table)
+	assert.Contains(t, plan.Changes[0].TableChanges[0].DDL, `CREATE POLICY "readers" ON "public"."shares"`)
+}
+
 // An apply runs the reviewed create only when the reviewed desired file still
 // derives the same statements. A schema file edited after the review derives
 // a different sequence, so the apply refuses and creates nothing.
