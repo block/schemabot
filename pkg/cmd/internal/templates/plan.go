@@ -625,29 +625,45 @@ func WriteBlockedChanges(changes []BlockedChange) {
 	if len(changes) == 0 {
 		return
 	}
-	n := 0
-	for _, c := range changes {
-		n += max(c.Steps, 1)
-	}
-	noun := "changes"
-	if n == 1 {
-		noun = "change"
-	}
-	fmt.Printf("%s Cannot apply: %d %s the engine refuses to execute\n", glyph.Refused, n, noun)
-	for _, c := range changes {
-		table := blockedChangeLabel(c)
-		if len(c.Causes) == 0 {
-			fmt.Printf("  - %s\n", table)
-			continue
-		}
-		fmt.Printf("  - %s: %s\n", table, c.Causes[0])
-		for _, cause := range c.Causes[1:] {
-			fmt.Printf("    - %s\n", cause)
-		}
+	fmt.Printf("%s Cannot apply: %s the engine refuses to execute\n", glyph.Refused, BlockedChangeCount(changes))
+	for _, line := range BlockedChangeLines(changes) {
+		fmt.Printf("  %s\n", line)
 	}
 	fmt.Println()
 	fmt.Println(presentation.BlockedChangesRemedy)
 	fmt.Println()
+}
+
+// BlockedChangeCount counts the statements changes refuse, as "1 change" or
+// "3 changes". A change whose step count is unknown counts as one.
+func BlockedChangeCount(changes []BlockedChange) string {
+	n := 0
+	for _, c := range changes {
+		n += max(c.Steps, 1)
+	}
+	if n == 1 {
+		return "1 change"
+	}
+	return fmt.Sprintf("%d changes", n)
+}
+
+// BlockedChangeLines lists changes one line per table, "- <table>: <cause>",
+// with each further cause on its own indented line, since each needs its
+// own fix.
+func BlockedChangeLines(changes []BlockedChange) []string {
+	var lines []string
+	for _, c := range changes {
+		table := blockedChangeLabel(c)
+		if len(c.Causes) == 0 {
+			lines = append(lines, "- "+table)
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("- %s: %s", table, c.Causes[0]))
+		for _, cause := range c.Causes[1:] {
+			lines = append(lines, "  - "+cause)
+		}
+	}
+	return lines
 }
 
 // blockedChangeLabel names a blocked change's table, with how many of its

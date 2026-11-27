@@ -192,8 +192,8 @@ func TestRollbackShardOnlyUnsafeChangeRequiresAllowUnsafe(t *testing.T) {
 
 // A rollback whose plan carries a blocked execution verdict is refused below
 // the plan that shows the refused statement, before the prompt, any lock, or
-// the apply, whatever the consent flags. The refusal names the plan, the table,
-// and the engine's reason.
+// the apply, whatever the consent flags. The refusal points at the list above
+// it, which names the table and the engine's reason.
 func TestRollbackCmd_BlockedPlanRefusesBeforeLock(t *testing.T) {
 	t.Setenv("SCHEMABOT_TOKEN", "fictional-rollback-test")
 	plan := apitypes.PlanResponse{PlanID: "plan-example-rollback", Database: "shop", DatabaseType: "mysql", Environment: "production",
@@ -207,7 +207,8 @@ func TestRollbackCmd_BlockedPlanRefusesBeforeLock(t *testing.T) {
 		cmd := RollbackCmd{ApplyID: "apply-example-90", Environment: "production", AutoApprove: true, AllowUnsafe: true}
 		runErr = cmd.Run(t.Context(), &Globals{Endpoint: endpoint})
 	}))
-	assert.EqualError(t, runErr, `rollback blocked: plan plan-example-rollback contains a blocked change for table "orders": direct execution is enabled but the table's size is unavailable`)
+	assert.EqualError(t, runErr, "rollback refused: 1 change the engine refuses to execute (listed above)")
+	assert.Contains(t, output, "- orders: direct execution is enabled but the table's size is unavailable")
 	assert.Contains(t, output, "DROP INDEX `idx_status`")
 	assert.NotContains(t, output, "Do you want to apply this rollback?")
 	assert.Equal(t, []string{"POST /api/rollback/plan", "GET /api/status"}, requests())

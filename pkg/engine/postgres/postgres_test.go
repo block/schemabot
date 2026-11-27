@@ -92,14 +92,14 @@ func TestExecutionVerdict(t *testing.T) {
 			statement: pgplan.Statement{Route: planner.RouteCopyAndSwap, Backend: router.BackendCopyAndSwap,
 				Disposition: router.DispositionUnavailable},
 			wantMode:   engine.ExecutionModeBlocked,
-			wantReason: `statement for table "users" requires copy-and-swap, which is unavailable`,
+			wantReason: `statement for table "users": the change needs a full copy of the table, which SchemaBot's PostgreSQL support does not run yet; reach the same schema without rewriting the table, such as a new column filled in batches, or make this change outside SchemaBot`,
 		},
 		{
 			name: "copy and swap the engine carries",
 			statement: pgplan.Statement{Route: planner.RouteCopyAndSwap, Backend: router.BackendCopyAndSwap,
 				Disposition: router.DispositionExecute},
 			wantMode:   engine.ExecutionModeBlocked,
-			wantReason: `statement for table "users" requires copy-and-swap, which SchemaBot's PostgreSQL support does not run yet`,
+			wantReason: `statement for table "users": the change needs a full copy of the table, which SchemaBot's PostgreSQL support does not run yet; reach the same schema without rewriting the table, such as a new column filled in batches, or make this change outside SchemaBot`,
 		},
 		{
 			name: "unavailable without copy-and-swap backend",
