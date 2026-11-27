@@ -29,29 +29,21 @@ const postgresSchemaExists = `
 SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace
                WHERE nspname OPERATOR(pg_catalog.=) $1)`
 
-const inspectUnmodeledPostgresTableObjects = `
+const inspectPostgresTableInheritance = `
 SELECT
-  EXISTS (SELECT 1 FROM pg_catalog.pg_trigger
-          WHERE tgrelid OPERATOR(pg_catalog.=) c.oid AND NOT tgisinternal),
-  EXISTS (SELECT 1 FROM pg_catalog.pg_description
-          WHERE objoid OPERATOR(pg_catalog.=) c.oid AND objsubid OPERATOR(pg_catalog.>=) 0),
   EXISTS (SELECT 1 FROM pg_catalog.pg_inherits WHERE inhrelid OPERATOR(pg_catalog.=) c.oid)
     AND NOT c.relispartition
 FROM pg_catalog.pg_class AS c
 JOIN pg_catalog.pg_namespace AS n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
 WHERE n.nspname OPERATOR(pg_catalog.=) $1 AND c.relname OPERATOR(pg_catalog.=) $2`
 
-type unmodeledTableObjects struct {
-	trigger     bool
-	comment     bool
-	inheritance bool
-}
-
 // PullSchema exports tables that the PostgreSQL declarative format can
 // represent. A table's own foreign keys and storage parameters are written
-// into its file. It refuses tables carrying user triggers, table or column
-// comments, or table inheritance, a table referenced by a foreign key that the
-// pull does not write, as well as shapes rejected by the renderer.
+// into its file. A user trigger or a table or column comment is left out of
+// the file and left in place: no plan or apply reads or changes it, so the
+// table is still managed. It refuses tables with table inheritance, a table
+// referenced by a foreign key that the pull does not write, as well as shapes
+// rejected by the renderer.
 // By default one refused table refuses the whole pull, so a caller never
 // mistakes a partial baseline for the namespace. A request that sets
 // skip_unrepresentable_tables gets the rest of the namespace instead, with
@@ -138,11 +130,12 @@ type baselinePolicy struct {
 	// baseline carrying it would plan a VALIDATE CONSTRAINT the forward apply
 	// never ran, and existing rows that break the key would fail it.
 	refuseNotValidForeignKeys bool
-	// refuseUnmodeledObjects refuses a table that carries objects the
-	// declarative format does not represent — a trigger or a table/column comment
-	// — even though the renderer would happily render its columns and
-	// indexes without them.
-	refuseUnmodeledObjects bool
+	// refuseInheritance refuses a child of classic table inheritance,
+	// which the declarative format cannot express, even though the renderer
+	// would render its columns and indexes. A trigger or a table or column comment
+	// is not refused: neither the differ nor any apply reads or changes it, so
+	// the file is complete for everything a plan can do to the table.
+	refuseInheritance bool
 	// skipUndeclaredArchiveTables leaves archive-named tables out only when
 	// no forward schema file declares them. Declared archives are managed.
 	skipUndeclaredArchiveTables bool
@@ -155,14 +148,14 @@ type baselinePolicy struct {
 }
 
 // pulledBaseline becomes the owner's declared schema, so a table the format
-// would describe incompletely is refused rather than written down without
-// its trigger or comment, and every table the plan would hold a file
-// accountable for is present, archive tables included.
+// would describe incompletely is refused, and every table the plan would hold
+// a file accountable for is present, archive tables included. A table's
+// triggers and comments stay on the live table, outside the file.
 var pulledBaseline = baselinePolicy{
-	refuseUnmodeledObjects: true,
-	includeRowSecurity:     true,
-	includeForeignKeys:     true,
-	unwrittenKeyRemedy:     "on a table the pull cannot write, such as one an extension owns; remove the key",
+	refuseInheritance:  true,
+	includeRowSecurity: true,
+	includeForeignKeys: true,
+	unwrittenKeyRemedy: "on a table the pull cannot write, such as one an extension owns; remove the key",
 }
 
 // rollbackBaseline is read only by a rollback re-plan, which manages the
@@ -426,13 +419,13 @@ func renderPostgresTable(ctx context.Context, pool *pgxpool.Pool, namespace, tab
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if policy.refuseUnmodeledObjects {
-		objects, err := pullUnmodeledTableObjects(ctx, pool, namespace, table)
+	if policy.refuseInheritance {
+		inherits, err := inheritsFromAParent(ctx, pool, namespace, table)
 		if err != nil {
 			return nil, err
 		}
-		if refusal := unmodeledTableObjectsRefusal(namespace, table, objects); refusal != nil {
-			return &renderedTable{renderErr: refusal}, nil
+		if inherits {
+			return &renderedTable{renderErr: inheritanceRefusal(namespace, table)}, nil
 		}
 	}
 	model, err := schemadiff.Introspect(ctx, pool, namespace, table)
@@ -514,45 +507,23 @@ func pullNamespaces(ctx context.Context, pool *pgxpool.Pool, requested string) (
 	return namespaces, nil
 }
 
-func pullUnmodeledTableObjects(ctx context.Context, pool *pgxpool.Pool, namespace, table string) (unmodeledTableObjects, error) {
-	var objects unmodeledTableObjects
-	err := pool.QueryRow(ctx, inspectUnmodeledPostgresTableObjects, namespace, table).Scan(
-		&objects.trigger,
-		&objects.comment,
-		&objects.inheritance,
-	)
-	if err != nil {
-		return unmodeledTableObjects{}, fmt.Errorf("inspect PostgreSQL schema %q table %q for unmodeled objects: %w", namespace, table, err)
+// inheritsFromAParent reports whether the table is a child of classic table
+// inheritance. A partition also has a pg_inherits row, and it is not one.
+func inheritsFromAParent(ctx context.Context, pool *pgxpool.Pool, namespace, table string) (bool, error) {
+	var inherits bool
+	if err := pool.QueryRow(ctx, inspectPostgresTableInheritance, namespace, table).Scan(&inherits); err != nil {
+		return false, fmt.Errorf("inspect PostgreSQL schema %q table %q for table inheritance: %w", namespace, table, err)
 	}
-	return objects, nil
+	return inherits, nil
 }
 
-// unmodeledTableObjectsRefusal names every object kind on the table that the
-// declarative format cannot carry, so a refused pull tells the operator what
-// to move or drop instead of hiding the objects behind a rendered table that
-// looks complete. It returns nil when the table carries none.
-func unmodeledTableObjectsRefusal(namespace, table string, objects unmodeledTableObjects) *tableRefusal {
-	present := []struct {
-		kind    string
-		present bool
-	}{
-		{"trigger", objects.trigger},
-		{"comment", objects.comment},
-		{"table inheritance", objects.inheritance},
-	}
-	var kinds []string
-	for _, candidate := range present {
-		if candidate.present {
-			kinds = append(kinds, candidate.kind)
-		}
-	}
-	if len(kinds) == 0 {
-		return nil
-	}
-	list := strings.Join(kinds, ", ")
+// inheritanceRefusal names the table inheritance the declarative format cannot
+// carry, so a refused pull tells the operator what to move or drop instead of
+// hiding it behind a rendered table that looks complete.
+func inheritanceRefusal(namespace, table string) *tableRefusal {
 	return &tableRefusal{
 		namespace: namespace, table: table,
-		detail: "carries objects the declarative format does not represent: " + list,
-		reason: "schema files cannot describe its " + list,
+		detail: "carries objects the declarative format does not represent: table inheritance",
+		reason: "schema files cannot describe its table inheritance",
 	}
 }

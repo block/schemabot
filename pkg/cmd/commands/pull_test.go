@@ -263,7 +263,7 @@ func TestFilterPullSchemaTablesKeepsMatchingSkippedTables(t *testing.T) {
 				Tables: map[string]string{"audit_events": "CREATE TABLE audit_events (id bigint);", "orders": "CREATE TABLE orders (id bigint);"},
 				SkippedTables: []apitypes.SkippedTable{
 					{Table: "audit_log", Reason: "unlogged tables cannot be rendered as a desired schema"},
-					{Table: "sessions", Reason: "schema files cannot describe its trigger"},
+					{Table: "sessions", Reason: "schema files cannot describe its table inheritance"},
 				},
 			},
 			"billing": {

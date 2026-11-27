@@ -16,8 +16,9 @@ import (
 )
 
 // launchBarSchema is a typical application's schema: tables that reference
-// each other, a table tuned with storage parameters, and one table for each
-// shape a schema file cannot describe yet. orders is the biggest table.
+// each other, a table tuned with storage parameters, a table with an
+// updated_at trigger, a table with comments, and one table for each shape a
+// schema file cannot describe yet. orders is the biggest table.
 const launchBarSchema = `
 	CREATE TABLE public.users (id bigint PRIMARY KEY, email text NOT NULL UNIQUE);
 	CREATE TABLE public.orders (
@@ -46,11 +47,13 @@ const launchBarSchema = `
 
 // A team brings an existing database to SchemaBot. pull writes every table a
 // schema file can describe, foreign keys and storage parameters included, and
-// skips each table it cannot describe, naming what it carries. The pulled
-// files, with the skipped tables ignored, plan no change. The team's first
-// pull request adds a nullable column to the biggest table, with the size
-// limit set below that table's size. The column changes only the catalog, so
-// it plans as runnable, the apply completes, and the column exists.
+// tables with triggers or comments too, which stay on the live table outside
+// the file. It skips each table it cannot describe, naming what it carries.
+// The pulled files, with the skipped tables ignored, plan no change. The
+// team's first pull request adds a nullable column to the biggest table, with
+// the size limit set below that table's size. The column changes only the
+// catalog, so it plans as runnable, the apply completes, and the column
+// exists.
 func TestEnginePostgresLaunchBar(t *testing.T) {
 	const database = "launch_bar_test"
 	dsn, db := testutil.StartPostgres(t, database)
@@ -64,7 +67,7 @@ func TestEnginePostgresLaunchBar(t *testing.T) {
 	pulled := response.Namespaces["public"]
 	require.NotNil(t, pulled)
 
-	assert.Equal(t, []string{"events", "orders", "users"}, sortedKeys(pulled.Tables))
+	assert.Equal(t, []string{"accounts", "events", "notes", "orders", "users"}, sortedKeys(pulled.Tables))
 	assert.Contains(t, pulled.Tables["orders"], `CONSTRAINT "orders_user_id_fkey" FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE`)
 	assert.Contains(t, pulled.Tables["events"], "WITH (fillfactor='70')")
 
@@ -73,8 +76,6 @@ func TestEnginePostgresLaunchBar(t *testing.T) {
 		skipped[table.GetTable()] = table.GetReason()
 	}
 	assert.Equal(t, map[string]string{
-		"accounts":         "schema files cannot describe its trigger",
-		"notes":            "schema files cannot describe its comment",
 		"tags":             schemadiff.ErrUnrenderableCollation.Error(),
 		"sessions":         schemadiff.ErrUnrenderableUnlogged.Error(),
 		"archived_records": "schema files cannot describe its table inheritance",
