@@ -16,14 +16,14 @@ import (
 	"github.com/block/schemabot/pkg/testutil"
 )
 
-// An owner makes accounts.display_name NOT NULL after an earlier attempt
-// failed at validation and left its helper check NOT VALID. Once the rows are
-// fixed, the plan drops the leftover helper, adds and validates a new one,
-// sets NOT NULL, and drops the new helper. The two drops are the same
-// statement on one table, but each carries the engine's record of the helper
-// it was reviewed against. The apply, opted into the unsafe drop, hands each
-// drop its own record, completes every step, and leaves the column NOT NULL
-// with no helper behind.
+// An owner makes accounts.display_name NOT NULL on a table that already has a
+// check under the name the NOT NULL sequence gives its helper, but with a rule
+// of its own. The plan drops that check, adds and validates the helper, sets
+// NOT NULL, and drops the helper. The two drops are the same statement on one
+// table, but each carries the engine's record of the constraint it was
+// reviewed against. The apply, opted into the unsafe drop, hands each drop its
+// own record, completes every step, and leaves the column NOT NULL with no
+// helper behind.
 func TestLocalClientPostgresApplyRunsARepeatedStatementWithItsOwnRecord(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -40,7 +40,7 @@ func TestLocalClientPostgresApplyRunsARepeatedStatementWithItsOwnRecord(t *testi
 	_, err := targetDB.ExecContext(t.Context(), `
 		CREATE TABLE public.accounts (id bigint PRIMARY KEY, display_name text);
 		INSERT INTO public.accounts VALUES (1, 'Ada'), (2, 'Grace');
-		ALTER TABLE public.accounts ADD CONSTRAINT `+helper+` CHECK (display_name IS NOT NULL) NOT VALID`)
+		ALTER TABLE public.accounts ADD CONSTRAINT `+helper+` CHECK (display_name <> '')`)
 	require.NoError(t, err)
 
 	stor := createStorage(t, storageDSN)
@@ -63,7 +63,7 @@ func TestLocalClientPostgresApplyRunsARepeatedStatementWithItsOwnRecord(t *testi
 	require.NoError(t, err)
 	require.Len(t, plan.Changes, 1)
 	steps := plan.Changes[0].TableChanges
-	require.Len(t, steps, 5, "drop the leftover helper, add, validate, SET NOT NULL, drop the new helper")
+	require.Len(t, steps, 5, "drop the existing check, add the helper, validate, SET NOT NULL, drop the helper")
 	assert.Contains(t, steps[0].Ddl, "DROP CONSTRAINT")
 	assert.Contains(t, steps[4].Ddl, "DROP CONSTRAINT")
 
