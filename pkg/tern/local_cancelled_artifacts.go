@@ -108,8 +108,17 @@ func (c *LocalClient) releaseFailedApplyArtifacts(ctx context.Context, apply *st
 			append(apply.LogAttrs(), "engine_type", c.config.Type)...)
 		return
 	}
+	history, err := c.taskHistory(ctx, apply, tasks)
+	if err != nil {
+		// A constraint is dropped only on proof the apply added it, and the
+		// proof is a completed step a resumed drive may not carry. Without the
+		// stored steps the release cannot tell the apply's constraints from the
+		// table's own, so it keeps every one.
+		c.logSkippedArtifactRelease(ctx, apply, failedRelease, err)
+		return
+	}
 	var sameTable []*storage.Task
-	for _, task := range c.taskHistory(ctx, apply, tasks) {
+	for _, task := range history {
 		if task != nil && sameTaskTable(task, failedTask) {
 			sameTable = append(sameTable, task)
 		}
@@ -122,15 +131,12 @@ func (c *LocalClient) releaseFailedApplyArtifacts(ctx context.Context, apply *st
 // taskHistory returns every task the apply stored, with the drive's own
 // copies in place of the stored ones they update. A resumed drive carries only
 // the tasks it still has to weigh, and the completed steps it leaves out are
-// what prove the apply added a constraint. When storage cannot be read, the
-// drive's copies are all there is, and a constraint no copy shows added is
-// kept and reported with the statement that drops it.
-func (c *LocalClient) taskHistory(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) []*storage.Task {
+// what prove the apply added a constraint, so a history storage cannot read
+// is an error rather than the drive's copies alone.
+func (c *LocalClient) taskHistory(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) ([]*storage.Task, error) {
 	stored, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
 	if err != nil {
-		c.logger.Warn("could not read the apply's stored tasks for a release; it weighs only the drive's own, and keeps any constraint none of them shows added",
-			append(apply.LogAttrs(), "error", err)...)
-		return tasks
+		return nil, fmt.Errorf("read the stored tasks of apply %s: %w", apply.ApplyIdentifier, errors.Join(errTaskHistoryUnread, err))
 	}
 	current := make(map[string]*storage.Task, len(tasks))
 	for _, task := range tasks {
@@ -155,8 +161,12 @@ func (c *LocalClient) taskHistory(ctx context.Context, apply *storage.Apply, tas
 			history = append(history, task)
 		}
 	}
-	return history
+	return history, nil
 }
+
+// errTaskHistoryUnread marks a release that could not read the apply's stored
+// tasks, and so could not prove which constraints the apply added.
+var errTaskHistoryUnread = errors.New("the apply's task history could not be read")
 
 // sameTaskTable reports whether two tasks change the same table of the same
 // schema, within the same apply operation.
@@ -628,6 +638,8 @@ func skippedArtifactReleaseReason(err error) string {
 	switch {
 	case errors.Is(err, storage.ErrActiveApplyExists):
 		return "another schema change is running against the same target and may own the copy"
+	case errors.Is(err, errTaskHistoryUnread):
+		return "SchemaBot could not read the apply's task history, so it could not prove which constraints the apply added"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "the release ran past the time it is allowed to hold the target, so it gave the target back"
 	default:

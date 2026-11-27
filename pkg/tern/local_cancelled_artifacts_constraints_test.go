@@ -1,6 +1,8 @@
 package tern
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"testing"
 
@@ -153,7 +155,8 @@ func TestTaskHistoryAddsTheStoredStepsAResumedDriveLeftOut(t *testing.T) {
 	failedValidate.State = state.Task.Failed
 	c, _ := newFailureLogTestClient(apply, []*storage.Task{add, storedValidate})
 
-	history := c.taskHistory(t.Context(), apply, []*storage.Task{&failedValidate})
+	history, err := c.taskHistory(t.Context(), apply, []*storage.Task{&failedValidate})
+	require.NoError(t, err)
 	require.Len(t, history, 2)
 	assert.Same(t, add, history[0])
 	assert.Same(t, &failedValidate, history[1])
@@ -162,4 +165,47 @@ func TestTaskHistoryAddsTheStoredStepsAResumedDriveLeftOut(t *testing.T) {
 	artifacts := c.cancelledArtifactTables(apply, history)["public"]
 	require.NotNil(t, artifacts)
 	assert.Equal(t, []string{"users_name_not_null_check"}, artifacts.addedConstraints["users"])
+}
+
+// A resumed drive fails the validation of a constraint an earlier drive
+// added, and the release cannot read the apply's stored tasks. The completed
+// ADD that proves the apply added the constraint is among them, so the
+// release drops nothing: the constraint stays on the table, and the apply log
+// says the cleanup was skipped and why.
+func TestReleaseFailedApplyArtifactsKeepsConstraintsWhenTheTaskHistoryIsUnread(t *testing.T) {
+	apply := &storage.Apply{ID: 11, ApplyIdentifier: "apply-11", Database: "shop"}
+	failedValidate := &storage.Task{ApplyID: apply.ID, TaskIdentifier: "validate", Namespace: "public", TableName: "users", State: state.Task.Failed,
+		DDL: "ALTER TABLE public.users VALIDATE CONSTRAINT users_name_not_null_check"}
+	c, logs := newFailureLogTestClient(apply, nil)
+	c.config.Type = storage.DatabaseTypePostgres
+	c.storage.(*controlTestStorage).tasks = &unreadableTaskStore{err: errors.New("connection refused")}
+	releaser := &recordingFailedReleaser{}
+	c.postgresEngine = releaser
+
+	c.releaseFailedApplyArtifacts(t.Context(), apply, []*storage.Task{failedValidate}, failedValidate)
+
+	assert.Zero(t, releaser.calls, "a release that cannot prove what the apply added drops nothing")
+	require.Len(t, logs.entries, 1)
+	assert.Equal(t, storage.LogLevelWarn, logs.entries[0].Level)
+	assert.Equal(t, "What the failed schema change left on the target was not reclaimed because SchemaBot could not read the apply's task history, so it could not prove which constraints the apply added",
+		logs.entries[0].Message)
+}
+
+type unreadableTaskStore struct {
+	storage.TaskStore
+	err error
+}
+
+func (s *unreadableTaskStore) GetByApplyID(context.Context, int64) ([]*storage.Task, error) {
+	return nil, s.err
+}
+
+type recordingFailedReleaser struct {
+	engine.Engine
+	calls int
+}
+
+func (r *recordingFailedReleaser) ReleaseFailedArtifacts(context.Context, *engine.ReleaseArtifactsRequest) (*engine.ReleaseArtifactsResult, error) {
+	r.calls++
+	return &engine.ReleaseArtifactsResult{}, nil
 }
