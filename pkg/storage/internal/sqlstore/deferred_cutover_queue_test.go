@@ -98,11 +98,15 @@ func testDeferredCutoverQueue(t *testing.T, newStore func(*testing.T) *Storage) 
 		store := newStore(t)
 		applyA := seedHalfStartedDeferredApply(t, store, "apply_queue_first")
 		stopQueueApply(t, store, applyA)
+		// A's heartbeat is aged a minute after the stop, so a start that moved
+		// it would change it by far more than the second a timestamp may
+		// tick over between two writes, on either dialect.
+		_, err := store.db.ExecContext(ctx,
+			"UPDATE applies SET updated_at = "+agedHeartbeatExpr(store, time.Minute)+" WHERE id = ?", applyA.ID)
+		require.NoError(t, err)
 		applyB := createQueueApply(t, store, "apply_queue_second", state.Apply.Running, true, time.Minute)
 		insertQueueOperation(t, store, applyB, "shard-1", state.ApplyOperation.WaitingForCutover, true)
 		shardB := insertQueueOperation(t, store, applyB, "shard-2", state.ApplyOperation.Pending, false)
-		// Stopping A moved its heartbeat, so the start is measured against the
-		// stopped row rather than the one A was created with.
 		stopped, err := store.Applies().Get(ctx, applyA.ID)
 		require.NoError(t, err)
 		require.NotNil(t, stopped)
