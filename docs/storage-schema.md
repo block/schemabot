@@ -139,8 +139,13 @@ proportion to the rows in it, on every pod, inside the boot's budget (see
 **PostgreSQL stops the boot rather than make a change that locks a table for as
 long as the change takes.** A new column does that when it is `NOT NULL` with no
 `DEFAULT`, generated, an identity or `serial` column, `UNIQUE`, or a foreign key with a
-`DEFAULT`. One error names every change in that state, and none of them converge
-until all are resolved.
+`DEFAULT`. So does a `DEFAULT` that might call a volatile function. The defaults
+that converge are a constant, a SQL value function such as `CURRENT_TIMESTAMP`,
+one of `pg_catalog.now()`, `pg_catalog.transaction_timestamp()`, and
+`pg_catalog.statement_timestamp()`, and a cast of any of these. Write `now()`
+with its `pg_catalog.` prefix, because the bare name is looked up through
+`search_path` and could reach a user function of the same name. One error names
+every change in that state, and none of them converge until all are resolved.
 
 An index PostgreSQL cannot use stops the boot as well, and the error says
 whether the build is still running or failed part way. A running build needs

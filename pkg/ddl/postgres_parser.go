@@ -246,9 +246,11 @@ func (postgresStatementParser) SynthesizeAddColumn(createTableDDL, columnName st
 //   - NOT NULL without a DEFAULT needs a backfill — the server would reject
 //     the ADD COLUMN outright on a populated table.
 //   - A DEFAULT whose expression is not provably non-volatile (a constant,
-//     a cast of a constant, or a SQL value function such as
-//     CURRENT_TIMESTAMP) fails closed: the parse tree cannot see function
-//     volatility, and a volatile default rewrites the whole table.
+//     a SQL value function such as CURRENT_TIMESTAMP, a pg_catalog-qualified
+//     call such as pg_catalog.now(), or a cast of one of these) fails
+//     closed: the parse tree cannot see function volatility, and a volatile
+//     default rewrites the whole table. An unqualified now() is refused
+//     because search_path could resolve it to a volatile user function.
 //   - UNIQUE builds a unique index over every existing row inside the same
 //     ALTER TABLE, even though the new column is NULL in all of them.
 //   - REFERENCES is metadata-only while the column has no DEFAULT — the
@@ -274,7 +276,7 @@ func PostgresAddColumnManualReason(createTableDDL, columnName string) (string, e
 			notNull = true
 		case pgproto.ConstrType_CONSTR_DEFAULT:
 			hasDefault = true
-			constantDefault = postgresNonVolatileExpression(constraint.GetRawExpr())
+			constantDefault = postgresNonVolatileExpression(constraint.GetRawExpr(), timeCallsMustNamePgCatalog)
 		case pgproto.ConstrType_CONSTR_GENERATED, pgproto.ConstrType_CONSTR_IDENTITY:
 			return "definition is generated or identity, which rewrites the whole table under an exclusive lock; add it manually", nil
 		case pgproto.ConstrType_CONSTR_UNIQUE:
@@ -288,7 +290,7 @@ func PostgresAddColumnManualReason(createTableDDL, columnName string) (string, e
 		}
 	}
 	if hasDefault && !constantDefault {
-		return "definition has a DEFAULT expression whose volatility cannot be proven from the statement alone, and a volatile default rewrites the whole table under an exclusive lock; add it manually or ship the column with a constant DEFAULT", nil
+		return "definition has a DEFAULT expression whose volatility cannot be proven from the statement alone, and a volatile default rewrites the whole table under an exclusive lock; add it manually or ship the column with a constant DEFAULT or a schema-qualified one such as pg_catalog.now()", nil
 	}
 	if foreignKey && hasDefault {
 		return "definition is a FOREIGN KEY with a DEFAULT, which validates every existing row against the referenced table under an exclusive lock; add it manually or ship the column nullable with no DEFAULT (the reference alone is metadata-only)", nil
@@ -318,24 +320,95 @@ func postgresSerialType(typeName *pgproto.TypeName) bool {
 	}
 }
 
+// postgresTimeCallNaming says which spellings of a call to one of the
+// built-in STABLE time functions (see postgresStableTimeFunctions) a caller
+// of postgresNonVolatileExpression accepts. The two callers differ because
+// an unqualified call is resolved through search_path when the statement
+// runs, so the parse tree alone cannot rule out a volatile user function of
+// the same name that shadows the built-in one.
+type postgresTimeCallNaming int
+
+const (
+	// timeCallsMustNamePgCatalog accepts only pg_catalog.now() and its
+	// siblings. The startup storage check (PostgresAddColumnManualReason)
+	// uses it: its verdict decides whether an ADD COLUMN runs automatically
+	// under an exclusive lock, so it fails closed on anything search_path
+	// could redirect.
+	timeCallsMustNamePgCatalog postgresTimeCallNaming = iota
+	// timeCallsMayResolveThroughSearchPath also accepts the unqualified
+	// now() form. The plan's table-size check (addColumnScalesWithTableSize)
+	// uses it: its verdict only decides whether the plan shows the table's
+	// size, and DEFAULT now() is how schema files write it in practice.
+	timeCallsMayResolveThroughSearchPath
+)
+
+// postgresStableTimeFunctions are the built-in functions PostgreSQL marks
+// STABLE that return the transaction or statement start time. A DEFAULT that
+// calls one is evaluated once by ADD COLUMN and stored in the catalog, with
+// no table rewrite. clock_timestamp() is VOLATILE and is deliberately absent.
+var postgresStableTimeFunctions = map[string]bool{
+	"now":                   true,
+	"transaction_timestamp": true,
+	"statement_timestamp":   true,
+}
+
 // postgresNonVolatileExpression reports whether a DEFAULT expression is
 // provably non-volatile from its parse tree: a constant, a cast whose
-// argument is itself provably non-volatile, or a SQL value function
-// (CURRENT_TIMESTAMP and friends, which PostgreSQL defines as STABLE).
-// Function calls report false — the parse tree carries no volatility
-// information, so even a stable function like now() cannot be proven safe
+// argument is itself provably non-volatile, a SQL value function
+// (CURRENT_TIMESTAMP and friends, which PostgreSQL defines as STABLE), or a
+// plain call to one of postgresStableTimeFunctions spelled as naming allows.
+// Every other function call reports false — the parse tree carries no
+// volatility information, so an arbitrary function cannot be proven safe
 // without catalog access.
-func postgresNonVolatileExpression(expr *pgproto.Node) bool {
+func postgresNonVolatileExpression(expr *pgproto.Node, naming postgresTimeCallNaming) bool {
 	switch x := expr.GetNode().(type) {
 	case *pgproto.Node_AConst:
 		return true
 	case *pgproto.Node_TypeCast:
-		return postgresNonVolatileExpression(x.TypeCast.GetArg())
+		return postgresNonVolatileExpression(x.TypeCast.GetArg(), naming)
 	case *pgproto.Node_SqlvalueFunction:
 		return true
+	case *pgproto.Node_FuncCall:
+		return postgresStableTimeCall(x.FuncCall, naming)
 	default:
 		return false
 	}
+}
+
+// postgresStableTimeCall reports whether call is a plain, argument-free call
+// to one of postgresStableTimeFunctions whose name is spelled as naming
+// allows. A window (OVER), FILTER, DISTINCT, VARIADIC, `*`, ORDER BY, or
+// WITHIN GROUP decoration is refused: none applies to these functions, and
+// accepting a shape the server would treat differently is how a wrong verdict
+// slips in. A schema qualifier other than pg_catalog is always refused.
+func postgresStableTimeCall(call *pgproto.FuncCall, naming postgresTimeCallNaming) bool {
+	if !postgresPlainCallWithoutArguments(call) {
+		return false
+	}
+	parts := call.GetFuncname()
+	switch len(parts) {
+	case 1:
+		if naming != timeCallsMayResolveThroughSearchPath {
+			return false
+		}
+		return postgresStableTimeFunctions[parts[0].GetString_().GetSval()]
+	case 2:
+		if parts[0].GetString_().GetSval() != "pg_catalog" {
+			return false
+		}
+		return postgresStableTimeFunctions[parts[1].GetString_().GetSval()]
+	default:
+		return false
+	}
+}
+
+// postgresPlainCallWithoutArguments reports whether call is written as
+// name() with nothing inside the parentheses and nothing after them.
+func postgresPlainCallWithoutArguments(call *pgproto.FuncCall) bool {
+	hasArguments := len(call.GetArgs()) > 0 || call.GetAggStar() ||
+		call.GetAggDistinct() || call.GetFuncVariadic() || len(call.GetAggOrder()) > 0
+	hasTrailingClause := call.GetOver() != nil || call.GetAggFilter() != nil || call.GetAggWithinGroup()
+	return !hasArguments && !hasTrailingClause
 }
 
 // CreateIndex implements StatementParser using the parsed IndexStmt. Any
@@ -363,8 +436,9 @@ func (postgresStatementParser) CreateIndex(stmt string) (string, string, bool, e
 // provably metadata-only: PRIMARY KEY, UNIQUE, and EXCLUDE adds build an
 // index; FOREIGN KEY and CHECK adds validate every row unless declared NOT
 // VALID; SET NOT NULL scans the table; a column type change can rewrite it;
-// and a column add is metadata-only only while its DEFAULT (if any) is a
-// constant. Plain drops, renames, and default changes report false.
+// and a column add is metadata-only only while its DEFAULT (if any) is one
+// PostgreSQL evaluates once (see addColumnScalesWithTableSize). Plain drops,
+// renames, and default changes report false.
 func (postgresStatementParser) CostScalesWithTableSize(stmt string) (bool, error) {
 	result, err := pgquery.Parse(stmt)
 	if err != nil {
@@ -433,9 +507,9 @@ func alterCmdScalesWithTableSize(cmd *pgproto.AlterTableCmd) bool {
 // in all of them, and a REFERENCES column with a DEFAULT validates every
 // existing row against the referenced table. A plain column with no DEFAULT,
 // or with one PostgreSQL evaluates once and stores in the catalog (a
-// constant, a cast of one, or CURRENT_TIMESTAMP and the other SQL value
-// functions), including a nullable REFERENCES column without one, is
-// metadata-only.
+// constant, CURRENT_TIMESTAMP and the other SQL value functions, now() and
+// its STABLE siblings qualified or not, or a cast of one of these), including
+// a nullable REFERENCES column without one, is metadata-only.
 func addColumnScalesWithTableSize(col *pgproto.ColumnDef) bool {
 	if postgresSerialType(col.GetTypeName()) {
 		return true
@@ -450,7 +524,7 @@ func addColumnScalesWithTableSize(col *pgproto.ColumnDef) bool {
 			return true
 		case pgproto.ConstrType_CONSTR_DEFAULT:
 			hasDefault = true
-			if !postgresNonVolatileExpression(constraint.GetRawExpr()) {
+			if !postgresNonVolatileExpression(constraint.GetRawExpr(), timeCallsMayResolveThroughSearchPath) {
 				return true
 			}
 		case pgproto.ConstrType_CONSTR_FOREIGN:
