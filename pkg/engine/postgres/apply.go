@@ -615,8 +615,9 @@ func classifyApplyFailure(err error, table string, validates *schemadiff.Constra
 	// Rows that break a constraint keep breaking it until someone changes
 	// them, which takes a person far longer than the drive's retries do, so
 	// the failure ends the apply at once rather than spending its retries on
-	// an answer that cannot change. The re-apply after the data fix resumes
-	// at the validation.
+	// an answer that cannot change. A constraint the apply added is then
+	// dropped, so the re-apply after the data fix plans it again; one the
+	// table already had stays, and the re-apply resumes at its validation.
 	if detail, ok := brokenForeignKeyDetail(err, table); ok {
 		return applyFailure{detail: detail}
 	}

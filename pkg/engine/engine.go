@@ -453,10 +453,16 @@ func ReleaseCancelledArtifacts(ctx context.Context, eng Engine, req *ReleaseArti
 
 // FailedArtifactReleaser is an optional capability for engines that add a
 // constraint of their own to a live table as a step of a change and remove it
-// in a later step. When the apply fails for good between the two, nothing is
-// left to drive the change, and the constraint goes on checking the
-// application's writes, the same cost a cancel would leave. The release
+// in a later step. When a drive ends the apply failed between the two,
+// nothing is left to drive the change, and the constraint goes on checking
+// the application's writes, the same cost a cancel would leave. The release
 // removes the constraints the failed apply added, as a cancel does.
+//
+// The release runs only where a drive settles the failure. An apply that
+// stops retrying because its retries or its freshness window ran out is
+// settled without a drive and keeps its constraints. Each is a step the
+// next apply's plan resumes from: it validates what the desired schema
+// keeps and drops what it does not.
 //
 // Row copies are out of scope: an engine may resume a failed apply's copy
 // from them, so a failure keeps them. Callers hold the same claim and

@@ -12,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	webhooktemplates "github.com/block/schemabot/pkg/webhook/templates"
 )
 
 // An apply drops `_jobs_old`, a leftover table a repository named in
@@ -392,12 +393,15 @@ func TestParseProgressResponseDropsTerminalEscapesFromServerText(t *testing.T) {
 
 // A NOT NULL change fails at its validation, and the drive records the steps
 // queued behind it cancelled without running them. Nobody cancelled them, so
-// the CLI reads them as not run. The same rows in an apply an operator
-// cancelled still read as cancelled before they started.
-func TestParseProgressResponseReadsStepsBehindAFailureAsNotRun(t *testing.T) {
-	queued := func(applyState string) TableProgress {
-		data := ParseProgressResponse(&apitypes.ProgressResponse{
-			State: applyState,
+// the CLI and the PR summary both read them as not run. The same rows in an
+// apply an operator cancelled still read as cancelled before they started,
+// on both surfaces.
+func TestProgressReadsStepsBehindAFailureAsNotRunOnEverySurface(t *testing.T) {
+	response := func(applyState string) *apitypes.ProgressResponse {
+		return &apitypes.ProgressResponse{
+			State:    applyState,
+			Engine:   "postgres",
+			Database: "testapp",
 			Tables: []*apitypes.TableProgressResponse{{
 				TableName:  "users",
 				Keyspace:   "public",
@@ -405,15 +409,25 @@ func TestParseProgressResponseReadsStepsBehindAFailureAsNotRun(t *testing.T) {
 				DDL:        `ALTER TABLE "public"."users" ALTER COLUMN "name" SET NOT NULL`,
 				Status:     "STATE_CANCELLED",
 			}},
-		})
+		}
+	}
+	cli := func(applyState string) string {
+		data := ParseProgressResponse(response(applyState))
 		require.Len(t, data.Tables, 1)
-		return data.Tables[0]
+		return FormatTableProgressWithActivity(data.Tables[0], "", "")
+	}
+	summary := func(applyState string) string {
+		return webhooktemplates.RenderApplySummaryComment(webhooktemplates.ApplyStatusFromProgress(response(applyState), "octocat"))
 	}
 
-	failed := FormatTableProgressWithActivity(queued(state.Apply.Failed), "", "")
+	failed := cli(state.Apply.Failed)
 	assert.Contains(t, failed, "users: ⏭️ Not run")
 	assert.NotContains(t, failed, "Cancelled")
+	failedSummary := summary(state.Apply.Failed)
+	assert.Contains(t, failedSummary, "**`users`** — Not run\n", "%s", failedSummary)
+	assert.NotContains(t, failedSummary, "Cancelled", "%s", failedSummary)
 
-	cancelled := FormatTableProgressWithActivity(queued(state.Apply.Cancelled), "", "")
-	assert.Contains(t, cancelled, "users: 🚫 Cancelled (not started)")
+	assert.Contains(t, cli(state.Apply.Cancelled), "users: 🚫 Cancelled (not started)")
+	cancelledSummary := summary(state.Apply.Cancelled)
+	assert.Contains(t, cancelledSummary, "**`users`** — Cancelled (not started)\n", "%s", cancelledSummary)
 }

@@ -58,6 +58,10 @@ type namespaceArtifacts struct {
 	// unreadTables names the tables with a statement the release could not
 	// read, on which it removes no constraint.
 	unreadTables []string
+	// heldConstraints says, per table and constraint, why the release keeps a
+	// constraint the apply's completed tasks added: the table's plan drops a
+	// rule the table had, or has a statement the release could not read.
+	heldConstraints map[string]map[string]string
 }
 
 // releaseCancelledArtifacts reclaims the artifacts the cancelled apply left on
@@ -224,7 +228,7 @@ func (c *LocalClient) releaseNamespaceArtifacts(ctx context.Context, eng engine.
 	// What the release did is recorded before its error is returned: a release
 	// that fails part-way has still moved the copy, and the entry naming where
 	// it went is what an operator follows to recover it.
-	reclaimed := c.recordReleaseResult(ctx, apply, namespace, kind.outcome, result)
+	reclaimed := c.recordReleaseResult(ctx, apply, namespace, kind.outcome, result, artifacts.heldConstraints)
 	if err != nil {
 		return reclaimed, err
 	}
@@ -237,7 +241,9 @@ func (c *LocalClient) releaseNamespaceArtifacts(ctx context.Context, eng engine.
 
 // recordReleaseResult writes what one schema's release reclaimed and retained to
 // the server log and the apply log, and reports whether it reclaimed anything.
-func (c *LocalClient) recordReleaseResult(ctx context.Context, apply *storage.Apply, namespace, outcome string, result *engine.ReleaseArtifactsResult) bool {
+// held says why the release kept a constraint the apply added, per table and
+// constraint.
+func (c *LocalClient) recordReleaseResult(ctx context.Context, apply *storage.Apply, namespace, outcome string, result *engine.ReleaseArtifactsResult, held map[string]map[string]string) bool {
 	if result == nil {
 		return false
 	}
@@ -256,6 +262,15 @@ func (c *LocalClient) recordReleaseResult(ctx context.Context, apply *storage.Ap
 			remainingConstraintMessage(constraint, outcome), "", "")
 	}
 	for _, constraint := range result.PreexistingConstraints {
+		if heldBecause, ok := held[constraint.Table][constraint.Name]; ok {
+			// The schema change added it, but the release kept it on purpose,
+			// so the log must not say the change did not add it.
+			c.logger.Warn("a constraint the schema change added is still on a live table, kept because its table's rules could not be released safely",
+				append(apply.LogAttrs(), "namespace", namespace, "outcome", outcome, "table", constraint.Table, "constraint", constraint.Name, "held_because", heldBecause)...)
+			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
+				heldConstraintMessage(constraint, outcome, heldBecause), "", "")
+			continue
+		}
 		// The schema change did not add it and the release does not remove
 		// it, but the operator may expect the table back as it was.
 		c.logger.Warn("a constraint the schema change worked with, but did not add, is still on a live table",
@@ -311,6 +326,15 @@ func remainingConstraintMessage(constraint engine.EngineConstraint, outcome stri
 func preexistingConstraintMessage(constraint engine.EngineConstraint, outcome string) string {
 	return fmt.Sprintf("Constraint %s is still on %s. No finished step of the %s schema change added it, so SchemaBot left it, and it %s until it is dropped. Drop it with: %s",
 		constraint.Name, constraint.Table, outcome, constraint.Effect, constraint.Removal)
+}
+
+// heldConstraintMessage describes, for the apply log, a constraint the
+// schema change added that the release kept because heldBecause: removing it
+// could leave the table with neither the rule its plan drops nor the one that
+// replaces it.
+func heldConstraintMessage(constraint engine.EngineConstraint, outcome, heldBecause string) string {
+	return fmt.Sprintf("Constraint %s is still on %s. The %s schema change added it, but %s, so SchemaBot kept every constraint on the table rather than risk leaving it with no rule. It %s until it is dropped. Drop it with: %s",
+		constraint.Name, constraint.Table, outcome, heldBecause, constraint.Effect, constraint.Removal)
 }
 
 // releasedArtifactsMessage describes a release for the apply log, naming where
@@ -405,20 +429,35 @@ func (c *LocalClient) cancelledArtifactTables(apply *storage.Apply, tasks []*sto
 // cannot read is treated the same way, since that statement might drop one.
 func (c *LocalClient) withholdReplacedConstraints(apply *storage.Apply, entry *namespaceArtifacts) {
 	for table := range entry.droppedConstraints {
-		c.keepTableConstraints(apply, entry, table, "a release keeps the constraints on a table whose schema change drops one: an unvalidated one may be the only rule left on the table")
+		c.keepTableConstraints(apply, entry, table, "a release keeps the constraints on a table whose schema change drops one: an unvalidated one may be the only rule left on the table",
+			"its plan also drops a rule the table had")
 	}
 	for _, table := range entry.unreadTables {
-		c.keepTableConstraints(apply, entry, table, "a release keeps the constraints on a table it cannot read every statement of: an unread one may have dropped the rule an unvalidated one replaces")
+		c.keepTableConstraints(apply, entry, table, "a release keeps the constraints on a table it cannot read every statement of: an unread one may have dropped the rule an unvalidated one replaces",
+			"SchemaBot could not read every statement of its plan")
 	}
 }
 
 // keepTableConstraints takes table out of the constraints the release may
-// drop, logging each constraint it keeps.
-func (c *LocalClient) keepTableConstraints(apply *storage.Apply, entry *namespaceArtifacts, table, reason string) {
+// drop, logging each constraint it keeps. Each one the apply added is held
+// for heldBecause, which the apply log gives as the reason it is still on the
+// table.
+func (c *LocalClient) keepTableConstraints(apply *storage.Apply, entry *namespaceArtifacts, table, reason, heldBecause string) {
 	kept := slices.Concat(entry.addedConstraints[table], entry.validatedConstraints[table])
 	slices.Sort(kept)
 	for _, name := range slices.Compact(kept) {
 		c.logger.Info(reason, append(apply.LogAttrs(), "namespace", entry.task.Namespace, "table", table, "constraint", name)...)
+	}
+	for _, name := range entry.addedConstraints[table] {
+		if entry.heldConstraints == nil {
+			entry.heldConstraints = map[string]map[string]string{}
+		}
+		if entry.heldConstraints[table] == nil {
+			entry.heldConstraints[table] = map[string]string{}
+		}
+		if _, held := entry.heldConstraints[table][name]; !held {
+			entry.heldConstraints[table][name] = heldBecause
+		}
 	}
 	delete(entry.addedConstraints, table)
 	delete(entry.validatedConstraints, table)

@@ -341,3 +341,74 @@ func checkConstraintCount(t *testing.T, db *sql.DB, name string) int {
 		`SELECT count(*) FROM pg_catalog.pg_constraint WHERE conrelid = 'public.users'::regclass AND conname = $1`, name).Scan(&count))
 	return count
 }
+
+// An owner adds a foreign key from orders to users while an order still
+// points at a user that does not exist. The key is added NOT VALID, which
+// checks every write the application makes from then on, and its validation
+// fails on the orphan row. A retry cannot pass until someone fixes the row,
+// so the apply fails at once. The drive drops the key the apply added, so
+// the application's writes behave as they did before the apply, and the
+// apply log names the key it removed.
+func TestLocalClientPostgresFailedValidationRemovesTheForeignKey(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	const (
+		database = "fail_foreign_key"
+		key      = "orders_user_id_fkey"
+	)
+	_, storageDSN := setupMySQLContainer(t)
+	setupStorageSchema(t, storageDSN)
+	cleanupTasks(t, storageDSN)
+	targetDSN, targetDB := testutil.StartPostgres(t, database)
+	_, err := targetDB.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint);
+		INSERT INTO public.users VALUES (1);
+		INSERT INTO public.orders VALUES (1, 1), (2, 99)`)
+	require.NoError(t, err)
+
+	stor := createStorage(t, storageDSN)
+	t.Cleanup(func() { utils.CloseAndLog(stor) })
+	client, err := NewLocalClient(LocalConfig{Database: database, Type: storage.DatabaseTypePostgres, TargetDSN: targetDSN,
+		SchemaOverrides: map[string]string{"logical": "public"}}, stor, slog.Default())
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(client) })
+
+	plan, err := client.Plan(t.Context(), &ternv1.PlanRequest{Database: database, Type: storage.DatabaseTypePostgres,
+		SchemaFiles: map[string]*ternv1.SchemaFiles{"logical": {Files: map[string]string{
+			"users.sql":  "CREATE TABLE users (id bigint PRIMARY KEY);",
+			"orders.sql": "CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint, CONSTRAINT orders_user_id_fkey FOREIGN KEY (user_id) REFERENCES users (id));",
+		}}}})
+	require.NoError(t, err)
+	require.Len(t, plan.Changes, 1)
+	require.Len(t, plan.Changes[0].TableChanges, 2)
+	require.Contains(t, plan.Changes[0].TableChanges[0].Ddl, "NOT VALID", "the plan adds the key without checking existing rows")
+
+	result, err := client.Apply(t.Context(), &ternv1.ApplyRequest{PlanId: plan.PlanId, Environment: localClientTestEnvironment,
+		DdlChanges: plan.Changes[0].TableChanges})
+	require.NoError(t, err)
+	require.True(t, result.Accepted, result.ErrorMessage)
+	startTestOperator(t, stor, client, result.ApplyId)
+
+	apply := waitForTerminalApply(t, stor, result.ApplyId)
+	assert.Equal(t, state.Apply.Failed, apply.State, "an orphan row ends the apply instead of retrying it")
+	assert.Contains(t, apply.ErrorMessage, `"orders"`)
+	assert.Contains(t, apply.ErrorMessage, key)
+	tasks, err := stor.Tasks().GetByApplyID(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []string{state.Task.Completed, state.Task.Failed}, taskStates(tasks))
+
+	var keys int
+	require.NoError(t, targetDB.QueryRowContext(t.Context(),
+		`SELECT count(*) FROM pg_catalog.pg_constraint WHERE conrelid = 'public.orders'::regclass AND conname = $1`, key).Scan(&keys))
+	assert.Zero(t, keys, "the failure drops the key the apply added")
+	_, err = targetDB.ExecContext(t.Context(), `INSERT INTO public.orders VALUES (3, 98)`)
+	require.NoError(t, err, "an orphan write lands again, as it did before the apply")
+
+	logs, err := stor.ApplyLogs().GetByApply(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, countLogMessagesContaining(logs, `Removed constraint orders_user_id_fkey from public.orders. The failed schema change added it`),
+		"the apply log names the key the failure removed")
+}

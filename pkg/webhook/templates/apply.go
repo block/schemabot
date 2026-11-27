@@ -1216,7 +1216,7 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		}
 
 	case state.Task.Cancelled:
-		fmt.Fprintf(sb, "**%s**: 🚫 %s\n", inlineCode(table.TableName), cancelledTablePhrase(table))
+		fmt.Fprintf(sb, "**%s**: 🚫 %s\n", inlineCode(table.TableName), presentation.ReadCancelledTask(tableFacts(table, apitypes.BuildWork{}), tableBegan(table), false).Label)
 		writeDDLLine(sb, dialect, table.DDL, budget)
 
 	case state.Task.RevertWindow:
@@ -1391,19 +1391,6 @@ func tableBegan(table TableProgressData) bool {
 // copiedRows reports whether a table's row copy made any progress.
 func copiedRows(table TableProgressData) bool {
 	return table.PercentComplete > 0 || table.RowsCopied > 0
-}
-
-// cancelledTablePhrase is a cancelled table's state: how far its row copy
-// had come when the cancel stopped it, or that it was never started.
-func cancelledTablePhrase(table TableProgressData) string {
-	switch {
-	case copiedRows(table):
-		return "Cancelled at " + ui.FormatRowCopyPercent(table.PercentComplete, table.RowsCopied, table.RowsTotal)
-	case tableBegan(table):
-		return "Cancelled"
-	default:
-		return "Cancelled (not started)"
-	}
 }
 
 // recoveringCopyPercent returns the least-progressed recovering table's copy
@@ -1892,6 +1879,7 @@ func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusComme
 	}
 
 	dialect := dialectForEngine(data.Engine, data.ApplyID)
+	applyFailed := state.IsState(data.State, state.Apply.Failed)
 
 	// What went wrong leads, then what landed, then what never ran — and a
 	// table's rows stay together so the reader meets each table once.
@@ -1961,7 +1949,7 @@ func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusComme
 		}
 
 		for _, t := range g.tables {
-			writeSummaryTableEntry(sb, dialect, t, labelCompleted, budget)
+			writeSummaryTableEntry(sb, dialect, t, labelCompleted, applyFailed, budget)
 		}
 
 		if groupCollapsed {
@@ -1998,7 +1986,7 @@ func groupStateEmoji(tables []TableProgressData) string {
 // unsuccessful apply, each row must answer "did this table make it?", so
 // completed tables are labeled explicitly. On a successful apply the header
 // already says every table completed, so the label would be noise.
-func writeSummaryTableEntry(sb *strings.Builder, dialect schema.Dialect, t TableProgressData, labelCompleted bool, budget *ddlBlockBudget) {
+func writeSummaryTableEntry(sb *strings.Builder, dialect schema.Dialect, t TableProgressData, labelCompleted, applyFailed bool, budget *ddlBlockBudget) {
 	normalized := state.NormalizeTaskStatus(t.Status)
 
 	switch normalized {
@@ -2023,11 +2011,7 @@ func writeSummaryTableEntry(sb *strings.Builder, dialect schema.Dialect, t Table
 	case state.Task.Reverted:
 		fmt.Fprintf(sb, "**%s** — Reverted\n", inlineCode(t.TableName))
 	case state.Task.Cancelled:
-		label := "Cancelled"
-		if copiedRows(t) {
-			label = fmt.Sprintf("Cancelled at %s", ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal))
-		}
-		fmt.Fprintf(sb, "**%s** — %s\n", inlineCode(t.TableName), label)
+		fmt.Fprintf(sb, "**%s** — %s\n", inlineCode(t.TableName), presentation.ReadCancelledTask(tableFacts(t, apitypes.BuildWork{}), tableBegan(t), applyFailed).Label)
 	default:
 		// Unknown or in-flight statuses still get a visible label — a bare
 		// table name reads as success, which is wrong for anything but

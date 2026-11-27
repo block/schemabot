@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -19,8 +20,10 @@ import (
 // checking the table's writes, whether it keeps the old rule's name or takes
 // a new one, and whether the drop and the add share a statement or run as
 // steps of their own. A SET NOT NULL helper the plan adds and later drops is
-// the plan's own, so its drop does not count. A step that never ran added
-// nothing, though the plan still validates what it would have added.
+// the plan's own, so its drop does not count, but on a table whose plan also
+// drops a rule the table had, the helper is kept with the rest and recorded
+// as held for that reason. A step that never ran added nothing, though the
+// plan still validates what it would have added.
 func TestCancelledArtifactTablesAttributesUnvalidatedConstraints(t *testing.T) {
 	apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-7", Database: "shop"}
 	task := func(table, ddl, taskState string) *storage.Task {
@@ -41,6 +44,11 @@ func TestCancelledArtifactTablesAttributesUnvalidatedConstraints(t *testing.T) {
 		task("users", "ALTER TABLE public.users VALIDATE CONSTRAINT users_name_not_null_check", state.Task.Failed),
 		task("users", "ALTER TABLE public.users ALTER COLUMN name SET NOT NULL", state.Task.Pending),
 		task("users", "ALTER TABLE public.users DROP CONSTRAINT users_name_not_null_check", state.Task.Pending),
+		task("members", "ALTER TABLE public.members DROP CONSTRAINT members_age_check", state.Task.Completed),
+		task("members", "ALTER TABLE public.members ADD CONSTRAINT members_name_not_null_check CHECK (name IS NOT NULL) NOT VALID", state.Task.Completed),
+		task("members", "ALTER TABLE public.members VALIDATE CONSTRAINT members_name_not_null_check", state.Task.Failed),
+		task("members", "ALTER TABLE public.members ALTER COLUMN name SET NOT NULL", state.Task.Pending),
+		task("members", "ALTER TABLE public.members DROP CONSTRAINT members_name_not_null_check", state.Task.Pending),
 		task("refunds", "ALTER TABLE public.refunds ADD CONSTRAINT refunds_order_id_fkey FOREIGN KEY (order_id) REFERENCES public.orders (id) NOT VALID", state.Task.Pending),
 		task("refunds", "ALTER TABLE public.refunds VALIDATE CONSTRAINT refunds_order_id_fkey", state.Task.Pending),
 	}
@@ -65,6 +73,12 @@ func TestCancelledArtifactTablesAttributesUnvalidatedConstraints(t *testing.T) {
 	assert.Equal(t, []string{"users_name_not_null_check"}, artifacts.addedConstraints["users"], "the plan drops only the helper it added, so the release may drop it")
 	assert.Equal(t, []string{"users_name_not_null_check"}, artifacts.validatedConstraints["users"])
 
+	assert.Empty(t, artifacts.addedConstraints["members"], "a helper on a table whose plan drops a rule it had is kept with the rest")
+	assert.Equal(t, map[string]string{"members_name_not_null_check": "its plan also drops a rule the table had"}, artifacts.heldConstraints["members"])
+	assert.Equal(t, map[string]string{"items_qty_check": "its plan also drops a rule the table had"}, artifacts.heldConstraints["items"])
+	assert.NotContains(t, artifacts.heldConstraints, "users", "a release that may drop the helper holds nothing")
+	assert.NotContains(t, artifacts.heldConstraints, "refunds", "a constraint no finished step added is not held")
+
 	assert.Empty(t, artifacts.addedConstraints["refunds"], "a step that never ran added nothing")
 	assert.Equal(t, []string{"refunds_order_id_fkey"}, artifacts.validatedConstraints["refunds"])
 }
@@ -86,4 +100,18 @@ func TestCancelledArtifactTablesRemovesNoConstraintOnAnUnreadTable(t *testing.T)
 	assert.Equal(t, []string{"orders"}, artifacts.tables, "the table's other artifacts are still released")
 	assert.Empty(t, artifacts.addedConstraints["orders"])
 	assert.Empty(t, artifacts.validatedConstraints["orders"])
+	assert.Equal(t, map[string]string{"orders_id_check": "SchemaBot could not read every statement of its plan"}, artifacts.heldConstraints["orders"])
+}
+
+// A constraint the release kept on purpose reads, in the apply log, as one
+// the schema change added, with the reason it is still there and the
+// statement that drops it.
+func TestHeldConstraintMessage(t *testing.T) {
+	msg := heldConstraintMessage(engine.EngineConstraint{
+		Table:   "members",
+		Name:    "members_name_not_null_check",
+		Effect:  "rejects writes that leave name NULL",
+		Removal: `ALTER TABLE "public"."members" DROP CONSTRAINT "members_name_not_null_check"`,
+	}, "failed", "its plan also drops a rule the table had")
+	assert.Equal(t, `Constraint members_name_not_null_check is still on members. The failed schema change added it, but its plan also drops a rule the table had, so SchemaBot kept every constraint on the table rather than risk leaving it with no rule. It rejects writes that leave name NULL until it is dropped. Drop it with: ALTER TABLE "public"."members" DROP CONSTRAINT "members_name_not_null_check"`, msg)
 }
