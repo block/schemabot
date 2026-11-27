@@ -112,6 +112,9 @@ const (
 type nativeApply struct {
 	rowSecurity      *pgstatement.DesiredWithRowSecurity
 	reviewedSecurity []string
+	// createsTable marks a row security apply that creates its table, in
+	// the same transaction as the row security.
+	createsTable     bool
 	namespace        string
 	table            string
 	sql              string
@@ -255,6 +258,16 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 	if err != nil {
 		slog.Warn("PostgreSQL apply admission rejected planned DDL", "database", req.Database, "table", tc.Table, "error", err)
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned DDL is not one statement or a valid greenfield create set", tc.Table)
+	}
+	if hasRLS {
+		creates, err := createsTableWithRowSecurity(tc.DDL)
+		if err != nil {
+			slog.Warn("PostgreSQL apply admission rejected planned DDL", "database", req.Database, "table", tc.Table, "error", err)
+			return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: classify the planned row security DDL: %w", tc.Table, err)
+		}
+		if creates {
+			return validateCreateWithRowSecurityApply(req)
+		}
 	}
 	if hasRLS {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: row security changes require one supported atomic operation for a single qualified table", tc.Table)
@@ -1784,6 +1797,15 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	}
 	defer pool.Close()
 
+	if change.rowSecurity != nil && change.createsTable {
+		_, err := executor.ExecuteReviewedCreateWithRowSecurity(ctx, pool, change.namespace, tableOwner, *change.rowSecurity, change.reviewedSecurity, executor.Budget{
+			LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
+		})
+		if err != nil {
+			return fmt.Errorf("create table %q.%q with its row security: %w", change.namespace, change.table, err)
+		}
+		return nil
+	}
 	if change.rowSecurity != nil {
 		_, err := executor.ExecuteReviewedRowSecurity(ctx, pool, change.namespace, *change.rowSecurity, change.reviewedSecurity, executor.Budget{
 			LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,

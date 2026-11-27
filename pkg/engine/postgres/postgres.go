@@ -340,7 +340,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 				continue
 			}
 			if rowSecurity, ok := file.RowSecurity(); ok {
-				rlsChanges, err := planRowSecurityOperation(ctx, pool, namespace, rowSecurity)
+				rlsChanges, err := planRowSecurityOperation(ctx, pool, namespace, rowSecurity, tableOwner)
 				if err != nil {
 					return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
 				}

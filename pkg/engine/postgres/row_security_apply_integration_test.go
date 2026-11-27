@@ -146,3 +146,81 @@ func TestEnginePlanRefusesDuplicateRowSecurityDeclarations(t *testing.T) {
  `).Scan(&predicate))
 	assert.Equal(t, "(id = 1)", predicate)
 }
+
+// A schema file that declares a new table with row security and a policy
+// plans as one change: the CREATE TABLE and its security statements, which
+// apply in one transaction, so the table never exists without its policy.
+// The table is new and holds no rows, so the change is not unsafe.
+func TestEngineCreateWithRowSecurityPlanAndApply(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "rls_create")
+	files := schema.SchemaFiles{"public": {Files: map[string]string{"documents.sql": `
+  CREATE TABLE documents (
+   id bigint PRIMARY KEY
+  );
+  ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON documents FOR SELECT USING (id = 1);
+ `}}}
+	eng := New()
+	plan, err := eng.Plan(t.Context(), &engine.PlanRequest{Database: "rls_create", Credentials: &engine.Credentials{DSN: dsn}, SchemaFiles: files})
+	require.NoError(t, err)
+	require.Len(t, plan.Changes, 1)
+	require.Len(t, plan.Changes[0].TableChanges, 1)
+	change := plan.Changes[0].TableChanges[0]
+	assert.Equal(t, "documents", change.Table)
+	assert.Equal(t, ddl.StatementCreateTable, change.Operation)
+	assert.False(t, change.IsUnsafe, "a new table holds no rows to expose")
+	assert.Contains(t, change.DDL, "CREATE TABLE")
+	assert.Contains(t, change.DDL, "ENABLE ROW LEVEL SECURITY")
+	assert.Contains(t, change.DDL, `CREATE POLICY "readers" ON "public"."documents"`)
+	var absent bool
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT to_regclass('public.documents') IS NULL").Scan(&absent))
+	assert.True(t, absent, "planning previews the create and rolls it back")
+
+	req := applyRequest(dsn, "documents", change.DDL)
+	req.SchemaFiles = files
+	result, err := eng.Apply(t.Context(), req)
+	require.NoError(t, err)
+	require.True(t, result.Accepted)
+	progress := awaitPostgresProgress(t, eng, "documents")
+	require.Equal(t, engine.StateCompleted, progress.State, progress.ErrorMessage)
+	var enabled bool
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT relrowsecurity FROM pg_class WHERE oid='public.documents'::regclass").Scan(&enabled))
+	assert.True(t, enabled)
+	var policy string
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT polname FROM pg_policy WHERE polrelid='public.documents'::regclass").Scan(&policy))
+	assert.Equal(t, "readers", policy)
+	again, err := eng.Plan(t.Context(), &engine.PlanRequest{Database: "rls_create", Credentials: &engine.Credentials{DSN: dsn}, SchemaFiles: files})
+	require.NoError(t, err)
+	assert.True(t, again.NoChanges)
+}
+
+// An apply runs the reviewed create only when the reviewed desired file still
+// derives the same statements. A schema file edited after the review derives
+// a different sequence, so the apply refuses and creates nothing.
+func TestEngineCreateWithRowSecurityRefusesAnUnreviewedSequence(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "rls_create_changed")
+	reviewed := schema.SchemaFiles{"public": {Files: map[string]string{"documents.sql": `
+  CREATE TABLE documents (id bigint PRIMARY KEY);
+  ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON documents FOR SELECT USING (id = 1);
+ `}}}
+	eng := New()
+	plan, err := eng.Plan(t.Context(), &engine.PlanRequest{Database: "rls_create_changed", Credentials: &engine.Credentials{DSN: dsn}, SchemaFiles: reviewed})
+	require.NoError(t, err)
+	require.Len(t, plan.Changes, 1)
+	change := plan.Changes[0].TableChanges[0]
+	req := applyRequest(dsn, "documents", change.DDL)
+	req.SchemaFiles = schema.SchemaFiles{"public": {Files: map[string]string{"documents.sql": `
+  CREATE TABLE documents (id bigint PRIMARY KEY);
+  ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON documents FOR SELECT USING (id = 2);
+ `}}}
+	_, err = eng.Apply(t.Context(), req)
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "documents")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.False(t, progress.Retryable)
+	var absent bool
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT to_regclass('public.documents') IS NULL").Scan(&absent))
+	assert.True(t, absent)
+}

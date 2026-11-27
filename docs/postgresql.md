@@ -72,7 +72,7 @@ early release.
 - Dropping a table whose schema file was deleted, after you approve the drop
   with `--allow-unsafe`. See [Tables with no schema file](#tables-with-no-schema-file).
 - Adding labels to an existing enum type. See [Enum types](#enum-types).
-- Row-level security policies on an existing table.
+- Row-level security policies on an existing table, or on a new table.
 - `schemabot init` and `schemabot pull` for an existing database.
 - PostgreSQL as the database that stores SchemaBot's own state.
 
@@ -86,7 +86,7 @@ early release.
 | Creating an enum type, or removing or reordering its labels | Blocked |
 | `stop`, `start`, `cutover`, deferred cutover, `revert`, `skip-revert` | Not available. Only an index build can be cancelled. See [Unsupported workflow features](#unsupported-workflow-features) |
 | Some changes to a partitioned table's parent | Refused when the apply runs. See [Partitioned tables](#partitioned-tables) |
-| Row-level security on a new table, or mixed with structural changes | Blocked. A namespace with managed RLS cannot be rolled back. See [Row-level security](#row-level-security) |
+| Row-level security mixed with structural changes on an existing table | Blocked. A namespace with managed RLS cannot be rolled back. See [Row-level security](#row-level-security) |
 | Pulling every table shape | `pull` skips a table it cannot write completely and names it, rather than writing a partial file. `onboard` and `init` add it to `ignore_tables`. See [Schema pull](#schema-pull) |
 | Detailed catalog output from the schema intelligence API | Not available |
 
@@ -209,6 +209,7 @@ If your tables belong to a dedicated owner role, read
 | A new table, with its indexes | Runs together: the table, then its indexes, built without `CONCURRENTLY` because nothing reads the table yet. See [Greenfield tables](#greenfield-tables) |
 | A new label on an existing enum type | Runs as `ALTER TYPE ... ADD VALUE`, one label per step, before the table changes. Creating a type or removing a label fails the plan. See [Enum types](#enum-types) |
 | Row-level security policies on an existing table | Run in one transaction, after you explicitly approve them, because they change who can read rows. See [Row-level security](#row-level-security) |
+| A new table with row-level security | Runs in one transaction: the table, its RLS setting, and its policies, so the table never exists without them. It holds no rows, so it needs no approval. See [Row-level security](#row-level-security) |
 | Adding a foreign key | Runs in two steps: `ADD CONSTRAINT ... NOT VALID`, then `VALIDATE CONSTRAINT`, which checks existing rows while writes continue. See [Foreign keys](#foreign-keys) |
 | Dropping a foreign key | Shown in the plan, but blocked. See [Foreign keys](#foreign-keys) |
 | Making a column `NOT NULL` | Runs in four steps on a table up to the size limit: a helper `CHECK (column IS NOT NULL) NOT VALID`, `VALIDATE CONSTRAINT`, which checks existing rows while writes continue, `SET NOT NULL`, which uses the validated check instead of scanning, and the helper's drop. If a row holds `NULL`, the validation fails and names the helper. Fix those rows and SchemaBot retries the validation on its own. If its retries run out first, drop the helper outside SchemaBot, then plan and apply again |
@@ -1176,6 +1177,14 @@ are one operation:
   a busy table refuses rather than waits. Keep policy changes small. A plan
   with no RLS change takes no exclusive lock and needs no ownership.
 
+**A new table with RLS.** A file that declares a new table with RLS clauses
+plans as one change: the `CREATE TABLE`, then its RLS setting, policies, and
+comments. Planning runs the create on the target and rolls it back, so the
+plan shows the exact SQL the apply runs. The apply derives that SQL again
+from the reviewed file and runs it in one transaction only if the two match.
+A mismatch, or a table of that name created since the plan, refuses the
+apply; plan again.
+
 **Files without RLS clauses.** A file that declares only the table and its
 indexes still works on a table with live RLS. It manages columns and indexes
 and leaves policies alone. Leaving the RLS clauses out does **not** disable
@@ -1184,8 +1193,7 @@ policies.
 
 **Not supported yet:**
 
-- RLS on a new table
-- RLS changes and structural changes in the same plan
+- RLS changes and structural changes to an existing table in the same plan
 - Rolling back a plan for a namespace that has tables with managed RLS.
   SchemaBot never strips policies to make a plan rollback-capable
 - Running a reviewed RLS change on a target whose physical schema name
