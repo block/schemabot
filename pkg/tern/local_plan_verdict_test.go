@@ -2,6 +2,7 @@ package tern
 
 import (
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -221,32 +222,6 @@ func TestMaterializedPlanKeepsDispatchedBlockedVerdict(t *testing.T) {
 	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
 	assert.Equal(t, "the primary's engine refuses this statement", change.ModeReason)
 	require.Error(t, got.BlockedApplyError())
-}
-
-// When the re-plan holds the same change twice with different verdicts, the
-// blocked one wins regardless of order: admitting a plan one copy would refuse
-// is the failure the gate exists to prevent.
-func TestReplannedChangesRecordBlockedWins(t *testing.T) {
-	key := driftChangeKey{namespace: "testapp", table: "users", operation: "alter", ddl: "ALTER TABLE users ADD COLUMN email varchar(255)"}
-	statement := "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
-	blocked := replannedChange{ddl: statement, mode: engine.ExecutionModeBlocked, reason: localBlockedReason}
-	direct := replannedChange{ddl: statement, mode: engine.ExecutionModeDirect, reason: "direct"}
-	unjudged := replannedChange{ddl: statement}
-
-	blockedFirst := replannedChanges{byChange: map[driftChangeKey]replannedChange{}}
-	blockedFirst.record(key, blocked)
-	blockedFirst.record(key, unjudged)
-	assert.Equal(t, blocked, blockedFirst.byChange[key])
-
-	blockedLast := replannedChanges{byChange: map[driftChangeKey]replannedChange{}}
-	blockedLast.record(key, direct)
-	blockedLast.record(key, blocked)
-	assert.Equal(t, blocked, blockedLast.byChange[key])
-
-	neitherBlocked := replannedChanges{byChange: map[driftChangeKey]replannedChange{}}
-	neitherBlocked.record(key, direct)
-	neitherBlocked.record(key, unjudged)
-	assert.Equal(t, direct, neitherBlocked.byChange[key], "the first non-blocked change stands")
 }
 
 const dropLegacyIDReason = "DROP COLUMN removes data"
@@ -618,33 +593,6 @@ func TestSameTextShardVerdictNotBorrowedFromSibling(t *testing.T) {
 	assert.Empty(t, scope.ddlChanges[0].UnsafeReason)
 }
 
-// When the re-plan holds the same change twice and only one copy is unsafe,
-// the kept copy is unsafe regardless of order, as a blocked copy wins: a
-// verdict that would require the opt-in is never dropped by a duplicate.
-func TestReplannedChangesRecordUnsafeWins(t *testing.T) {
-	key := driftChangeKey{namespace: "testapp", table: "users", operation: "alter", ddl: "x"}
-	safe := replannedChange{ddl: "a", mode: engine.ExecutionModeDirect}
-	unsafe := replannedChange{ddl: "a", mode: engine.ExecutionModeDirect, unsafe: true, unsafeReason: "drops data"}
-
-	unsafeLast := replannedChanges{byChange: map[driftChangeKey]replannedChange{}}
-	unsafeLast.record(key, safe)
-	unsafeLast.record(key, unsafe)
-	assert.Equal(t, unsafe, unsafeLast.byChange[key])
-
-	unsafeFirst := replannedChanges{byChange: map[driftChangeKey]replannedChange{}}
-	unsafeFirst.record(key, unsafe)
-	unsafeFirst.record(key, safe)
-	assert.Equal(t, unsafe, unsafeFirst.byChange[key])
-
-	// A blocked copy is kept for its verdict and still takes the unsafe flag
-	// of the copy it displaced.
-	blocked := replannedChange{ddl: "a", mode: engine.ExecutionModeBlocked, reason: localBlockedReason}
-	blockedLast := replannedChanges{byChange: map[driftChangeKey]replannedChange{}}
-	blockedLast.record(key, unsafe)
-	blockedLast.record(key, blocked)
-	assert.Equal(t, replannedChange{ddl: "a", mode: engine.ExecutionModeBlocked, reason: localBlockedReason, unsafe: true, unsafeReason: "drops data"}, blockedLast.byChange[key])
-}
-
 // The re-plan's unsafe verdict only ever tightens a change: an unsafe re-plan
 // marks a safe change unsafe, and a safe re-plan leaves a change already
 // marked unsafe, and its reason, as they were.
@@ -672,25 +620,84 @@ func TestReplannedChangeStampOntoOnlyTightensUnsafe(t *testing.T) {
 	assert.Empty(t, safe.UnsafeReason)
 }
 
-// A re-plan that produces one change twice with records that disagree cannot
-// say which record the change runs against, so materializing it is refused.
-func TestStampReplannedTablesRefusesConflictingEngineMetadata(t *testing.T) {
+// A re-plan can hold the same statement twice on one table, each copy acting
+// on a different object: a PostgreSQL SET NOT NULL re-planned after a failed
+// attempt drops the helper the failure left and drops the new helper at the
+// end. Each reviewed copy is stamped from its own re-planned copy, in plan
+// order, so both copies materialize with the record they were reviewed with
+// and each keeps its own verdict.
+func TestStampReplannedTablesPairsRepeatedChangesInOrder(t *testing.T) {
 	client := newPlanMaterializeClient(&fakePlanStore{})
 	parser, err := client.statementParser()
 	require.NoError(t, err)
-	const statement = "ALTER TABLE `users` DROP COLUMN `legacy_id`"
+	const statement = "ALTER TABLE `notes` DROP CONSTRAINT `notes_body_not_null`"
 	canon, err := canonicalDDLForDrift(parser, statement)
 	require.NoError(t, err)
-	key := driftChangeKey{namespace: client.planNamespace(""), table: "users", operation: "alter", ddl: canon}
+	key := driftChangeKey{namespace: client.planNamespace(""), table: "notes", operation: "alter", ddl: canon}
+	leftover := map[string]string{"helper": "leftover"}
+	added := map[string]string{"helper": "added"}
 
-	replanned := replannedChanges{byChange: map[driftChangeKey]replannedChange{}}
-	replanned.record(key, replannedChange{ddl: statement, metadata: map[string]string{"record": "a"}})
-	replanned.record(key, replannedChange{ddl: statement, metadata: map[string]string{"record": "b"}})
+	replanned := replannedChanges{byChange: map[driftChangeKey][]replannedChange{}}
+	replanned.record(key, replannedChange{ddl: statement, mode: engine.ExecutionModeDirect, reason: "drops the leftover helper", metadata: leftover})
+	replanned.record(key, replannedChange{ddl: statement, mode: engine.ExecutionModeBlocked, reason: localBlockedReason, metadata: added})
 
-	tables := []storage.TableChange{{Table: "users", Operation: "alter", DDL: statement}}
-	err = client.stampReplannedTables(parser, tables, replanned)
+	tables := []storage.TableChange{
+		{Table: "notes", Operation: "alter", DDL: statement, Metadata: leftover},
+		{Table: "notes", Operation: "alter", DDL: statement, Metadata: added},
+	}
+	require.NoError(t, client.stampReplannedTables(parser, tables, replanned))
+	assert.Equal(t, engine.ExecutionModeDirect, tables[0].ExecutionMode)
+	assert.Equal(t, "drops the leftover helper", tables[0].ModeReason)
+	assert.Equal(t, engine.ExecutionModeBlocked, tables[1].ExecutionMode, "the second copy keeps its own blocked verdict")
+	assert.Equal(t, localBlockedReason, tables[1].ModeReason)
+
+	crossed := []storage.TableChange{
+		{Table: "notes", Operation: "alter", DDL: statement, Metadata: added},
+		{Table: "notes", Operation: "alter", DDL: statement, Metadata: leftover},
+	}
+	err = client.stampReplannedTables(parser, crossed, replanned)
+	require.Error(t, err, "copies whose records pair crossed are refused rather than run against the other copy's object")
+	assert.Contains(t, err.Error(), "the objects this change acts on are not the ones the plan reviewed")
+
+	extra := append(slices.Clone(tables), storage.TableChange{Table: "notes", Operation: "alter", DDL: statement, Metadata: added})
+	err = client.stampReplannedTables(parser, extra, replanned)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "more than one copy of a change with different engine records")
+	assert.Contains(t, err.Error(), "no re-planned change for one the drift comparison matched")
+}
+
+// A non-primary deployment materializes a plan that drops the same helper
+// constraint twice on one table, each drop reviewed against a different
+// helper. Its own re-plan produces the same two drops with the same two
+// records, so the plan materializes with each drop carrying its own record.
+func TestMaterializedPlanKeepsEachRepeatedChangesRecord(t *testing.T) {
+	const statement = "ALTER TABLE `notes` DROP CONSTRAINT `notes_body_not_null`"
+	leftover := map[string]string{"helper": "leftover"}
+	added := map[string]string{"helper": "added"}
+	recomputed := &engine.PlanResult{Changes: []engine.SchemaChange{{
+		Namespace: "testapp",
+		TableChanges: []engine.TableChange{
+			{Table: "notes", Operation: ddl.StatementAlterTable, DDL: statement, Metadata: leftover},
+			{Table: "notes", Operation: ddl.StatementAlterTable, DDL: statement, Metadata: added},
+		},
+	}}}
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 23}
+	c := newPlanMaterializeClientWithPlan(store, recomputed)
+
+	got, replanned, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+		PlanId: "plan_repeated_drop",
+		DdlChanges: []*ternv1.TableChange{
+			{TableName: "notes", Ddl: statement, ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp", Metadata: leftover},
+			{TableName: "notes", Ddl: statement, ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp", Metadata: added},
+		},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.True(t, replanned)
+	tables := store.created.Namespaces["testapp"].Tables
+	require.Len(t, tables, 2)
+	assert.Equal(t, leftover, tables[0].Metadata)
+	assert.Equal(t, added, tables[1].Metadata)
 }
 
 // A blocked verdict on one shard's copy of a table already seen on another

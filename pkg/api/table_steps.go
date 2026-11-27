@@ -113,7 +113,9 @@ func buildTableStepOperationGroups(
 		stepOf[table] = i + 1
 	}
 	changesByMember := make([]map[int][]storage.TableChange, len(members))
+	ordinalsByMember := make([]*storage.PlanChangeOrdinals, len(members))
 	for m, member := range members {
+		ordinalsByMember[m] = storage.NewPlanChangeOrdinals(member.Plan)
 		changesByMember[m] = map[int][]storage.TableChange{}
 		for _, change := range applyTaskChanges(member.Plan) {
 			step := stepOf[change.Table]
@@ -137,7 +139,7 @@ func buildTableStepOperationGroups(
 			operation.RolloutStep = step
 			groups = append(groups, &storage.ApplyOperationWithTasks{
 				Operation: operation,
-				Tasks:     buildApplyTasks(member.Plan, changes, environment, applyOpts, "", now),
+				Tasks:     buildApplyTasks(member.Plan, ordinalsByMember[m], changes, environment, applyOpts, "", now),
 			})
 		}
 	}
