@@ -679,7 +679,7 @@ func (c *LocalClient) runEngineTaskAttempt(ctx context.Context, apply *storage.A
 	request.Changes[0].TableChanges[0].Metadata = metadata
 	needsFiles, err := c.taskNeedsRowSecurityFiles(task)
 	if err != nil {
-		return c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskFailed(ctx, task, fmt.Sprintf("resolve row security parser: %v", err)))
+		return c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskFailed(ctx, task, fmt.Sprintf("read whether the task's DDL declares row security: %v", err)))
 	}
 	if needsFiles {
 		planID, err := planIDForTasks(apply, []*storage.Task{task})

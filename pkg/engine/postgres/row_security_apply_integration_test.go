@@ -150,7 +150,8 @@ func TestEnginePlanRefusesDuplicateRowSecurityDeclarations(t *testing.T) {
 // A schema file that declares a new table with row security and a policy
 // plans as one change: the CREATE TABLE and its security statements, which
 // apply in one transaction, so the table never exists without its policy.
-// The table is new and holds no rows, so the change is not unsafe.
+// The table is new and holds no rows, so the change is not unsafe. Rolling
+// the plan back drops the table, which is unsafe.
 func TestEngineCreateWithRowSecurityPlanAndApply(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "rls_create")
 	files := schema.SchemaFiles{"public": {Files: map[string]string{"documents.sql": `
@@ -192,6 +193,21 @@ func TestEngineCreateWithRowSecurityPlanAndApply(t *testing.T) {
 	again, err := eng.Plan(t.Context(), &engine.PlanRequest{Database: "rls_create", Credentials: &engine.Credentials{DSN: dsn}, SchemaFiles: files})
 	require.NoError(t, err)
 	assert.True(t, again.NoChanges)
+
+	// The namespace had no table with row security when the plan captured
+	// its rollback originals, so the plan can be rolled back. The rollback
+	// drops the new table and its policies with it, which never exposes a
+	// row, and is unsafe, so it needs the operator's acknowledgement.
+	require.True(t, plan.Changes[0].OriginalFilesCaptured)
+	assert.Empty(t, plan.Changes[0].RollbackBlockers)
+	assert.Empty(t, plan.Changes[0].OriginalFiles, "the namespace had no table before the plan")
+	rollback, err := eng.Plan(t.Context(), &engine.PlanRequest{Database: "rls_create", Credentials: &engine.Credentials{DSN: dsn},
+		SchemaFiles: schema.SchemaFiles{"public": {Files: plan.Changes[0].OriginalFiles}}})
+	require.NoError(t, err)
+	require.Len(t, rollback.Changes, 1)
+	require.Len(t, rollback.Changes[0].TableChanges, 1)
+	assert.Equal(t, "DROP TABLE public.documents", rollback.Changes[0].TableChanges[0].DDL)
+	assert.True(t, rollback.Changes[0].TableChanges[0].IsUnsafe)
 }
 
 // An apply runs the reviewed create only when the reviewed desired file still

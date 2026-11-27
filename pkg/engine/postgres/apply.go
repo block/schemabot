@@ -260,17 +260,18 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned DDL is not one statement or a valid greenfield create set", tc.Table)
 	}
 	if hasRLS {
+		// A new table with row security is created with its policies in one
+		// reviewed transaction. Any other row security change on this path
+		// is refused: it needs one supported atomic operation.
 		creates, err := createsTableWithRowSecurity(tc.DDL)
 		if err != nil {
 			slog.Warn("PostgreSQL apply admission rejected planned DDL", "database", req.Database, "table", tc.Table, "error", err)
 			return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: classify the planned row security DDL: %w", tc.Table, err)
 		}
-		if creates {
-			return validateCreateWithRowSecurityApply(req)
+		if !creates {
+			return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: row security changes require one supported atomic operation for a single qualified table", tc.Table)
 		}
-	}
-	if hasRLS {
-		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: row security changes require one supported atomic operation for a single qualified table", tc.Table)
+		return validateCreateWithRowSecurityApply(req)
 	}
 	if req.Options["defer_cutover"] == "true" {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: deferred cutover is unsupported", tc.Table)

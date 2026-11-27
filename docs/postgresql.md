@@ -86,7 +86,7 @@ early release.
 | Creating an enum type, or removing or reordering its labels | Blocked |
 | `stop`, `start`, `cutover`, deferred cutover, `revert`, `skip-revert` | Not available. Only an index build can be cancelled. See [Unsupported workflow features](#unsupported-workflow-features) |
 | Some changes to a partitioned table's parent | Refused when the apply runs. See [Partitioned tables](#partitioned-tables) |
-| Row-level security mixed with structural changes on an existing table | Blocked. A namespace with managed RLS cannot be rolled back. See [Row-level security](#row-level-security) |
+| Row-level security mixed with structural changes on an existing table | Blocked. A plan for a namespace that already has managed RLS cannot be rolled back. See [Row-level security](#row-level-security) |
 | Pulling every table shape | `pull` skips a table it cannot write completely and names it, rather than writing a partial file. `onboard` and `init` add it to `ignore_tables`. See [Schema pull](#schema-pull) |
 | Detailed catalog output from the schema intelligence API | Not available |
 
@@ -1194,8 +1194,11 @@ policies.
 **Not supported yet:**
 
 - RLS changes and structural changes to an existing table in the same plan
-- Rolling back a plan for a namespace that has tables with managed RLS.
-  SchemaBot never strips policies to make a plan rollback-capable
+- Rolling back a plan for a namespace that already had tables with managed
+  RLS. SchemaBot never strips policies to make a plan rollback-capable. A plan
+  that creates the namespace's first RLS table can be rolled back: the
+  rollback drops that table and its policies, which is unsafe and needs
+  `--allow-unsafe`
 - Running a reviewed RLS change on a target whose physical schema name
   differs. That target needs its own plan and review
 - Direct RLS apply requests that lack the stored schema files
