@@ -222,6 +222,44 @@ func TestTasks(t *testing.T, h Harness) {
 		assert.Nil(t, gotUnsized.EstimatedRows, "a task created without a row estimate reads back without one")
 	})
 
+	// A task's plan change ordinal is written once, when the task is created,
+	// and read back with it. A task created without one reads back as 0, and
+	// a progress update never changes it.
+	t.Run("PlanChangeOrdinal_WrittenAtCreate_SurvivesUpdate", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "task_ordinal_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_task_ordinal", 903)
+		now := time.Now().UTC().Truncate(time.Second)
+
+		cleanup := newTask(apply, "task_ordinal_cleanup", "notes", now)
+		cleanup.PlanChangeOrdinal = 5
+		_, err := store.Tasks().Create(ctx, cleanup)
+		require.NoError(t, err)
+		legacy := newTask(apply, "task_ordinal_legacy", "users", now)
+		_, err = store.Tasks().Create(ctx, legacy)
+		require.NoError(t, err)
+
+		got, err := store.Tasks().Get(ctx, cleanup.TaskIdentifier)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, 5, got.PlanChangeOrdinal)
+
+		got.PlanChangeOrdinal = 0
+		got.State = state.Task.Running
+		require.NoError(t, store.Tasks().Update(ctx, got))
+		updated, err := store.Tasks().Get(ctx, cleanup.TaskIdentifier)
+		require.NoError(t, err)
+		require.NotNil(t, updated)
+		assert.Equal(t, state.Task.Running, updated.State)
+		assert.Equal(t, 5, updated.PlanChangeOrdinal, "a progress update never changes which change the task runs")
+
+		gotLegacy, err := store.Tasks().Get(ctx, legacy.TaskIdentifier)
+		require.NoError(t, err)
+		require.NotNil(t, gotLegacy)
+		assert.Zero(t, gotLegacy.PlanChangeOrdinal)
+	})
+
 	t.Run("Create_Get_Update", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)

@@ -34,6 +34,7 @@ CREATE TABLE `tasks` (
   `cutover_attempts` int NOT NULL DEFAULT '0',
   `is_instant` tinyint(1) DEFAULT '0',
   `engine_migration_id` varchar(255) DEFAULT NULL,
+  `plan_change_ordinal` int NOT NULL DEFAULT '0',
   `started_at` datetime DEFAULT NULL,
   `completed_at` datetime DEFAULT NULL,
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,

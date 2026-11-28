@@ -2,6 +2,7 @@ package commands
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -108,6 +109,47 @@ func TestPlanCmd_ServerErrorHumanOutput(t *testing.T) {
 	assert.Contains(t, plainOutput, "read secret file /secrets/db-passwords/test-password")
 }
 
+// A plan refused for the schema files as written prints the refusal and its
+// code, without the HTTP status: the fix is an edit to the files, not a retry.
+func TestPlanCmd_SchemaRefusalOmitsTheHTTPStatus(t *testing.T) {
+	const refusal = `plan failed: plan PostgreSQL table "h_coll": unsupported schema change: column "code" collation change`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/api/plan", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		body, err := json.Marshal(apitypes.ErrorResponse{Error: refusal, ErrorCode: apitypes.ErrCodeSchemaRefused})
+		require.NoError(t, err)
+		_, err = w.Write(body)
+		require.NoError(t, err)
+	}))
+	t.Cleanup(server.Close)
+
+	cmd := PlanCmd{SchemaDir: writeTestSchemaDir(t), Environment: "staging"}
+	var runErr error
+	output := captureStdout(func() {
+		runErr = cmd.Run(&Globals{Endpoint: server.URL})
+	})
+
+	require.ErrorIs(t, runErr, ErrSilent)
+	plainOutput := stripAnsi(output)
+	assert.Contains(t, plainOutput, "Plan failed\n  Database: testdb\n  Environment: staging\n  Error code: schema_refused\n", plainOutput)
+	assert.Contains(t, plainOutput, `column "code" collation change`, plainOutput)
+	assert.NotContains(t, plainOutput, "API status", plainOutput)
+}
+
+// A plan refused for its schema files reports the API's schema_refused code
+// in --json output, so an agent does not read the refusal as a server fault to
+// retry; any other failure keeps the generic api_error code.
+func TestPlanErrorCode(t *testing.T) {
+	refused := fmt.Errorf("plan staging: %w", &client.APIError{Status: http.StatusUnprocessableEntity, ErrorCode: apitypes.ErrCodeSchemaRefused})
+	assert.Equal(t, apitypes.ErrCodeSchemaRefused, planErrorCode(refused))
+
+	uncoded := &client.APIError{Status: http.StatusInternalServerError}
+	assert.Equal(t, "api_error", planErrorCode(uncoded))
+
+	assert.Equal(t, "api_error", planErrorCode(errors.New("dial tcp: connection refused")))
+}
+
 func TestPlanCmd_EnvironmentDiscoveryServerErrorHumanOutput(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "/api/databases/testdb/environments", r.URL.Path)
@@ -173,6 +215,24 @@ func TestPlanFingerprint_IdenticalPlans(t *testing.T) {
 	fp2 := planFingerprint(plan2)
 
 	assert.Equal(t, fp2, fp1, "Expected identical fingerprints for identical plans")
+}
+
+// Two environments that run the same DDL but where only one refuses it are
+// different plans to read: rendering them as one would attribute one
+// environment's refusal to the other, or hide it.
+func TestPlanFingerprint_RefusalSetsPlansApart(t *testing.T) {
+	change := func(mode, reason string) *apitypes.TableChangeResponse {
+		return &apitypes.TableChangeResponse{
+			DDL: "ALTER TABLE events ADD COLUMN kind text", ChangeType: "ALTER", TableName: "events",
+			ExecutionMode: mode, ModeReason: reason,
+		}
+	}
+	staging := planFingerprint(planWithTables(change("", "")))
+	production := planFingerprint(planWithTables(change("blocked", "the table is 1.4 GiB")))
+	otherReason := planFingerprint(planWithTables(change("blocked", "the table is 2.0 GiB")))
+
+	assert.NotEqual(t, staging, production, "a refusal on one environment only sets the plans apart")
+	assert.NotEqual(t, production, otherReason, "refusals for different reasons set the plans apart")
 }
 
 func TestPlanFingerprint_DifferentPlans(t *testing.T) {

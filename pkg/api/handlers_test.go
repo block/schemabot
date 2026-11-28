@@ -639,6 +639,41 @@ func (s *memoryControlRequestStore) GetByOperation(_ context.Context, applyID in
 	return nil, nil
 }
 
+// ListPending and ListSettled return the latest request of each operation on
+// the apply, filtered by whether it is pending, ordered by operation.
+func (s *memoryControlRequestStore) ListPending(_ context.Context, applyID int64) ([]*storage.ApplyControlRequest, error) {
+	return s.latestByOperation(applyID, true), nil
+}
+
+func (s *memoryControlRequestStore) ListSettled(_ context.Context, applyID int64) ([]*storage.ApplyControlRequest, error) {
+	return s.latestByOperation(applyID, false), nil
+}
+
+func (s *memoryControlRequestStore) ListByApply(_ context.Context, applyID int64) ([]*storage.ApplyControlRequest, error) {
+	return append(s.latestByOperation(applyID, true), s.latestByOperation(applyID, false)...), nil
+}
+
+func (s *memoryControlRequestStore) latestByOperation(applyID int64, pending bool) []*storage.ApplyControlRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	latest := make(map[storage.ControlOperation]*storage.ApplyControlRequest)
+	for _, req := range s.requests {
+		if req.ApplyID == applyID {
+			latest[req.Operation] = req
+		}
+	}
+	var out []*storage.ApplyControlRequest
+	for _, req := range latest {
+		if (req.Status == storage.ControlRequestPending) == pending {
+			out = append(out, cloneControlRequest(req))
+		}
+	}
+	slices.SortFunc(out, func(a, b *storage.ApplyControlRequest) int {
+		return strings.Compare(string(a.Operation), string(b.Operation))
+	})
+	return out
+}
+
 func (s *memoryControlRequestStore) ListStrandedPending(context.Context, int) ([]*storage.StrandedControlRequest, error) {
 	return nil, nil
 }
@@ -5884,6 +5919,32 @@ func TestValidateRollbackSourceApplyRejectsPlanWithoutOriginalFiles(t *testing.T
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no stored original schema files")
+}
+
+// A plan that could not save a namespace's schema recorded which tables kept
+// it from saving. The refused rollback names them with why, and names the way
+// to undo the change.
+func TestValidateRollbackSourceApplyNamesTheTablesThatKeptThePlanFromSaving(t *testing.T) {
+	now := time.Now().UTC()
+	apply := rollbackGuardrailApply("apply_blocked", 1, 10, now)
+	plan := rollbackGuardrailPlan(10, false)
+	plan.Namespaces["orders"].RollbackBlockers = []storage.RollbackBlocker{
+		{Table: "documents", Reason: "row security is managed on this table"},
+		{Table: "notes", Reason: "row security is managed on this table"},
+	}
+	svc := newRollbackGuardrailService(apply, plan, []*storage.Task{rollbackGuardrailTask(1, 10, now)})
+
+	_, _, err := svc.ValidateRollbackSourceApply(t.Context(), RollbackSourceRequest{
+		ApplyIdentifier: "apply_blocked",
+		Environment:     "staging",
+		Repository:      "org/repo",
+		PullRequest:     1,
+	})
+
+	require.Error(t, err)
+	assert.Equal(t, "apply apply_blocked can't be rolled back: when it was planned, SchemaBot couldn't save the current schema of these tables in namespace orders: "+
+		"documents (row security is managed on this table), notes (row security is managed on this table). "+
+		"To undo the change, revert the schema files in a new pull request.", err.Error())
 }
 
 func TestValidateRollbackSourceApplyRejectsPlannerSourceMismatchForOlderApply(t *testing.T) {

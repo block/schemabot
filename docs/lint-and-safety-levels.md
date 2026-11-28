@@ -257,8 +257,10 @@ Blocked changes sit above unsafe changes on the ladder: the engine cannot
 execute the statement at all, so an apply is guaranteed to fail on it. There is
 no flag that lets a blocked change through — the guidance is to rewrite the
 statement as a supported schema change. Blocked changes render on the plan
-comment and again on the locked apply comment, and any apply command is
-rejected up front while they are present. The plan comment offers no apply
+comment, on the locked apply comment, and at the end of `schemabot plan`, which
+exits non-zero. Both surfaces list the same changes for the same reasons, and
+statements on one table refused for one reason are named once with their count.
+Any apply command is rejected up front while they are present. The plan comment offers no apply
 command for an environment with a blocked change; its footer offers the
 re-plan to run once the statement is rewritten. Local apply admission re-checks the
 whole stored plan before creating or attaching apply work, so a dispatch for

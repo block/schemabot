@@ -527,11 +527,11 @@ func TestNewLocalTernClient_ConfiguresPostgresTableSizeLimit(t *testing.T) {
 	assert.Equal(t, limit, eng.TableSizeLimit())
 }
 
-// The server-level concurrent index bound reaches the engine of every local
+// The server-level concurrent index and validation bounds reach the engine of every local
 // client the control plane builds, so a configured value governs concurrent
 // builds instead of silently reverting to the default.
 func TestNewLocalTernClient_ConfiguresPostgresConcurrentIndexMaxDuration(t *testing.T) {
-	cfg := &ServerConfig{Postgres: PostgresConfig{ConcurrentIndexMaxDuration: "36h"}}
+	cfg := &ServerConfig{Postgres: PostgresConfig{ConcurrentIndexMaxDuration: "36h", ValidateMaxDuration: "12h"}}
 	service := New(nil, cfg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	envConfig := EnvironmentConfig{DSN: "postgres://localhost:5432/orders"}
@@ -543,6 +543,7 @@ func TestNewLocalTernClient_ConfiguresPostgresConcurrentIndexMaxDuration(t *test
 	eng, ok := lc.Engine().(*postgresengine.Engine)
 	require.True(t, ok)
 	assert.Equal(t, 36*time.Hour, eng.ConcurrentIndexMaxDuration())
+	assert.Equal(t, 12*time.Hour, eng.ValidateMaxDuration())
 }
 
 // namedProgressObserver gives each test observer its own identity so the

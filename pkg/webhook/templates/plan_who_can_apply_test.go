@@ -9,10 +9,58 @@ import (
 )
 
 // With PR command authorization on, the plan comment names who can run its
-// apply right under the apply command, so a PR author who is not listed asks
-// an operator to review and apply in one pass instead of finding out from a
-// refused apply. Principals render as inline code, never as @-mentions, so a
-// plan posted on every push does not notify every listed team.
+// apply under its heading, before the DDL, so a PR author who is not listed
+// asks an operator to review and apply in one pass instead of finding out at
+// the end of the comment or from a refused apply. It says so once: the footer
+// keeps only the apply command. A reader the apply gate's check denied is
+// named as unable to run it; when the check could not run, the comment says
+// only who can, which is still true. A reader the gate admits sees nothing.
+func TestPlanCommentWhoCanApplyLeadsThePlan(t *testing.T) {
+	plan := PlanCommentData{
+		Database: "orders", Environment: "staging", DatabaseType: "mysql", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{Keyspace: "orders", Statements: []string{"ALTER TABLE `orders` ADD COLUMN `note` varchar(255);"}}},
+	}
+	principals := ApplyAuthorizationData{OperatorPrincipals: []string{"acme/orders-operators"}}
+	list := "- Operators: `acme/orders-operators`\n"
+	tests := []struct {
+		name string
+		auth *ApplyAuthorizationData
+		want string
+	}{
+		{name: "authorized reader", auth: nil},
+		{
+			name: "unauthorized reader",
+			auth: &ApplyAuthorizationData{OperatorPrincipals: principals.OperatorPrincipals, DeniedReader: "octocat"},
+			want: "🔐 **`octocat` cannot run `schemabot apply` for `orders`.** Only this team can. Ask a member to run it:\n" + list,
+		},
+		{
+			name: "reader's authorization could not be checked",
+			auth: &principals,
+			want: "🔐 Only this team can run `schemabot apply` for `orders`. Ask a member to run it:\n" + list,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := plan
+			data.ApplyAuthorization = tt.auth
+			out := RenderPlanComment(data)
+			_, footer, _ := strings.Cut(out, "\n---\n")
+			assert.Equal(t, "\n▶️ **To apply**, comment:\n```\nschemabot apply -e staging\n```\n", footer, "the footer keeps only the apply command")
+			if tt.want == "" {
+				assert.NotContains(t, out, "🔐", out)
+				return
+			}
+			assert.Equal(t, 1, strings.Count(out, "🔐"), out)
+			beforeNotice, afterNotice, found := strings.Cut(out, tt.want)
+			assert.True(t, found, out)
+			assert.Regexp(t, `\A## Schema Change Plan — Staging\n\n\*\*Database\*\*: [^\n]*\n\n\*Started at [^\n]*\*\n\n\z`, beforeNotice, "the notice follows the header directly")
+			assert.Contains(t, afterNotice, "ALTER TABLE `orders`", "the DDL follows the notice")
+		})
+	}
+}
+
+// Principals render as inline code, never as @-mentions, so a plan posted on
+// every push does not notify every listed team.
 func TestPlanCommentListsWhoCanApply(t *testing.T) {
 	auth := &ApplyAuthorizationData{
 		OperatorPrincipals: []string{"acme/orders-operators", "lee"},
@@ -31,7 +79,7 @@ func TestPlanCommentListsWhoCanApply(t *testing.T) {
 
 	t.Run("single environment", func(t *testing.T) {
 		out := RenderPlanComment(*plan("staging"))
-		assert.Contains(t, out, "```\nschemabot apply -e staging\n```\n\n"+whoCanApply, out)
+		assert.Contains(t, out, whoCanApply, out)
 		assert.NotContains(t, out, "@acme", out)
 	})
 
@@ -44,11 +92,12 @@ func TestPlanCommentListsWhoCanApply(t *testing.T) {
 		})
 		assert.Equal(t, 1, strings.Count(out, "🔐"), out)
 		assert.Contains(t, out, whoCanApply, out)
+		assert.Less(t, strings.Index(out, whoCanApply), strings.Index(out, "### Staging"), "the list leads every environment's section: %s", out)
 	})
 
 	// Auto-plan on a deployment with one environment builds the comment as a
 	// multi-environment one that renders as that environment's plan; the list
-	// set on the wrapper alone still reaches its footer.
+	// set on the wrapper alone still reaches it.
 	t.Run("one environment through the multi-environment comment", func(t *testing.T) {
 		child := plan("staging")
 		child.ApplyAuthorization = nil
@@ -58,7 +107,8 @@ func TestPlanCommentListsWhoCanApply(t *testing.T) {
 			Plans:              map[string]*PlanCommentData{"staging": child},
 			ApplyAuthorization: auth,
 		})
-		assert.Contains(t, out, "```\nschemabot apply -e staging\n```\n\n"+whoCanApply, out)
+		assert.Contains(t, out, whoCanApply, out)
+		assert.Less(t, strings.Index(out, whoCanApply), strings.Index(out, "ALTER TABLE"), out)
 	})
 
 	// A multi-environment comment whose footer offers no apply, here because
@@ -242,7 +292,9 @@ func TestWhoCanApplySentence(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, whoCanApplySentence("orders", tt.principals))
+			assert.Equal(t, tt.want, whoCanApplySentence("orders", "", tt.principals))
 		})
 	}
+	assert.Equal(t, "**`octocat` cannot run `schemabot apply` for `orders`.** Only these teams and this user can. Ask one of them to run it:",
+		whoCanApplySentence("orders", "octocat", []string{"acme/orders-operators", "acme/db-admins", "lee"}))
 }

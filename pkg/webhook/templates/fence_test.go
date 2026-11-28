@@ -304,7 +304,7 @@ func TestDDLBlocksContainHostileIdentifier(t *testing.T) {
 			TableName: "x\n```\n# injected",
 			Status:    state.Task.Completed,
 			DDL:       hostileDDL,
-		}, false, newDDLBlockBudget(1, commentBodyLimit))
+		}, false, false, newDDLBlockBudget(1, commentBodyLimit))
 
 		assert.Equal(t, "**```` x ``` # injected ````**\n"+expectedBlock+"\n", out.String())
 	})

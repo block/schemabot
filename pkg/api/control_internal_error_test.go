@@ -289,18 +289,20 @@ func TestStopRefusalsClassifyEveryEngine(t *testing.T) {
 }
 
 // A stop of a PostgreSQL schema change is refused up front: the engine has no
-// stopped phase, so the request is never recorded. The refusal gives the
-// engine's own reason and the remedy the PR comment offers for this apply:
-// cancel for a concurrent index build that is its only statement, waiting for
-// anything else, and both when its stored progress cannot be read.
+// stopped phase, so the request is never recorded. The refusal says what can't
+// be paused and gives the command to run instead, for this apply: cancel for a
+// concurrent index build that is its only statement, progress for anything
+// else, and both when its stored progress cannot be read.
 func TestStopOfPostgresApplyIsRefusedBeforeItIsRecorded(t *testing.T) {
-	const reason = "stop rejected: stop is not supported for PostgreSQL schema changes: concurrent index builds have no resumable midpoint, and other statements commit or fail on their own. "
+	const cancel = "`schemabot cancel apply-postgres-stop -e staging`"
+	const progress = "`schemabot progress apply-postgres-stop -e staging --no-watch`"
 	operation := func(metadata string) *storage.ApplyOperation {
 		return &storage.ApplyOperation{ID: 11, ApplyID: 1, ProgressMetadata: metadata}
 	}
 	tests := []struct {
 		name       string
 		operations *staticApplyOperationStore
+		code       string
 		want       string
 	}{
 		{
@@ -308,26 +310,31 @@ func TestStopOfPostgresApplyIsRefusedBeforeItIsRecorded(t *testing.T) {
 			operations: &staticApplyOperationStore{operations: []*storage.ApplyOperation{
 				operation(`{"executor_operation":"concurrent-index-build","step":"1","steps_total":"1"}`),
 			}},
-			want: reason + "Use cancel to end this concurrent index build",
+			code: apitypes.ErrCodeStopUnsupportedCancel,
+			want: "stop rejected: PostgreSQL can't pause an index build. To end it: " + cancel,
 		},
 		{
 			name: "plain DDL is left to finish",
 			operations: &staticApplyOperationStore{operations: []*storage.ApplyOperation{
 				operation(`{"step":"1","steps_total":"1","statement":"ALTER TABLE users ADD COLUMN email text"}`),
 			}},
-			want: reason + "This schema change commits or fails on its own; wait for it to finish",
+			code: apitypes.ErrCodeStopUnsupportedFinishes,
+			want: "stop rejected: PostgreSQL can't pause this schema change, and it finishes on its own. To follow it: " + progress,
 		},
 		{
 			name: "an index build among other statements is left to finish",
 			operations: &staticApplyOperationStore{operations: []*storage.ApplyOperation{
 				operation(`{"executor_operation":"concurrent-index-build","step":"2","steps_total":"3"}`),
 			}},
-			want: reason + "This schema change commits or fails on its own; wait for it to finish",
+			code: apitypes.ErrCodeStopUnsupportedFinishes,
+			want: "stop rejected: PostgreSQL can't pause this schema change, and it finishes on its own. To follow it: " + progress,
 		},
 		{
 			name:       "unreadable progress names the remedy for each kind of statement",
 			operations: &staticApplyOperationStore{err: errors.New(sensitiveControlFailure)},
-			want:       reason + "Use cancel if this schema change is a single concurrent index build; otherwise wait for it to finish",
+			code:       apitypes.ErrCodeStopUnsupported,
+			want: "stop rejected: PostgreSQL can't pause a schema change. If it is a single index build, end it with " + cancel +
+				"; anything else finishes on its own. To follow it: " + progress,
 		},
 	}
 	for _, tt := range tests {
@@ -344,6 +351,7 @@ func TestStopOfPostgresApplyIsRefusedBeforeItIsRecorded(t *testing.T) {
 
 			require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
 			assert.Equal(t, tt.want, resp.Error)
+			assert.Equal(t, tt.code, resp.ErrorCode, "the code names the remedy for a client that renders the command itself")
 			assert.NotContains(t, w.Body.String(), "10.0.0.5")
 			assert.Empty(t, requests.requests, "a refused stop records no control request")
 		})

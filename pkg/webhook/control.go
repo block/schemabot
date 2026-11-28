@@ -210,7 +210,7 @@ func runControlCommand[R any](
 			return nil
 		}
 		h.postCommandError(repo, pr, installationID, actionName, result.Environment, requestedBy,
-			controlOperationFailureMessage(err, actionName, result.ApplyID))
+			controlOperationFailureMessage(err, actionName, result.ApplyID, result.Environment))
 		return nil
 	}
 	if resp == nil {

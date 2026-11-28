@@ -101,3 +101,61 @@ func TestLocalClientAtomicRowSecurityPlanAndApply(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, again.Changes)
 }
+
+// A schema file that adds a new table with its row security plans as one
+// create, and the drive applies it against the reviewed files: the table, its
+// RLS setting, and its policy land together, and the file then plans nothing.
+func TestLocalClientCreateTableWithRowSecurityPlanAndApply(t *testing.T) {
+	_, storageDSN := setupMySQLContainer(t)
+	setupStorageSchema(t, storageDSN)
+	cleanupTasks(t, storageDSN)
+	dsn, db := testutil.StartPostgres(t, "create_rls")
+	stor := createStorage(t, storageDSN)
+	defer utils.CloseAndLog(stor)
+	client, err := NewLocalClient(LocalConfig{Database: "create_rls", Type: storage.DatabaseTypePostgres, TargetDSN: dsn, SchemaOverrides: map[string]string{"logical": "public"}}, stor, slog.Default())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+	files := map[string]*ternv1.SchemaFiles{"logical": {Files: map[string]string{"documents.sql": `
+  CREATE TABLE documents (id bigint PRIMARY KEY, owner text);
+  ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY own_rows ON documents FOR ALL USING (owner = current_user);
+ `}}}
+
+	plan, err := client.Plan(t.Context(), &ternv1.PlanRequest{Database: "create_rls", Type: storage.DatabaseTypePostgres, SchemaFiles: files})
+	require.NoError(t, err)
+	require.Len(t, plan.Changes, 1)
+	require.Len(t, plan.Changes[0].TableChanges, 1)
+	change := plan.Changes[0].TableChanges[0]
+	assert.Equal(t, ternv1.ChangeType_CHANGE_TYPE_CREATE, change.ChangeType)
+	assert.Contains(t, change.Ddl, "CREATE TABLE")
+	assert.Contains(t, change.Ddl, "ENABLE ROW LEVEL SECURITY")
+	assert.Contains(t, change.Ddl, "CREATE POLICY")
+
+	result, err := client.Apply(t.Context(), &ternv1.ApplyRequest{PlanId: plan.PlanId, Environment: localClientTestEnvironment, DdlChanges: plan.Changes[0].TableChanges})
+	require.NoError(t, err)
+	require.True(t, result.Accepted, result.ErrorMessage)
+	driveQueuedApply(t, stor, client, result.ApplyId)
+
+	apply, err := stor.Applies().GetByApplyIdentifier(t.Context(), result.ApplyId)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Completed, apply.State, apply.ErrorMessage)
+	tasks, err := stor.Tasks().GetByApplyID(t.Context(), apply.ID)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, state.Task.Completed, tasks[0].State, tasks[0].ErrorMessage)
+	assert.Equal(t, "create", tasks[0].DDLAction)
+
+	var rowSecurity bool
+	require.NoError(t, db.QueryRowContext(t.Context(), `SELECT relrowsecurity FROM pg_class WHERE oid = 'public.documents'::regclass`).Scan(&rowSecurity))
+	assert.True(t, rowSecurity, "the table never exists without its row security")
+	var predicate string
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+  SELECT pg_get_expr(polqual, polrelid) FROM pg_policy
+  WHERE polrelid='public.documents'::regclass AND polname='own_rows'
+ `).Scan(&predicate))
+	assert.Equal(t, "(owner = CURRENT_USER)", predicate)
+
+	again, err := client.Plan(t.Context(), &ternv1.PlanRequest{Database: "create_rls", Type: storage.DatabaseTypePostgres, SchemaFiles: files})
+	require.NoError(t, err)
+	assert.Empty(t, again.Changes)
+}

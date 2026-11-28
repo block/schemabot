@@ -34,18 +34,21 @@ type configFile struct {
 			SafeMigrations  *bool `json:"safe_migrations,omitempty"`
 		} `json:"databases"`
 	} `json:"organizations"`
-	ListenAddr            string  `json:"listen_addr"`
-	SchemaDir             string  `json:"schema_dir"`
-	RevertWindowDuration  string  `json:"revert_window_duration,omitempty"`
-	DefaultThrottleRatio  float64 `json:"default_throttle_ratio,omitempty"`
-	ProxyHost             string  `json:"proxy_host,omitempty"`
-	ProxyAdvertiseHost    string  `json:"proxy_advertise_host,omitempty"`
-	ProxyPortStart        int     `json:"proxy_port_start,omitempty"`
-	ProxyPortEnd          int     `json:"proxy_port_end,omitempty"`
-	BranchTLSMode         string  `json:"branch_tls_mode,omitempty"`
-	BranchCreationDelay   string  `json:"branch_creation_delay,omitempty"`
-	DeployRequestDelay    string  `json:"deploy_request_delay,omitempty"`
-	ProcessorTickInterval string  `json:"processor_tick_interval,omitempty"`
+	ListenAddr           string  `json:"listen_addr"`
+	SchemaDir            string  `json:"schema_dir"`
+	RevertWindowDuration string  `json:"revert_window_duration,omitempty"`
+	DefaultThrottleRatio float64 `json:"default_throttle_ratio,omitempty"`
+	ProxyHost            string  `json:"proxy_host,omitempty"`
+	ProxyAdvertiseHost   string  `json:"proxy_advertise_host,omitempty"`
+	ProxyPortStart       int     `json:"proxy_port_start,omitempty"`
+	ProxyPortEnd         int     `json:"proxy_port_end,omitempty"`
+	// ProxyAdvertisePortStart is the host port proxy_port_start is published
+	// on, when the range is published as one block at an offset.
+	ProxyAdvertisePortStart int    `json:"proxy_advertise_port_start,omitempty"`
+	BranchTLSMode           string `json:"branch_tls_mode,omitempty"`
+	BranchCreationDelay     string `json:"branch_creation_delay,omitempty"`
+	DeployRequestDelay      string `json:"deploy_request_delay,omitempty"`
+	ProcessorTickInterval   string `json:"processor_tick_interval,omitempty"`
 }
 
 func main() {
@@ -101,18 +104,19 @@ func main() {
 	ctx := context.Background()
 
 	server, err := localscale.New(ctx, localscale.Config{
-		Orgs:                  orgs,
-		ListenAddr:            cf.ListenAddr,
-		RevertWindowDuration:  revertWindow,
-		DefaultThrottleRatio:  cf.DefaultThrottleRatio,
-		ProxyHost:             cf.ProxyHost,
-		ProxyAdvertiseHost:    cf.ProxyAdvertiseHost,
-		BranchTLSMode:         cf.BranchTLSMode,
-		ProxyPortRange:        [2]int{cf.ProxyPortStart, cf.ProxyPortEnd},
-		BranchCreationDelay:   branchCreationDelay,
-		DeployRequestDelay:    deployRequestDelay,
-		ProcessorTickInterval: processorTickInterval,
-		Logger:                logger,
+		Orgs:                    orgs,
+		ListenAddr:              cf.ListenAddr,
+		RevertWindowDuration:    revertWindow,
+		DefaultThrottleRatio:    cf.DefaultThrottleRatio,
+		ProxyHost:               cf.ProxyHost,
+		ProxyAdvertiseHost:      cf.ProxyAdvertiseHost,
+		BranchTLSMode:           cf.BranchTLSMode,
+		ProxyPortRange:          [2]int{cf.ProxyPortStart, cf.ProxyPortEnd},
+		ProxyAdvertisePortStart: cf.ProxyAdvertisePortStart,
+		BranchCreationDelay:     branchCreationDelay,
+		DeployRequestDelay:      deployRequestDelay,
+		ProcessorTickInterval:   processorTickInterval,
+		Logger:                  logger,
 		// Seeding runs inside New, before the server reports healthy, so a
 		// dependent waiting on /health never starts against a cluster whose
 		// tables have not been created yet.

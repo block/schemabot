@@ -246,7 +246,7 @@ func TestCaptureOriginalFilesCarriesForeignKeys(t *testing.T) {
 			require.NoError(t, err)
 			defer pool.Close()
 
-			files, blockers, err := captureOriginalFiles(t.Context(), pool, tt.database, "app", nil, mustIgnoredTables(t, tt.ignored))
+			files, blockers, err := captureOriginalFiles(t.Context(), pool, tt.database, "app", nil, nil, mustIgnoredTables(t, tt.ignored))
 
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantBlockers, blockers)

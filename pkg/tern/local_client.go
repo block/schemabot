@@ -149,6 +149,10 @@ type LocalConfig struct {
 	// must be rebuilt. Zero uses the engine default.
 	PostgresConcurrentIndexMaxDuration time.Duration
 
+	// PostgresValidateMaxDuration bounds one PostgreSQL VALIDATE CONSTRAINT
+	// scan. Zero uses the engine default.
+	PostgresValidateMaxDuration time.Duration
+
 	// Metadata holds engine-specific configuration as key-value pairs.
 	// The tern layer does not interpret these — it passes them through to the
 	// engine via Credentials.Metadata and reads specific keys as needed.
@@ -379,7 +383,7 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 		postgresEngine: postgres.NewForTarget(cfg.PostgresNativeSafeTableSizeLimitBytes, cfg.PostgresConcurrentIndexMaxDuration, cfg.Database, &engine.Credentials{
 			DSN:      cfg.TargetDSN,
 			Metadata: maps.Clone(cfg.Metadata),
-		}).WithTableOwner(cfg.TableOwner),
+		}).WithTableOwner(cfg.TableOwner).WithValidateMaxDuration(cfg.PostgresValidateMaxDuration),
 		customEngine:      customEngine,
 		psClientFunc:      psClientFunc,
 		logger:            logger,
@@ -3091,6 +3095,7 @@ func buildDispatchTasks(plan *storage.Plan, scope dispatchScope, environment, en
 			UpdatedAt:      now,
 		}
 	}
+	storage.AssignPlanChangeOrdinals(plan, tasks)
 	return tasks
 }
 

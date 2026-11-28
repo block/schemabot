@@ -206,7 +206,7 @@ func TestStopWithdrawsAQueuedStart(t *testing.T) {
 		_, _, err := stop(t, getApply(t, ctx, stor, applyID))
 		require.Error(t, err)
 		assert.Equal(t, http.StatusConflict, controlOperationHTTPStatus(err))
-		assert.Equal(t, apitypes.ErrCodeAlreadyStopped, controlOperationErrorCode(err))
+		assert.Equal(t, apitypes.ErrCodeAlreadyStopped, ControlOperationErrorCode(err))
 		assert.ErrorContains(t, err, "schema change is already stopped")
 		row, err := stor.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationStop)
 		require.NoError(t, err)

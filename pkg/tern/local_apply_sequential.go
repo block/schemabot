@@ -679,7 +679,7 @@ func (c *LocalClient) runEngineTaskAttempt(ctx context.Context, apply *storage.A
 	request.Changes[0].TableChanges[0].Metadata = metadata
 	needsFiles, err := c.taskNeedsRowSecurityFiles(task)
 	if err != nil {
-		return c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskFailed(ctx, task, fmt.Sprintf("resolve row security parser: %v", err)))
+		return c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskFailed(ctx, task, fmt.Sprintf("read whether the task's DDL declares row security: %v", err)))
 	}
 	if needsFiles {
 		planID, err := planIDForTasks(apply, []*storage.Task{task})
@@ -2006,6 +2006,7 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		if handedBack, err := c.cancelTasksQueuedBehindFailure(ctx, apply, tasks, failedTask); handedBack || err != nil {
 			return err
 		}
+		c.releaseFailedApplyArtifacts(ctx, apply, tasks, failedTask)
 		adoptSequentialOutcome(apply, failedTask, stoppedByUser, now)
 		logger.Info("sequential operation drive settled; operator derives the operation row and projects the parent",
 			"stopped_by_user", stoppedByUser, "failed_task", failedTask != nil, "settled_state", apply.State)
@@ -2046,6 +2047,11 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 	if handedBack, err := c.cancelTasksQueuedBehindFailure(ctx, apply, tasks, failedTask); handedBack || err != nil {
 		return err
 	}
+	// The release runs before the outcome is stored, while this drive still
+	// holds the apply, so no later apply can reach the target between the
+	// failure and the release. A drive that stores no outcome leaves the apply
+	// to the next drive, which releases again and finds nothing left.
+	c.releaseFailedApplyArtifacts(ctx, apply, tasks, failedTask)
 	adoptSequentialOutcome(apply, failedTask, stoppedByUser, now)
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		if c.driveCancelled(ctx, apply, "while persisting the sequential outcome") {
@@ -2138,10 +2144,18 @@ func (c *LocalClient) taskNeedsRowSecurityFiles(task *storage.Task) (bool, error
 	if err != nil {
 		return false, err
 	}
-	rls, ok := parser.(interface{ CanonicalRowSecurity(string) (string, error) })
+	rls, ok := parser.(interface {
+		DeclaresRowSecurity(string) (bool, error)
+	})
 	if !ok {
 		return false, nil
 	}
-	_, err = rls.CanonicalRowSecurity(task.DDL)
-	return err == nil, nil
+	// Both an atomic row security change and the create of a new table with
+	// its row security are applied against the reviewed files, so either one
+	// carries them.
+	declares, err := rls.DeclaresRowSecurity(task.DDL)
+	if err != nil {
+		return false, fmt.Errorf("read whether task %s declares row security: %w", task.TaskIdentifier, err)
+	}
+	return declares, nil
 }

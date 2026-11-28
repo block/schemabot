@@ -240,6 +240,7 @@ func TestPostgresParserClassify(t *testing.T) {
 		{"alter table", "ALTER TABLE users ADD COLUMN email TEXT", StatementAlterTable, "users"},
 		{"alter table rename column is an alteration", "ALTER TABLE users RENAME COLUMN email TO email_address", StatementAlterTable, "users"},
 		{"alter table rename constraint is an alteration", "ALTER TABLE users RENAME CONSTRAINT users_pk TO users_pkey", StatementAlterTable, "users"},
+		{"alter index rename is an alteration of its table", "ALTER INDEX public.users_email_key_new RENAME TO users_email_key", StatementAlterTable, ""},
 		{"alter table rename to is a table rename", "ALTER TABLE users RENAME TO customers", StatementRenameTable, "users"},
 		{"drop table", "DROP TABLE users", StatementDropTable, "users"},
 		{"drop table schema-qualified returns bare name", "DROP TABLE app.users", StatementDropTable, "users"},
@@ -384,6 +385,11 @@ func TestPostgresParserCanonicalizeUnqualified(t *testing.T) {
 	t.Run("drop table and drop index reduce to the bare object name", func(t *testing.T) {
 		assert.Equal(t, "DROP TABLE orders", p.CanonicalizeUnqualified(`DROP TABLE "app-region-a".orders`))
 		assert.Equal(t, "DROP INDEX uk_orders_customer", p.CanonicalizeUnqualified(`DROP INDEX "app-region-a".uk_orders_customer`))
+	})
+
+	t.Run("an index rename drops the qualifier on the renamed index", func(t *testing.T) {
+		assert.Equal(t, "ALTER INDEX uk_orders_customer_new RENAME TO uk_orders_customer",
+			p.CanonicalizeUnqualified(`ALTER INDEX "app-region-a".uk_orders_customer_new RENAME TO uk_orders_customer`))
 	})
 
 	t.Run("drop column keeps the explicit COLUMN keyword", func(t *testing.T) {

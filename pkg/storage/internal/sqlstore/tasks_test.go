@@ -1511,20 +1511,22 @@ func leasedOperationFor(t *testing.T, store *Storage, apply *storage.Apply, depl
 
 // attachTaskToOperation puts the task under the operation, the way a drive's
 // own task rows are created.
-func attachTaskToOperation(t *testing.T, identifier string, operationID int64) {
+func attachTaskToOperation(t *testing.T, store *Storage, identifier string, operationID int64) {
 	t.Helper()
-	_, err := testDB.ExecContext(t.Context(),
+	_, err := store.db.ExecContext(t.Context(),
 		"UPDATE tasks SET apply_operation_id = ? WHERE task_identifier = ?", operationID, identifier)
 	require.NoError(t, err)
 }
 
 // backdateOperationHeartbeat ages the operation's lease heartbeat, which is what
-// the claim path reads to decide the lease is re-claimable.
-func backdateOperationHeartbeat(t *testing.T, operationID int64, age time.Duration) {
+// the claim path reads to decide the lease is re-claimable. The age is taken
+// from the server's clock, the one the claim compares against, so the session
+// time zone cannot move it.
+func backdateOperationHeartbeat(t *testing.T, store *Storage, operationID int64, age time.Duration) {
 	t.Helper()
-	_, err := testDB.ExecContext(t.Context(),
-		"UPDATE apply_operations SET updated_at = NOW() - INTERVAL ? SECOND WHERE id = ?",
-		int64(age.Seconds()), operationID)
+	heartbeat := store.applyOperations.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(age.Microseconds())), IntervalMicrosecond)
+	_, err := store.db.ExecContext(t.Context(),
+		fmt.Sprintf("UPDATE apply_operations SET updated_at = %s WHERE id = ?", heartbeat), operationID)
 	require.NoError(t, err)
 }
 
@@ -1876,7 +1878,7 @@ func TestTaskStore_ReapStrandedActive_KeepsTaskWhoseOperationADriverHolds(t *tes
 
 	held := leasedOperationFor(t, store, parent, "region-a")
 	task := createRetryableReapTask(t, store, parent, "task_reap_active_lease", "users", state.Task.Running, "")
-	attachTaskToOperation(t, task.TaskIdentifier, held)
+	attachTaskToOperation(t, store, task.TaskIdentifier, held)
 	backdateTaskUpdatedAt(t, task.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
 
 	settled, err := store.tasks.reapStrandedActive(ctx, 10)
@@ -1886,7 +1888,7 @@ func TestTaskStore_ReapStrandedActive_KeepsTaskWhoseOperationADriverHolds(t *tes
 
 	// The driver goes away without releasing: its heartbeat ages past the point
 	// where a peer would take the operation from it.
-	backdateOperationHeartbeat(t, held, storage.ApplyLeaseStaleAfter+time.Minute)
+	backdateOperationHeartbeat(t, store, held, storage.ApplyLeaseStaleAfter+time.Minute)
 
 	settled, err = store.tasks.reapStrandedActive(ctx, 10)
 	require.NoError(t, err)
@@ -1907,9 +1909,9 @@ func TestTaskStore_ReapStrandedActive_SkipsRowWhoseOperationWasClaimedAfterTheSc
 	backdateApplyUpdatedAt(t, parent.ID, strandedActiveParentQuiescence+time.Minute)
 
 	unheld := leasedOperationFor(t, store, parent, "region-a")
-	backdateOperationHeartbeat(t, unheld, storage.ApplyLeaseStaleAfter+time.Minute)
+	backdateOperationHeartbeat(t, store, unheld, storage.ApplyLeaseStaleAfter+time.Minute)
 	task := createRetryableReapTask(t, store, parent, "task_reap_active_reclaim", "users", state.Task.Running, "")
-	attachTaskToOperation(t, task.TaskIdentifier, unheld)
+	attachTaskToOperation(t, store, task.TaskIdentifier, unheld)
 	backdateTaskUpdatedAt(t, task.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
 
 	// The scan selected the row; before the write lands, a peer reclaims the
@@ -1935,14 +1937,14 @@ func TestTaskStore_ReapStrandedRetryable_KeepsTaskWhoseOperationADriverHolds(t *
 
 	held := leasedOperationFor(t, store, parent, "region-a")
 	task := createRetryableReapTask(t, store, parent, "task_reap_retryable_lease", "users", state.Task.FailedRetryable, "copy failed")
-	attachTaskToOperation(t, task.TaskIdentifier, held)
+	attachTaskToOperation(t, store, task.TaskIdentifier, held)
 
 	settled, err := store.tasks.reapStrandedRetryable(ctx, 10)
 	require.NoError(t, err)
 	assert.Empty(t, settled, "a driver holds the operation, so the retry promise is not the reaper's to retire")
 	assertTaskState(t, store, task.TaskIdentifier, state.Task.FailedRetryable)
 
-	backdateOperationHeartbeat(t, held, storage.ApplyLeaseStaleAfter+time.Minute)
+	backdateOperationHeartbeat(t, store, held, storage.ApplyLeaseStaleAfter+time.Minute)
 
 	settled, err = store.tasks.reapStrandedRetryable(ctx, 10)
 	require.NoError(t, err)
@@ -1964,9 +1966,9 @@ func TestTaskStore_ReapStrandedRetryable_SkipsRowWhoseOperationWasClaimedAfterTh
 	backdateApplyUpdatedAt(t, parent.ID, strandedRetryableQuiescence+time.Minute)
 
 	unheld := leasedOperationFor(t, store, parent, "region-a")
-	backdateOperationHeartbeat(t, unheld, storage.ApplyLeaseStaleAfter+time.Minute)
+	backdateOperationHeartbeat(t, store, unheld, storage.ApplyLeaseStaleAfter+time.Minute)
 	task := createRetryableReapTask(t, store, parent, "task_reap_retryable_reclaim", "users", state.Task.FailedRetryable, "copy failed")
-	attachTaskToOperation(t, task.TaskIdentifier, unheld)
+	attachTaskToOperation(t, store, task.TaskIdentifier, unheld)
 
 	// The scan selected the row; before the write lands, a peer reclaims the
 	// stale operation and starts heartbeating it.
@@ -1994,16 +1996,16 @@ func TestTaskStore_ReapStrandedActive_LeaseCoversOnlyItsOwnOperationsRows(t *tes
 
 	held := leasedOperationFor(t, store, parent, "region-a")
 	abandoned := leasedOperationFor(t, store, parent, "region-b")
-	backdateOperationHeartbeat(t, abandoned, storage.ApplyLeaseStaleAfter+time.Minute)
+	backdateOperationHeartbeat(t, store, abandoned, storage.ApplyLeaseStaleAfter+time.Minute)
 
 	// Both rows are stale by every window the sweep applies, so the only thing
 	// that can tell them apart is which operation each one belongs to.
 	live := createRetryableReapTask(t, store, parent, "task_reap_fanout_live", "users", state.Task.Running, "")
-	attachTaskToOperation(t, live.TaskIdentifier, held)
+	attachTaskToOperation(t, store, live.TaskIdentifier, held)
 	backdateTaskUpdatedAt(t, live.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
 
 	stranded := createRetryableReapTask(t, store, parent, "task_reap_fanout_stranded", "orders", state.Task.Running, "")
-	attachTaskToOperation(t, stranded.TaskIdentifier, abandoned)
+	attachTaskToOperation(t, store, stranded.TaskIdentifier, abandoned)
 	backdateTaskUpdatedAt(t, stranded.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
 
 	settled, err := store.tasks.reapStrandedActive(ctx, 10)
@@ -2030,12 +2032,12 @@ func TestTaskStore_ReapStrandedActive_KeepsTaskWhoseHeartbeatIsInsideTheStalenes
 
 	held := leasedOperationFor(t, store, parent, "region-a")
 	task := createRetryableReapTask(t, store, parent, "task_reap_active_window", "users", state.Task.Running, "")
-	attachTaskToOperation(t, task.TaskIdentifier, held)
+	attachTaskToOperation(t, store, task.TaskIdentifier, held)
 	backdateTaskUpdatedAt(t, task.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
 
 	// A heartbeat old enough to look idle, but well inside the window a peer
 	// would have to wait out before taking the operation.
-	backdateOperationHeartbeat(t, held, storage.ApplyLeaseStaleAfter/2)
+	backdateOperationHeartbeat(t, store, held, storage.ApplyLeaseStaleAfter/2)
 
 	settled, err := store.tasks.reapStrandedActive(ctx, 10)
 	require.NoError(t, err)
@@ -2044,7 +2046,7 @@ func TestTaskStore_ReapStrandedActive_KeepsTaskWhoseHeartbeatIsInsideTheStalenes
 
 	// One second past the window is where the claim path would let a peer take
 	// it, and that is where the row becomes the reaper's.
-	backdateOperationHeartbeat(t, held, storage.ApplyLeaseStaleAfter+time.Second)
+	backdateOperationHeartbeat(t, store, held, storage.ApplyLeaseStaleAfter+time.Second)
 
 	settled, err = store.tasks.reapStrandedActive(ctx, 10)
 	require.NoError(t, err)
@@ -2068,7 +2070,7 @@ func TestTaskStore_ReapStrandedActive_ReapsTaskWhoseOperationHasNoLeaseOwner(t *
 	unowned := leasedOperationFor(t, store, parent, "region-a")
 	clearOperationLeaseOwner(t, unowned)
 	task := createRetryableReapTask(t, store, parent, "task_reap_active_unowned", "users", state.Task.Running, "")
-	attachTaskToOperation(t, task.TaskIdentifier, unowned)
+	attachTaskToOperation(t, store, task.TaskIdentifier, unowned)
 	backdateTaskUpdatedAt(t, task.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
 
 	settled, err := store.tasks.reapStrandedActive(ctx, 10)
@@ -2093,16 +2095,16 @@ func TestTaskStore_ReapStrandedActive_LeasedRowDoesNotSpendTheScanLimit(t *testi
 
 	held := leasedOperationFor(t, store, parent, "region-a")
 	abandoned := leasedOperationFor(t, store, parent, "region-b")
-	backdateOperationHeartbeat(t, abandoned, storage.ApplyLeaseStaleAfter+time.Minute)
+	backdateOperationHeartbeat(t, store, abandoned, storage.ApplyLeaseStaleAfter+time.Minute)
 
 	// The leased row is created first, so the sweep's created_at, id ordering
 	// offers it before the stranded one.
 	live := createRetryableReapTask(t, store, parent, "task_reap_budget_live", "users", state.Task.Running, "")
-	attachTaskToOperation(t, live.TaskIdentifier, held)
+	attachTaskToOperation(t, store, live.TaskIdentifier, held)
 	backdateTaskUpdatedAt(t, live.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
 
 	stranded := createRetryableReapTask(t, store, parent, "task_reap_budget_stranded", "orders", state.Task.Running, "")
-	attachTaskToOperation(t, stranded.TaskIdentifier, abandoned)
+	attachTaskToOperation(t, store, stranded.TaskIdentifier, abandoned)
 	backdateTaskUpdatedAt(t, stranded.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
 
 	settled, err := store.tasks.reapStrandedActive(ctx, 1)
@@ -2124,13 +2126,13 @@ func TestTaskStore_ReapStrandedRetryable_LeasedRowDoesNotSpendTheScanLimit(t *te
 
 	held := leasedOperationFor(t, store, parent, "region-a")
 	abandoned := leasedOperationFor(t, store, parent, "region-b")
-	backdateOperationHeartbeat(t, abandoned, storage.ApplyLeaseStaleAfter+time.Minute)
+	backdateOperationHeartbeat(t, store, abandoned, storage.ApplyLeaseStaleAfter+time.Minute)
 
 	live := createRetryableReapTask(t, store, parent, "task_reap_rbudget_live", "users", state.Task.FailedRetryable, "copy failed")
-	attachTaskToOperation(t, live.TaskIdentifier, held)
+	attachTaskToOperation(t, store, live.TaskIdentifier, held)
 
 	stranded := createRetryableReapTask(t, store, parent, "task_reap_rbudget_stranded", "orders", state.Task.FailedRetryable, "copy failed")
-	attachTaskToOperation(t, stranded.TaskIdentifier, abandoned)
+	attachTaskToOperation(t, store, stranded.TaskIdentifier, abandoned)
 
 	settled, err := store.tasks.reapStrandedRetryable(ctx, 1)
 	require.NoError(t, err)

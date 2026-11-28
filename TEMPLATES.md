@@ -518,6 +518,10 @@ schemabot apply -e staging
 
 *Started at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
+🔐 **`octocat` cannot run `schemabot apply` for `testapp`.** Only these teams and this user can. Ask one of them to run it:
+- Operators: `acme/testapp-operators`
+- Admins: `acme/db-admins`, `jdoe`
+
 ```sql
 CREATE TABLE `users` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
@@ -559,10 +563,6 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 schemabot apply -e staging
 ```
-
-🔐 Only these teams and this user can run `schemabot apply` for `testapp`. Ask one of them to run it:
-- Operators: `acme/testapp-operators`
-- Admins: `acme/db-admins`, `jdoe`
 
 </details>
 
@@ -612,7 +612,7 @@ ALTER TABLE app.users ADD COLUMN email text;
 
 📋 **Plan**: **1** table to alter
 
-⚠️ No rollback for namespace `app`: SchemaBot couldn't save the current schema of the tables below, so an apply of this plan can't be rolled back. To undo the change, revert the schema files in a new pull request.
+⚠️ No rollback for namespace `app`: rollback needs a schema file for every table the plan manages, and SchemaBot can't write one yet for the tables below. The apply still runs. To undo it, revert the schema files in a new pull request.
 
 - `orders`: holds a foreign key added NOT VALID, which a schema file cannot declare
 
@@ -935,7 +935,7 @@ ALTER TABLE `orders` ADD COLUMN `notes` text;
 - `users`: dropping primary key is not supported
 - `orders`: adding foreign key constraints is not supported
 
-An apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
+An apply will fail on these statements. Each reason names its fix: make it and plan again, or contact your SchemaBot operators for help.
 
 📋 **Plan**: **2** tables to alter
 
@@ -968,10 +968,10 @@ ALTER TABLE orders ADD COLUMN notes text;
 ```
 
 ⛔ **Cannot apply**: 1 change the engine refuses to execute
-- `users`: statement for table "users" adds a column together with a constraint, which builds or checks the constraint while the table is locked; add the column without the constraint and apply it, then add the constraint with a name as its own change
-  - statement for table "users": table size 2147483648 bytes exceeds the 1073741824-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit
+- `users`: adds a column together with a constraint, which builds or checks the constraint while the table is locked; add the column without the constraint and apply it, then add the constraint with a name as its own change
+  - the table is 2.0 GiB with its indexes, over the 1.0 GiB limit SchemaBot sets for a native-safe apply, not a PostgreSQL limit; raise postgres.native_safe_table_size_limit_bytes to change a table this size, then plan again
 
-An apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
+An apply will fail on these statements. Each reason names its fix: make it and plan again, or contact your SchemaBot operators for help.
 
 📋 **Plan**: **2** tables to alter
 
@@ -1409,10 +1409,10 @@ ALTER TABLE orders ADD COLUMN notes text;
 ---
 
 **⛔ Apply rejected**: 1 planned change the engine refuses to execute
-- `users`: statement for table "users" adds a column together with a constraint, which builds or checks the constraint while the table is locked; add the column without the constraint and apply it, then add the constraint with a name as its own change
-  - statement for table "users": table size 2147483648 bytes exceeds the 1073741824-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit
+- `users`: adds a column together with a constraint, which builds or checks the constraint while the table is locked; add the column without the constraint and apply it, then add the constraint with a name as its own change
+  - the table is 2.0 GiB with its indexes, over the 1.0 GiB limit SchemaBot sets for a native-safe apply, not a PostgreSQL limit; raise postgres.native_safe_table_size_limit_bytes to change a table this size, then plan again
 
-Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
+Each reason names its fix: make it and plan again, or contact your SchemaBot operators for help.
 
 </details>
 
@@ -3587,7 +3587,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -4235,6 +4235,41 @@ Options: ⏸️ Defer Cutover
        CREATE INDEX CONCURRENTLY idx_orders_placed_at ON orders USING btree (placed_at);
 
 📋 Plan: 1 table to create, 1 table to alter, 1 index to create
+
+
+```
+</details>
+
+<details>
+<summary><a name="plan-postgres-blocked"></a><strong>Plan (Postgres, Blocked)</strong></summary>
+
+```
+
+╭─────────────────────────────────────────────╮
+│  PostgreSQL Schema Change Plan              │
+│                                             │
+│  Database: testapp                          │
+│  Environment: staging                       │
+╰─────────────────────────────────────────────╯
+
+     ~ events
+       ALTER TABLE public.events ADD CONSTRAINT events_kind_not_null_check CHECK (kind IS NOT NULL) NOT VALID;
+
+     ~ events
+       ALTER TABLE public.events VALIDATE CONSTRAINT events_kind_not_null_check;
+
+     ~ events
+       ALTER TABLE public.events ALTER COLUMN kind SET NOT NULL;
+
+     ~ events
+       ALTER TABLE public.events DROP CONSTRAINT events_kind_not_null_check;
+
+📋 Plan: 1 table to alter
+
+⛔ Cannot apply: 4 changes the engine refuses to execute
+  - events (4 steps): the table is 1.4 GiB with its indexes, over the 1.0 GiB limit SchemaBot sets for a native-safe apply, not a PostgreSQL limit; raise postgres.native_safe_table_size_limit_bytes to change a table this size, then plan again
+
+An apply will fail on these statements. Each reason names its fix: make it and plan again, or contact your SchemaBot operators for help.
 
 
 ```
@@ -6149,7 +6184,7 @@ ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -6771,18 +6806,18 @@ step 2 of 3 · `CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON public.users
 
 **Schema `public`**
 
+**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE users ADD COLUMN last_seen_at timestamptz;
+```
+
 **`users`**: 🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 10.42%
 
 ```sql
 CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON users USING btree (last_seen_at);
 ```
 - Building index: 2,500 of 10,000 blocks
-
-**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
-
-```sql
-ALTER TABLE users ADD COLUMN last_seen_at timestamptz;
-```
 
 **`sessions`**: ⏳ Queued
 
@@ -7156,7 +7191,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -7203,7 +7238,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -7251,7 +7286,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -7833,7 +7868,7 @@ Cutover is already in progress. SchemaBot will keep reporting progress from the 
 <summary><a name="resumed-superseded-progress-comment"></a><strong>Resumed: Superseded Progress Comment</strong></summary>
 
 
-▶️ Schema change resumed — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+Progress before the stop — the schema change resumed in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
 
 <details>
 <summary>Progress before the stop</summary>
@@ -7870,7 +7905,7 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 <summary><a name="revert-superseded-progress-comment"></a><strong>Revert: Superseded Progress Comment</strong></summary>
 
 
-Schema change reverting — the revert is tracked in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+Progress before the revert — the revert is tracked in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
 
 <details>
 <summary>Progress before the revert</summary>
@@ -7913,7 +7948,7 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 <summary><a name="skip-revert-superseded-progress-comment"></a><strong>Skip Revert: Superseded Progress Comment</strong></summary>
 
 
-Revert skipped — the schema change is finalizing in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+Progress before the revert was skipped — the schema change is finalizing in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
 
 <details>
 <summary>Progress before the revert was skipped</summary>
@@ -7956,7 +7991,7 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 <summary><a name="cutover-started-superseded-progress-comment"></a><strong>Cutover Started: Superseded Progress Comment</strong></summary>
 
 
-Cutover started — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+Progress before the cutover — the cutover is tracked in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
 
 <details>
 <summary>Progress before the cutover</summary>
@@ -7996,7 +8031,7 @@ _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:0
 <summary><a name="cutover-complete-superseded-cutover-prompt"></a><strong>Cutover Complete: Superseded Cutover Prompt</strong></summary>
 
 
-Cutover complete — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+Cutover prompt — the cutover completed, and progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
 
 <details>
 <summary>Cutover prompt</summary>
@@ -8137,7 +8172,7 @@ ALTER TABLE `users`
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`products`** — Cancelled
+**`products`** — Not run
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
@@ -8145,7 +8180,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -8193,7 +8228,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -8297,17 +8332,17 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 
 ### ❌ public
 
-**`users`** — Failed
-```sql
-CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON users USING btree (last_seen_at);
-```
-
 **`users`** — Completed
 ```sql
 ALTER TABLE users ADD COLUMN last_seen_at timestamptz;
 ```
 
-**`sessions`** — Cancelled
+**`users`** — Failed
+```sql
+CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON users USING btree (last_seen_at);
+```
+
+**`sessions`** — Not run
 ```sql
 ALTER TABLE sessions ADD COLUMN payload jsonb;
 ```
@@ -8315,7 +8350,7 @@ ALTER TABLE sessions ADD COLUMN payload jsonb;
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -8489,17 +8524,17 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ALTER TABLE `payments` ADD INDEX `idx_order_id`(`order_id`);
 ```
 
-**`sessions`** — Cancelled
+**`sessions`** — Not run
 ```sql
 ALTER TABLE `sessions` ADD INDEX `idx_expires_at`(`expires_at`);
 ```
 
-**`audit_logs`** — Cancelled
+**`audit_logs`** — Not run
 ```sql
 ALTER TABLE `audit_logs` ADD INDEX `idx_created_at`(`created_at`);
 ```
 
-**`notifications`** — Cancelled
+**`notifications`** — Not run
 ```sql
 ALTER TABLE `notifications` ADD INDEX `idx_user_status`(`user_id`, `status`);
 ```
@@ -8507,7 +8542,7 @@ ALTER TABLE `notifications` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -8570,7 +8605,7 @@ ALTER TABLE `payments` ADD INDEX `idx_order_id`(`order_id`);
 
 ### 🚫 analytics
 
-**`events`** — Cancelled
+**`events`** — Not run
 ```sql
 ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
 ```
@@ -8578,7 +8613,7 @@ ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -8894,7 +8929,7 @@ Single table progress (default):
 
 
 To recover: Fix the issue above, then run a new apply.
-The new apply will only process tables that haven't completed.
+The new apply plans again from the live schema and runs only what is not applied yet.
 
 ```
 </details>
@@ -9302,7 +9337,7 @@ Sequential mode: First table failed (others cancelled)
 
 
 To recover: Fix the issue above, then run a new apply.
-The new apply will only process tables that haven't completed.
+The new apply plans again from the live schema and runs only what is not applied yet.
 
 ```
 </details>
@@ -9335,7 +9370,7 @@ Sequential mode: Middle table failed
 
 
 To recover: Fix the issue above, then run a new apply.
-The new apply will only process tables that haven't completed.
+The new apply plans again from the live schema and runs only what is not applied yet.
 
 ```
 </details>
@@ -9603,7 +9638,7 @@ To resume from where it stopped:
 
 
 To recover: Fix the issue above, then run a new apply.
-The new apply will only process tables that haven't completed.
+The new apply plans again from the live schema and runs only what is not applied yet.
 
 ```
 </details>
@@ -11074,7 +11109,7 @@ _No details available yet._
 
 ---
 
-To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e production
 ```
@@ -11398,7 +11433,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`products`** — Cancelled
+**`products`** — Not run
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
@@ -11427,7 +11462,7 @@ _No details available yet._
 
 ---
 
-To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e production
 ```
@@ -11841,7 +11876,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e production
 ```
@@ -11900,7 +11935,7 @@ ALTER TABLE `mutes` ADD UNIQUE `uk_target`(`target_id`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e production
 ```
@@ -11968,7 +12003,7 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6 -e production
 ```
 
-A new apply can retry the failure once this one finishes or is stopped; it reprocesses only the tables that haven't completed.
+A new apply can retry the failure once this one finishes or is stopped; it plans again from the live schema and runs only what is not applied yet.
 
 _Last updated: <relative-time datetime="2026-03-15T14:30:00Z">2026-03-15 14:30:00 UTC</relative-time> (2026-03-15 14:30:00 UTC)_
 
@@ -12167,7 +12202,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e production
 ```
@@ -12199,7 +12234,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e production
 ```
@@ -12240,7 +12275,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e production
 ```
@@ -12280,7 +12315,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 ---
 
-To retry:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
 ```
 schemabot apply -e staging
 ```
@@ -12400,7 +12435,7 @@ To stop this schema change:
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
-To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:
+To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:
   schemabot apply -s <schema_dir> -e production
 
 ```
@@ -12446,7 +12481,7 @@ To retry once the failure above is resolved — a new apply reprocesses only the
 
 To stop this schema change:
   schemabot stop apply-multi-a1b2c3d4 -e production
-A new apply can retry the failure once this one finishes or is stopped; it reprocesses only the tables that haven't completed.
+A new apply can retry the failure once this one finishes or is stopped; it plans again from the live schema and runs only what is not applied yet.
 
 ```
 </details>
@@ -12750,7 +12785,7 @@ To resume from where it stopped:
 
 
 To recover: Fix the issue above, then run a new apply.
-The new apply will only process tables that haven't completed.
+The new apply plans again from the live schema and runs only what is not applied yet.
 
 ```
 </details>
@@ -12797,7 +12832,7 @@ The new apply will only process tables that haven't completed.
 
 
 To recover: Fix the issue above, then run a new apply.
-The new apply will only process tables that haven't completed.
+The new apply plans again from the live schema and runs only what is not applied yet.
 ```
 </details>
 
@@ -12966,7 +13001,7 @@ Sequential mode: First table failed (others cancelled)
 
 
 To recover: Fix the issue above, then run a new apply.
-The new apply will only process tables that haven't completed.
+The new apply plans again from the live schema and runs only what is not applied yet.
 
 ```
 </details>
@@ -12999,7 +13034,7 @@ Sequential mode: Middle table failed
 
 
 To recover: Fix the issue above, then run a new apply.
-The new apply will only process tables that haven't completed.
+The new apply plans again from the live schema and runs only what is not applied yet.
 
 ```
 </details>

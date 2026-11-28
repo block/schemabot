@@ -1079,11 +1079,12 @@ func sortProgressRows(rows []TableProgressData) []TableProgressData {
 
 // sortRowsByTable orders rows for display without modifying the input. Tables
 // are ranked by the most urgent state among their rows under statePriority,
-// and a table's rows stay adjacent — ordered by their own state — so a table
-// whose plan produced several statements reads as one block rather than
-// scattering across the list by state. Tables with the same rank keep plan
-// order. When every row is a distinct table this is exactly a stable sort by
-// statePriority.
+// and a table's rows stay adjacent in plan order, so a table whose plan
+// produced several statements reads as one block, in the order its steps
+// run, rather than scattering across the list by state: a completed step
+// never drops below the failed step after it. Tables with the same rank keep
+// plan order. When every row is a distinct table this is exactly a stable
+// sort by statePriority.
 func sortRowsByTable(rows []TableProgressData, statePriority func(tableStatus string) int) []TableProgressData {
 	type tableRank struct {
 		priority   int
@@ -1112,10 +1113,7 @@ func sortRowsByTable(rows []TableProgressData, statePriority func(tableStatus st
 		if ri.priority != rj.priority {
 			return ri.priority < rj.priority
 		}
-		if ri.firstIndex != rj.firstIndex {
-			return ri.firstIndex < rj.firstIndex
-		}
-		return statePriority(sorted[i].Status) < statePriority(sorted[j].Status)
+		return ri.firstIndex < rj.firstIndex
 	})
 	return sorted
 }
@@ -1218,7 +1216,7 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		}
 
 	case state.Task.Cancelled:
-		fmt.Fprintf(sb, "**%s**: 🚫 %s\n", inlineCode(table.TableName), cancelledTablePhrase(table))
+		fmt.Fprintf(sb, "**%s**: 🚫 %s\n", inlineCode(table.TableName), presentation.ReadCancelledTask(tableFacts(table, apitypes.BuildWork{}), tableBegan(table), false).Label)
 		writeDDLLine(sb, dialect, table.DDL, budget)
 
 	case state.Task.RevertWindow:
@@ -1395,19 +1393,6 @@ func copiedRows(table TableProgressData) bool {
 	return table.PercentComplete > 0 || table.RowsCopied > 0
 }
 
-// cancelledTablePhrase is a cancelled table's state: how far its row copy
-// had come when the cancel stopped it, or that it was never started.
-func cancelledTablePhrase(table TableProgressData) string {
-	switch {
-	case copiedRows(table):
-		return "Cancelled at " + ui.FormatRowCopyPercent(table.PercentComplete, table.RowsCopied, table.RowsTotal)
-	case tableBegan(table):
-		return "Cancelled"
-	default:
-		return "Cancelled (not started)"
-	}
-}
-
 // recoveringCopyPercent returns the least-progressed recovering table's copy
 // percent as display text, so the recovery summary never overstates how far
 // the slowest table has come.
@@ -1576,7 +1561,7 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 		sb.WriteString("\n---\n\n")
 		sb.WriteString("This schema change was cancelled and cannot be resumed. Open a new schema change to apply it again.\n")
 	case state.Apply.Failed:
-		writeMemberFooterAction(sb, data, "To retry:", AppendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
+		writeMemberFooterAction(sb, data, presentation.RetryLabel+":", AppendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 	case state.Apply.RevertWindow:
 		// Skip-revert (finalize) is the common path, so it leads; revert (undo) follows.
 		writeMemberFooterAction(sb, data, "To skip revert and keep changes:", AppendTenantFlag(fmt.Sprintf("schemabot skip-revert %s -e %s", data.ApplyID, data.Environment), data.Tenant))
@@ -1692,7 +1677,7 @@ func writeSummaryFailed(sb *strings.Builder, data ApplyStatusCommentData, comple
 	}
 
 	writeSummaryTableList(sb, data, budget)
-	writeMemberFooterAction(sb, data, "To retry:", AppendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
+	writeMemberFooterAction(sb, data, presentation.RetryLabel+":", AppendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 }
 
 // writeTablesStoppedAtCutover explains, under a failed apply's error, the
@@ -1894,6 +1879,7 @@ func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusComme
 	}
 
 	dialect := dialectForEngine(data.Engine, data.ApplyID)
+	applyFailed := state.IsState(data.State, state.Apply.Failed)
 
 	// What went wrong leads, then what landed, then what never ran — and a
 	// table's rows stay together so the reader meets each table once.
@@ -1963,7 +1949,7 @@ func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusComme
 		}
 
 		for _, t := range g.tables {
-			writeSummaryTableEntry(sb, dialect, t, labelCompleted, budget)
+			writeSummaryTableEntry(sb, dialect, t, labelCompleted, applyFailed, budget)
 		}
 
 		if groupCollapsed {
@@ -2000,7 +1986,7 @@ func groupStateEmoji(tables []TableProgressData) string {
 // unsuccessful apply, each row must answer "did this table make it?", so
 // completed tables are labeled explicitly. On a successful apply the header
 // already says every table completed, so the label would be noise.
-func writeSummaryTableEntry(sb *strings.Builder, dialect schema.Dialect, t TableProgressData, labelCompleted bool, budget *ddlBlockBudget) {
+func writeSummaryTableEntry(sb *strings.Builder, dialect schema.Dialect, t TableProgressData, labelCompleted, applyFailed bool, budget *ddlBlockBudget) {
 	normalized := state.NormalizeTaskStatus(t.Status)
 
 	switch normalized {
@@ -2025,11 +2011,7 @@ func writeSummaryTableEntry(sb *strings.Builder, dialect schema.Dialect, t Table
 	case state.Task.Reverted:
 		fmt.Fprintf(sb, "**%s** — Reverted\n", inlineCode(t.TableName))
 	case state.Task.Cancelled:
-		label := "Cancelled"
-		if copiedRows(t) {
-			label = fmt.Sprintf("Cancelled at %s", ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal))
-		}
-		fmt.Fprintf(sb, "**%s** — %s\n", inlineCode(t.TableName), label)
+		fmt.Fprintf(sb, "**%s** — %s\n", inlineCode(t.TableName), presentation.ReadCancelledTask(tableFacts(t, apitypes.BuildWork{}), tableBegan(t), applyFailed).Label)
 	default:
 		// Unknown or in-flight statuses still get a visible label — a bare
 		// table name reads as success, which is wrong for anything but
@@ -2084,11 +2066,11 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 	} else {
 		data.Step, data.StepsTotal, data.Statement = step.Step, step.StepsTotal, step.Statement
 	}
-	if work, err := apitypes.ParseBuildWork(resp.Metadata); err != nil {
-		slog.Warn("progress comment omits build work because the progress metadata is malformed", "apply_id", resp.ApplyID, "error", err)
-	} else {
-		data.BuildWork = work
+	work, err := apitypes.ParseBuildWork(resp.Metadata)
+	if err != nil {
+		slog.Warn("progress comment omits part of the build work because the progress metadata is malformed", "apply_id", resp.ApplyID, "error", err)
 	}
+	data.BuildWork = work
 
 	if changes, err := apitypes.ParseVSchemaChanges(resp.Metadata); err != nil {
 		slog.Warn("failed to parse VSchema changes from progress metadata", "apply_id", resp.ApplyID, "error", err)
@@ -2120,6 +2102,7 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 			ThrottleReason:      t.ThrottleReason,
 			Shards:              shardProgressFromResponse(t.Shards),
 			PlannedShards:       int(t.PlannedShards),
+			Started:             t.StartedAt != "",
 		})
 	}
 

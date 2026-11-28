@@ -302,6 +302,87 @@ func TestApplyComments(t *testing.T, h Harness) {
 		assert.Nil(t, summary.PendingFreezeCommentID)
 	})
 
+	// Freeze verifies the owed freeze and its stored body: a rotation
+	// records the freeze in the same write that tracks its successor,
+	// RecordFrozenBody stores only the first body and only while that
+	// comment's freeze is owed, ClearFreeze removes the marker and body
+	// together but never a freeze owed to a different comment, and a new
+	// upsert drops a body stored for an earlier freeze.
+	t.Run("Freeze", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		lock := CreateLock(t, store, "comment_frozen_body_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_comment_frozen_body", 708)
+
+		supersededID := int64(100)
+		require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+			ApplyID:         apply.ID,
+			CommentState:    state.Comment.Progress,
+			GitHubCommentID: 200,
+			FreezeCommentID: &supersededID,
+		}))
+		retrieved, err := store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+		require.NoError(t, err)
+		require.NotNil(t, retrieved)
+		require.NotNil(t, retrieved.FreezeCommentID)
+		assert.Equal(t, supersededID, *retrieved.FreezeCommentID)
+		assert.Nil(t, retrieved.FrozenBody, "no body is stored until one is rendered")
+		assert.Nil(t, retrieved.PendingFreezeCommentID, "the earlier release's marker stays unset")
+
+		recorded, err := store.ApplyComments().RecordFrozenBody(ctx, apply.ID, state.Comment.Progress, 999, "wrong comment")
+		require.NoError(t, err)
+		assert.False(t, recorded, "a body for a comment that is not owed a freeze is not stored")
+
+		recorded, err = store.ApplyComments().RecordFrozenBody(ctx, apply.ID, state.Comment.Progress, supersededID, "first body")
+		require.NoError(t, err)
+		assert.True(t, recorded)
+		recorded, err = store.ApplyComments().RecordFrozenBody(ctx, apply.ID, state.Comment.Progress, supersededID, "second body")
+		require.NoError(t, err)
+		assert.False(t, recorded, "the first stored body is the one every retry sends")
+		retrieved, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+		require.NoError(t, err)
+		require.NotNil(t, retrieved)
+		require.NotNil(t, retrieved.FrozenBody)
+		assert.Equal(t, "first body", *retrieved.FrozenBody)
+
+		require.NoError(t, store.ApplyComments().ClearFreeze(ctx, apply.ID, state.Comment.Progress, 999))
+		retrieved, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+		require.NoError(t, err)
+		require.NotNil(t, retrieved)
+		require.NotNil(t, retrieved.FreezeCommentID, "clearing a different comment's freeze leaves this one owed")
+		require.NotNil(t, retrieved.FrozenBody)
+
+		require.NoError(t, store.ApplyComments().ClearFreeze(ctx, apply.ID, state.Comment.Progress, supersededID))
+		retrieved, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+		require.NoError(t, err)
+		require.NotNil(t, retrieved)
+		assert.Nil(t, retrieved.FreezeCommentID)
+		assert.Nil(t, retrieved.FrozenBody)
+		assert.Equal(t, int64(200), retrieved.GitHubCommentID)
+		require.NoError(t, store.ApplyComments().ClearFreeze(ctx, apply.ID, state.Comment.Progress, supersededID))
+		require.NoError(t, store.ApplyComments().ClearFreeze(ctx, apply.ID+1000, state.Comment.Progress, supersededID))
+
+		// A later rotation owes a new freeze; a body stored for the earlier
+		// one must not be sent for it.
+		require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+			ApplyID: apply.ID, CommentState: state.Comment.Progress, GitHubCommentID: 300, FreezeCommentID: &supersededID,
+		}))
+		recorded, err = store.ApplyComments().RecordFrozenBody(ctx, apply.ID, state.Comment.Progress, supersededID, "earlier freeze body")
+		require.NoError(t, err)
+		require.True(t, recorded)
+		nextSupersededID := int64(300)
+		require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+			ApplyID: apply.ID, CommentState: state.Comment.Progress, GitHubCommentID: 400, FreezeCommentID: &nextSupersededID,
+		}))
+		retrieved, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+		require.NoError(t, err)
+		require.NotNil(t, retrieved)
+		require.NotNil(t, retrieved.FreezeCommentID)
+		assert.Equal(t, nextSupersededID, *retrieved.FreezeCommentID)
+		assert.Nil(t, retrieved.FrozenBody, "the upsert drops the body stored for the earlier freeze")
+	})
+
 	// ClaimSummaryComment verifies the atomic summary-marker claim is
 	// first-writer-wins: the first claim inserts the sentinel
 	// (github_comment_id = 0) and wins, every later claim for the same apply
@@ -726,7 +807,8 @@ func TestApplyComments(t *testing.T, h Harness) {
 	})
 
 	// LeaseGuardsWrites verifies every lease-guarded comment mutation —
-	// Upsert, IncrementEditCount, ClearPendingFreeze, and Supersede: a caller
+	// Upsert, IncrementEditCount, ClearPendingFreeze, RecordFrozenBody,
+	// ClearFreeze, and Supersede: a caller
 	// holding a stale lease fails closed with ErrApplyLeaseLost and leaves
 	// the row untouched, the current lease holder's writes land, and a caller
 	// with no lease in context writes unguarded. The lease is established
@@ -799,6 +881,36 @@ func TestApplyComments(t *testing.T, h Harness) {
 		require.NotNil(t, retrieved)
 		assert.Nil(t, retrieved.PendingFreezeCommentID)
 
+		// RecordFrozenBody and ClearFreeze are lease-guarded too: a stale
+		// lease neither stores a body nor clears the freeze, the current lease
+		// does both.
+		freezeID := int64(60)
+		comment.PendingFreezeCommentID = nil
+		comment.FreezeCommentID = &freezeID
+		require.NoError(t, store.ApplyComments().Upsert(ownedCtx, comment))
+		_, err = store.ApplyComments().RecordFrozenBody(staleCtx, apply.ID, state.Comment.Progress, freezeID, "frozen")
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		retrieved, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+		require.NoError(t, err)
+		require.NotNil(t, retrieved)
+		assert.Nil(t, retrieved.FrozenBody, "a stale lease must not store a frozen body")
+
+		recorded, err := store.ApplyComments().RecordFrozenBody(ownedCtx, apply.ID, state.Comment.Progress, freezeID, "frozen")
+		require.NoError(t, err)
+		require.True(t, recorded)
+		require.ErrorIs(t, store.ApplyComments().ClearFreeze(staleCtx, apply.ID, state.Comment.Progress, freezeID), storage.ErrApplyLeaseLost)
+		retrieved, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+		require.NoError(t, err)
+		require.NotNil(t, retrieved)
+		require.NotNil(t, retrieved.FreezeCommentID, "a stale lease must not clear the freeze")
+
+		require.NoError(t, store.ApplyComments().ClearFreeze(ownedCtx, apply.ID, state.Comment.Progress, freezeID))
+		retrieved, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+		require.NoError(t, err)
+		require.NotNil(t, retrieved)
+		assert.Nil(t, retrieved.FreezeCommentID)
+		assert.Nil(t, retrieved.FrozenBody)
+
 		// Supersede is lease-guarded like the other mutations: a stale lease
 		// cannot retire the tracked comment, the current lease holder's
 		// supersede lands.
@@ -854,6 +966,17 @@ func TestApplyComments(t *testing.T, h Harness) {
 	t.Run("ClearPendingFreeze_DBError", func(t *testing.T) {
 		store := h.NewUnreachableStorage(t)
 		require.Error(t, store.ApplyComments().ClearPendingFreeze(t.Context(), 1, state.Comment.Progress))
+	})
+
+	t.Run("RecordFrozenBody_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.ApplyComments().RecordFrozenBody(t.Context(), 1, state.Comment.Progress, 1, "frozen")
+		require.Error(t, err)
+	})
+
+	t.Run("ClearFreeze_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		require.Error(t, store.ApplyComments().ClearFreeze(t.Context(), 1, state.Comment.Progress, 1))
 	})
 
 	t.Run("ClaimSummaryComment_DBError", func(t *testing.T) {

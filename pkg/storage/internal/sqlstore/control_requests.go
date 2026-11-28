@@ -712,6 +712,32 @@ func (s *controlRequestStore) ListSettled(ctx context.Context, applyID int64) ([
 	return requests, nil
 }
 
+func (s *controlRequestStore) ListByApply(ctx context.Context, applyID int64) ([]*storage.ApplyControlRequest, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+controlRequestColumns+`
+		FROM apply_control_requests
+		WHERE apply_id = ?
+		ORDER BY operation
+	`, applyID)
+	if err != nil {
+		return nil, fmt.Errorf("list control requests for apply %d: %w", applyID, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	var requests []*storage.ApplyControlRequest
+	for rows.Next() {
+		req, err := scanControlRequest(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan control request for apply %d: %w", applyID, err)
+		}
+		requests = append(requests, req)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read control requests for apply %d: %w", applyID, err)
+	}
+	return requests, nil
+}
+
 func (s *controlRequestStore) RecordRemoteFailure(ctx context.Context, req *storage.ApplyControlRequest) (bool, error) {
 	var changed bool
 	op := fmt.Sprintf("record remote failure for apply %d operation %s", req.ApplyID, req.Operation)

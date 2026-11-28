@@ -467,8 +467,8 @@ func addColumnScalesWithTableSize(col *pgproto.ColumnDef) bool {
 // statement vocabulary and extracts the bare name of the first relation the
 // statement targets. Postgres expresses a table rename as
 // ALTER TABLE ... RENAME TO (a RenameStmt), so the rename forms classify by
-// what they rename: the whole table is a rename, a column or constraint is an
-// ordinary table alteration.
+// what they rename: the whole table is a rename, a column, constraint, or
+// index is an ordinary table alteration.
 func classifyPostgresNode(node *pgproto.Node) (StatementType, string) {
 	switch x := node.GetNode().(type) {
 	case *pgproto.Node_CreateStmt:
@@ -495,6 +495,11 @@ func classifyPostgresNode(node *pgproto.Node) (StatementType, string) {
 			return StatementRenameTable, x.RenameStmt.GetRelation().GetRelname()
 		case pgproto.ObjectType_OBJECT_COLUMN, pgproto.ObjectType_OBJECT_TABCONSTRAINT:
 			return StatementAlterTable, x.RenameStmt.GetRelation().GetRelname()
+		case pgproto.ObjectType_OBJECT_INDEX:
+			// Renaming an index alters its table's index set. Like DROP
+			// INDEX, ALTER INDEX ... RENAME TO names only the index, so no
+			// table name is available.
+			return StatementAlterTable, ""
 		default:
 			return StatementUnknown, ""
 		}
@@ -736,6 +741,15 @@ func restoreDropColumnKeyword(stmt *pgproto.Node, canonical string) string {
 		canonical = pattern.ReplaceAllString(canonical, "DROP COLUMN $1$2")
 	}
 	return canonical
+}
+
+// DeclaresRowSecurity reports whether sql sets a table's row security or
+// declares, alters, drops, or comments on a policy in any of its statements.
+func (postgresStatementParser) DeclaresRowSecurity(sql string) (bool, error) {
+	if _, err := pgstatement.ParseRowSecurityChange(sql); err == nil {
+		return true, nil
+	}
+	return pgstatement.HasRowSecurityDeclaration(sql)
 }
 
 // CanonicalRowSecurity delegates PostgreSQL operation grammar to pg-sprite.

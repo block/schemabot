@@ -224,7 +224,7 @@ func TestRenderShardedApplyComment_FooterOffersStopWhileRunning(t *testing.T) {
 	assert.Contains(t, pastFailure, "A new apply can retry the failure once this one finishes or is stopped")
 
 	failed := render(state.Apply.Failed, failedShard("dupes"))
-	assert.Contains(t, failed, "To retry:\n```\nschemabot apply -e production --tenant acme\n```\n")
+	assert.Contains(t, failed, presentation.RetryLabel+":\n```\nschemabot apply -e production --tenant acme\n```\n")
 	assert.NotContains(t, failed, "schemabot stop")
 }
 
