@@ -58,7 +58,7 @@ func planRowSecurityOperation(ctx context.Context, pool *pgxpool.Pool, namespace
 	if len(preview.Statements) == 0 {
 		return nil, nil
 	}
-	reason := "Row security changes alter who can access rows; review the complete policy and settings replacement"
+	reason := "Row security changes alter who can access rows, so review the complete policy and settings replacement"
 	if deniesEveryRow(wanted.RowSecurity) {
 		reason += "; " + denyAllReason
 	}

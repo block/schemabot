@@ -75,7 +75,7 @@ func TestEngineRowSecurityRoundTrip(t *testing.T) {
 		change := result.Changes[0].TableChanges[0]
 		assert.True(t, change.IsUnsafe)
 		assert.Equal(t, ddl.StatementAlterTable, change.Operation)
-		assert.Equal(t, "Row security changes alter who can access rows; review the complete policy and settings replacement", change.UnsafeReason)
+		assert.Equal(t, "Row security changes alter who can access rows, so review the complete policy and settings replacement", change.UnsafeReason)
 		operation, err := statement.ParseRowSecurityChange(change.DDL)
 		require.NoError(t, err)
 		require.Equal(t, []string{
