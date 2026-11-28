@@ -1092,6 +1092,18 @@ func committedCreatePrefixDetail(err error, table string) (string, bool) {
 	return sanitizeReasonText(detail), true
 }
 
+// privilegeRemedy is the statement that provisions the access a privilege
+// refusal names, with the refusal's hint. The catalog check that failed is
+// how the engine proved the access missing, not something the reader runs,
+// so it is left out.
+func privilegeRemedy(err *preflight.PrivilegeError) string {
+	remedy := "provision with: " + err.Grant
+	if err.Hint != "" {
+		remedy += "; " + err.Hint
+	}
+	return remedy
+}
+
 // refusalForCause holds classifyRefusal's cause-to-refusal mapping; causes
 // and remedies leave unsanitized and classifyRefusal sanitizes the composed
 // detail at its return.

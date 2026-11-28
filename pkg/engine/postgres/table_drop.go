@@ -271,18 +271,6 @@ func privilegeDropReason(err *preflight.PrivilegeError) string {
 	return "the engine role cannot drop it, because only the table's owner can drop a table — " + privilegeRemedy(err)
 }
 
-// privilegeRemedy is the statement that provisions the access a privilege
-// refusal names, with the refusal's hint. The catalog check that failed is
-// how the engine proved the access missing, not something the reader runs,
-// so it is left out.
-func privilegeRemedy(err *preflight.PrivilegeError) string {
-	remedy := "provision with: " + err.Grant
-	if err.Hint != "" {
-		remedy += "; " + err.Hint
-	}
-	return remedy
-}
-
 // tableDropRefusals reads the reasons the target already gives to refuse
 // the drop of a table: objects that depend on it, and a role that cannot
 // drop it. The server's own refusal at execution stays the backstop for a
@@ -298,6 +286,10 @@ func tableDropRefusals(ctx context.Context, pool *pgxpool.Pool, namespace, table
 	}
 	_, err = preflight.CheckPrivileges(ctx, pool, namespace, table, preflight.Requirement{Tier: tableDropTier})
 	if privilegeErr, ok := errors.AsType[*preflight.PrivilegeError](err); ok {
+		slog.Info("PostgreSQL table drop refused: the engine role cannot drop the table",
+			"namespace", namespace,
+			"table", table,
+			"check", privilegeErr.Check)
 		reasons = append(reasons, privilegeDropReason(privilegeErr))
 	} else if err != nil {
 		return nil, fmt.Errorf("check the privileges to drop table %q: %w", table, err)
