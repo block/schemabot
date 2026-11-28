@@ -243,8 +243,9 @@ func TestFreezeListCmdPrintsEachGroup(t *testing.T) {
 	assert.Contains(t, out, "In effect (1)\n  1. freeze-abc  production (on demand, in effect)\n")
 	assert.Contains(t, out, "Scheduled (1)\n  1. freeze-next  production (planned)\n")
 	assert.Contains(t, out, "Window:   2026-11-21T10:00:00Z until 2026-11-22T10:00:00Z\n")
-	assert.Contains(t, out, "Recent (2)\n")
-	assert.Contains(t, out, "  2. freeze-old  production (on demand, lifted)\n")
+	assert.Contains(t, out, "Recently ended (1)\n  1. freeze-old  production (on demand, lifted)\n")
+	assert.Equal(t, 1, strings.Count(out, "freeze-abc"), "a freeze in effect is listed once, under In effect: %s", out)
+	assert.Contains(t, out, "Window:   2026-11-21T10:00:00Z until lifted at 2026-11-21T11:00:00Z\n")
 	assert.Contains(t, out, "Lifted:   by erin at 2026-11-21T11:00:00Z: SEV resolved\n")
 	assert.Contains(t, out, "Reason:   SEV-1234 payments latency\n")
 	assert.Contains(t, out, "By:       dana\n")
@@ -305,14 +306,19 @@ func TestFreezeOverrideCmdShowsTheRequest(t *testing.T) {
 	assert.Contains(t, out, "Blockers:     freeze freeze-abc\n")
 }
 
+// unfreeze confirms the lift with what the freeze now records: who lifted
+// it, when, why, and what it covered.
 func TestUnfreezeCmdLiftsTheFreeze(t *testing.T) {
-	api := &freezeAPI{status: http.StatusOK, reply: freezeFixture()}
+	lifted := freezeFixture()
+	liftedAt := freezeStart.Add(time.Hour)
+	lifted.InEffect, lifted.LiftedAt, lifted.LiftedBy, lifted.LiftReason = false, &liftedAt, "erin", "SEV resolved"
+	api := &freezeAPI{status: http.StatusOK, reply: lifted}
 	endpoint := api.start(t)
 
 	out, err := runFreezeCmd(endpoint, (&UnfreezeCmd{ID: "freeze-abc", Reason: "SEV resolved"}).Run)
 
 	require.NoError(t, err)
-	assert.Equal(t, "✓ freeze-abc lifted.\n", out)
+	assert.Equal(t, "✓ freeze-abc lifted by erin at 2026-11-21T11:00:00Z: SEV resolved.\n   Scope:  whole environment in production\n", out)
 	assert.Equal(t, "/api/freezes/freeze-abc/lift", api.path)
 	assert.Equal(t, "SEV resolved", api.body["reason"])
 }

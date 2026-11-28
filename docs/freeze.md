@@ -88,8 +88,9 @@ $ schemabot freeze -e production --planned --reason "Launch week code freeze" \
    Running applies: continue
 ```
 
-`freeze list` shows the freezes in effect, the scheduled ones, and the recent
-ones of any state. `-e` narrows it to one environment:
+`freeze list` shows the freezes in effect, the scheduled ones, and the ones
+that recently ended. Each freeze is listed once, under its current state. `-e`
+narrows it to one environment:
 
 ```console
 $ schemabot freeze list -e production
@@ -107,15 +108,25 @@ Scheduled (1)
      Reason:   Launch week code freeze
      By:       alice
 
-Recent (2)
-  1. freeze-b62e0d9c41f7a385  production (planned)
-     ...
-  2. freeze-3f9a1c2e7b4d8a06  production (on demand, in effect)
-     ...
+Recently ended (1)
+  1. freeze-71d0e4a2c9b85f13  production (on demand, lifted)
+     Scope:    whole environment
+     Window:   2026-12-02T09:00:00Z until lifted at 2026-12-02T11:30:00Z
+     Reason:   Payments latency incident
+     By:       alice
+     Lifted:   by carol at 2026-12-02T11:30:00Z: incident resolved
 ```
 
-`unfreeze` ends a planned freeze early, or cancels it before it starts. See
-the [CLI reference](cli.md#freeze-an-environment) for every flag.
+`unfreeze` ends a freeze early, or cancels a planned one before it starts. It
+confirms who lifted the freeze, when, why, and what it covered:
+
+```console
+$ schemabot unfreeze freeze-71d0e4a2c9b85f13 --reason "incident resolved"
+✓ freeze-71d0e4a2c9b85f13 lifted by carol at 2026-12-02T11:30:00Z: incident resolved.
+   Scope:  whole environment in production
+```
+
+See the [CLI reference](cli.md#freeze-an-environment) for every flag.
 
 ## When a freeze refuses your change
 
@@ -149,7 +160,7 @@ too.
 `schemabot plan` warns you the same way. Under the plan, it names the freezes
 in effect and those scheduled, and says to apply with `--override "<reason>"`
 if the change can't wait. A plan that apply refuses whatever its flags, such
-as one with a blocked change, names no freeze, as the plan comment does not. The response to `POST /api/plan` carries them in
+as one with a blocked change, names no freeze, as the plan comment does not. `schemabot apply` refused for an unsafe change names the freezes under its plan the same way, so `--allow-unsafe` is not followed by a freeze refusal you could not see coming. The response to `POST /api/plan` carries them in
 `freezes`, in effect first, each with `in_effect`.
 
 You have two choices:
@@ -177,9 +188,19 @@ On a pull request, the refusal comment says which policy applies: "Go ahead with
 
 ### From the CLI
 
-Under the default policy the command with `--override "<reason>"` runs like
-any other. Under `approval`, SchemaBot still refuses the change and records
-the request. The approver reads the reason:
+Under the default policy the command with `--override "<reason>"` runs, and
+its output names the override that let it through:
+
+```console
+$ schemabot apply -s schema -e production --override "Hotfix: checkout needs the gift_note column"
+...
+Apply started: apply-2f6b0c91d4e8a357
+❄️ production is frozen; override ovr-5a9e17c3b2d04f68 let this change through. See it with 'schemabot freeze override ovr-5a9e17c3b2d04f68'.
+```
+
+With `--output json --no-watch` the output carries the request ID in
+`freeze_override`. Under `approval`, SchemaBot still refuses the change and
+records the request. The approver reads the reason:
 
 ```console
 $ schemabot apply -s schema -e production --override "Hotfix: checkout needs the gift_note column"

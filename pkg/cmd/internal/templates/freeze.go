@@ -43,6 +43,24 @@ func freezeUntil(f apitypes.Freeze) string {
 	return ui.FreezeUntil(f.EndsAt)
 }
 
+// freezeWindowEnd is where a freeze's window actually ended: when it was
+// lifted before its planned end, the lift; otherwise its planned end.
+func freezeWindowEnd(f apitypes.Freeze) string {
+	if f.LiftedAt != nil && (f.EndsAt == nil || f.LiftedAt.Before(*f.EndsAt)) {
+		return "until lifted at " + freezeTime(*f.LiftedAt)
+	}
+	return freezeUntil(f)
+}
+
+// freezeLifted says who lifted a freeze, when, and why.
+func freezeLifted(f apitypes.Freeze) string {
+	lifted := fmt.Sprintf("by %s at %s", ui.TerminalSafeLine(f.LiftedBy), freezeTime(*f.LiftedAt))
+	if f.LiftReason != "" {
+		lifted += ": " + ui.TerminalSafeLine(f.LiftReason)
+	}
+	return lifted
+}
+
 // WriteFreezeCreated writes the confirmation of a new freeze.
 func WriteFreezeCreated(f apitypes.Freeze) {
 	state := "frozen"
@@ -100,9 +118,27 @@ func writeFreezeStopSweep(sweep *apitypes.FreezeStopSweep) {
 	}
 }
 
-// WriteFreezeLifted writes the confirmation of a lifted freeze.
+// WriteFreezeLifted writes the confirmation of a lifted freeze: who lifted
+// it, when, and why, as the freeze now records them.
 func WriteFreezeLifted(f apitypes.Freeze) {
-	fmt.Printf("✓ %s lifted.\n", ui.TerminalSafeLine(f.ID))
+	if f.LiftedAt == nil {
+		fmt.Printf("✓ %s lifted.\n", ui.TerminalSafeLine(f.ID))
+		return
+	}
+	fmt.Printf("✓ %s lifted %s.\n", ui.TerminalSafeLine(f.ID), freezeLifted(f))
+	fmt.Printf("   Scope:  %s in %s\n", freezeScope(f), ui.TerminalSafeLine(f.Environment))
+}
+
+// WriteFreezeOverrideUsed says an apply ran through a freeze on an override,
+// naming the request so its record is one command away. It writes nothing
+// when no override was used.
+func WriteFreezeOverrideUsed(overrideID, environment string) {
+	if overrideID == "" {
+		return
+	}
+	id := ui.TerminalSafeLine(overrideID)
+	fmt.Printf("%s %s is frozen; override %s let this change through. See it with '%s'.\n",
+		glyph.Frozen, ui.TerminalSafeLine(environment), id, cliname.Command("freeze", "override", id))
 }
 
 // writeFreezeRows prints one freeze under a heading. detail adds the fields
@@ -118,15 +154,11 @@ func writeFreezeRows(f apitypes.Freeze, heading string, detail bool) {
 	fmt.Printf("%s%s  %s (%s%s)\n", heading, ui.TerminalSafeLine(f.ID), ui.TerminalSafeLine(f.Environment), freezeKind(f.Kind), status)
 	row := func(label, value string) { fmt.Printf("     %-9s %s\n", label+":", value) }
 	row("Scope", freezeScope(f))
-	row("Window", freezeTime(f.StartsAt)+" "+freezeUntil(f))
+	row("Window", freezeTime(f.StartsAt)+" "+freezeWindowEnd(f))
 	row("Reason", ui.TerminalSafeLine(f.Reason))
 	row("By", ui.TerminalSafeLine(f.CreatedBy))
 	if f.LiftedAt != nil {
-		lifted := fmt.Sprintf("by %s at %s", ui.TerminalSafeLine(f.LiftedBy), freezeTime(*f.LiftedAt))
-		if f.LiftReason != "" {
-			lifted += ": " + ui.TerminalSafeLine(f.LiftReason)
-		}
-		row("Lifted", lifted)
+		row("Lifted", freezeLifted(f))
 	}
 	if detail {
 		row("Running", ui.TerminalSafeLine(f.Running)+" (applies already running in scope)")
@@ -143,15 +175,27 @@ func WriteFreezeShow(f apitypes.Freeze) {
 	writeFreezeRows(f, "Freeze ", true)
 }
 
-// WriteFreezeList writes the three freeze groups the API returns.
+// WriteFreezeList writes the freezes in effect, those scheduled, and those
+// that recently ended. The API's recent group also holds the freezes in the
+// first two, so each freeze is listed once, under its current state.
 func WriteFreezeList(list apitypes.FreezeListResponse) {
+	listed := make(map[string]bool, len(list.InEffect)+len(list.Scheduled))
+	for _, f := range append(append([]apitypes.Freeze(nil), list.InEffect...), list.Scheduled...) {
+		listed[f.ID] = true
+	}
+	var ended []apitypes.Freeze
+	for _, f := range list.Recent {
+		if !listed[f.ID] {
+			ended = append(ended, f)
+		}
+	}
 	groups := []struct {
 		title   string
 		freezes []apitypes.Freeze
 	}{
 		{"In effect", list.InEffect},
 		{"Scheduled", list.Scheduled},
-		{"Recent", list.Recent},
+		{"Recently ended", ended},
 	}
 	for i, group := range groups {
 		if i > 0 {

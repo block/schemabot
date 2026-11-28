@@ -255,3 +255,59 @@ func TestQuietChangeGateRefusalPrintsOnlyTheTemplate(t *testing.T) {
 	assert.NotContains(t, err.Error(), "INJECTED")
 	assert.ErrorIs(t, err, apiErr, "the API error stays reachable for lock cleanup")
 }
+
+// An apply the server lets through a freeze on an override names the override
+// request, so the operator sees that the freeze was bypassed and which record
+// says so, in text and in JSON alike.
+func TestApplyNamesTheOverrideThatLetItThroughAFreeze(t *testing.T) {
+	accepted := apitypes.ApplyResponse{Accepted: true, ApplyID: "apply-1", FreezeOverride: "ovr-123"}
+
+	t.Run("text", func(t *testing.T) {
+		server, _, _ := gateApplyServer(t, http.StatusOK, accepted)
+		cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "production", AutoApprove: true, Override: "SEV-1234 fix the index", Output: OutputFormatLog}
+		var runErr error
+		out := stripAnsi(captureStdout(func() {
+			runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
+		}))
+		require.NoError(t, runErr)
+		assert.Contains(t, out, "Apply started: apply-1\n❄️ production is frozen; override ovr-123 let this change through. See it with 'schemabot freeze override ovr-123'.\n")
+	})
+
+	t.Run("json", func(t *testing.T) {
+		server, _, _ := gateApplyServer(t, http.StatusOK, accepted)
+		cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "production", AutoApprove: true, Override: "SEV-1234 fix the index", Output: OutputFormatJSON}
+		var runErr error
+		out := captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) })
+		require.NoError(t, runErr)
+		assert.Contains(t, out, `"freeze_override":"ovr-123"`)
+	})
+
+	t.Run("no freeze held it", func(t *testing.T) {
+		server, _, _ := gateApplyServer(t, http.StatusOK, apitypes.ApplyResponse{Accepted: true, ApplyID: "apply-1"})
+		cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "production", AutoApprove: true, Output: OutputFormatLog}
+		var runErr error
+		out := stripAnsi(captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) }))
+		require.NoError(t, runErr)
+		assert.NotContains(t, out, "override")
+	})
+}
+
+// An apply refused for its unsafe changes also shows the freezes that would
+// refuse it, as plan does, so allowing the unsafe changes is not followed by
+// a second refusal the operator could not see coming.
+func TestBlockUnsafeApplyShowsTheFreezesToo(t *testing.T) {
+	plan := planWithTablesAndEngine("mysql", &apitypes.TableChangeResponse{
+		TableName: "legacy", DDL: "DROP TABLE `legacy`", ChangeType: "drop", IsUnsafe: true, UnsafeReason: "drops a table",
+	})
+	plan.Freezes = []apitypes.Freeze{{ID: "freeze-abc", Environment: "production", Reason: "SEV-1234 payments latency", InEffect: true}}
+
+	var err error
+	out := stripAnsi(captureStdout(func() {
+		err = blockUnsafeApply(plan, "orders", "production", "schema", "", OutputFormatLog)
+	}))
+
+	require.ErrorIs(t, err, ErrSilent)
+	assert.Contains(t, out, "❄️ production is frozen, so applying this plan would be refused now.\n")
+	assert.Contains(t, out, "   freeze-abc  SEV-1234 payments latency  (until lifted)\n")
+	assert.Contains(t, out, "--allow-unsafe")
+}

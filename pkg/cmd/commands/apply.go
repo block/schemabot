@@ -675,9 +675,12 @@ func blockUnsafeApply(planResult *apitypes.PlanResponse, database, environment, 
 		return errors.New(templates.UnsafeChangesBlockedSummary(unsafeChanges, retry))
 	}
 
-	// First show the plan so user can see what changes are proposed
+	// First show the plan so user can see what changes are proposed, and
+	// the freezes that would refuse the apply too, so allowing the unsafe
+	// changes is not followed by a second refusal the operator never saw.
 	OutputPlanResult(planResult, database, environment, schemaDir, true)
 	writeNarrowedTo(planResult)
+	writePlanFreezes(environment, planResult)
 
 	// Then show the unsafe changes warning
 	templates.WriteUnsafeChangesBlocked(unsafeChanges, retry)
