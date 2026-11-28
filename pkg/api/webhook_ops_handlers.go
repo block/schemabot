@@ -113,13 +113,42 @@ func (s *Service) extendWebhookOpsDeadline(w http.ResponseWriter, r *http.Reques
 	return s.extendOperatorWriteDeadline(w, r, webhookOpsRequestTimeout)
 }
 
-func (s *Service) writeWebhookOpsError(w http.ResponseWriter, err error) {
+// writeWebhookOpsError answers a failed webhook operator request. A refusal of
+// the request itself keeps its own text. Any other failure answers a fixed
+// message, because its cause can be a GitHub, storage, or SQL driver error
+// carrying addresses or credentials; the cause goes to the server log with the
+// operation, the repository, and attrs, the identifiers the caller has in scope.
+func (s *Service) writeWebhookOpsError(w http.ResponseWriter, operation, repo string, err error, attrs ...any) {
 	var reqErr *webhookOpsRequestError
 	if errors.As(err, &reqErr) {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.writeError(w, http.StatusInternalServerError, err.Error())
+	logAttrs := append([]any{"operation", operation, "repo", repo}, attrs...)
+	logAttrs = append(logAttrs, "error", err)
+	if errors.Is(err, ErrRepoNotConfigured) {
+		s.logger.Warn("webhook operator request failed: the repository is not declared in the repos config", logAttrs...)
+	} else {
+		s.logger.Error("webhook operator request failed", logAttrs...)
+	}
+	s.writeError(w, http.StatusInternalServerError, webhookOpsFailureMessage(operation, repo, err))
+}
+
+// webhookOpsFailureMessage is the 500 body of a webhook operator request that
+// failed inside SchemaBot. The cause stays in the server log. These requests
+// read state or replay what a webhook delivery would have done, so they can be
+// repeated. A repository missing from the repos config is named, since the
+// operator can fix that and a retry cannot.
+func webhookOpsFailureMessage(operation, repo string, err error) string {
+	subject := strings.ReplaceAll(operation, "_", " ") + " failed"
+	if repo != "" {
+		subject += fmt.Sprintf(" for repository %q", repo)
+	}
+	if errors.Is(err, ErrRepoNotConfigured) {
+		return subject + ": the repository is not declared in this server's repos config. " +
+			"Name a repository this server serves, or add it to the repos config."
+	}
+	return subject + ": SchemaBot hit an internal error. Retry in a moment. " + retryFailureTail
 }
 
 type ChecksScanRequest = apitypes.ChecksScanRequest
@@ -206,7 +235,8 @@ func (s *Service) handleChecksSynthesize(w http.ResponseWriter, r *http.Request)
 	defer cancel()
 	response, err := executeChecksSynthesize(ctx, s.config, s.checkRunBackfiller, req, s.logger)
 	if err != nil {
-		s.writeWebhookOpsError(w, err)
+		s.writeWebhookOpsError(w, "checks_synthesize", canonicalRepo(req.Repo), err,
+			"environment", req.Environment, "prs", req.PRs, "merge_queue_heads", req.MergeQueueHeads)
 		return
 	}
 	s.writeJSON(w, http.StatusOK, response)
@@ -486,7 +516,8 @@ func (s *Service) handleChecksScan(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	response, err := executeChecksScan(ctx, s.config, s.storage, req, s.logger)
 	if err != nil {
-		s.writeWebhookOpsError(w, err)
+		s.writeWebhookOpsError(w, "checks_scan", canonicalRepo(req.Repo), err,
+			"environment", req.Environment, "check_name", req.CheckName, "page", req.Page, "prs", req.PRs)
 		return
 	}
 	s.writeJSON(w, http.StatusOK, response)
@@ -645,7 +676,7 @@ func (s *Service) handleChecksRepos(w http.ResponseWriter, r *http.Request) {
 	}
 	response, err := executeChecksRepos(s.config)
 	if err != nil {
-		s.writeWebhookOpsError(w, err)
+		s.writeWebhookOpsError(w, "checks_repos", "", err)
 		return
 	}
 	s.writeJSON(w, http.StatusOK, response)

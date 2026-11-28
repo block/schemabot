@@ -42,11 +42,11 @@ type InspectedCheckRun = apitypes.InspectedCheckRun
 func (s *Service) handleChecksInspect(w http.ResponseWriter, r *http.Request) {
 	req, err := checksInspectRequestFromQuery(r.URL.Query())
 	if err != nil {
-		s.writeWebhookOpsError(w, err)
+		s.writeWebhookOpsError(w, "checks_inspect", req.Repo, err, "pull_request", req.PullRequest, "environment", req.Environment)
 		return
 	}
 	if err := validateChecksInspectRequest(s.config, req); err != nil {
-		s.writeWebhookOpsError(w, err)
+		s.writeWebhookOpsError(w, "checks_inspect", req.Repo, err, "pull_request", req.PullRequest, "environment", req.Environment)
 		return
 	}
 	if !s.checkChecksInspectCallerBudget(w, r, req) {
@@ -60,7 +60,7 @@ func (s *Service) handleChecksInspect(w http.ResponseWriter, r *http.Request) {
 	}
 	response, err := executeChecksInspectWith(ctx, s.config, s.storage, req, s.logger, resolve)
 	if err != nil {
-		s.writeWebhookOpsError(w, err)
+		s.writeWebhookOpsError(w, "checks_inspect", req.Repo, err, "pull_request", req.PullRequest, "environment", req.Environment)
 		return
 	}
 	s.writeJSON(w, http.StatusOK, response)

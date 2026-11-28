@@ -369,7 +369,9 @@ func TestApplyFailureKeepsReplanTextWhenPlanMemberDiffers(t *testing.T) {
 
 // An apply that fails inside SchemaBot answers 500 with a fixed message that
 // names the plan and says the apply may already be recorded. The cause stays
-// in the server log with the plan and environment.
+// in the server log with the plan, the environment, and the database and
+// deployment the plan routes to, so the line answers where the apply was
+// headed without a plan lookup.
 func TestHandleApplyAnswersFixedMessageWhenApplyFails(t *testing.T) {
 	plan := executeApplyTestPlan()
 	plan.Deployment = "user:pass@10.0.0.5:3306"
@@ -386,6 +388,8 @@ func TestHandleApplyAnswersFixedMessageWhenApplyFails(t *testing.T) {
 	line := requireLogLine(t, decodeLogLines(t, logs.Bytes()), "apply failed")
 	assert.Equal(t, "plan-1", line["plan_id"])
 	assert.Equal(t, "staging", line["environment"])
+	assert.Equal(t, "testdb", line["database"])
+	assert.Equal(t, "user:pass@10.0.0.5:3306", line["deployment"])
 	assert.Contains(t, line["error"], "user:pass")
 }
 
