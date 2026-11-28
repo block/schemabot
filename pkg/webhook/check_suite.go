@@ -29,6 +29,7 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -515,14 +516,13 @@ func (h *Handler) processDurableCheckSuiteRerequest(ctx context.Context, event *
 // re-plans a PR which already succeeded costs only the repeated work.
 func (h *Handler) rerunCheckSuite(ctx context.Context, repo, headSHA string, installationID int64, payload checkSuitePayload, deliveryID string) (retry bool, err error) {
 	runCtx := ctx
-	ctx, cancel, client, err := h.autoPlanBootstrap(ctx, repo, installationID)
+	lookupCtx, cancel, client, err := h.autoPlanBootstrap(ctx, repo, installationID)
 	if err != nil {
 		metrics.RecordWebhookEvent(runCtx, h.metricAppForRepo(repo), "check_suite", payload.Action, repo, "auto_plan_bootstrap_failed")
 		return true, fmt.Errorf("bootstrap check_suite re-run %s for %s@%s: %w", deliveryID, repo, headSHA, err)
 	}
-	defer cancel()
-
-	prs, err := h.checkSuiteRerunPRs(ctx, client, repo, headSHA, payload)
+	prs, err := h.checkSuiteRerunPRs(lookupCtx, client, repo, headSHA, payload)
+	cancel()
 	if err != nil {
 		return true, err
 	}
@@ -531,8 +531,26 @@ func (h *Handler) rerunCheckSuite(ctx context.Context, repo, headSHA string, ins
 			"delivery_id", deliveryID, "repo", repo, "head_sha", headSHA)
 		return false, nil
 	}
+	return h.replanCheckSuitePRs(runCtx, client, repo, headSHA, installationID, deliveryID, prs)
+}
+
+// replanCheckSuitePRs re-plans each PR a Re-run all checks names. The PRs are
+// independent, so each gets its own auto-plan deadline, and one PR's failure
+// does not stop the rest from being planned. The delivery is retried when any
+// failure is retryable, and dead-lettered only when every failure is
+// permanent.
+func (h *Handler) replanCheckSuitePRs(runCtx context.Context, client *ghclient.InstallationClient, repo, headSHA string, installationID int64, deliveryID string, prs []int) (retry bool, err error) {
+	var errs []error
 	for _, pr := range prs {
-		retry, err := h.replanRerunRequest(ctx, runCtx, client, rerunRequest{
+		if runCtx.Err() != nil {
+			h.logger.Warn("check_suite re-run stopped before planning every PR because its run was cancelled; the delivery will be retried",
+				"delivery_id", deliveryID, "repo", repo, "head_sha", headSHA, "next_pr", pr)
+			errs = append(errs, fmt.Errorf("check_suite re-run %s for %s@%s cancelled before PR #%d: %w", deliveryID, repo, headSHA, pr, runCtx.Err()))
+			retry = true
+			break
+		}
+		prCtx, prCancel := autoPlanContext(runCtx)
+		prRetry, prErr := h.replanRerunRequest(prCtx, runCtx, client, rerunRequest{
 			kind:           checkSuiteRerun,
 			deliveryID:     deliveryID,
 			repo:           repo,
@@ -540,11 +558,15 @@ func (h *Handler) rerunCheckSuite(ctx context.Context, repo, headSHA string, ins
 			headSHA:        headSHA,
 			installationID: installationID,
 		})
-		if err != nil {
-			return retry, err
+		prCancel()
+		if prErr != nil {
+			h.logger.Warn("check_suite re-run could not plan a PR; the remaining PRs are still planned",
+				"delivery_id", deliveryID, "repo", repo, "pr", pr, "head_sha", headSHA, "retryable", prRetry, "error", prErr)
+			errs = append(errs, prErr)
+			retry = retry || prRetry
 		}
 	}
-	return false, nil
+	return retry, errors.Join(errs...)
 }
 
 // checkSuiteRerunPRs lists the PR numbers a Re-run all checks names. A

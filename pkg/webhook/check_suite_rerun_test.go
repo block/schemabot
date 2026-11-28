@@ -36,9 +36,21 @@ func durableCheckSuiteRerunEvent(t *testing.T, event *storage.WebhookEvent) *sto
 // listings that start config discovery, which only a re-plan reaches.
 func serveRerunPR(t *testing.T, mux *http.ServeMux, number int, state, headSHA string) *atomic.Int64 {
 	t.Helper()
+	serveRerunPRInfo(t, mux, number, state, headSHA)
 	var discovery atomic.Int64
-	prPath := "/repos/octocat/hello-world/pulls/" + strconv.Itoa(number)
-	mux.HandleFunc("GET "+prPath, func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/"+strconv.Itoa(number)+"/files", func(w http.ResponseWriter, _ *http.Request) {
+		discovery.Add(1)
+		require.NoError(t, json.NewEncoder(w).Encode([]map[string]any{
+			{"filename": "README.md", "status": "modified", "additions": 1, "deletions": 1},
+		}))
+	})
+	return &discovery
+}
+
+// serveRerunPRInfo answers the live PR read a re-run makes before planning.
+func serveRerunPRInfo(t *testing.T, mux *http.ServeMux, number int, state, headSHA string) {
+	t.Helper()
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/"+strconv.Itoa(number), func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
 			"number": number,
 			"state":  state,
@@ -47,13 +59,6 @@ func serveRerunPR(t *testing.T, mux *http.ServeMux, number int, state, headSHA s
 			"user":   map[string]any{"login": "octocat"},
 		}))
 	})
-	mux.HandleFunc("GET "+prPath+"/files", func(w http.ResponseWriter, _ *http.Request) {
-		discovery.Add(1)
-		require.NoError(t, json.NewEncoder(w).Encode([]map[string]any{
-			{"filename": "README.md", "status": "modified", "additions": 1, "deletions": 1},
-		}))
-	})
-	return &discovery
 }
 
 // serveChangedFileModes answers the reads that find a PR's changed file
@@ -172,6 +177,47 @@ func TestDurableCheckSuiteRerunRetriesGitHubFailure(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "verify current head for durable check_suite rerequest")
 	require.True(t, retry)
+}
+
+// One PR the re-run cannot plan does not cost the others their re-run. #7
+// changes more files than GitHub reports for a PR, which no retry can fix,
+// so the delivery is dead-lettered, but only after #8 is planned.
+func TestDurableCheckSuiteRerunPlansEveryPRDespiteAPermanentFailure(t *testing.T) {
+	store := newRecordingWebhookEventStore()
+	h, mux := newCheckSuiteProcessHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {EnableChecks: new(false)}})
+	serveChangedFileModes(t, mux)
+	serveRerunPRInfo(t, mux, 7, "open", "suite-sha")
+	var capPages atomic.Int64
+	servePRFileListPastCap(t, mux, 7, &capPages, "")
+	planned := serveRerunPR(t, mux, 8, "open", "suite-sha")
+
+	retry, err := h.processDurableCheckSuite(t.Context(), durableCheckSuiteRerunEvent(t, durableCheckSuiteEvent(t, "suite-sha", 7, 8)))
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "octocat/hello-world#7")
+	require.Contains(t, err.Error(), "reached GitHub API limit")
+	require.False(t, retry, "a failure no retry can fix dead-letters the delivery")
+	require.Positive(t, capPages.Load())
+	require.Equal(t, int64(1), planned.Load(), "the PR after the failure is still planned")
+}
+
+// A retryable failure on one PR still lets the later PRs plan, and keeps
+// the delivery retryable so the failed PR gets another attempt.
+func TestDurableCheckSuiteRerunRetriesAfterPlanningTheRest(t *testing.T) {
+	store := newRecordingWebhookEventStore()
+	h, mux := newCheckSuiteProcessHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}})
+	serveChangedFileModes(t, mux)
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	planned := serveRerunPR(t, mux, 8, "open", "suite-sha")
+
+	retry, err := h.processDurableCheckSuite(t.Context(), durableCheckSuiteRerunEvent(t, durableCheckSuiteEvent(t, "suite-sha", 7, 8)))
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "verify current head for durable check_suite rerequest")
+	require.True(t, retry)
+	require.Equal(t, int64(1), planned.Load(), "the PR after the failure is still planned")
 }
 
 // The repository can be removed from config between enqueue and claim, and a
