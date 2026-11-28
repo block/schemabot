@@ -28,7 +28,7 @@ type Storage interface {
 | `PlanStore` | Schema change plans (DDL, original schema for rollback) |
 | `ApplyStore` | Schema change execution state, heartbeat-based leasing |
 | `TaskStore` | Individual DDL tasks within an apply, progress tracking |
-| `ApplyLogStore` | Audit trail (state transitions, errors, progress events) |
+| `ApplyLogStore` | Event log (state transitions, errors, progress events); the entries of long-settled applies can be purged, so it is not a permanent record |
 | `ControlRequestStore` | Durable user control intent that can be recovered by drivers |
 | `CheckStore` | GitHub status check state |
 | `SettingsStore` | Admin-level key-value settings |
@@ -73,8 +73,12 @@ each PR: a covering row is deleted only when a newer `completed` or
 `failed_permanent` row (a higher row id) exists for the same repository and PR.
 A newer row still in flight covers its head now but can fail later, so it does
 not justify a delete. The id orders them, not `received_at`, because a
-redelivery resets `received_at` and keeps the id. Purging never makes the
-reconciler plan a head again, and the table keeps about one row per PR. Rows
+redelivery resets `received_at` and keeps the id. The table keeps about one row
+per PR. Purging can still make the reconciler evaluate a PR once more, which is
+the safe direction: the keep is per PR, so a head the PR returns to later has
+lost its row, and the delivery that recorded the PR's current target (an old
+retarget, for example) can be deleted on age alone. Purging never makes an
+unplanned head read as planned. Rows
 that cover nothing (failed outside its cool-off, superseded, other event types)
 are deleted on age alone. GitHub lets an operator redeliver only deliveries from
 the past 3 days, and a redelivery reopens a terminal row anyway, so dedup needs
