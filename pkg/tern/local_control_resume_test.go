@@ -2606,10 +2606,11 @@ func TestResumeApplyReplanFailurePausesForRetry(t *testing.T) {
 	assert.Equal(t, state.Task.FailedRetryable, tasks[0].State)
 }
 
-// replanRefusingEngine fails every re-plan with planErr and reports the
-// deferred cutover signal as signalExists.
+// replanRefusingEngine answers every re-plan with plan, or fails it with
+// planErr, and reports the deferred cutover signal as signalExists.
 type replanRefusingEngine struct {
 	engine.Engine
+	plan         *engine.PlanResult
 	planErr      error
 	signalExists bool
 }
@@ -2617,7 +2618,7 @@ type replanRefusingEngine struct {
 func (e *replanRefusingEngine) Name() string { return "replan-refusing" }
 
 func (e *replanRefusingEngine) Plan(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) {
-	return nil, e.planErr
+	return e.plan, e.planErr
 }
 
 func (e *replanRefusingEngine) DeferredCutoverSignalExists(context.Context, *engine.DeferredCutoverSignalRequest) (bool, error) {
@@ -2636,6 +2637,28 @@ func TestResumeApplyPermanentReplanRefusalFailsTheApply(t *testing.T) {
 	require.ErrorContains(t, err, "live schema drifted from the reviewed plan")
 	assert.Equal(t, state.Apply.Failed, applyStore.apply.State)
 	assert.Equal(t, "re-plan failed during recovery: re-plan failed: live schema drifted from the reviewed plan", applyStore.apply.ErrorMessage)
+	assert.Equal(t, state.Task.Failed, tasks[0].State)
+}
+
+// A running apply whose table was changed by hand since the plan was reviewed
+// fails at once: the re-plan now lists a statement no task was reviewed with,
+// and resume refuses to run unreviewed DDL. Every retry would re-plan to the
+// same drift, so the refusal does not spend the recovery budget.
+func TestResumeApplyHandDriftFailsTheApply(t *testing.T) {
+	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{plan: &storage.Plan{ID: 5}})
+	client.planetscaleEngine = &replanRefusingEngine{plan: &engine.PlanResult{
+		Changes: []engine.SchemaChange{{
+			Namespace:    "commerce",
+			TableChanges: []engine.TableChange{{Table: "users", Operation: ddl.StatementAlterTable, DDL: "ALTER TABLE `users` MODIFY COLUMN `email` int"}},
+		}},
+	}}
+
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
+
+	require.ErrorContains(t, err, "local schema has drifted from the reviewed plan")
+	assert.False(t, engine.IsRetryable(err))
+	assert.Equal(t, state.Apply.Failed, applyStore.apply.State)
+	assert.Contains(t, applyStore.apply.ErrorMessage, "resume would apply unreviewed DDL")
 	assert.Equal(t, state.Task.Failed, tasks[0].State)
 }
 

@@ -1301,14 +1301,14 @@ func (c *LocalClient) verifyReplannedTaskDDL(task *storage.Task, replanned []str
 		operation: task.DDLAction,
 	})
 	if len(unreviewed) == 0 {
-		return "", false, fmt.Errorf("local schema has not drifted from the reviewed plan, but resume cannot run task %s: its reviewed DDL %q is absent from the re-plan for %s while the re-plan still lists the reviewed DDL of %s, which will not run it; resume refuses to run another task's statement in this task's place",
+		return "", false, engine.NewPermanentError("local schema has not drifted from the reviewed plan, but resume cannot run task %s: its reviewed DDL %q is absent from the re-plan for %s while the re-plan still lists the reviewed DDL of %s, which will not run it; resume refuses to run another task's statement in this task's place",
 			task.TaskIdentifier, reviewedCanon, loc, describeSiblingsThatWillNotRun(orphaned))
 	}
 	if len(siblings.pending) == 0 && len(orphaned) == 0 && len(unreviewed) == 1 {
-		return "", false, fmt.Errorf("local schema has drifted from the reviewed plan; resume would apply unreviewed DDL for %s: reviewed %q, re-planned %q",
+		return "", false, engine.NewPermanentError("local schema has drifted from the reviewed plan; resume would apply unreviewed DDL for %s: reviewed %q, re-planned %q",
 			loc, reviewedCanon, unreviewed[0])
 	}
-	return "", false, fmt.Errorf("local schema has drifted from the reviewed plan; the re-plan lists %s for %s, including %s that neither task %s nor %s was reviewed with, so resume refuses to apply unreviewed DDL: reviewed %q, unreviewed %q",
+	return "", false, engine.NewPermanentError("local schema has drifted from the reviewed plan; the re-plan lists %s for %s, including %s that neither task %s nor %s was reviewed with, so resume refuses to apply unreviewed DDL: reviewed %q, unreviewed %q",
 		countOf(len(replannedCanon), "pending statement"), loc, countOf(len(unreviewed), "statement"), task.TaskIdentifier, describePendingSiblings(siblings.pending), reviewedCanon, unreviewed)
 }
 
