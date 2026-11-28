@@ -585,6 +585,14 @@ type Credentials struct {
 	Metadata map[string]string
 }
 
+// AppliedSchemaFiles looks up the schema files SchemaBot last applied to a
+// namespace of a plan's target, in the plan's environment: the files of the
+// newest completed apply that addressed namespace, or nil when no completed
+// apply has. An error means the history could not be read, and the engine
+// must not plan as if nothing had been applied. Reading them walks the apply
+// history, so an engine asks only for a namespace it needs.
+type AppliedSchemaFiles func(ctx context.Context, namespace string) (*schema.Namespace, error)
+
 // PlanRequest contains the input for computing a schema change plan.
 type PlanRequest struct {
 	Database     string             // Target database name
@@ -593,6 +601,12 @@ type PlanRequest struct {
 	Repository   string             // GitHub repo for context (optional)
 	PullRequest  int                // PR number for context (optional)
 	Credentials  *Credentials       // Resolved credentials (from discovery)
+
+	// AppliedSchemaFiles looks up what SchemaBot last declared for a
+	// namespace of the target, so an engine can tell a declaration a file
+	// removed from one it never made. It is nil when the plan has no history
+	// to read.
+	AppliedSchemaFiles AppliedSchemaFiles
 
 	// GroupedExecution reports whether an apply of this plan will hand the
 	// engine every ALTER at once or one table at a time.

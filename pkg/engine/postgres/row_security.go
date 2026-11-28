@@ -125,7 +125,8 @@ func plannerRefusal(err error) error {
 		errors.Is(err, schemadiff.ErrExpressionUnsettled),
 		errors.Is(err, schemadiff.ErrUnsupportedChange),
 		errors.Is(err, schemadiff.ErrReferencedTableNotFound),
-		errors.Is(err, executor.ErrPolicyRecursion):
+		errors.Is(err, executor.ErrPolicyRecursion),
+		errors.As(err, new(*removedRowSecurityError)):
 		return &engine.PlanRefusedError{Err: err}
 	}
 	return err
