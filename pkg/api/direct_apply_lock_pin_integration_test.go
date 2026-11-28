@@ -156,7 +156,7 @@ func TestHandleApply_DirectApplyHoldsItsLockRowAgainstRelease(t *testing.T) {
 	go func() {
 		released <- f.st.Locks().ReleaseByIDIfUnused(ctx, f.lock.ID, "testapp", storage.DatabaseTypeMySQL, directApplyLockOwner, "")
 	}()
-	require.Eventually(t, func() bool { return statementWaitsOnRowLock(t, f.db, "SELECT id FROM locks") },
+	require.Eventually(t, func() bool { return statementWaitsOnRowLock(t, f.db, "FROM locks") },
 		directApplyLockPinDeadline, 20*time.Millisecond, "the release waits on the lock row the apply's creation holds")
 	select {
 	case err := <-released:

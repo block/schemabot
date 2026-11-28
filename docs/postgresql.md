@@ -69,6 +69,8 @@ early release.
 - Creating a table together with its indexes.
 - Adding a foreign key to an existing table, or creating a table that has
   one. See [Foreign keys](#foreign-keys).
+- Dropping a foreign key the schema file left out, after you approve the drop
+  with `--allow-unsafe`. See [Foreign keys](#foreign-keys).
 - Dropping a table whose schema file was deleted, after you approve the drop
   with `--allow-unsafe`. See [Tables with no schema file](#tables-with-no-schema-file).
 - Adding labels to an existing enum type. See [Enum types](#enum-types).
@@ -82,7 +84,7 @@ early release.
 |---|---|
 | Rewriting a table, such as changing a column's type | Blocked. It needs pg-sprite's copy-and-swap, which is still in preview |
 | `ALTER TABLE` on a table larger than the size limit, unless it only changes the catalog | Blocked, for the same reason |
-| Dropping a foreign key | Blocked. See [Foreign keys](#foreign-keys) for running one yourself |
+| Dropping a foreign key a schema file cannot declare, or one the plan would drop before its replacement is in place | Blocked. See [Foreign keys](#foreign-keys) |
 | Creating an enum type, or removing or reordering its labels | Blocked |
 | `stop`, `start`, `cutover`, deferred cutover, `revert`, `skip-revert` | Not available. Only an index build can be cancelled. See [Unsupported workflow features](#unsupported-workflow-features) |
 | Some changes to a partitioned table's parent | Refused when the apply runs. See [Partitioned tables](#partitioned-tables) |
@@ -214,7 +216,7 @@ If your tables belong to a dedicated owner role, read
 | Row-level security policies on an existing table | Run in one transaction, after you explicitly approve them, because they change who can read rows. See [Row-level security](#row-level-security) |
 | A new table with row-level security | Runs in one transaction: the table, its RLS setting, and its policies, so the table never exists without them. It holds no rows, so it needs no approval. See [Row-level security](#row-level-security) |
 | Adding a foreign key | Runs in two steps: `ADD CONSTRAINT ... NOT VALID`, then `VALIDATE CONSTRAINT`, which checks existing rows while writes continue. See [Foreign keys](#foreign-keys) |
-| Dropping a foreign key | Shown in the plan, but blocked. See [Foreign keys](#foreign-keys) |
+| Dropping a foreign key | Runs as `DROP CONSTRAINT` after you approve it with `--allow-unsafe`, and the plan names the key. A key the file moves to a new name is dropped only after the new key is added and validated. See [Foreign keys](#foreign-keys) |
 | Making a column `NOT NULL` | Runs in four steps on a table up to the size limit: a helper `CHECK (column IS NOT NULL) NOT VALID`, `VALIDATE CONSTRAINT`, which checks existing rows while writes continue, `SET NOT NULL`, which uses the validated check instead of scanning, and the helper's drop. If a row holds `NULL`, the validation fails, names the helper, and ends the apply without retrying: a retry cannot pass until the rows change. SchemaBot then removes the helper the apply added, so writes are not checked for `NULL` meanwhile. Fix those rows, then plan and apply again. A helper that was already on the table stays, and the plan starts at its validation. Cancelling the apply removes a helper the apply added the same way. Two cases keep the helper: a plan that also drops a constraint the table had, where SchemaBot keeps every constraint on the table so it never ends up with no rule, and an apply that ran out of retries. The apply log names a kept helper and the statement that drops it |
 | Dropping a column, or a column's `NOT NULL` | Runs after you approve it with `--allow-unsafe`, and the plan names the column. A dropped column's values are deleted, and reverting the file does not bring them back. A dropped `NOT NULL` lets the column hold `NULL`, so putting it back means fixing those rows first. See [Dropping a column or constraint](#dropping-a-column-or-constraint) |
 | Renaming a column in the schema file | Plans as a drop of the old column and an add of the new one, so the old column's values are deleted. To keep them, add the new column, copy the values, and drop the old column in a later change. See [Renaming a column or table](pre-merge-workflow.md#renaming-a-column-or-table) |
@@ -483,7 +485,8 @@ applying the same plan again meets the same refusal.
 | The build failed part-way and left an invalid index | Retryable. The failure names the index | Nothing. The next drive removes the invalid index and builds again |
 | The duration bound ended the build | Retryable. The failure names `postgres.concurrent_index_max_duration` | Raise the setting before the retry, or it meets the same bound |
 | The duration bound ended the build, and it left nothing behind | Refused. The failure names the setting | Raise the setting, then apply again |
-| The build failed on the table's rows, such as duplicates under a unique index | Refused | Fix the rows, then apply again |
+| The build failed on the table's rows, such as duplicates under a unique index | Refused. The failure names the index and the SQLSTATE, such as `23505` for a duplicate key, and says what became of the invalid index the build left: dropped, already gone, held by another build, or still in place under a name the failure gives, because PostgreSQL refused to drop it | Fix the rows, then apply again. When the failure names an invalid index that is left, drop it first, since it still checks every write. On a partitioned table, the partition's invalid index stays until you drop it or the rerun builds it |
+| A trigger or function in the database raised during the build (SQLSTATE `P0001` or `P0004`) | Failed. The failure names the SQLSTATE | Change or disable that code, then apply again. The next apply removes the invalid index and builds again |
 | Another backend still holds the index or the table | Retryable. The failure names the index and the backend | Nothing. SchemaBot retries once that build ends |
 | An invalid index has the name but cannot be cleared by this change: it is on another table, backs a constraint, or belongs to a partitioned table | Refused. The failure names the index | Remove the index yourself, then apply again |
 | The target connection pool cannot hold the sessions the build needs | Refused | Raise the pool size in the target DSN |
@@ -516,6 +519,14 @@ recovery needs one more connection than the build alone.
 
 Leave an invalid index in place for SchemaBot to recover. Dropping it by hand
 can race a build the server is still running.
+
+A build that fails on the table's rows is the exception: SchemaBot drops its
+invalid index right away, through the same lock and drop. PostgreSQL keeps
+checking writes against an invalid index, so a unique one would reject every
+write that repeats a key, which the live schema allows. A retry cannot
+succeed before the rows are fixed, so waiting for it would only block those
+writes. If the drop fails, the failure says the index still rejects such
+writes.
 
 ### Partitioned index builds
 
@@ -741,7 +752,11 @@ they would break the table. The plan comment names the fix:
 | Adds a `NOT NULL` column with no default to a table that holds rows | Give the column a default. Or add it nullable, fill every row, and declare `NOT NULL` in a later change, which SchemaBot runs online. |
 | Drops the index, key, or column the table's replica identity uses | Point `REPLICA IDENTITY` at another index outside SchemaBot. |
 | Drops with `CASCADE` | Drop each dependent object as its own change, and remove `CASCADE`. |
-| Retypes or drops a column that a view, policy, trigger, or generated column reads | Change or drop the objects the comment names first. |
+| Retypes or drops a column that a view reads | Drop or redefine the view outside SchemaBot, then plan again. |
+| Drops a column that a policy or trigger reads | Change those objects so they no longer read the column, then plan the drop again: a policy in the schema file that declares it, which for a policy reading the column through a subquery is its own table's file, and a trigger outside SchemaBot. |
+| Retypes a column that a policy or trigger reads | A retype that rewrites nothing: outside SchemaBot, drop the objects, retype the column, and recreate them in one transaction. A retype that rewrites the table: add a column of the new type, have the application write to both and backfill it, change the objects to read it (a policy in its schema file, a trigger outside SchemaBot) and switch reads to it, then drop the old column once nothing uses it. Never drop a policy in one change and recreate it in a later one: in between, the table runs without it, and with no other permissive policy every row is denied. |
+| Retypes a column that a generated column reads | Outside SchemaBot, drop the generated column, retype the column, and add the generated column back in one transaction. If a policy or trigger reads the column too, drop and recreate it in the same transaction. The transaction blocks reads and writes until it commits. Adding a stored generated column back rewrites the table, which SchemaBot does not run, so dropping it in a change of its own loses it; adding a virtual one back changes only the catalog. |
+| Drops a column that a generated column reads | If the generated column goes too, remove it from the file and apply that first. To keep it, make the change outside SchemaBot. |
 | Retypes or drops a column in a partition key | PostgreSQL never allows it. Create a new partitioned table with the new key and move the rows into it. |
 | Uses an operation with no safe path, such as an `EXCLUDE` constraint | Make the change outside SchemaBot. |
 
@@ -953,15 +968,18 @@ SchemaBot's catalog reads name every catalog object with `pg_catalog.`, so a
 
 ### Foreign keys
 
-SchemaBot adds the foreign keys a schema file declares. It does not drop one
-yet.
+SchemaBot adds the foreign keys a schema file declares, and drops the live
+ones it leaves out.
 
 | The file | Plan |
 |---|---|
 | Declares a foreign key that matches the live one | No change |
 | Adds a foreign key to an existing table | `ADD CONSTRAINT ... NOT VALID`, then `VALIDATE CONSTRAINT`. Both run |
 | Creates a table that has a foreign key | The `CREATE TABLE`, with the key. It runs |
-| Leaves out a live foreign key | `DROP CONSTRAINT`, blocked |
+| Leaves out a live foreign key | `DROP CONSTRAINT`. It runs after you approve it with `--allow-unsafe` |
+| Leaves out a live foreign key to a table the same plan drops | The table's drop is blocked, because the plan still counts the key as a reference from a table that stays, and that blocks the whole plan. Leave out the key in one pull request and delete the table's file in the next |
+| Moves a foreign key to a new name | The new key's `ADD CONSTRAINT ... NOT VALID` and `VALIDATE CONSTRAINT`, then the old key's `DROP CONSTRAINT`, so the rows stay checked throughout. All run, and the drop needs `--allow-unsafe` |
+| Changes a foreign key under the same name on a partitioned table, or in a plan that also drops or retypes a column | The old key would be dropped before the new one is in place, so the drop is blocked. Declare the changed key under a new name, or make the column change in its own pull request |
 | Has a foreign key into another namespace | Cannot be declared. The plan stays blocked until the foreign key is removed from the database |
 
 A file can declare a foreign key only when the referenced table already exists
@@ -992,9 +1010,12 @@ it with the statement that drops it. The next plan shows only its
 `VALIDATE CONSTRAINT`. Cancelling the apply during the validation removes a key
 the apply added the same way.
 
-**To remove a foreign key.** A dropped foreign key is usually one the file left
-out. To keep it, declare it in the file. To remove it, run the
-`DROP CONSTRAINT` outside SchemaBot, then plan again.
+**How a dropped key runs.** The `DROP CONSTRAINT` takes `ACCESS EXCLUSIVE` on
+the table and the referenced table, under the 3-second `lock_timeout`, and
+changes only the catalog. Under that lock the apply checks that the key still
+has the definition the plan showed, and drops nothing if it changed. A dropped
+foreign key is usually one the file left out: to keep it, declare it in the
+file and plan again.
 
 **Declaring tables that have foreign keys.** `pull` writes them:
 
@@ -1093,43 +1114,9 @@ people keep control of what runs.
 | Tell the user why a change was blocked or refused, in SchemaBot's words | Dropping an invalid index, or ending a backend with `pg_cancel_backend` |
 | Report a failure SchemaBot will retry, and check on it again | The `GRANT` a refusal names, and changes to the `postgres.*` server settings |
 
-Recognize each outcome by its signal:
-
-| Outcome | Signal |
-|---|---|
-| Blocked plan | The plan Check Run fails, and the plan comment names each blocked table with the reason. No flag unblocks it: `--allow-unsafe` accepts a destructive change, but it does not make a blocked change runnable |
-| Refused at apply time | The apply fails and names what to change. Applying the same plan again meets the same refusal |
-| Retryable failure | The apply names what it is waiting for, such as a build that is still running. SchemaBot retries it on the next drive |
-| Changed since review | A table, column, or constraint the plan drops changed after review, so the drop does not run. An automatic apply posts a new plan in a new comment. Nobody has reviewed it, so the agent asks the user before confirming, per the command policy for `apply-confirm` |
-
-When SchemaBot blocks or refuses a change, the agent:
-
-1. Stops. It does not apply again, look for a flag, or try another
-   environment or credential.
-2. Tells the user the reason SchemaBot gave.
-3. Rewrites the schema files into the safe steps the reason names, when it
-   names them, and shows the user the new plan.
-4. Tells the user when no safe form exists, such as for a column type change
-   that rewrites the table. That change needs a separately reviewed process
-   that a person runs.
-
-A plan that drops a column and adds one on the same table is almost always a
-rename, and it deletes the old column's values. The agent says so before
-anyone applies it with `--allow-unsafe`, and offers the add, copy, and
-drop-later steps instead.
-
-A failed index build can leave an invalid index behind. Leave it in place: the
-next apply removes it once it proves no build still holds it. Dropping it by
-hand can race a build the server is still running.
-
-You can copy this into your agent's instructions:
-
-> - If SchemaBot blocks or refuses a PostgreSQL change, stop. Tell me the
->   reason it gave.
-> - You may rewrite the schema files into the safe steps SchemaBot names and
->   plan again. Show me the new plan.
-> - Never run DDL against the database yourself, drop an invalid index, or
->   cancel a backend. Give me the command instead.
+An agent with the [SchemaBot agent skill](ai-agents.md#install-the-agent-skill)
+follows these rules. Its [PostgreSQL](../skills/schemabot/references/refusals-and-failures.md#postgresql) reference has the
+signal of each outcome and what the agent does next.
 
 ## Schema pull
 
@@ -1222,9 +1209,9 @@ and remove the trigger.
    DROP FUNCTION set_updated_at();
    ```
 
-A table with an explicit column collation is skipped and listed in
-`ignore_tables`. Changing a column's collation rewrites the column, so it
-stays out of the files.
+A column with an explicit collation is pulled with its `COLLATE` clause, and
+a type change keeps that collation. Changing a column's collation is
+refused, because it rewrites the column.
 
 The schema intelligence API's detailed catalog output is not available for
 PostgreSQL. A request for it is rejected rather than answered with the basic
@@ -1270,6 +1257,25 @@ Editing the policy to `USING (true)` plans a policy replacement that needs the
 same unsafe-change consent as a destructive change, because it changes who
 can read rows. Applying it opens every row the remaining policies and grants
 allow, so review the access change before you consent.
+
+A plan that changes an existing table's RLS says in its unsafe reason which
+commands it leaves no permissive policy granting, when a policy granted them
+before. PostgreSQL grants rows only
+through a permissive policy, for that command or for `ALL`. With none for
+`SELECT`, every role subject to RLS reads no rows. With none for `INSERT`,
+its inserts are refused. With none for `UPDATE` or `DELETE`, those succeed
+without changing any row. A new table holds no rows yet, so its create
+carries no such reason.
+
+SchemaBot does not manage RLS yet on some tables: one that has a foreign key
+or that a foreign key references, an unlogged table, and a few other
+shapes. The plan is refused with each such table and its
+reason named, every such table in the schema at once, and the keys when a
+foreign key on an existing table is the reason. To plan the table's
+other changes, remove the RLS statements from its file. If the table already
+has RLS, make the file's RLS statements match its current settings and
+policies instead, since a file that stops declaring RLS SchemaBot applied is
+refused.
 
 **How a policy change runs.** A table's policy, setting, and comment changes
 are one operation:
@@ -1526,7 +1532,22 @@ another.
 table's set, commits or fails as one transaction. Recovery plans again against
 the live database before doing more work. An index build is the exception: it
 runs outside a transaction, and the next drive recovers any invalid index it
-leaves. See [Index builds](#index-builds).
+leaves, unless database code refused the build. See [Index builds](#index-builds).
+
+**Failures a retry cannot clear end the apply at once.** SchemaBot retries
+a failure that can clear on its own, such as lock contention or a dropped
+connection. These fail the apply on the first attempt instead:
+
+- Rows that break a constraint the statement adds or validates.
+- Objects that depend on what the statement drops.
+- A trigger or function in the database that raises on the statement, such
+  as an event trigger that guards DDL (SQLSTATE `P0001` or `P0004`). The
+  failure names the SQLSTATE. The trigger's message is in the server log.
+  Change or disable the trigger, then apply again.
+
+A failure SchemaBot does not classify names the server's SQLSTATE, when the
+server sent one, so you can find it in the server log. Refusals, duration
+bounds, and invalid indexes are described in their own words instead.
 
 **Rollback:**
 

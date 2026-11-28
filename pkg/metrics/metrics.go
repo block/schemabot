@@ -2254,9 +2254,12 @@ func RecordWebhookInboxDispatchLag(ctx context.Context, appName, eventType, repo
 //     (the quota reserve did not keep it back); the row waits for the limit
 //     to reset and the claim's attempt was refunded. Any sustained rate means
 //     the installation is exhausting its quota and check runs are at risk.
-//   - "superseded": the claimed auto-plan delivery was discarded without
-//     processing because a newer covering delivery exists for the same pull
-//     request; the successor performs the work.
+//   - "superseded": the claimed auto-plan delivery planned nothing, for one
+//     of two reasons. Either it was discarded without processing because a
+//     newer covering delivery exists for the same pull request, which
+//     performs the work, or processing found the pull request's head had
+//     already moved past the delivery's head, and the push that moved it
+//     plans the new head. The driver's log line for the delivery says which.
 //   - "released": the pool shut down mid-flight and refunded the claim.
 //   - "lease_lost": the driver lost delivery ownership (heartbeat failure or
 //     a lease-token mismatch recording the finish); another driver owns the
@@ -2326,15 +2329,16 @@ func RecordSummaryCommentRepaired(ctx context.Context, repo string, applyState s
 // reconciler found without a live inbox delivery — no row at all, or only
 // rows that cannot attest coverage (plain-failed synthesized rows, organic
 // rows that failed longer ago than storage.WebhookEventFailedCoverageCoolOff,
-// or superseded rows whose work was discarded by claim-time coalescing). A
+// or superseded rows, which planned nothing for their head). A
 // dead-lettered row covers its head, as does a plain-failed organic row
 // within the cool-off, so neither counts as missing (the dead-letter is
 // deliberately terminal; the organic failure has GitHub Redeliver as its
 // lever until the cool-off passes). A nonzero rate usually means
 // deliveries are being lost upstream of the inbox (edge auth, GitHub send
 // failures), but two causes involve no upstream loss. A head covered only by
-// superseded rows is a coalescing-created miss — check the superseded
-// dispatch outcome for the repo before blaming delivery. A head whose
+// superseded rows is a miss SchemaBot made itself, by coalescing or by a
+// head the PR moved away from and back to — check the superseded dispatch
+// outcome for the repo before blaming delivery. A head whose
 // organic row failed longer ago than the cool-off reached the inbox and
 // failed inside it — read that row's last_error. With synthesis
 // enabled each miss also triggers a recovery delivery, counted by

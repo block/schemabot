@@ -83,6 +83,13 @@ func parseDesiredFiles(namespace string, files map[string]string) (map[string]st
 // lists it as a problem located at that line, for a renderer that points the
 // file's author at it.
 func desiredFileRefusal(namespace, filename string, err error) error {
+	if errors.Is(err, statement.ErrRowSecurityForeignKey) {
+		// The row security path builds the file's table with no stand-in
+		// for a referenced table, so it manages no table that declares a
+		// foreign key, as it manages no live table in one.
+		return &engine.PlanRefusedError{Err: fmt.Errorf(
+			"SchemaBot does not manage row security on the table in %q/%q yet, because the file declares a foreign key; remove either the foreign key or the row security statements from the file, then plan again", namespace, filename)}
+	}
 	refusal := &engine.PlanRefusedError{Err: fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)}
 	var syntaxErr *statement.SyntaxError
 	if errors.As(err, &syntaxErr) {

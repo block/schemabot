@@ -89,6 +89,49 @@ const (
 	defaultWebhookReconcileScanClaim = defaultWebhookReconcileInterval / 2
 )
 
+// InboxCoverageWindow is how long the reconciler may still ask the inbox
+// whether a pull request head was planned. The inbox purge keeps the newest
+// finished row that covers each pull request, so a purge can only make the
+// reconciler plan a head again, never make an unplanned head read as planned.
+// Refusing a retention window shorter than Total keeps every row the reconciler
+// reads by update time. It does not cover the delivery a target observation
+// names, which can be any age; losing that one costs a replan, not a check.
+type InboxCoverageWindow struct {
+	// Lookback is how far back in update time the reconciler scans pull
+	// requests.
+	Lookback time.Duration
+
+	// Grace is how long after an update the reconciler waits before judging a
+	// pull request, so a delivery still in flight is not mistaken for a loss.
+	Grace time.Duration
+
+	// FailedCoverageCoolOff is how long a failed delivery keeps covering its
+	// head after it failed.
+	FailedCoverageCoolOff time.Duration
+}
+
+// Total is the shortest retention window that keeps every row the reconciler
+// can still ask about.
+func (w InboxCoverageWindow) Total() time.Duration {
+	return w.Lookback + w.Grace + w.FailedCoverageCoolOff
+}
+
+// ReconcileInboxCoverageWindow returns the coverage window for a reconciler
+// whose lookback an operator set to configuredLookback. A lookback that is not
+// positive means the default is in force, which is how the handler treats it
+// (see WithWebhookReconcileScanBounds).
+func ReconcileInboxCoverageWindow(configuredLookback time.Duration) InboxCoverageWindow {
+	lookback := configuredLookback
+	if lookback <= 0 {
+		lookback = defaultWebhookReconcileLookback
+	}
+	return InboxCoverageWindow{
+		Lookback:              lookback,
+		Grace:                 defaultWebhookReconcileGrace,
+		FailedCoverageCoolOff: storage.WebhookEventFailedCoverageCoolOff,
+	}
+}
+
 // webhookReconcileScanCursor is the persisted resume point for one
 // repository's missing-delivery scan. When a pass exhausts its page budget
 // before reaching the lookback cutoff, the cursor records where the following

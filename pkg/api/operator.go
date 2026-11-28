@@ -136,6 +136,11 @@ func (s *Service) StartOperator(ctx context.Context) {
 			s.reaperLoop(driverCtx, stop, BranchReconcileInterval, "branch reconcile", pass)
 		})
 	}
+	if pass, interval, ok := s.storageRetentionPass(); ok {
+		s.maintenanceWg.Go(func() {
+			s.reaperLoop(driverCtx, stop, interval, "storage retention", pass)
+		})
+	}
 
 	// The fan-out cap only means something relative to the pool it bounds, and
 	// an operator asking "why is my sharded apply only running two shards?" has

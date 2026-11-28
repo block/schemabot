@@ -651,6 +651,40 @@ func TestPollForCompletionAtomic_AutoDeployPermanentRefusalFailsApply(t *testing
 	assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)
 }
 
+// retiredThenRefusedEngine retires the change it refuses to start, as the
+// PlanetScale engine closes a deploy request whose deploy it was refused, so
+// progress reports the change cancelled once Start answers.
+type retiredThenRefusedEngine struct{ *fakeControlEngine }
+
+func (e *retiredThenRefusedEngine) Start(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	e.startCount++
+	e.progressResult = &engine.ProgressResult{State: engine.StateCancelled}
+	return nil, engine.NewPermanentError("deploy request #9 needs approval; turn off approvals, then run a new plan and apply.")
+}
+
+// An apply is waiting for its deploy, and the engine refuses the automatic
+// start permanently and retires the change so nothing can deploy it later.
+// The engine then reports the change cancelled, which still means nothing is
+// running, so the drive fails the apply with the refusal's message rather
+// than reporting a cancel nobody asked for.
+func TestHandleAtomicProgressTick_AutoDeployPermanentRefusalThatRetiresTheChangeFailsApply(t *testing.T) {
+	eng := &retiredThenRefusedEngine{&fakeControlEngine{progressResult: &engine.ProgressResult{State: engine.StateWaitingForDeploy}}}
+	client, apply, tasks, _ := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetAmple)
+	ps := &atomicPollState{lastProgressLog: time.Now()}
+
+	done := client.handleAtomicProgressTick(t.Context(), eng, apply, tasks, &engine.Credentials{}, nil, ps, map[string]string{}, false)
+
+	assert.True(t, done, "the drive stops")
+	require.NoError(t, ps.terminalErr)
+	assert.Equal(t, 1, eng.startCount)
+	assert.Equal(t, 2, eng.progressCalls, "the drive re-reads progress before failing")
+	assert.Equal(t, state.Apply.Failed, apply.State)
+	assert.Equal(t, "deploy could not start: deploy request #9 needs approval; turn off approvals, then run a new plan and apply.", apply.ErrorMessage)
+	for _, task := range tasks {
+		assert.Equal(t, state.Task.Failed, task.State, "task %s", task.TaskIdentifier)
+	}
+}
+
 // startedThenRefusedEngine starts the deploy and then answers Start with a
 // permanent refusal, standing in for an engine that breaks the Start contract.
 type startedThenRefusedEngine struct{ *fakeControlEngine }

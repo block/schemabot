@@ -166,6 +166,11 @@ func TestAgentSkillCommandPolicy(t *testing.T) {
 				assert.True(t, hasFlag(child, "--no-watch"), "the CLI's %s has no --no-watch; update cliCommandKinds", child.Name)
 				assert.Contains(t, handOverPart, "`"+child.Name+" --no-watch`",
 					"the command policy must tell an agent to run %s with --no-watch", child.Name)
+				// --json takes one snapshot and never opens the watcher, so
+				// the policy may name it as the other safe form.
+				assert.True(t, hasFlag(child, "--json"), "the CLI's %s has no --json; update cliCommandKinds", child.Name)
+				assert.Contains(t, handOverPart, "`"+child.Name+" --json`",
+					"the command policy must name %s --json as a safe snapshot", child.Name)
 				continue
 			}
 			if kind == cliChangesSchemaBot {
@@ -206,6 +211,23 @@ func TestAgentSkillCommandPolicy(t *testing.T) {
 	t.Run("hands over when the blast radius is unknown", func(t *testing.T) {
 		other := markdownSection(t, policy, "## Other environments: decide who it affects")
 		assert.Contains(t, other, "treat anything you cannot confirm as shared")
+	})
+
+	t.Run("stops when SchemaBot refuses", func(t *testing.T) {
+		refused := markdownSection(t, policy, "## When SchemaBot blocks or refuses a change")
+		assert.Contains(t, refused, "Never get past a refusal by repeating the command, adding a flag, or trying another environment")
+		assert.Contains(t, refused, "make it only once the user agrees")
+		assert.Contains(t, refused, "never try other credentials or turn off authentication")
+		assert.Contains(t, skill, "**Stop when SchemaBot refuses**")
+		assert.Contains(t, skill, "only into a form SchemaBot names or the user agrees to")
+	})
+
+	t.Run("never acts outside SchemaBot", func(t *testing.T) {
+		outside := markdownSection(t, policy, "## Never act outside SchemaBot")
+		assert.Contains(t, outside, "Never run DDL against the database or cluster yourself")
+		assert.Contains(t, outside, "never drop an invalid index, cancel a backend, or run the `GRANT` a refusal names")
+		assert.Contains(t, outside, "never act in the PlanetScale console")
+		assert.Contains(t, skill, "**Never act outside SchemaBot.**")
 	})
 }
 
@@ -288,9 +310,9 @@ type cliKind string
 
 const (
 	cliReadsOnly cliKind = "reads only"
-	// cliWatchHasControls reads only with --no-watch; watching, its keys
-	// stop or cancel the apply, or run its cutover.
-	cliWatchHasControls cliKind = "reads only with --no-watch"
+	// cliWatchHasControls reads only with --no-watch or --json; watching,
+	// its keys stop or cancel the apply, or run its cutover.
+	cliWatchHasControls cliKind = "reads only with --no-watch or --json"
 	cliWorksLocally     cliKind = "works on the local machine or the worktree"
 	cliRunsAServer      cliKind = "runs a SchemaBot server"
 	cliChangesSchemaBot cliKind = "changes SchemaBot itself"
