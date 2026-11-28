@@ -341,12 +341,29 @@ func (s *applyLogStore) DeleteForSettledAppliesOlderThan(ctx context.Context, ag
 	return deleted, nil
 }
 
+// settledApplyLogCountQuery renders the statement that counts the apply log
+// entries belonging to applies that pass the eligibility test from
+// settledApplyLogEligibility, the same test settledApplyLogPageQuery renders.
+func settledApplyLogCountQuery(eligible string) string {
+	return `
+		SELECT COUNT(*)
+		FROM apply_logs l
+		JOIN applies a ON a.id = l.apply_id
+		WHERE ` + eligible + `
+	`
+}
+
 // CountForSettledAppliesOlderThan counts the log entries
 // DeleteForSettledAppliesOlderThan may delete for the same age, using the same
-// eligibility test, so a dry run reports what a real pass could remove. Like
-// the delete it starts from the applies that settled before the cutoff and
-// probes apply_logs by apply_id, so it never reads the entries of stopped or
-// recent applies.
+// eligibility test, so a dry run reports what a real pass could remove. The
+// figure holds as of the statement: applies keep settling and leases come and
+// go, so a later pass can remove more or fewer entries.
+//
+// It is one count over every eligible entry, with no limit, so on a deployment
+// that has never purged it reads the whole backlog. Unlike the page select it
+// has no ORDER BY to steer the join, so which table the database reads first
+// is the planner's choice. A caller bounds it with a deadline and reads a
+// deadline error as a count that is unavailable, never as zero.
 func (s *applyLogStore) CountForSettledAppliesOlderThan(ctx context.Context, age time.Duration) (int64, error) {
 	if age.Microseconds() <= 0 {
 		return 0, fmt.Errorf("count apply logs of settled applies: age must be positive, got %s", age)
@@ -354,12 +371,7 @@ func (s *applyLogStore) CountForSettledAppliesOlderThan(ctx context.Context, age
 
 	eligible, eligibleArgs := settledApplyLogEligibility(s.dialect, age)
 	var count int64
-	err := s.db.QueryRowContext(ctx, `
-		SELECT COUNT(*)
-		FROM apply_logs l
-		JOIN applies a ON a.id = l.apply_id
-		WHERE `+eligible+`
-	`, eligibleArgs...).Scan(&count)
+	err := s.db.QueryRowContext(ctx, settledApplyLogCountQuery(eligible), eligibleArgs...).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("count apply logs of applies settled more than %s ago: %w", age, err)
 	}

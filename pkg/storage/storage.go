@@ -2335,8 +2335,11 @@ type ApplyLogStore interface {
 	// DeleteForSettledAppliesOlderThan would be free to delete for the same age,
 	// with no limit: entries of applies settled more than age ago, measured on the
 	// database clock, that no driver holds a fresh lease on. It changes nothing,
-	// so a dry run can report what a purge would remove. An age that is not
-	// positive is an error.
+	// so a dry run can report what a purge would remove. The figure holds as of
+	// the call: a later purge can remove more or fewer entries. The count reads
+	// every eligible entry, so callers bound it with a deadline and treat a
+	// deadline error as no count, never as zero. An age that is not positive is
+	// an error.
 	CountForSettledAppliesOlderThan(ctx context.Context, age time.Duration) (int64, error)
 }
 
