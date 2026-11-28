@@ -9,6 +9,7 @@ import (
 	"github.com/block/pg-sprite/pkg/diffplan"
 	"github.com/block/pg-sprite/pkg/executor"
 	"github.com/block/pg-sprite/pkg/plan"
+	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/schemadiff"
 	"github.com/block/pg-sprite/pkg/statement"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -96,7 +97,8 @@ func desiredFileRefusal(namespace, filename string, err error) error {
 	return refusal
 }
 
-// plannerRefusal reports a planner's decline of the declared schema as a plan
+// plannerRefusal wraps a failure to plan one schema file with the file it
+// came from, and reports a planner's decline of the declared schema as a plan
 // refusal. A planner reads the target as well as the files, so its errors mix
 // declines with failures of the connection or the role, and only the declines
 // are refusals. pg-sprite names each decline with a sentinel: a shape the
@@ -105,14 +107,16 @@ func desiredFileRefusal(namespace, filename string, err error) error {
 // never settles), a change no ALTER can converge, a foreign key to a table the
 // target lacks, policies that read each other back, and the parser's own
 // refusals when a planner reaches them. Each is fixed by editing the schema
-// files. Any other failure, such as a lost connection or a missing privilege,
-// is returned as it came. A file the parser does not admit never reaches a
-// planner: parseDesiredFiles refuses it first.
+// files. A privilege the planning role lacks is a refusal too, fixed by a
+// grant on the target: see planningPrivilegeRefusal. Any other failure, such
+// as a lost connection, is returned as it came. A file the parser does not
+// admit never reaches a planner: parseDesiredFiles refuses it first.
 //
 // pg-sprite keeps the closed set of these refusals in its migrate package,
 // which also carries its schema change runner, so the sentinels are named here
 // until a lighter pg-sprite package exports a predicate over that set.
-func plannerRefusal(err error) error {
+func plannerRefusal(namespace, filename string, err error) error {
+	wrapped := fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
 	switch {
 	case errors.Is(err, statement.ErrMultipleCreateTables),
 		errors.Is(err, statement.ErrDisallowedStatement),
@@ -125,11 +129,54 @@ func plannerRefusal(err error) error {
 		errors.Is(err, schemadiff.ErrExpressionUnsettled),
 		errors.Is(err, schemadiff.ErrUnsupportedChange),
 		errors.Is(err, schemadiff.ErrReferencedTableNotFound),
+		errors.Is(err, schemadiff.ErrReferencedTableNotReadable),
+		errors.Is(err, schemadiff.ErrReferencedTableNotReferenceable),
 		errors.Is(err, executor.ErrPolicyRecursion),
 		errors.As(err, new(*removedRowSecurityError)):
-		return &engine.PlanRefusedError{Err: err}
+		return &engine.PlanRefusedError{Err: wrapped}
 	}
-	return err
+	if refusal := planningPrivilegeRefusal(namespace, filename, wrapped); refusal != nil {
+		return &engine.PlanRefusedError{Err: refusal}
+	}
+	return wrapped
+}
+
+// planningPrivilegeError is a schema file the planning role cannot plan for
+// want of a privilege on the target. Planning again fails the same way until
+// the grant is made, so it is a refusal about the target rather than the
+// files, and its text ends in the grant to make.
+type planningPrivilegeError struct {
+	text string
+	err  error
+}
+
+func (e *planningPrivilegeError) Error() string { return e.text }
+func (e *planningPrivilegeError) Unwrap() error { return e.err }
+
+// planningPrivilegeRefusal returns the refusal for a plan that failed on a
+// privilege the planning role lacks, or nil for any other failure. When
+// pg-sprite checked the privilege itself, its PrivilegeError carries the exact
+// GRANT, and the refusal names it with the catalog check that verifies it.
+// Otherwise the server's insufficient_privilege error names the object, and
+// the refusal keeps that error and says to grant the privilege it names.
+func planningPrivilegeRefusal(namespace, filename string, wrapped error) *planningPrivilegeError {
+	if privilege, ok := errors.AsType[*preflight.PrivilegeError](wrapped); ok {
+		remedy := fmt.Sprintf("provision with: %s (verified by: %s)", privilege.Grant, privilege.Check)
+		if privilege.Hint != "" {
+			remedy += "; " + privilege.Hint
+		}
+		return &planningPrivilegeError{
+			text: fmt.Sprintf("plan PostgreSQL schema in %q/%q: SchemaBot's role lacks a privilege planning this file needs; %s; then re-plan", namespace, filename, remedy),
+			err:  wrapped,
+		}
+	}
+	if isInsufficientPrivilege(wrapped) {
+		return &planningPrivilegeError{
+			text: wrapped.Error() + "; SchemaBot's role lacks the privilege this error names, so grant it to that role, then re-plan",
+			err:  wrapped,
+		}
+	}
+	return nil
 }
 
 // referencedTableRemedy names the fix for a foreign key the planner cannot

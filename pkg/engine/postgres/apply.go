@@ -713,8 +713,7 @@ func classifyApplyFailure(err error, table string, validates *schemadiff.Constra
 // server's message, which names objects the plan did not, and the server log
 // keeps it.
 func missingGrantDetail(err error, table string) (string, bool) {
-	var pgErr *pgconn.PgError
-	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateInsufficientPrivilege {
+	if !isInsufficientPrivilege(err) {
 		return "", false
 	}
 	return sanitizeReasonText(fmt.Sprintf(
@@ -2161,6 +2160,13 @@ func checkTableUnlessCatalogOnly(ctx context.Context, pool *pgxpool.Pool, change
 // role lacks a privilege the statement needs.
 const sqlstateInsufficientPrivilege = "42501"
 
+// isInsufficientPrivilege reports whether err carries the server's refusal of
+// a statement the role lacks a privilege for.
+func isInsufficientPrivilege(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == sqlstateInsufficientPrivilege
+}
+
 // sqlstateUndefinedTable is undefined_table: a statement names a relation
 // the database does not have.
 const sqlstateUndefinedTable = "42P01"
@@ -2202,8 +2208,7 @@ func probeLacksTemporaryGrant(err error) bool {
 	if !errors.Is(err, preflight.ErrAddColumnProbeUnavailable) {
 		return false
 	}
-	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == sqlstateInsufficientPrivilege
+	return isInsufficientPrivilege(err)
 }
 
 // provenCatalogOnly classifies statement against the live table and reports
