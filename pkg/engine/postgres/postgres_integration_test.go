@@ -3073,6 +3073,38 @@ func TestEnginePlanRowSecurityOnAForeignKeyTable(t *testing.T) {
 	assert.Equal(t, `SchemaBot does not manage row security on table "kinds" yet, because it is in a foreign key relationship ("cards.cards_kind_fk"); remove the row security statements from its schema file, then plan again`, refused.Error())
 }
 
+// A table that already has row security and gains a foreign key later
+// keeps that row security whatever its file says. A policy change on it is
+// refused with the foreign key named, and the refusal asks for statements
+// that match the table's current settings and policies rather than their
+// removal, which would be refused in turn.
+func TestEnginePlanRowSecurityOnAForeignKeyTableThatHasRowSecurity(t *testing.T) {
+	const database = "rls_foreign_key_live"
+	dsn, db := testutil.StartPostgres(t, database)
+	ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	_, err := db.ExecContext(ctx, `
+  CREATE TABLE public.kinds (id bigint PRIMARY KEY);
+  ALTER TABLE public.kinds ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON public.kinds FOR SELECT USING (true);
+  CREATE TABLE public.cards (id bigint PRIMARY KEY, kind_id bigint CONSTRAINT cards_kind_fk REFERENCES public.kinds (id));
+ `)
+	require.NoError(t, err)
+
+	_, err = New().Plan(ctx, &engine.PlanRequest{
+		Database: database, Credentials: &engine.Credentials{DSN: dsn},
+		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+			"kinds.sql": "CREATE TABLE kinds (id bigint PRIMARY KEY);\n" +
+				"ALTER TABLE kinds ENABLE ROW LEVEL SECURITY;\n" +
+				"CREATE POLICY readers ON kinds FOR SELECT USING (id > 0);\n",
+			"cards.sql": "CREATE TABLE cards (id bigint PRIMARY KEY, kind_id bigint CONSTRAINT cards_kind_fk REFERENCES kinds (id));\n",
+		}}},
+	})
+	var refused *engine.PlanRefusedError
+	require.ErrorAs(t, err, &refused)
+	assert.Equal(t, `SchemaBot does not manage row security on table "kinds" yet, because it is in a foreign key relationship ("cards.cards_kind_fk"); make the row security statements in its schema file match the table's current settings and policies, then plan again`, refused.Error())
+}
+
 // A file that turns on row security with no policy, or drops a table's only
 // permissive policy, hides every row from every role subject to row
 // security. The plan says so in its unsafe reason.
@@ -3103,7 +3135,7 @@ func TestEnginePlanRowSecurityWithNoPolicyWarnsDenyAll(t *testing.T) {
 	} {
 		change := planFile(rowSecurity)
 		assert.True(t, change.IsUnsafe, name)
-		assert.Contains(t, change.UnsafeReason, "row security is on with no policy that grants access, so every role subject to it reads no rows and every write fails", name)
+		assert.Contains(t, change.UnsafeReason, "row security is on with no policy that grants access, so every role subject to it reads no rows, its inserts are refused, and its updates and deletes change no rows", name)
 	}
 
 	change := planFile("CREATE POLICY readers ON notes FOR SELECT USING (true);\n")

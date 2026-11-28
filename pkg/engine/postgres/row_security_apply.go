@@ -73,7 +73,7 @@ func planRowSecurityOperation(ctx context.Context, pool *pgxpool.Pool, namespace
 // policy does to the application, so the plan says it rather than leaving
 // the reviewer to work it out from the statements. It is one finding, so it
 // carries no "; ", which separates the findings a reason lists.
-const denyAllReason = "after this change row security is on with no policy that grants access, so every role subject to it reads no rows and every write fails: declare a permissive policy in the same file"
+const denyAllReason = "after this change row security is on with no policy that grants access, so every role subject to it reads no rows, its inserts are refused, and its updates and deletes change no rows: declare a permissive policy in the same file"
 
 // deniesEveryRow reports row security that is on with no permissive
 // policy. PostgreSQL grants a row only through a permissive policy, and
@@ -96,6 +96,12 @@ func deniesEveryRow(rs schemadiff.RowSecurity) bool {
 // relationship, into a plan refusal that names the table and the shape. The
 // refusal stays until the file or the table changes, so planning again
 // cannot clear it. Any other error, privileges included, is not one.
+//
+// A table that has no row security yet gets its other changes planned once
+// the file declares none. A table that already has some keeps it whatever
+// the file says, and a file that stops declaring row security SchemaBot
+// applied is refused (RV-4), so there the author makes the file's
+// statements match the table's settings and policies instead.
 func unsupportedRowSecurityShape(namespace string, live schemadiff.Model, err error) (error, bool) {
 	if !errors.Is(err, executor.ErrRowSecurityRefused) || errors.Is(err, executor.ErrRowSecurityPrivileges) {
 		return nil, false
@@ -108,9 +114,13 @@ func unsupportedRowSecurityShape(namespace string, live schemadiff.Model, err er
 	if errors.Is(shape, schemadiff.ErrUnrenderableForeignKey) {
 		why = "it is in a foreign key relationship (" + strings.Join(quoteAll(foreignKeyRelationships(namespace, live)), ", ") + ")"
 	}
+	next := "remove the row security statements from its schema file, then plan again"
+	if hasRowSecurity(live.RowSecurity) {
+		next = "make the row security statements in its schema file match the table's current settings and policies, then plan again"
+	}
 	return &engine.PlanRefusedError{Err: fmt.Errorf(
-		"SchemaBot does not manage row security on table %q yet, because %s; remove the row security statements from its schema file, then plan again",
-		live.Table, why)}, true
+		"SchemaBot does not manage row security on table %q yet, because %s; %s",
+		live.Table, why, next)}, true
 }
 
 // rowSecurityShapePhrases says, in the operator's terms, what about a table

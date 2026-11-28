@@ -140,6 +140,23 @@ func TestUnsupportedRowSecurityShape(t *testing.T) {
 	assert.False(t, ok)
 }
 
+// A table that already has row security keeps it whatever the file says,
+// and a file that stops declaring row security SchemaBot applied is
+// refused, so the refusal asks for statements that match the table instead
+// of their removal.
+func TestUnsupportedRowSecurityShapeOnATableWithRowSecurity(t *testing.T) {
+	unlogged := fmt.Errorf("%w: %w", executor.ErrRowSecurityRefused, schemadiff.ErrUnrenderableUnlogged)
+	for name, rs := range map[string]schemadiff.RowSecurity{
+		"enabled":  {Enabled: true},
+		"forced":   {Forced: true},
+		"a policy": {Policies: []schemadiff.Policy{{Name: "readers", Permissive: true}}},
+	} {
+		refusal, ok := unsupportedRowSecurityShape("public", schemadiff.Model{Table: "events", RowSecurity: rs}, unlogged)
+		require.True(t, ok, name)
+		assert.Equal(t, `SchemaBot does not manage row security on table "events" yet, because it is unlogged; make the row security statements in its schema file match the table's current settings and policies, then plan again`, refusal.Error(), name)
+	}
+}
+
 // Row security that is on denies every row unless a permissive policy
 // grants it; restrictive policies only narrow what a permissive one grants.
 func TestDeniesEveryRow(t *testing.T) {

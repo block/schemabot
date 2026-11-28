@@ -1273,13 +1273,17 @@ allow, so review the access change before you consent.
 
 A plan that leaves RLS on with no permissive policy says so in its unsafe
 reason. PostgreSQL grants rows only through a permissive policy, so every
-role subject to RLS reads no rows and every write fails until one exists.
+role subject to RLS reads no rows until one exists. Its inserts are refused,
+and its updates and deletes succeed without changing any row.
 
 SchemaBot does not manage RLS yet on some tables: one that has a foreign key
 or that a foreign key references, one with a column of an explicit collation,
 and a few other shapes. The plan is refused with the table and the reason
-named, and the keys when a foreign key is the reason. Remove the RLS
-statements from that table's file to plan its other changes.
+named, and the keys when a foreign key is the reason. To plan the table's
+other changes, remove the RLS statements from its file. If the table already
+has RLS, make the file's RLS statements match its current settings and
+policies instead, since a file that stops declaring RLS SchemaBot applied is
+refused.
 
 **How a policy change runs.** A table's policy, setting, and comment changes
 are one operation:
