@@ -84,7 +84,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.change_gate.overrides` | Counter | environment, gate, checkpoint | Applies, starts and cutovers an approved override request let through a change gate, once per overridden gate |
 | `schemabot.change_gate.errors` | Counter | environment, checkpoint | Change gate checks that failed, refusing the change with a retryable 503 (`start`, `resume`, `cutover`) |
 | `schemabot.webhook.check_suite_recovery_total` | Counter | environment, repository, outcome | Durable check_suite recovery outcomes (`covered`, `synthesized`, `resynthesized`, `already_queued` per candidate PR; `no_pr_at_ingress`, `no_open_pr`, `truncated` per delivery) |
-| `schemabot.webhook.inbox_dispatch_lag_seconds` | Histogram | environment, event_type, repository | Time from webhook receipt to the delivery's first dispatch claim |
+| `schemabot.webhook.inbox_dispatch_lag_seconds` | Histogram | environment, event_type, repository | Time from webhook receipt to the delivery's first dispatch claim (`repository` is omitted for a repository this deployment does not manage, as on `schemabot.webhook.events_total`) |
 | `schemabot.webhook.dispatch_duration_seconds` | Histogram | environment, event_type, outcome | Duration of one durable webhook dispatch claim by outcome (deliberately no repository label — see the ledger note below) |
 | `schemabot.github.requests_total` | Counter | environment, operation, category, resource, status, repository, github_app, installation_id | GitHub API request attempts observed by SchemaBot, including attempts that never produced a response |
 | `schemabot.github.primary_rate_limit_rejections_total` | Counter | environment, operation, resource, github_app, installation_id, origin | Primary quota refusals at HTTP, local prevention, or the configured quota reserve; investigate shared quota usage and blocked work (see guidance below) |
@@ -229,8 +229,9 @@ it would have had, such as `processed` once a handler answers "repository not
 registered" or `ignored` for an event type SchemaBot does not handle, and is
 counted without the `repository` attribute, for the same cardinality reason.
 The same applies to the `durable_enqueue_failed` and `durable_dispatch_*`
-statuses of a closed pull request, which is queued before the allowlist check.
-The delivery's log line names the repository.
+statuses of a closed pull request, which is queued before the allowlist check,
+and to its `schemabot.webhook.inbox_dispatch_lag_seconds` sample. The
+delivery's log line names the repository.
 
 When `repos:` is empty, every repository counts as managed, so every
 repository that sends a delivery keeps its name on the series. List the

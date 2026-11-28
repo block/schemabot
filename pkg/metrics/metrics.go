@@ -2222,11 +2222,18 @@ func RecordWebhookInboxDispatchLag(ctx context.Context, appName, eventType, repo
 	if lag < 0 {
 		lag = 0
 	}
-	recordHistogram(ctx, "schemabot.webhook.inbox_dispatch_lag_seconds", lag.Seconds(),
-		"Time a webhook delivery spent dispatchable before its first dispatch claim",
+	attrs := []attribute.KeyValue{
 		EnvironmentAttribute(""),
 		attribute.String("event_type", eventType),
-		attribute.String("repository", repo),
+	}
+	// An empty repo is one the caller left off because this deployment does
+	// not manage it, as on webhook.events_total.
+	if repo != "" {
+		attrs = append(attrs, attribute.String("repository", repo))
+	}
+	recordHistogram(ctx, "schemabot.webhook.inbox_dispatch_lag_seconds", lag.Seconds(),
+		"Time a webhook delivery spent dispatchable before its first dispatch claim",
+		attrs...,
 	)
 }
 

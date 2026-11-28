@@ -374,7 +374,7 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 			// receipt — the pre-deferral behavior, never a bogus epoch lag.
 			lagSince = event.ReceivedAt
 		}
-		metrics.RecordWebhookInboxDispatchLag(ctx, appName, event.Event, event.Repository, time.Since(lagSince))
+		metrics.RecordWebhookInboxDispatchLag(ctx, appName, event.Event, metricRepo, time.Since(lagSince))
 	}
 
 	if event.Event == "pull_request" && isAutoPlannablePullRequestAction(event.Action) {

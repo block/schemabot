@@ -136,33 +136,66 @@ func TestDurableWebhookDispatchMetricsFirstClaimCompleted(t *testing.T) {
 // A queued delivery whose repository this deployment does not manage, such as
 // a closed pull request (queued before the allowlist check) or a row whose
 // repository left the config while it waited, still records its dispatch
-// statuses, but without a repository attribute: the repository's name is
+// statuses and its inbox lag, but without a repository attribute, whether the
+// dispatch completes, is retried, or fails for good: the repository's name is
 // unbounded and belongs in the driver's log lines.
 func TestDurableWebhookDispatchMetricsOmitUnmanagedRepository(t *testing.T) {
-	reader := newDispatchMetricsReader(t)
-	store := newScriptedWebhookEventStore(&storage.WebhookEvent{
-		Provider:   storage.WebhookProviderGitHub,
-		DeliveryID: "delivery-metrics-unmanaged",
-		Event:      "issue_comment",
-		Repository: "octocat/hello-world",
-		Payload:    []byte(`{}`),
-		ReceivedAt: time.Now(),
-	})
-	config := &api.ServerConfig{Repos: map[string]api.RepoConfig{"org/allowed-repo": {}}}
-	h := newDurableDriverHandler(t, store, config, nil)
-
-	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
-
-	require.Len(t, store.completed, 1, "the no-op issue_comment delivery must be marked completed")
-	points := collectCounterPoints(t, reader, "schemabot.webhook.events_total")
-	statuses := make([]string, 0, len(points))
-	for _, point := range points {
-		status, _ := point.Attributes.Value("status")
-		statuses = append(statuses, status.AsString())
-		repository, hasRepository := point.Attributes.Value("repository")
-		assert.False(t, hasRepository, "status %s must not carry the unmanaged repository, got %q", status.AsString(), repository.AsString())
+	cases := []struct {
+		name         string
+		process      func(context.Context, *storage.WebhookEvent) (bool, error)
+		wantStatuses []string
+	}{
+		{
+			name:         "completed",
+			wantStatuses: []string{"durable_dispatch_started", "durable_dispatch_completed"},
+		},
+		{
+			name: "retrying",
+			process: func(context.Context, *storage.WebhookEvent) (bool, error) {
+				return true, errors.New("transient failure")
+			},
+			wantStatuses: []string{"durable_dispatch_started", "durable_dispatch_retrying"},
+		},
+		{
+			name: "failed permanently",
+			process: func(context.Context, *storage.WebhookEvent) (bool, error) {
+				return false, errors.New("deterministic rejection")
+			},
+			wantStatuses: []string{"durable_dispatch_started", "durable_dispatch_failed_permanent"},
+		},
 	}
-	assert.ElementsMatch(t, []string{"durable_dispatch_started", "durable_dispatch_completed"}, statuses)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := newDispatchMetricsReader(t)
+			store := newScriptedWebhookEventStore(&storage.WebhookEvent{
+				Provider:   storage.WebhookProviderGitHub,
+				DeliveryID: "delivery-metrics-unmanaged",
+				Event:      "issue_comment",
+				Repository: "octocat/hello-world",
+				Payload:    []byte(`{}`),
+				ReceivedAt: time.Now(),
+			})
+			config := &api.ServerConfig{Repos: map[string]api.RepoConfig{"org/allowed-repo": {}}}
+			h := newDurableDriverHandler(t, store, config, nil)
+			h.durableWebhookProcessOverride = tc.process
+
+			h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+			points := collectCounterPoints(t, reader, "schemabot.webhook.events_total")
+			statuses := make([]string, 0, len(points))
+			for _, point := range points {
+				status, _ := point.Attributes.Value("status")
+				statuses = append(statuses, status.AsString())
+				repository, hasRepository := point.Attributes.Value("repository")
+				assert.False(t, hasRepository, "status %s must not carry the unmanaged repository, got %q", status.AsString(), repository.AsString())
+			}
+			assert.ElementsMatch(t, tc.wantStatuses, statuses)
+			lagPoints := collectDispatchHistogramPoints(t, reader, "schemabot.webhook.inbox_dispatch_lag_seconds")
+			require.Len(t, lagPoints, 1)
+			repository, hasRepository := lagPoints[0].Attributes.Value("repository")
+			assert.False(t, hasRepository, "the inbox lag must not carry the unmanaged repository, got %q", repository.AsString())
+		})
+	}
 }
 
 // A delivery that spent time deferred by a not-before time measures dispatch
