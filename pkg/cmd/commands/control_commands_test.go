@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/alecthomas/kong"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -724,4 +726,38 @@ func TestReleaseCmdWatchesTheRolloutItReleases(t *testing.T) {
 		"Held deployments will resume. Use 'schemabot progress "+controlTestApplyID+" -e staging' to follow them.\n\n"+
 		controlWatchMarker, out)
 	assertWatchedOnce(t, server.URL, *watches)
+}
+
+// start and release follow the schema change unless the operator passes
+// --no-watch. The default lives in the flag declaration, so this parses the
+// commands the way the CLI does rather than building them by hand.
+func TestStartAndReleaseWatchByDefault(t *testing.T) {
+	for _, tc := range []struct {
+		args      []string
+		wantWatch bool
+	}{
+		{args: []string{"start", controlTestApplyID, "-e", "staging"}, wantWatch: true},
+		{args: []string{"start", controlTestApplyID, "-e", "staging", "--no-watch"}, wantWatch: false},
+		{args: []string{"release", controlTestApplyID, "-e", "staging"}, wantWatch: true},
+		{args: []string{"release", controlTestApplyID, "-e", "staging", "--no-watch"}, wantWatch: false},
+	} {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			var cli struct {
+				Globals
+				Start   StartCmd   `cmd:""`
+				Release ReleaseCmd `cmd:""`
+			}
+			parser, err := kong.New(&cli, kong.Name("schemabot"))
+			require.NoError(t, err)
+
+			_, err = parser.Parse(tc.args)
+			require.NoError(t, err)
+
+			watch := cli.Start.Watch
+			if tc.args[0] == "release" {
+				watch = cli.Release.Watch
+			}
+			assert.Equal(t, tc.wantWatch, watch)
+		})
+	}
 }
