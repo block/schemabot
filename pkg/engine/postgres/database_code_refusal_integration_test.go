@@ -38,10 +38,6 @@ func TestEnginePlanRefusesWhenAnEventTriggerRaisesOnTheScratchSchema(t *testing.
 		END $$;
 		CREATE EVENT TRIGGER refuse_create_index ON ddl_command_end EXECUTE FUNCTION public.refuse_create_index()`)
 	require.NoError(t, err)
-	t.Cleanup(func() {
-		_, err := db.ExecContext(t.Context(), `DROP EVENT TRIGGER IF EXISTS refuse_create_index`)
-		assert.NoError(t, err)
-	})
 	req := &engine.PlanRequest{
 		Database: database,
 		SchemaFiles: schema.SchemaFiles{
