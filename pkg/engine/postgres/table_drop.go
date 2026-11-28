@@ -95,6 +95,39 @@ func planTableDrops(namespace string, models map[string]schemadiff.Model, refuse
 	return plan
 }
 
+// plannedConstraintDrops names, per table, the constraints the namespace's
+// planned changes drop. The table drops run after every other change in the
+// namespace, so a foreign key dropped there no longer references the tables
+// they drop. A blocked step drops nothing, so only a step that runs counts.
+func plannedConstraintDrops(changes []engine.TableChange) (map[string]map[string]bool, error) {
+	dropped := map[string]map[string]bool{}
+	for _, tc := range changes {
+		if tc.ExecutionMode == engine.ExecutionModeBlocked {
+			continue
+		}
+		record, err := reviewedDropFromMetadata(tc.Metadata)
+		if err != nil {
+			return nil, fmt.Errorf("read the planned drop on table %q: %w", tc.Table, err)
+		}
+		if record == nil || record.Kind != schemadiff.DroppedConstraint {
+			continue
+		}
+		if dropped[tc.Table] == nil {
+			dropped[tc.Table] = map[string]bool{}
+		}
+		dropped[tc.Table][record.Name] = true
+	}
+	return dropped, nil
+}
+
+// withoutPlannedDrops leaves out the incoming foreign keys of tables in the
+// namespace that the plan drops before its table drops run.
+func withoutPlannedDrops(namespace string, incoming []schemadiff.IncomingForeignKey, dropped map[string]map[string]bool) []schemadiff.IncomingForeignKey {
+	return slices.DeleteFunc(slices.Clone(incoming), func(fk schemadiff.IncomingForeignKey) bool {
+		return fk.Schema == namespace && dropped[fk.Table][fk.Constraint]
+	})
+}
+
 // inTableHierarchy reports whether the table is partitioned, a partition, an
 // inheritance parent, or an inheritance child.
 func inTableHierarchy(m schemadiff.Model) bool {

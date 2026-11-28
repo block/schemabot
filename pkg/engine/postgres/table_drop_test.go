@@ -153,3 +153,38 @@ func TestTableDropForApply(t *testing.T) {
 		})
 	}
 }
+
+// A constraint drop the plan runs no longer keeps the table it referenced,
+// and only that one: a drop the plan blocks, a column drop, and a
+// constraint of the same name on another table or in another namespace
+// leave the reference in place.
+func TestPlannedConstraintDropsLeaveOutOnlyTheDropsThatRun(t *testing.T) {
+	dropOf := func(table string, kind schemadiff.DroppedKind, name, mode string) engine.TableChange {
+		metadata, err := reviewedDropMetadata(schemadiff.DroppedObject{Kind: kind, Name: name, Definition: "FOREIGN KEY (region_id) REFERENCES regions(id)"})
+		require.NoError(t, err)
+		return engine.TableChange{Table: table, ExecutionMode: mode, Metadata: metadata}
+	}
+	dropped, err := plannedConstraintDrops([]engine.TableChange{
+		dropOf("users", schemadiff.DroppedConstraint, "users_region_fkey", ""),
+		dropOf("stores", schemadiff.DroppedConstraint, "stores_region_fkey", engine.ExecutionModeBlocked),
+		dropOf("offices", schemadiff.DroppedColumn, "offices_region_fkey", ""),
+		{Table: "users", DDL: "ALTER TABLE public.users ADD COLUMN note text"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]map[string]bool{"users": {"users_region_fkey": true}}, dropped)
+
+	incoming := []schemadiff.IncomingForeignKey{
+		fk("users", "users_region_fkey"),
+		fk("stores", "stores_region_fkey"),
+		fk("offices", "offices_region_fkey"),
+		fk("vendors", "users_region_fkey"),
+		{Schema: "billing", Table: "users", Constraint: "users_region_fkey"},
+	}
+	assert.Equal(t, incoming[1:], withoutPlannedDrops("public", incoming, dropped))
+	assert.Len(t, incoming, 5, "the model's own list is left as it was")
+
+	plan := planTableDrops("public", map[string]schemadiff.Model{
+		"regions": {Table: "regions", IncomingForeignKeys: withoutPlannedDrops("public", []schemadiff.IncomingForeignKey{fk("users", "users_region_fkey")}, dropped)},
+	}, nil)
+	assert.Equal(t, []string{"regions"}, plan.order)
+}

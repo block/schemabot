@@ -459,7 +459,11 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		if err := ignored.RefuseDeclared(namespace, sortedKeys(desiredTables)); err != nil {
 			return nil, &engine.PlanRefusedError{Err: err}
 		}
-		drops, exempt, withheld, err := undeclaredTableDrops(ctx, pool, req.Database, namespace, desiredTables, ignored, parser)
+		droppedConstraints, err := plannedConstraintDrops(schemaChange.TableChanges)
+		if err != nil {
+			return nil, fmt.Errorf("read the constraint drops planned in namespace %q: %w", namespace, err)
+		}
+		drops, exempt, withheld, err := undeclaredTableDrops(ctx, pool, req.Database, namespace, desiredTables, droppedConstraints, ignored, parser)
 		if err != nil {
 			return nil, fmt.Errorf("compare live tables against schema files in namespace %q: %w", namespace, err)
 		}
@@ -1216,7 +1220,7 @@ func concurrentIndexDropStatement(sql string) (bool, error) {
 // schema files. The naming convention is the per-table exemption;
 // ignore_namespaces is the per-namespace one. Each exempt table is logged
 // and returned on the plan so the PR comment discloses what the plan skipped.
-func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, namespace string, declared map[string]bool, ignored engine.IgnoredTables, parser ddl.StatementParser) ([]engine.TableChange, []string, []string, error) {
+func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, namespace string, declared map[string]bool, droppedConstraints map[string]map[string]bool, ignored engine.IgnoredTables, parser ddl.StatementParser) ([]engine.TableChange, []string, []string, error) {
 	// ListManagedTables omits partitions, which follow their parent, and
 	// extension-owned tables, which belong to their extension: no file can
 	// declare either, and the server refuses to drop an extension's table.
@@ -1262,6 +1266,7 @@ func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, nam
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("read undeclared table %q: %w", name, err)
 		}
+		m.IncomingForeignKeys = withoutPlannedDrops(namespace, m.IncomingForeignKeys, droppedConstraints)
 		models[name] = m
 		if refused[name], err = tableDropRefusals(ctx, pool, namespace, name); err != nil {
 			return nil, nil, nil, err
