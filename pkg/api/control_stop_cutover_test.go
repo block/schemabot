@@ -164,10 +164,18 @@ func TestImmediateStopCompletionFailureKeepsStorageErrorOutOfApplyLog(t *testing
 	stores.applies.err = errors.New("dial tcp " + storageAddress + ": i/o timeout")
 	var logs bytes.Buffer
 	svc.logger = slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	_, _, err := stores.controls.RequestPending(t.Context(), &storage.ApplyControlRequest{
+		ApplyID: apply.ID, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending, RequestedBy: "cli:alice",
+	})
+	require.NoError(t, err, "the stop is queued before the immediate attempt, as stopApply does")
 
 	svc.tryImmediateStopAfterQueue(t.Context(), client, apply, apply.ExternalID, "cli:alice")
 
 	require.NotNil(t, client.stopReq, "the engine receives the immediate stop")
+	pending, err := stores.controls.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	require.NotNil(t, pending, "the durable stop request stays pending for the apply owner, as the apply log says")
+	assert.Equal(t, storage.ControlRequestPending, pending.Status)
 	require.True(t, hasApplyLogMessageContaining(stores.applyLogs.logs, "SchemaBot could not record it as complete; the durable stop request remains pending"),
 		"the apply log records that the stop is still pending")
 	for _, entry := range stores.applyLogs.logs {
