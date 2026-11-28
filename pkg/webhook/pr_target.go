@@ -16,6 +16,11 @@ import (
 
 var errPRTargetExcluded = errors.New("pull request target is excluded from SchemaBot")
 
+// errPRClosed refuses a plan's stored check state write on a closed PR. Close
+// cleanup removes a closed PR's stored check state and does not run again, so
+// a row written afterwards would be orphaned.
+var errPRClosed = errors.New("pull request is closed")
+
 func (h *Handler) evaluatePRTarget(ctx context.Context, client *ghclient.InstallationClient, repo string, info *ghclient.PullRequestInfo) (ghclient.PRTargetEligibility, error) {
 	if !h.skipsUnrequiredBranches() {
 		return servedPRTarget(), nil
@@ -186,6 +191,15 @@ func (h *Handler) recoveryDeliveryGUID(ctx context.Context, repo string, pr int,
 
 func samePRTargetContext(a, b *ghclient.PullRequestInfo) bool {
 	return a.BaseRef == b.BaseRef && a.DefaultBranch == b.DefaultBranch && a.NativeStack == b.NativeStack && a.StackBaseRef == b.StackBaseRef
+}
+
+// closedSinceSnapshot reports whether a PR that was open when the work
+// started is closed now. Close cleanup removes a closed PR's stored check
+// state, so a publication from work that started before the close would
+// recreate it. Work that started on an already closed PR, such as an apply's
+// terminal outcome after a merge, is not affected.
+func closedSinceSnapshot(snapshot, live *ghclient.PullRequestInfo) bool {
+	return !snapshot.IsClosed() && live.IsClosed()
 }
 
 type publicationTargetKey struct{}

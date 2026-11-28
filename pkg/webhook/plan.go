@@ -244,7 +244,11 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 	// Store per-database check record and update aggregate
 	headSHA, recoveredApplyOwnedCheckState, checkErr := h.storeManualPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, drift)
-	if checkErr != nil {
+	switch {
+	case errors.Is(checkErr, errPRClosed):
+		h.logger.Info("plan comment posted without stored check state because the PR is closed",
+			"repo", repo, "pr", pr, "database", schemaResult.Database, "deployment", deployment, "environment", environment)
+	case checkErr != nil:
 		h.logger.Error("failed to store plan check record", "repo", repo, "pr", pr, "database", schemaResult.Database, "deployment", deployment, "environment", environment, "error", checkErr)
 	}
 	commentData.RecoveredApplyOwnedCheckState = recoveredApplyOwnedCheckState
@@ -917,7 +921,10 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		} else {
 			sha, recoveredApplyOwnedCheckState, checkErr = h.storeManualPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, env, drift)
 		}
-		if checkErr != nil {
+		if errors.Is(checkErr, errPRClosed) {
+			h.logger.Info("plan stored no check state because the PR closed while it ran; its check state is not recreated",
+				"repo", repo, "pr", pr, "env", env, "database", schemaResult.Database)
+		} else if checkErr != nil {
 			h.logger.Error("failed to store plan check record", "repo", repo, "pr", pr, "env", env, "error", checkErr)
 			if drift.blocks() {
 				driftBlockUnstored[env] = drift.summary
