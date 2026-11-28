@@ -5624,6 +5624,7 @@ func TestBranchReconcileConfig(t *testing.T) {
 // pass with the largest allowed batch_size would fail before deleting a row.
 func TestStorageRetentionBatchSizeFitsTheStoreLimit(t *testing.T) {
 	assert.LessOrEqual(t, MaxStorageRetentionBatchSize, storage.MaxWebhookEventPurgeBatch)
+	assert.LessOrEqual(t, MaxStorageRetentionBatchSize, storage.MaxApplyLogPurgeBatch)
 }
 
 func TestStorageRetentionConfig(t *testing.T) {
@@ -5644,10 +5645,48 @@ func TestStorageRetentionConfig(t *testing.T) {
 	t.Run("parsed from YAML", func(t *testing.T) {
 		var cfg ServerConfig
 		require.NoError(t, yaml.Unmarshal([]byte(
-			"storage_retention:\n  enabled: true\n  dry_run: false\n  interval: 2h\n  batch_size: 1000\n  webhook_events: 240h\n"), &cfg))
+			"storage_retention:\n  enabled: true\n  dry_run: false\n  interval: 2h\n  batch_size: 1000\n  webhook_events: 240h\n  apply_logs: 2160h\n"), &cfg))
 		assert.Equal(t, StorageRetentionConfig{
-			Enabled: true, DryRun: boolPtr(false), Interval: "2h", BatchSize: 1000, WebhookEvents: "240h",
+			Enabled: true, DryRun: boolPtr(false), Interval: "2h", BatchSize: 1000, WebhookEvents: "240h", ApplyLogs: "2160h",
 		}, cfg.StorageRetention)
+	})
+
+	t.Run("apply logs are never purged unless a window is set", func(t *testing.T) {
+		cfg := ServerConfig{StorageRetention: StorageRetentionConfig{Enabled: true}}
+		window, set, err := cfg.StorageRetentionApplyLogs()
+		require.NoError(t, err)
+		assert.False(t, set)
+		assert.Zero(t, window)
+		assert.NoError(t, validate(StorageRetentionConfig{Enabled: true}))
+	})
+
+	t.Run("a configured apply logs window is used", func(t *testing.T) {
+		cfg := ServerConfig{StorageRetention: StorageRetentionConfig{ApplyLogs: "2160h"}}
+		window, set, err := cfg.StorageRetentionApplyLogs()
+		require.NoError(t, err)
+		assert.True(t, set)
+		assert.Equal(t, 2160*time.Hour, window)
+		assert.NoError(t, validate(StorageRetentionConfig{Enabled: true, ApplyLogs: "2160h"}))
+	})
+
+	t.Run("an apply logs window must parse and be positive", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			value   string
+			wantErr string
+		}{
+			{"zero", "0s", "storage_retention.apply_logs must be positive"},
+			{"negative", "-1h", "storage_retention.apply_logs must be positive"},
+			{"unparseable", "ninety days", "storage_retention.apply_logs"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				cfg := ServerConfig{StorageRetention: StorageRetentionConfig{ApplyLogs: tc.value}}
+				_, set, err := cfg.StorageRetentionApplyLogs()
+				assert.False(t, set)
+				assert.ErrorContains(t, err, tc.wantErr)
+				assert.ErrorContains(t, validate(StorageRetentionConfig{Enabled: true, ApplyLogs: tc.value}), tc.wantErr)
+			})
+		}
 	})
 
 	t.Run("off with the documented defaults when not configured", func(t *testing.T) {
@@ -5740,12 +5779,12 @@ func TestStorageRetentionConfig(t *testing.T) {
 	})
 
 	t.Run("validate ignores bad values when disabled", func(t *testing.T) {
-		assert.NoError(t, validate(StorageRetentionConfig{BatchSize: -5, Interval: "hourly", WebhookEvents: "a week"}))
+		assert.NoError(t, validate(StorageRetentionConfig{BatchSize: -5, Interval: "hourly", WebhookEvents: "a week", ApplyLogs: "ninety days"}))
 	})
 
 	t.Run("unknown keys are rejected", func(t *testing.T) {
-		_, err := ParseServerConfig([]byte("storage_retention:\n  apply_logs: 2160h\n"))
-		require.ErrorContains(t, err, "apply_logs")
+		_, err := ParseServerConfig([]byte("storage_retention:\n  pull_requests: 2160h\n"))
+		require.ErrorContains(t, err, "pull_requests")
 	})
 }
 

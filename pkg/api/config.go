@@ -445,6 +445,12 @@ type StorageRetentionConfig struct {
 	// delivery redeliverable, or than a raised webhook reconcile window; see
 	// serve.Build.
 	WebhookEvents string `yaml:"webhook_events,omitempty"`
+
+	// ApplyLogs is how long the log entries of a settled apply stay after the
+	// apply completed, as a Go duration string (e.g. "2160h"). There is no
+	// default: when it is not set, apply logs are never deleted, even with the
+	// pass enabled.
+	ApplyLogs string `yaml:"apply_logs,omitempty"`
 }
 
 const (
@@ -523,6 +529,21 @@ func (c *ServerConfig) StorageRetentionWebhookEvents() (time.Duration, error) {
 	return window, nil
 }
 
+// StorageRetentionApplyLogs returns how long the log entries of a settled apply
+// are kept, and whether a window is set. There is no default window: when
+// storage_retention.apply_logs is not set it reports false and apply logs are
+// never purged.
+func (c *ServerConfig) StorageRetentionApplyLogs() (time.Duration, bool, error) {
+	if c.StorageRetention.ApplyLogs == "" {
+		return 0, false, nil
+	}
+	window, err := parsePositiveDuration("storage_retention.apply_logs", c.StorageRetention.ApplyLogs, 0)
+	if err != nil {
+		return 0, false, err
+	}
+	return window, true, nil
+}
+
 // StorageRetentionBatchSize returns how many rows one purge delete removes,
 // falling back to the default when not configured.
 func (c *ServerConfig) StorageRetentionBatchSize() (int, error) {
@@ -553,6 +574,9 @@ func (c *ServerConfig) validateStorageRetention() error {
 		return err
 	}
 	if _, err := c.StorageRetentionWebhookEvents(); err != nil {
+		return err
+	}
+	if _, _, err := c.StorageRetentionApplyLogs(); err != nil {
 		return err
 	}
 	return nil
