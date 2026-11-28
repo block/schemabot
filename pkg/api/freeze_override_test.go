@@ -178,6 +178,14 @@ const (
 	overrideControl   = `{"environment":"staging","apply_id":"apply-stopped","caller":"cli:rita","override":"fix for incident 42"}`
 )
 
+// decodeApplyResponse decodes the body of an accepted POST /api/apply.
+func decodeApplyResponse(t *testing.T, rec *httptest.ResponseRecorder) apitypes.ApplyResponse {
+	t.Helper()
+	var resp apitypes.ApplyResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp), rec.Body.String())
+	return resp
+}
+
 // approveOverride records the approval a second person gives.
 func approveOverride(t *testing.T, store *memoryFreezeOverrideStore, id string) {
 	t.Helper()
@@ -229,6 +237,7 @@ func TestFreezeOverrideLetsAnApplyThrough(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 	require.NotNil(t, applies.apply)
 	assert.Equal(t, id, applies.apply.GetOptions().FreezeOverride)
+	assert.Equal(t, id, decodeApplyResponse(t, rec).FreezeOverride, "the response names the request that admitted the apply")
 	assert.Equal(t, 1, store.count(), "an admitted apply records no second request")
 	assert.Equal(t, map[string]int64{"checkpoint=start,environment=staging,gate=freeze": 4}, changeGateCounters(t, reader, "schemabot.change_gate.refusals"))
 	assert.Equal(t, map[string]int64{"checkpoint=start,environment=staging,gate=freeze": 1}, changeGateCounters(t, reader, "schemabot.change_gate.overrides"))
@@ -716,6 +725,20 @@ func TestFreezeOverrideNeedsAVerifiedRequester(t *testing.T) {
 	assert.Nil(t, applies.apply)
 }
 
+// An apply no freeze held names no override in its response.
+func TestApplyResponseOmitsFreezeOverrideWhenNoFreezeHeldIt(t *testing.T) {
+	svc, applies := newGateApplyTestService(t)
+	withOverrides(svc)
+
+	rec := postAs(t, serveRoutes(svc), overrideRequester, "/api/apply", overrideApplyBody)
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.NotNil(t, applies.apply)
+	assert.Empty(t, applies.apply.GetOptions().FreezeOverride)
+	assert.Equal(t, applies.apply.ApplyIdentifier, decodeApplyResponse(t, rec).ApplyID)
+	assert.NotContains(t, rec.Body.String(), "freeze_override")
+}
+
 // Under the reason override policy, the default, an operator's own reason
 // admits the change at once, like an audited deploy override. The request is stored approved by
 // its requester, with the reason, the apply records it, and the override is
@@ -741,6 +764,7 @@ func TestFreezeOverrideOnReasonLetsAnApplyThrough(t *testing.T) {
 	require.NotNil(t, applies.apply)
 	require.Equal(t, 1, store.count())
 	id := applies.apply.GetOptions().FreezeOverride
+	assert.Equal(t, id, decodeApplyResponse(t, rec).FreezeOverride, "the response names the request that admitted the apply")
 	stored, err := store.Get(t.Context(), id)
 	require.NoError(t, err)
 	assert.True(t, stored.OnReason())
@@ -762,6 +786,7 @@ func TestFreezeOverrideOnReasonLetsAnApplyThrough(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 	assert.Equal(t, 2, store.count(), "a retry with its own reason records its own override")
 	assert.NotEqual(t, id, applies.apply.GetOptions().FreezeOverride)
+	assert.Equal(t, applies.apply.GetOptions().FreezeOverride, decodeApplyResponse(t, rec).FreezeOverride)
 
 	other := &auth.User{Subject: "sam", Groups: []string{"schema-admins"}}
 	rec = postAs(t, mux, other, "/api/apply", `{"plan_id":"plan-1","environment":"staging"}`)
