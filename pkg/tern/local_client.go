@@ -2024,19 +2024,6 @@ func (c *LocalClient) planWithEngine(ctx context.Context, req *ternv1.PlanReques
 		return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
 	}
 	if c.config.Type != storage.DatabaseTypeMySQL {
-		// A PostgreSQL file that leaves out structure the target has can mean
-		// "leave it alone" rather than "remove it", so the engine is handed
-		// what SchemaBot last applied to tell a removed declaration from one
-		// never made. The MySQL family plans everything a file leaves out as a
-		// removal, so no other engine reads the history.
-		var applied schema.SchemaFiles
-		if c.config.Type == storage.DatabaseTypePostgres {
-			var err error
-			applied, err = c.appliedSchemaFiles(ctx, req.Environment, schemaFiles)
-			if err != nil {
-				return nil, err
-			}
-		}
 		var err error
 		engineSchemaFiles := schemaFiles
 		if c.remapsPostgresNamespaces() {
@@ -2044,15 +2031,18 @@ func (c *LocalClient) planWithEngine(ctx context.Context, req *ternv1.PlanReques
 			if err != nil {
 				return nil, fmt.Errorf("prepare PostgreSQL plan namespaces: %w", err)
 			}
-			if applied != nil {
-				applied, err = c.physicalSchemaFiles(applied)
-				if err != nil {
-					return nil, fmt.Errorf("prepare the namespaces of the PostgreSQL schema files last applied: %w", err)
-				}
-			}
 		}
 		planReq := c.enginePlanRequest(req, database, engineSchemaFiles, c.credentials())
-		planReq.AppliedSchemaFiles = applied
+		// A PostgreSQL file that leaves out structure the target has can mean
+		// "leave it alone" rather than "remove it", so the engine can look up
+		// what SchemaBot last applied to tell a removed declaration from one
+		// never made. The MySQL family plans everything a file leaves out as a
+		// removal, so no other engine reads the history.
+		if c.config.Type == storage.DatabaseTypePostgres {
+			if history := c.newAppliedHistory(req.Environment); history != nil {
+				planReq.AppliedSchemaFiles = history.LastApplied
+			}
+		}
 		result, err := eng.Plan(ctx, planReq)
 		if err != nil {
 			return nil, err
@@ -2141,78 +2131,112 @@ func (c *LocalClient) enginePlanRequest(req *ternv1.PlanRequest, database string
 	}
 }
 
-// appliedSchemaFiles returns, for each namespace of schemaFiles, the files
-// SchemaBot last applied to it on this deployment in environment, or nil
-// when it has applied none of them. An apply can leave a namespace out (an
-// ignored or unselected namespace), and a rollout member can apply a plan of
-// its own, so each namespace is taken from the newest completed apply whose
-// plan for this deployment addressed it: an apply that never touched a
-// namespace cannot erase what an earlier one applied there. Only the
-// namespaces the plan addresses are returned, since the engine reads history
-// for no other. An empty environment matches nothing rather than every
-// environment, so a plan that names none never reads another environment's
-// history.
+// appliedHistory answers a plan's lookups of the schema files SchemaBot last
+// applied, from the database's apply history in one environment. An apply
+// can leave a namespace out (an ignored or unselected namespace), and a
+// rollout member can apply a plan of its own, so each namespace is taken from
+// the newest completed apply whose plan for this deployment addressed it: an
+// apply that never touched a namespace cannot erase what an earlier one
+// applied there.
 //
-// Only the newest appliedHistoryWindow completed applies are read, since
-// every plan and every re-plan pays for the walk. A namespace none of them
-// addressed, such as one added since, is treated as never applied: the
-// engine then reads its files as written, as it did before any history.
-func (c *LocalClient) appliedSchemaFiles(ctx context.Context, environment string, schemaFiles schema.SchemaFiles) (schema.SchemaFiles, error) {
+// The history is read only when the engine asks, and only as far back as the
+// namespace it asks about: completed applies are walked newest first, and
+// every namespace an apply's plans addressed is remembered on the way, so a
+// later lookup resumes where the walk stopped. A namespace no completed apply
+// addressed costs the whole walk, which only a plan that may be removing a
+// declaration pays for, and an unread namespace is never reported as never
+// applied. One plan uses one appliedHistory.
+type appliedHistory struct {
+	client      *LocalClient
+	environment string
+
+	mu        sync.Mutex
+	completed []*storage.Apply // nil until the applies are first read
+	next      int              // the next apply in completed to read
+	found     map[string]*schema.Namespace
+}
+
+// newAppliedHistory returns the history a PostgreSQL plan in environment
+// reads, or nil when it has none to read. An empty environment matches
+// nothing rather than every environment, so a plan that names none never
+// reads another environment's history.
+func (c *LocalClient) newAppliedHistory(environment string) *appliedHistory {
 	if environment == "" {
 		c.logger.Debug("plan names no environment; the engine plans without the schema files last applied",
 			"database", c.config.Database, "database_type", c.config.Type)
-		return nil, nil
-	}
-	if len(schemaFiles) == 0 {
-		c.logger.Debug("plan covers no namespace; there are no schema files last applied to compare against",
-			"database", c.config.Database, "database_type", c.config.Type, "environment", environment)
-		return nil, nil
+		return nil
 	}
 	if c.storage == nil {
 		c.logger.Debug("client has no storage; the engine plans without the schema files last applied",
 			"database", c.config.Database, "database_type", c.config.Type, "environment", environment)
-		return nil, nil
+		return nil
 	}
-	applies, err := c.storage.Applies().GetByDatabase(ctx, c.config.Database, c.config.Type, environment)
-	if err != nil {
-		return nil, fmt.Errorf("load the applies of database %q in %s: %w", c.config.Database, environment, err)
-	}
-	completed := completedNewestFirst(applies)
-	if len(completed) > appliedHistoryWindow {
-		completed = completed[:appliedHistoryWindow]
-	}
-	applied := make(schema.SchemaFiles)
-	for _, apply := range completed {
-		if len(applied) == len(schemaFiles) {
-			break
+	return &appliedHistory{client: c, environment: environment, found: make(map[string]*schema.Namespace)}
+}
+
+// LastApplied is the plan's engine.AppliedSchemaFiles. namespace is the
+// engine's, so a remapped target's physical name is read back to the name
+// the stored plans carry.
+func (h *appliedHistory) LastApplied(ctx context.Context, namespace string) (*schema.Namespace, error) {
+	c := h.client
+	stored := namespace
+	if c.remapsPostgresNamespaces() {
+		var err error
+		if stored, err = c.canonicalNamespace(namespace); err != nil {
+			return nil, fmt.Errorf("resolve the namespace %q the schema files last applied are stored under: %w", namespace, err)
 		}
-		planIDs, err := c.appliedPlanIDs(ctx, apply)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if files, ok := h.found[stored]; ok {
+		return files, nil
+	}
+	if h.completed == nil {
+		applies, err := c.storage.Applies().GetByDatabase(ctx, c.config.Database, c.config.Type, h.environment)
 		if err != nil {
+			return nil, fmt.Errorf("load the applies of database %q in %s: %w", c.config.Database, h.environment, err)
+		}
+		h.completed = completedNewestFirst(applies)
+	}
+	for h.next < len(h.completed) {
+		apply := h.completed[h.next]
+		if err := h.read(ctx, apply); err != nil {
 			return nil, err
 		}
-		for _, planID := range planIDs {
-			plan, err := c.storage.Plans().GetByID(ctx, planID)
-			if err != nil {
-				return nil, fmt.Errorf("load plan %d of completed apply %s on database %q: %w", planID, apply.ApplyIdentifier, c.config.Database, err)
-			}
-			if plan == nil {
-				return nil, fmt.Errorf("plan %d of completed apply %s on database %q is not in storage", planID, apply.ApplyIdentifier, c.config.Database)
-			}
-			for namespace, files := range plan.SchemaFiles {
-				if _, wanted := schemaFiles[namespace]; !wanted {
-					continue
-				}
-				if _, found := applied[namespace]; found {
-					continue
-				}
-				applied[namespace] = files
+		h.next++
+		if files, ok := h.found[stored]; ok {
+			return files, nil
+		}
+	}
+	c.logger.Debug("no completed apply addressed the namespace; its files are read as written",
+		"database", c.config.Database, "database_type", c.config.Type, "environment", h.environment,
+		"namespace", stored, "applies_read", len(h.completed))
+	return nil, nil
+}
+
+// read remembers each namespace apply's plans on this deployment addressed
+// that no newer apply did.
+func (h *appliedHistory) read(ctx context.Context, apply *storage.Apply) error {
+	c := h.client
+	planIDs, err := c.appliedPlanIDs(ctx, apply)
+	if err != nil {
+		return err
+	}
+	for _, planID := range planIDs {
+		plan, err := c.storage.Plans().GetByID(ctx, planID)
+		if err != nil {
+			return fmt.Errorf("load plan %d of completed apply %s on database %q: %w", planID, apply.ApplyIdentifier, c.config.Database, err)
+		}
+		if plan == nil {
+			return fmt.Errorf("plan %d of completed apply %s on database %q is not in storage", planID, apply.ApplyIdentifier, c.config.Database)
+		}
+		for namespace, files := range plan.SchemaFiles {
+			if _, seen := h.found[namespace]; !seen {
+				h.found[namespace] = files
 			}
 		}
 	}
-	if len(applied) == 0 {
-		return nil, nil
-	}
-	return applied, nil
+	return nil
 }
 
 // appliedPlanIDs returns the plans a completed apply ran on this deployment:
@@ -2247,10 +2271,6 @@ func (c *LocalClient) appliedPlanIDs(ctx context.Context, apply *storage.Apply) 
 	}
 	return planIDs, nil
 }
-
-// appliedHistoryWindow bounds how many completed applies, newest first, a
-// plan reads for the files SchemaBot last applied.
-const appliedHistoryWindow = 25
 
 // completedNewestFirst returns the completed applies of applies, the most
 // recently completed first.

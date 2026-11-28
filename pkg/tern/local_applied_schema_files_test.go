@@ -25,6 +25,8 @@ type appliedHistoryStorage struct {
 	applies []*storage.Apply
 	ops     map[int64][]*storage.ApplyOperation
 	plans   map[int64]*storage.Plan
+	// planReads counts the plans read, which is what the walk pays for.
+	planReads int
 }
 
 func (s *appliedHistoryStorage) Applies() storage.ApplyStore {
@@ -36,7 +38,7 @@ func (s *appliedHistoryStorage) ApplyOperations() storage.ApplyOperationStore {
 }
 
 func (s *appliedHistoryStorage) Plans() storage.PlanStore {
-	return appliedHistoryPlans{plans: s.plans}
+	return appliedHistoryPlans{storage: s}
 }
 
 type appliedHistoryApplies struct {
@@ -59,11 +61,29 @@ func (o appliedHistoryOps) ListByApply(_ context.Context, applyID int64) ([]*sto
 
 type appliedHistoryPlans struct {
 	storage.PlanStore
-	plans map[int64]*storage.Plan
+	storage *appliedHistoryStorage
 }
 
 func (p appliedHistoryPlans) GetByID(_ context.Context, id int64) (*storage.Plan, error) {
-	return p.plans[id], nil
+	p.storage.planReads++
+	return p.storage.plans[id], nil
+}
+
+// historyClient is a PostgreSQL client for database testapp over history.
+func historyClient(history storage.Storage) *LocalClient {
+	return &LocalClient{
+		config:  LocalConfig{Database: "testapp", Type: storage.DatabaseTypePostgres},
+		storage: history,
+		logger:  slog.Default(),
+	}
+}
+
+// lastApplied looks up namespace in history.
+func lastApplied(t *testing.T, history *appliedHistory, namespace string) *schema.Namespace {
+	t.Helper()
+	files, err := history.LastApplied(t.Context(), namespace)
+	require.NoError(t, err, namespace)
+	return files
 }
 
 func appliedNamespace(file, content string) *schema.Namespace {
@@ -73,9 +93,9 @@ func appliedNamespace(file, content string) *schema.Namespace {
 // The schema files a plan compares against are, for each namespace the
 // plan covers, the files of the apply that last completed it on this
 // deployment. An apply that changed only another namespace, an apply that
-// ran only on another deployment, a newer apply that failed, and a
-// namespace the plan no longer covers leave that answer alone.
-func TestAppliedSchemaFilesTakesEachNamespaceFromItsLastCompletedApply(t *testing.T) {
+// ran only on another deployment, and a newer apply that failed leave that
+// answer alone.
+func TestAppliedHistoryTakesEachNamespaceFromItsLastCompletedApply(t *testing.T) {
 	now := time.Now()
 	at := func(ago time.Duration) *time.Time {
 		completed := now.Add(-ago)
@@ -113,29 +133,26 @@ func TestAppliedSchemaFilesTakesEachNamespaceFromItsLastCompletedApply(t *testin
 			20: {SchemaFiles: schema.SchemaFiles{"public": publicV1, "retired": retired}},
 		},
 	}
-	client := &LocalClient{
-		config:  LocalConfig{Database: "testapp", Type: storage.DatabaseTypePostgres},
-		storage: history,
-		logger:  slog.Default(),
-	}
+	applied := historyClient(history).newAppliedHistory("staging")
+	require.NotNil(t, applied)
 
-	desired := schema.SchemaFiles{"public": publicV2, "audit": audit}
-	applied, err := client.appliedSchemaFiles(t.Context(), "staging", desired)
-	require.NoError(t, err)
-	assert.Equal(t, schema.SchemaFiles{"public": publicV2, "audit": audit}, applied)
-
-	none, err := client.appliedSchemaFiles(t.Context(), "staging", schema.SchemaFiles{"billing": audit})
-	require.NoError(t, err)
-	assert.Nil(t, none, "a namespace no completed apply covered has no files last applied")
+	assert.Equal(t, publicV2, lastApplied(t, applied, "public"))
+	assert.Equal(t, audit, lastApplied(t, applied, "audit"))
+	assert.Equal(t, retired, lastApplied(t, applied, "retired"))
+	assert.Nil(t, lastApplied(t, applied, "billing"), "a namespace no completed apply addressed has no files last applied")
 }
 
-// A plan reads only the newest completed applies for the files last applied.
-// A namespace that only an older apply covered is treated as never applied,
-// so a plan never walks the whole history.
-func TestAppliedSchemaFilesReadsOnlyTheNewestApplies(t *testing.T) {
+// A lookup reads the history back only as far as the namespace it asks
+// about, and a later lookup resumes where the walk stopped. However many
+// applies other namespaces completed since, a namespace's last applied
+// files are still found: an unread namespace is never reported as never
+// applied.
+func TestAppliedHistoryReadsBackOnlyAsFarAsTheNamespace(t *testing.T) {
+	const newer = 26
 	now := time.Now()
+	billing := appliedNamespace("invoices.sql", "CREATE TABLE invoices (id bigint); ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;")
 	history := &appliedHistoryStorage{plans: map[int64]*storage.Plan{}}
-	for i := range appliedHistoryWindow + 1 {
+	for i := range newer + 1 {
 		id := int64(i + 1)
 		completed := now.Add(-time.Duration(i) * time.Minute)
 		history.applies = append(history.applies, &storage.Apply{
@@ -144,22 +161,41 @@ func TestAppliedSchemaFilesReadsOnlyTheNewestApplies(t *testing.T) {
 		})
 		history.plans[id] = &storage.Plan{SchemaFiles: schema.SchemaFiles{"public": appliedNamespace("users.sql", fmt.Sprintf("-- v%d", id))}}
 	}
-	oldest := history.applies[appliedHistoryWindow]
-	history.plans[oldest.PlanID].SchemaFiles["billing"] = appliedNamespace("invoices.sql", "CREATE TABLE invoices (id bigint)")
-	client := &LocalClient{
-		config:  LocalConfig{Database: "testapp", Type: storage.DatabaseTypePostgres},
-		storage: history,
-		logger:  slog.Default(),
+	// The oldest apply is the only one that addressed billing.
+	history.plans[newer+1].SchemaFiles = schema.SchemaFiles{"billing": billing}
+	applied := historyClient(history).newAppliedHistory("staging")
+
+	assert.Equal(t, appliedNamespace("users.sql", "-- v1"), lastApplied(t, applied, "public"))
+	assert.Equal(t, 1, history.planReads, "the newest apply addressed public, so nothing older is read")
+
+	assert.Equal(t, billing, lastApplied(t, applied, "billing"),
+		"billing's files are found behind every newer apply to public")
+	assert.Equal(t, newer+1, history.planReads, "the walk resumes after the applies already read")
+
+	assert.Equal(t, billing, lastApplied(t, applied, "billing"))
+	assert.Nil(t, lastApplied(t, applied, "audit"))
+	assert.Equal(t, newer+1, history.planReads, "every apply is read at most once per plan")
+}
+
+// A remapped target's engine asks under the physical namespace, and the
+// stored plans carry the logical one.
+func TestAppliedHistoryReadsARemappedNamespaceUnderItsLogicalName(t *testing.T) {
+	completed := time.Now()
+	app := appliedNamespace("users.sql", "CREATE TABLE users (id bigint)")
+	history := &appliedHistoryStorage{
+		applies: []*storage.Apply{{ID: 1, ApplyIdentifier: "apply-1", PlanID: 1, State: state.Apply.Completed, CompletedAt: &completed}},
+		plans:   map[int64]*storage.Plan{1: {SchemaFiles: schema.SchemaFiles{"app": app}}},
 	}
+	client := historyClient(history)
+	client.config.SchemaOverrides = map[string]string{"app": "app_staging"}
 
-	applied, err := client.appliedSchemaFiles(t.Context(), "staging", schema.SchemaFiles{
-		"public":  appliedNamespace("users.sql", ""),
-		"billing": appliedNamespace("invoices.sql", ""),
-	})
+	assert.Equal(t, app, lastApplied(t, client.newAppliedHistory("staging"), "app_staging"))
+}
 
-	require.NoError(t, err)
-	assert.Equal(t, schema.SchemaFiles{"public": appliedNamespace("users.sql", "-- v1")}, applied,
-		"billing, covered only by an apply past the window, reads as never applied")
+// A plan that names no environment reads no history, rather than every
+// environment's.
+func TestAppliedHistoryNeedsAnEnvironment(t *testing.T) {
+	assert.Nil(t, historyClient(&appliedHistoryStorage{}).newAppliedHistory(""))
 }
 
 // historyUnavailableStorage fails every read of apply history.
@@ -173,8 +209,10 @@ func (historyUnavailableApplies) GetByDatabase(context.Context, string, string, 
 	return nil, errors.New("apply history unavailable")
 }
 
-// Only PostgreSQL reads the files last applied, so a Vitess plan neither pays
-// for the history nor fails when it cannot be read.
+// Only PostgreSQL can look up the files last applied, so a Vitess plan
+// neither pays for the history nor fails when it cannot be read. A
+// PostgreSQL lookup over unreadable history fails rather than reading as
+// never applied.
 func TestPlanWithEngineReadsAppliedHistoryOnlyForPostgres(t *testing.T) {
 	var seen *engine.PlanRequest
 	eng := fakePlanEngine{planFn: func(_ context.Context, req *engine.PlanRequest) (*engine.PlanResult, error) {
@@ -202,5 +240,8 @@ func TestPlanWithEngineReadsAppliedHistoryOnlyForPostgres(t *testing.T) {
 		logger:         slog.Default(),
 	}
 	_, err = postgres.planWithEngine(t.Context(), req, "testapp", files)
-	require.ErrorContains(t, err, "apply history unavailable", "a PostgreSQL plan fails closed without its history")
+	require.NoError(t, err, "the history is read only when the engine looks a namespace up")
+	require.NotNil(t, seen.AppliedSchemaFiles)
+	_, err = seen.AppliedSchemaFiles(t.Context(), "commerce")
+	require.ErrorContains(t, err, "apply history unavailable", "a lookup fails closed without its history")
 }

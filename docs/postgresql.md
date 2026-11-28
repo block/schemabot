@@ -1311,9 +1311,10 @@ refusal names the table, its live settings and policies, and the two fixes:
   in the file. The plan then drops the policies and disables RLS.
 - To keep it, put the clauses back.
 
-"Last applied" means the most recent apply that completed for the database in
-that environment. An environment where SchemaBot never applied the clauses
-keeps the rule above.
+"Last applied" means the newest apply that completed in that environment and
+covered the file's namespace, however many applies to other namespaces came
+after it. An environment where SchemaBot never applied the clauses keeps the
+rule above.
 
 **Not supported yet:**
 

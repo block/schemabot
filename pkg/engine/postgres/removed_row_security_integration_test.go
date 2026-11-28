@@ -22,6 +22,22 @@ const (
 	plainRLSDisabled = plainTable + ` ALTER TABLE h_plain DISABLE ROW LEVEL SECURITY;`
 )
 
+// recordedHistory serves fixed schema files last applied, counting the
+// lookups an engine makes, or fails every lookup with err.
+type recordedHistory struct {
+	files   schema.SchemaFiles
+	err     error
+	lookups int
+}
+
+func (h *recordedHistory) LastApplied(_ context.Context, namespace string) (*schema.Namespace, error) {
+	h.lookups++
+	if h.err != nil {
+		return nil, h.err
+	}
+	return h.files[namespace], nil
+}
+
 // A pull request reverts the one that turned on row security for h_plain and
 // added the "read all" policy: the file is back to the bare table, while the
 // table still has both. SchemaBot applied those clauses, so the plan refuses
@@ -38,13 +54,21 @@ func TestEnginePlanRefusesRowSecurityTheFileNoLongerDeclares(t *testing.T) {
 			CREATE POLICY "read all" ON public.h_plain FOR SELECT USING (true);`)
 		require.NoError(t, err)
 	}
-	plan := func(t *testing.T, ctx context.Context, desired string, applied schema.SchemaFiles) (*engine.PlanResult, error) {
+	planWith := func(t *testing.T, ctx context.Context, desired string, history engine.AppliedSchemaFiles) (*engine.PlanResult, error) {
 		t.Helper()
 		return eng.Plan(ctx, &engine.PlanRequest{
 			Database: "rls_removed", Credentials: &engine.Credentials{DSN: dsn},
 			SchemaFiles:        schema.SchemaFiles{"public": {Files: map[string]string{"h_plain.sql": desired}}},
-			AppliedSchemaFiles: applied,
+			AppliedSchemaFiles: history,
 		})
+	}
+	plan := func(t *testing.T, ctx context.Context, desired string, applied schema.SchemaFiles) (*engine.PlanResult, error) {
+		t.Helper()
+		var history engine.AppliedSchemaFiles
+		if applied != nil {
+			history = (&recordedHistory{files: applied}).LastApplied
+		}
+		return planWith(t, ctx, desired, history)
 	}
 	appliedWith := func(file string) schema.SchemaFiles {
 		return schema.SchemaFiles{"public": {Files: map[string]string{"h_plain.sql": file}}}
@@ -133,5 +157,42 @@ func TestEnginePlanRefusesRowSecurityTheFileNoLongerDeclares(t *testing.T) {
 			require.NoError(t, err, name)
 			assert.True(t, result.NoChanges, name)
 		}
+	})
+
+	// The history is looked up only for a table that still has row
+	// security and whose file declares none, the one case the refusal can
+	// hit, so every other plan reads none of it.
+	t.Run("the history is read only when the refusal could apply", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		reset(t, ctx)
+		declared := &recordedHistory{files: appliedWith(plainWithPolicy)}
+		_, err := planWith(t, ctx, plainWithPolicy, declared.LastApplied)
+		require.NoError(t, err)
+		assert.Zero(t, declared.lookups, "a file that declares the table's row security needs no history")
+
+		left := &recordedHistory{files: appliedWith(plainWithPolicy)}
+		_, err = planWith(t, ctx, plainTable, left.LastApplied)
+		require.Error(t, err)
+		assert.Equal(t, 1, left.lookups)
+
+		_, err = db.ExecContext(ctx, `DROP POLICY "read all" ON public.h_plain; ALTER TABLE public.h_plain DISABLE ROW LEVEL SECURITY;`)
+		require.NoError(t, err)
+		none := &recordedHistory{files: appliedWith(plainWithPolicy)}
+		_, err = planWith(t, ctx, plainTable, none.LastApplied)
+		require.NoError(t, err)
+		assert.Zero(t, none.lookups, "a table with no row security left needs no history")
+	})
+
+	// History that cannot be read fails the plan as an error, never as a
+	// refusal or as a file that was never applied.
+	t.Run("unreadable history fails the plan", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		reset(t, ctx)
+		_, err := planWith(t, ctx, plainTable, (&recordedHistory{err: errors.New("apply history unavailable")}).LastApplied)
+		require.ErrorContains(t, err, "apply history unavailable")
+		var refused *engine.PlanRefusedError
+		assert.False(t, errors.As(err, &refused), "a storage failure is not a schema refusal: %v", err)
 	})
 }
