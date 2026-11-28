@@ -369,6 +369,7 @@ type scriptedWebhookEventStore struct {
 	// outcome channel send so tests can exercise the storage-failure paths.
 	markCompletedErr       error
 	markFailedErr          error
+	markSupersededErr      error
 	markFailedPermanentErr error
 	releaseErr             error
 
@@ -476,6 +477,9 @@ func (s *scriptedWebhookEventStore) MarkCompleted(_ context.Context, id int64, l
 }
 
 func (s *scriptedWebhookEventStore) MarkSuperseded(_ context.Context, id int64, leaseToken string) error {
+	if s.markSupersededErr != nil {
+		return s.markSupersededErr
+	}
 	s.superseded <- scriptedWebhookOutcome{id: id, leaseToken: leaseToken}
 	return nil
 }

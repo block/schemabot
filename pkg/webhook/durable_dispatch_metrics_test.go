@@ -225,24 +225,46 @@ func TestDurableWebhookDispatchMetricsFailedPermanentOutcome(t *testing.T) {
 
 // An auto-plan delivery whose head the PR had already moved past planned
 // nothing, so the driver marks it superseded: it is neither completed, which
-// would count it as coverage for that head, nor failed or dead-lettered.
+// would count it as coverage for that head, nor failed or dead-lettered. When
+// recording that fails, the outcome names why, as it does for a completion.
 func TestDurableWebhookDispatchMetricsHeadMovedOutcome(t *testing.T) {
-	reader := newDispatchMetricsReader(t)
-	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
-	h := newDurableDriverHandler(t, store, nil, nil)
-	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
-		return false, fmt.Errorf("durable delivery for an old head: %w", errAutoPlanHeadMoved)
+	for _, tt := range []struct {
+		name         string
+		markErr      error
+		wantRecorded bool
+		wantOutcome  string
+	}{
+		{name: "superseded", wantRecorded: true, wantOutcome: "superseded"},
+		// Another driver owns the delivery, so this one records nothing.
+		{name: "lease lost", markErr: storage.ErrWebhookEventLeaseLost, wantOutcome: "lease_lost"},
+		// The row stays processing until its lease expires and another
+		// driver finds the head moved again.
+		{name: "storage failure", markErr: errors.New("storage unavailable"), wantOutcome: "finish_error"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			reader := newDispatchMetricsReader(t)
+			store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
+			store.markSupersededErr = tt.markErr
+			h := newDurableDriverHandler(t, store, nil, nil)
+			h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+				return false, fmt.Errorf("durable delivery for an old head: %w", errAutoPlanHeadMoved)
+			}
+
+			h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+			if tt.wantRecorded {
+				require.Len(t, store.superseded, 1)
+			} else {
+				assert.Empty(t, store.superseded)
+			}
+			assert.Empty(t, store.completed, "a delivery that planned nothing must not be completed")
+			assert.Empty(t, store.failed, "a moved head is not retried")
+			assert.Empty(t, store.failedPermanent, "a moved head is not dead-lettered")
+			durationPoints := collectDispatchHistogramPoints(t, reader, "schemabot.webhook.dispatch_duration_seconds")
+			require.Len(t, durationPoints, 1)
+			assertStringAttr(t, durationPoints[0].Attributes, "outcome", tt.wantOutcome)
+		})
 	}
-
-	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
-
-	require.Len(t, store.superseded, 1)
-	assert.Empty(t, store.completed, "a delivery that planned nothing must not be completed")
-	assert.Empty(t, store.failed)
-	assert.Empty(t, store.failedPermanent)
-	durationPoints := collectDispatchHistogramPoints(t, reader, "schemabot.webhook.dispatch_duration_seconds")
-	require.Len(t, durationPoints, 1)
-	assertStringAttr(t, durationPoints[0].Attributes, "outcome", "superseded")
 }
 
 // A retryable failure on the final budgeted attempt records the failed
