@@ -73,7 +73,7 @@ per statement).
         │    └─ task         one per DDL statement (per shard on sharded Vitess)
         ├─ control requests  durable operator commands — stop/start/cancel,
         │                    cutover, release, revert/skip-revert
-        ├─ apply logs        audit trail — powers `schemabot logs`
+        ├─ apply logs        event log — powers `schemabot logs`
         └─ comments          tracked PR comments — progress + summary recovery
 
  checks   per-database rows -> one aggregate GitHub Check Run

@@ -137,7 +137,7 @@ func TestBlockEnumTypeWithoutAccess(t *testing.T) {
 		require.Len(t, changes, 2)
 		for _, change := range changes {
 			assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
-			assert.Equal(t, `the engine role lacks access to alter enum type "order_status"; provision with: GRANT "owner" TO "app" (verified by: pg_has_role(app, owner, 'USAGE'))`, change.ModeReason)
+			assert.Equal(t, `the engine role lacks access to alter enum type "order_status"; provision with: GRANT "owner" TO "app"`, change.ModeReason)
 		}
 	})
 
@@ -240,7 +240,7 @@ func TestEnumTypeRefusals(t *testing.T) {
 			err: &enumTypeError{err: fmt.Errorf("check enum type: %w", &preflight.PrivilegeError{Tier: preflight.TierAlterInPlace,
 				Check: "pg_has_role(app, owner, 'USAGE')", Grant: `GRANT "owner" TO "app"`, Hint: "if the owner is an administrative role, transfer the type instead"})},
 			reason: "insufficient-privileges",
-			detail: `the engine role lacks access to alter enum type "order_status"; provision with: GRANT "owner" TO "app" (verified by: pg_has_role(app, owner, 'USAGE')); if the owner is an administrative role, transfer the type instead`,
+			detail: `the engine role lacks access to alter enum type "order_status"; provision with: GRANT "owner" TO "app"; if the owner is an administrative role, transfer the type instead`,
 		},
 		{
 			name:   "type gone",
