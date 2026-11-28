@@ -157,13 +157,55 @@ func TestUnsupportedRowSecurityShapeOnATableWithRowSecurity(t *testing.T) {
 	}
 }
 
-// Row security that is on denies every row unless a permissive policy
-// grants it; restrictive policies only narrow what a permissive one grants.
-func TestDeniesEveryRow(t *testing.T) {
-	assert.False(t, deniesEveryRow(schemadiff.RowSecurity{}), "row security off")
-	assert.True(t, deniesEveryRow(schemadiff.RowSecurity{Enabled: true}))
-	assert.True(t, deniesEveryRow(schemadiff.RowSecurity{Enabled: true, Policies: []schemadiff.Policy{{Name: "narrow"}}}))
-	assert.False(t, deniesEveryRow(schemadiff.RowSecurity{Enabled: true, Policies: []schemadiff.Policy{{Name: "narrow"}, {Name: "readers", Permissive: true}}}))
+// Row security that is on denies a command unless a permissive policy
+// grants it, for that command or for ALL; restrictive policies only narrow
+// what a permissive one grants. The plan names the commands denied and what
+// each does to the application, as one finding.
+func TestDeniedCommands(t *testing.T) {
+	const denyAll = "after this change row security is on with no policy that grants access, so every role subject to it reads no rows, its inserts are refused, and its updates and deletes change no rows: declare a permissive policy in the same file"
+	for name, tc := range map[string]struct {
+		rs   schemadiff.RowSecurity
+		want string
+	}{
+		"row security off": {rs: schemadiff.RowSecurity{}},
+		"no policy":        {rs: schemadiff.RowSecurity{Enabled: true}, want: denyAll},
+		"only a restrictive policy": {rs: schemadiff.RowSecurity{Enabled: true, Policies: []schemadiff.Policy{
+			{Name: "narrow", Command: schemadiff.PolicyAll}}}, want: denyAll},
+		"a permissive policy for ALL": {rs: schemadiff.RowSecurity{Enabled: true, Policies: []schemadiff.Policy{
+			{Name: "narrow", Command: schemadiff.PolicySelect}, {Name: "owners", Command: schemadiff.PolicyAll, Permissive: true}}}},
+		"a permissive policy for SELECT": {rs: schemadiff.RowSecurity{Enabled: true, Policies: []schemadiff.Policy{
+			{Name: "readers", Command: schemadiff.PolicySelect, Permissive: true}}},
+			want: "after this change no permissive policy grants INSERT, UPDATE, or DELETE, so every role subject to row security has its inserts refused, changes no rows with its updates, and changes no rows with its deletes: if the application runs them, declare a permissive policy for them in the same file"},
+		"permissive policies for every command but DELETE": {rs: schemadiff.RowSecurity{Enabled: true, Policies: []schemadiff.Policy{
+			{Name: "readers", Command: schemadiff.PolicySelect, Permissive: true},
+			{Name: "writers", Command: schemadiff.PolicyInsert, Permissive: true},
+			{Name: "editors", Command: schemadiff.PolicyUpdate, Permissive: true}}},
+			want: "after this change no permissive policy grants DELETE, so every role subject to row security changes no rows with its deletes: if the application runs it, declare a permissive policy for it in the same file"},
+	} {
+		denied := deniedCommands(tc.rs)
+		if tc.want == "" {
+			assert.Empty(t, denied, name)
+			continue
+		}
+		reason := denyReason(denied)
+		assert.Equal(t, tc.want, reason, name)
+		assert.Len(t, ui.LintReasons(reason), 1, "%s: the warning and its fix are one finding", name)
+	}
+}
 
-	assert.Len(t, ui.LintReasons(denyAllReason), 1, "the deny-all warning and its fix are one finding")
+// Each table shape the row security path cannot manage reads as what it is
+// about the table, and a foreign key refusal with no key to list, such as a
+// table the target lacks, names the shape alone rather than an empty list.
+func TestRowSecurityShapePhrases(t *testing.T) {
+	for shape, want := range map[error]string{
+		schemadiff.ErrUnrenderableDefault:    "it has a column whose default draws from a sequence other than the one a serial column declares",
+		schemadiff.ErrMultipleOwnedSequences: "it has a column whose default uses more than one sequence the column owns",
+		schemadiff.ErrUnrenderablePartition:  "it is a partition of a partitioned table",
+	} {
+		assert.Equal(t, want, rowSecurityShapePhrase(fmt.Errorf("%w: %w", executor.ErrRowSecurityRefused, shape)))
+	}
+	refusal, ok := unsupportedRowSecurityShape("public", schemadiff.Model{Table: "cards"},
+		fmt.Errorf("%w: %w", executor.ErrRowSecurityRefused, schemadiff.ErrUnrenderableForeignKey))
+	require.True(t, ok)
+	assert.Equal(t, `SchemaBot does not manage row security on table "cards" yet, because it is in a foreign key relationship; remove the row security statements from its schema file, then plan again`, refusal.Error())
 }

@@ -3075,8 +3075,10 @@ func TestEnginePlanRowSecurityOnAForeignKeyTable(t *testing.T) {
 
 // Two files that turn on row security for tables the row security path
 // cannot manage, one in a foreign key relationship and one with a column of
-// an explicit collation, are refused together: the refusal names both
-// tables, so the author fixes both files before planning again.
+// an explicit collation, are refused together with a table the target lacks
+// that has one too: the refusal names every table, so the author fixes
+// every file before planning again, and the new table's refusal is a plan
+// refusal rather than an error the plan retries.
 func TestEnginePlanRowSecurityListsEveryRefusedTable(t *testing.T) {
 	const database = "rls_every_refusal"
 	dsn, db := testutil.StartPostgres(t, database)
@@ -3099,11 +3101,15 @@ func TestEnginePlanRowSecurityListsEveryRefusedTable(t *testing.T) {
 			"words.sql": "CREATE TABLE words (id bigint PRIMARY KEY, tag text COLLATE \"C\");\n" +
 				"ALTER TABLE words ENABLE ROW LEVEL SECURITY;\n" +
 				"CREATE POLICY readers ON words FOR SELECT USING (true);\n",
+			"labels.sql": "CREATE TABLE labels (id bigint PRIMARY KEY, tag text COLLATE \"C\");\n" +
+				"ALTER TABLE labels ENABLE ROW LEVEL SECURITY;\n" +
+				"CREATE POLICY readers ON labels FOR SELECT USING (true);\n",
 		}}},
 	})
 	var refused *engine.PlanRefusedError
 	require.ErrorAs(t, err, &refused)
 	assert.Equal(t, `SchemaBot does not manage row security on table "kinds" yet, because it is in a foreign key relationship ("cards.cards_kind_fk"); remove the row security statements from its schema file, then plan again
+SchemaBot does not manage row security on table "labels" yet, because it has a column with an explicit collation; remove the row security statements from its schema file, then plan again
 SchemaBot does not manage row security on table "words" yet, because it has a column with an explicit collation; remove the row security statements from its schema file, then plan again`, refused.Error())
 }
 
@@ -3141,20 +3147,29 @@ func TestEnginePlanRowSecurityOnAForeignKeyTableThatHasRowSecurity(t *testing.T)
 
 // A file that turns on row security with no policy, or drops a table's only
 // permissive policy, hides every row from every role subject to row
-// security. The plan says so in its unsafe reason.
+// security, and a file whose only permissive policy is for SELECT refuses
+// every write. The plan says so in its unsafe reason; a permissive policy
+// for ALL grants every command, so it carries no such reason.
 func TestEnginePlanRowSecurityWithNoPolicyWarnsDenyAll(t *testing.T) {
 	const database = "rls_deny_all"
 	dsn, db := testutil.StartPostgres(t, database)
 	ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
 	defer cancel()
-	_, err := db.ExecContext(ctx, `CREATE TABLE public.notes (id bigint PRIMARY KEY)`)
+	_, err := db.ExecContext(ctx, `
+  CREATE TABLE public.notes (id bigint PRIMARY KEY);
+  CREATE TABLE public.drafts (id bigint PRIMARY KEY);
+  ALTER TABLE public.drafts ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY owners ON public.drafts USING (true);
+ `)
 	require.NoError(t, err)
-	planFile := func(rowSecurity string) engine.TableChange {
+	planFile := func(table, rowSecurity string) engine.TableChange {
 		t.Helper()
 		result, err := New().Plan(ctx, &engine.PlanRequest{
 			Database: database, Credentials: &engine.Credentials{DSN: dsn},
 			SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
-				"notes.sql": "CREATE TABLE notes (id bigint PRIMARY KEY);\nALTER TABLE notes ENABLE ROW LEVEL SECURITY;\n" + rowSecurity,
+				"notes.sql":    "CREATE TABLE notes (id bigint PRIMARY KEY);\n",
+				"drafts.sql":   "CREATE TABLE drafts (id bigint PRIMARY KEY);\nALTER TABLE drafts ENABLE ROW LEVEL SECURITY;\nCREATE POLICY owners ON drafts USING (true);\n",
+				table + ".sql": "CREATE TABLE " + table + " (id bigint PRIMARY KEY);\nALTER TABLE " + table + " ENABLE ROW LEVEL SECURITY;\n" + rowSecurity,
 			}}},
 		})
 		require.NoError(t, err)
@@ -3163,18 +3178,23 @@ func TestEnginePlanRowSecurityWithNoPolicyWarnsDenyAll(t *testing.T) {
 		return result.Changes[0].TableChanges[0]
 	}
 
-	for name, rowSecurity := range map[string]string{
-		"no policy":              "",
-		"only a restrictive one": "CREATE POLICY narrow ON notes AS RESTRICTIVE FOR SELECT USING (id > 0);\n",
+	const denyAll = "row security is on with no policy that grants access, so every role subject to it reads no rows, its inserts are refused, and its updates and deletes change no rows"
+	for name, tc := range map[string]struct{ table, rowSecurity, want string }{
+		"no policy":                       {table: "notes", want: denyAll},
+		"only a restrictive one":          {table: "notes", rowSecurity: "CREATE POLICY narrow ON notes AS RESTRICTIVE FOR SELECT USING (id > 0);\n", want: denyAll},
+		"its only permissive one dropped": {table: "drafts", want: denyAll},
+		"a permissive one for SELECT": {table: "notes", rowSecurity: "CREATE POLICY readers ON notes FOR SELECT USING (true);\n",
+			want: "no permissive policy grants INSERT, UPDATE, or DELETE, so every role subject to row security has its inserts refused, changes no rows with its updates, and changes no rows with its deletes"},
 	} {
-		change := planFile(rowSecurity)
+		change := planFile(tc.table, tc.rowSecurity)
+		assert.Equal(t, tc.table, change.Table, name)
 		assert.True(t, change.IsUnsafe, name)
-		assert.Contains(t, change.UnsafeReason, "row security is on with no policy that grants access, so every role subject to it reads no rows, its inserts are refused, and its updates and deletes change no rows", name)
+		assert.Contains(t, change.UnsafeReason, tc.want, name)
 	}
 
-	change := planFile("CREATE POLICY readers ON notes FOR SELECT USING (true);\n")
+	change := planFile("notes", "CREATE POLICY owners ON notes USING (true);\n")
 	assert.True(t, change.IsUnsafe)
-	assert.NotContains(t, change.UnsafeReason, "no policy that grants access", "a permissive policy grants access")
+	assert.NotContains(t, change.UnsafeReason, "grants", "a permissive policy for ALL grants every command")
 }
 
 // Forward structural planning remains available for RLS tables and siblings.
