@@ -853,7 +853,7 @@ func TestInvalidIndexDetailKeepsItsRemedyLeadInsideTheClamp(t *testing.T) {
 			verdict.Schema, verdict.Index, verdict.Table = widest, widest, widest
 
 			detail := invalidIndexDetail(verdict)
-			_, remedy := invalidIndexAdvice(verdict, "")
+			_, remedy := invalidIndexAdvice(verdict, nil, "")
 
 			assert.NotContains(t, detail, widest, "no verdict renders an identifier raw")
 			lead := clauseSeparator + remedyLead(remedy)
@@ -923,7 +923,7 @@ func TestInvalidIndexRemedyLeadsWithTheInstruction(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.verdict.Schema, tt.verdict.Index = "public", "orders_ref_idx"
 
-			_, remedy := invalidIndexAdvice(tt.verdict, "")
+			_, remedy := invalidIndexAdvice(tt.verdict, nil, "")
 
 			assert.Equal(t, tt.want, remedyLead(remedy), remedy)
 		})
@@ -1472,6 +1472,8 @@ func TestEveryRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
 			pastFirstStep: true, namesIndex: true},
 		"invalid index the rows violate": {cause: &executor.InvalidIndexError{Schema: widest, Index: widest, Table: widest,
 			Build: &pgconn.PgError{Code: "23505"}, Cleanup: executor.ErrBuildLeftInvalidIndex},
+			pastFirstStep: true, namesIndex: true},
+		"invalid index the rows violate, left quarantined": {cause: quarantinedDataFaultLeftover(widest),
 			pastFirstStep: true, namesIndex: true},
 		"invalid index the rows violate, not proven its own": {cause: &executor.InvalidIndexError{Schema: widest, Index: widest, Table: widest,
 			Build: &pgconn.PgError{Code: "23505"}, Cleanup: executor.ErrAbandonmentUnproven},
@@ -4508,4 +4510,99 @@ func TestTableTooLargeRefusalReadsInBinaryUnits(t *testing.T) {
 
 	r = tableTooLargeRefusal(&preflight.SizeError{TotalBytes: 1073741825, LimitBytes: 1073741824})
 	assert.Equal(t, "the table is 1073741825 bytes with its indexes, over the 1073741824 bytes limit SchemaBot sets for a native-safe apply, not a PostgreSQL limit", r.cause)
+}
+
+// quarantinedDataFaultLeftover is a unique build that failed on duplicate
+// rows and whose invalid leftover the cleanup quarantined but the server
+// would not drop concurrently, the longest data-fault wording, with every
+// identifier set to name.
+func quarantinedDataFaultLeftover(name string) error {
+	verdict := &executor.InvalidIndexError{Schema: name, Index: name, Table: name,
+		Build: &pgconn.PgError{Code: "23505"}, Cleanup: executor.ErrBuildLeftInvalidIndex}
+	return &dataFaultIndexCleanupError{err: verdict, verdict: verdict, cleaned: true,
+		skipped: []executor.QuarantinedIndex{{Schema: name, Index: "pgsprite_abandoned_42", IndexOID: 42}}}
+}
+
+// A unique build that fails on duplicate rows leaves an invalid index that
+// PostgreSQL still maintains on every write, so it rejects writes that
+// duplicate its key although the live schema declares no such rule. The
+// engine drops that leftover right away through pg-sprite's proven drop,
+// detached from the apply under its own bound, and the refusal says what
+// became of it; a leftover the build did not prove its own is never touched.
+func TestBuildIndexConcurrentlyDropsTheIndexADataFaultLeft(t *testing.T) {
+	duplicate := &pgconn.PgError{Code: "23505"}
+	expression := &pgconn.PgError{Code: "22012"}
+	own := func(build error) *executor.InvalidIndexError {
+		return &executor.InvalidIndexError{Schema: "public", Index: "users_email_idx", Table: "users",
+			Build: build, Cleanup: executor.ErrBuildLeftInvalidIndex}
+	}
+	for name, tc := range map[string]struct {
+		verdict *executor.InvalidIndexError
+		drop    dropScript
+		drops   int
+		detail  string
+	}{
+		"dropped": {
+			verdict: own(duplicate), drop: droppedOneIndex, drops: 1,
+			detail: `index "public"."users_email_idx" was not built: rows duplicate its key (23505), and its invalid leftover was dropped; correct the rows, then re-run`,
+		},
+		"dropped after an expression failed on a row": {
+			verdict: own(expression), drop: droppedOneIndex, drops: 1,
+			detail: `index "public"."users_email_idx" was not built: the rows violate it (22012), and its invalid leftover was dropped; correct the rows, then re-run`,
+		},
+		"already gone": {
+			verdict: own(duplicate), drop: droppedNothing, drops: 1,
+			detail: `index "public"."users_email_idx" was not built: rows duplicate its key (23505), and its invalid leftover was already gone; correct the rows, then re-run`,
+		},
+		"quarantined": {
+			verdict: own(duplicate), drops: 1,
+			drop: func() (executor.IndexRecoveryReport, error) {
+				return executor.IndexRecoveryReport{Skipped: []executor.QuarantinedIndex{
+					{Schema: "public", Index: "pgsprite_abandoned_42", IndexOID: 42}}}, nil
+			},
+			detail: `index "public"."users_email_idx" was not built: rows duplicate its key (23505), and its invalid leftover, quarantined, still rejects writes that duplicate its key; ` +
+				`an operator must drop it, named "public"."pgsprite_abandoned_42", since the server refuses to drop it concurrently (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run`,
+		},
+		"drop failed": {
+			verdict: own(duplicate), drop: dropFailed(errors.New("lock not granted")), drops: 1,
+			detail: `index "public"."users_email_idx" was not built: rows duplicate its key (23505), and its invalid leftover still rejects writes that duplicate its key; ` +
+				`correct the rows, then re-run; the rerun removes the invalid index once it proves no build holds it`,
+		},
+		"not proven its own": {
+			verdict: &executor.InvalidIndexError{Schema: "public", Index: "users_email_idx", Table: "users",
+				Build: duplicate, Cleanup: executor.ErrAbandonmentUnproven},
+			detail: `index "public"."users_email_idx" was not built: rows duplicate its key (23505), and an invalid index not proven its own holds the name; ` +
+				`correct the rows, then re-run; the rerun removes the invalid index once it proves no build holds it`,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			drop := tc.drop
+			if drop == nil {
+				drop = dropFailed(errors.New("no drop is expected"))
+			}
+			calls := scriptConcurrentIndex(t, func() error { return tc.verdict }, func() error {
+				return errors.New("no rebuild is expected")
+			}, drop)
+			applyCtx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			before := time.Now()
+			err := buildIndexConcurrently(applyCtx, nil, concurrentIndexChange(time.Hour), newTestTracker(t), slog.New(slog.DiscardHandler))
+
+			require.Error(t, err)
+			r := classifyRefusal(err, "users")
+			require.NotNil(t, r)
+			assert.Equal(t, "data-fault", r.reason)
+			assert.Equal(t, tc.detail, r.detail)
+			require.Len(t, calls.drop, tc.drops)
+			if tc.drops == 0 {
+				return
+			}
+			assert.Equal(t, concurrentIndexDDL, calls.drop[0].sql)
+			assert.Equal(t, executor.ConcurrentBudget{CallerOwned: true}, calls.drop[0].budget)
+			assert.NoError(t, calls.drop[0].ctxErr)
+			require.True(t, calls.drop[0].hasDeadline)
+			assert.WithinDuration(t, before.Add(dataFaultIndexCleanupBound), calls.drop[0].deadline, time.Second)
+		})
+	}
 }
