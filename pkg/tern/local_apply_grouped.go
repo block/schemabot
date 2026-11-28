@@ -779,6 +779,30 @@ func applyQuiesceDecision(projectedApplyState string) (quiesce, retryablePause, 
 	return quiesce, retryablePause, stampCompletedAt
 }
 
+// atomicControlReadFailed handles a failed read of the apply's pending control
+// requests on a grouped progress tick and reports whether the drive stops
+// polling. The rest of the tick is skipped either way, because it acts on
+// requests the drive could not see. Inside the lease staleness window the
+// engine work keeps running and the next tick reads again; past it the drive
+// hands the apply back for another driver to claim.
+func (c *LocalClient) atomicControlReadFailed(ctx context.Context, logger *slog.Logger, apply *storage.Apply, ps *atomicPollState, point string, err error) bool {
+	if c.driveCancelled(ctx, apply, "while reading pending control requests "+point) {
+		return true
+	}
+	now := time.Now()
+	if ps.controlReadOutage.recordFailure(now, c.controlReadOutageWindow()) {
+		logger.Error("pending control requests have been unreadable for the lease staleness window; this driver halts the engine and hands the apply back for another driver to claim",
+			append(apply.MutableLogAttrs(), "read_point", point, "consecutive_read_failures", ps.controlReadOutage.failures,
+				"failing_for", ps.controlReadOutage.failingFor(now), "error", err)...)
+		return true
+	}
+	ps.nextPollWait = c.progressPollWait(ps.controlReadOutage.failures)
+	logger.Warn("pending control request read failed; the engine work keeps running and the drive reads again at the next poll",
+		append(apply.MutableLogAttrs(), "read_point", point, "consecutive_read_failures", ps.controlReadOutage.failures,
+			"failing_for", ps.controlReadOutage.failingFor(now), "next_poll_in", ps.nextPollWait, "error", err)...)
+	return false
+}
+
 // handleAtomicProgressTick processes a single progress poll tick in atomic mode.
 // Returns true when this operation's drive should stop polling: the aggregate
 // apply quiesced (terminal or paused for retry), this owner attempt must exit
@@ -797,10 +821,9 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	}
 	pendingBeforeProgress, err := loadPendingControlOperations(ctx, c.storage, apply)
 	if err != nil {
-		logger.Warn("pending control request read failed; current apply owner will exit for operator retry",
-			"error", err)
-		return true
+		return c.atomicControlReadFailed(ctx, logger, apply, ps, "before the progress check", err)
 	}
+	ps.controlReadOutage.recordSuccess()
 	ps.parked.observe(pendingBeforeProgress)
 	if pendingBeforeProgress.has(storage.ControlOperationCancel, storage.ControlOperationStop) {
 		if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
@@ -1029,10 +1052,9 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	}
 	pendingAfterProgress, err := loadPendingControlOperations(ctx, c.storage, apply)
 	if err != nil {
-		logger.Warn("pending control request read failed after progress sync; current apply owner will exit for operator retry",
-			"error", err)
-		return true
+		return c.atomicControlReadFailed(ctx, logger, apply, ps, "after the progress sync", err)
 	}
+	ps.controlReadOutage.recordSuccess()
 	ps.parked.observe(pendingAfterProgress)
 	if pendingAfterProgress.has(storage.ControlOperationCancel, storage.ControlOperationStop) {
 		if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {

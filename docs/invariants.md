@@ -1225,7 +1225,9 @@ stops on its own (OW-3) rather than needing to guess from one failed write.
 *Breaks if violated:* a storage blip aborts a healthy copy that has been running for days.
 *Enforced:* the ownership checks in the drive loop, which stop the drive on a proven token change
 and retry everything else
-(`pkg/api/operator.go`), modelled in [storage-outage-behavior.md](storage-outage-behavior.md).
+(`pkg/api/operator.go`), and the local drive's poll, which rides out failed reads of its pending
+control requests for the staleness window before handing the apply back (`controlReadOutage`,
+`pkg/tern/control_read_outage.go`), modelled in [storage-outage-behavior.md](storage-outage-behavior.md).
 
 ### OW-5: One active apply per deployment
 

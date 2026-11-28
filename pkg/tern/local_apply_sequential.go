@@ -882,6 +882,10 @@ type atomicPollState struct {
 	// writes did not all land; see pollTaskToCompletion's counterpart.
 	progressWriteFailures int
 
+	// controlReadOutage tracks a run of failed pending control request reads,
+	// which the drive rides out for the lease staleness window.
+	controlReadOutage controlReadOutage
+
 	// stateEnteredAt tracks when the current waiting state was entered,
 	// used for timeout enforcement on deferred cutover and revert window.
 	stateEnteredAt time.Time
@@ -1222,6 +1226,9 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 	// ends on it as its own failure instead of polling on until the frozen row
 	// reads as a stalled drive.
 	var progressWriteFailures int
+	// controlReadOutage tracks a run of failed pending control request reads,
+	// which the drive rides out for the lease staleness window.
+	var controlReadOutage controlReadOutage
 	var resumeEventLogged bool
 	var lastProgressMetadata map[string]string
 	var progressMetadataLeaseLost bool
@@ -1247,10 +1254,25 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 			}
 			pending, err := loadPendingControlOperations(ctx, c.storage, apply)
 			if err != nil {
-				logger.Warn("pending control request read failed; current apply owner will exit for operator retry",
-					"task_id", task.TaskIdentifier, "error", err)
-				return taskAbort
+				if ctx.Err() != nil {
+					logger.Info("drive context cancelled while reading pending control requests; handing the apply back for another driver to claim",
+						"task_id", task.TaskIdentifier, "table", task.TableName)
+					return taskHandover
+				}
+				now := time.Now()
+				if controlReadOutage.recordFailure(now, c.controlReadOutageWindow()) {
+					logger.Error("pending control requests have been unreadable for the lease staleness window; this driver halts the engine and hands the apply back for another driver to claim",
+						"task_id", task.TaskIdentifier, "table", task.TableName,
+						"consecutive_read_failures", controlReadOutage.failures, "failing_for", controlReadOutage.failingFor(now), "error", err)
+					return taskHandover
+				}
+				nextPollWait = c.progressPollWait(controlReadOutage.failures)
+				logger.Warn("pending control request read failed; the engine work keeps running and the drive reads again at the next poll",
+					"task_id", task.TaskIdentifier, "table", task.TableName,
+					"consecutive_read_failures", controlReadOutage.failures, "failing_for", controlReadOutage.failingFor(now), "next_poll_in", nextPollWait, "error", err)
+				continue
 			}
+			controlReadOutage.recordSuccess()
 			parked.observe(pending)
 			if pending.has(storage.ControlOperationCancel, storage.ControlOperationStop) {
 				if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {

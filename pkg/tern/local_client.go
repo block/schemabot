@@ -239,6 +239,12 @@ type LocalClient struct {
 	// as its wait on a held target. Tests may lower it to drive many polls quickly.
 	taskPollIntervalOverride time.Duration
 
+	// controlReadOutageWindowOverride, when positive, replaces
+	// storage.ApplyLeaseStaleAfter as how long a drive keeps polling while it
+	// cannot read its apply's pending control requests. Tests may lower it to
+	// observe the hand-back.
+	controlReadOutageWindowOverride time.Duration
+
 	// progressPollJitter, when set, replaces rand.Int64N as the source of the
 	// random amount progressPollWait takes off a backed-off wait. It returns a
 	// value in [0, n). Tests set it to pin the schedule.
