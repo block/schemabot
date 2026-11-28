@@ -54,16 +54,53 @@ func TestControlReadOutageHandsBackAfterTheWindow(t *testing.T) {
 	start := time.Unix(1_700_000_000, 0)
 	window := time.Minute
 
-	assert.False(t, outage.recordFailure(start, window), "the first failure opens the run")
-	assert.False(t, outage.recordFailure(start.Add(59*time.Second), window), "a run shorter than the window keeps the drive")
+	assert.Equal(t, window, outage.remaining(start, window), "no open run leaves the whole window")
+	assert.False(t, outage.recordFailure(start, start.Add(time.Second), window), "the first failure opens the run")
+	assert.Equal(t, time.Second, outage.failingFor(start.Add(time.Second)), "the run is measured from when its first read started")
+	assert.False(t, outage.recordFailure(start.Add(58*time.Second), start.Add(59*time.Second), window), "a run shorter than the window keeps the drive")
 	assert.Equal(t, 2, outage.failures)
-	assert.Equal(t, 59*time.Second, outage.failingFor(start.Add(59*time.Second)))
-	assert.True(t, outage.recordFailure(start.Add(window), window), "a run as long as the window hands the apply back")
+	assert.Equal(t, time.Second, outage.remaining(start.Add(59*time.Second), window))
+	assert.Equal(t, time.Second, outage.nextPollWait(10*time.Second, start.Add(59*time.Second), window), "the next read is not scheduled past the window")
+	assert.Equal(t, 500*time.Millisecond, outage.nextPollWait(500*time.Millisecond, start.Add(59*time.Second), window))
+	assert.True(t, outage.recordFailure(start.Add(59*time.Second), start.Add(window), window), "a run as long as the window hands the apply back")
+	assert.Zero(t, outage.remaining(start.Add(2*window), window))
 
 	outage.recordSuccess()
 	assert.Zero(t, outage.failures)
 	assert.Zero(t, outage.failingFor(start.Add(2*window)))
-	assert.False(t, outage.recordFailure(start.Add(2*window), window), "a run after a success is measured from its own first failure")
+	assert.False(t, outage.recordFailure(start.Add(2*window), start.Add(2*window), window), "a run after a success is measured from its own first failure")
+}
+
+// A first read that hangs for the whole window is cut off at the window and
+// counts in full, so a drive whose heartbeat still succeeds cannot sit on a
+// hung read past the window.
+func TestControlReadOutageMeasuresAHungFirstReadFromItsStart(t *testing.T) {
+	var outage controlReadOutage
+	start := time.Unix(1_700_000_000, 0)
+	assert.True(t, outage.recordFailure(start, start.Add(time.Minute), time.Minute))
+}
+
+// A read that hangs is bounded by the outage window rather than by the
+// drive's context, so the drive hands the apply back once the window passes
+// even though nothing cancels the drive.
+func TestPollTaskToCompletionHandsBackWhenAControlRequestReadHangsPastTheWindow(t *testing.T) {
+	controlRequests := &hangingControlRequestStore{ControlRequestStore: &testControlRequestStore{}}
+	eng := &phaseSequenceEngine{results: []*engine.ProgressResult{
+		{State: engine.StateRunning, Tables: []engine.TableProgress{{Namespace: "orders", Table: "line_items", State: state.Task.Running, Progress: 40}}},
+	}}
+	client, apply, task := controlReadOutageSequentialFixture(controlRequests, eng)
+	client.controlReadOutageWindowOverride = 50 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	action := client.pollTaskToCompletion(ctx, apply, task, nil, nil)
+
+	assert.Equal(t, taskHandover, action)
+	require.NoError(t, ctx.Err(), "the window ended the read, not the test's deadline")
+	assert.Less(t, time.Since(start), 5*time.Second, "the hung read was cut off at the window")
+	assert.Positive(t, controlRequests.reads.Load())
+	assert.Zero(t, eng.calls)
 }
 
 // The window a drive rides out matches the lease staleness window, the same
@@ -171,10 +208,52 @@ func TestHandleAtomicProgressTickRidesOutAControlRequestReadOutage(t *testing.T)
 	outage.mu.Lock()
 	outage.failReads = -1
 	outage.mu.Unlock()
-	f.client.controlReadOutageWindowOverride = time.Nanosecond
 	stateBeforeHandBack := f.apply.State
 	assert.False(t, f.tick(t), "the first failure of a new run keeps the drive")
+	f.ps.controlReadOutage.since = time.Now().Add(-time.Hour)
 	assert.True(t, f.tick(t), "a run that has lasted the window stops the drive")
 	require.NoError(t, f.ps.terminalErr, "the apply is handed back, not settled")
 	assert.Equal(t, stateBeforeHandBack, f.apply.State, "the hand-back writes no state")
+}
+
+// alternatingControlRequestStore lets every other read succeed, so a grouped
+// tick reads its pending requests before the progress check and then fails
+// the read after the progress sync, on every tick.
+type alternatingControlRequestStore struct {
+	*testControlRequestStore
+	mu    sync.Mutex
+	reads int
+}
+
+func (s *alternatingControlRequestStore) ListPending(ctx context.Context, applyID int64) ([]*storage.ApplyControlRequest, error) {
+	s.mu.Lock()
+	s.reads++
+	failing := s.reads%2 == 0
+	s.mu.Unlock()
+	if failing {
+		return nil, errors.New("terminating connection due to administrator command")
+	}
+	return s.testControlRequestStore.ListPending(ctx, applyID)
+}
+
+// A grouped tick acts on revert handling and settlement only after the read
+// that follows the progress sync. When that read fails on every tick while
+// the one before the progress check succeeds, the run of failures still
+// grows and reaches the window, so a queued request is never left unread
+// while the lease stays fresh.
+func TestHandleAtomicProgressTickHandsBackWhenTheReadAfterTheProgressSyncKeepsFailing(t *testing.T) {
+	f := newRevertWindowTickFixture(storage.ApplyOptions{})
+	f.ps.stateEnteredAt = time.Now()
+	f.client.storage.(*exactProgressStorage).controlRequests = &alternatingControlRequestStore{testControlRequestStore: f.controlRequests}
+	f.client.progressPollJitter = func(int64) int64 { return 0 }
+	f.client.controlReadOutageWindowOverride = time.Hour
+
+	assert.False(t, f.tick(t))
+	assert.Equal(t, 1, f.ps.controlReadOutage.failures)
+	assert.False(t, f.tick(t))
+	assert.Equal(t, 2, f.ps.controlReadOutage.failures, "the successful read before the progress check does not end the run")
+
+	f.ps.controlReadOutage.since = time.Now().Add(-time.Hour)
+	assert.True(t, f.tick(t), "the run reaches the window and the drive hands the apply back")
+	require.NoError(t, f.ps.terminalErr)
 }

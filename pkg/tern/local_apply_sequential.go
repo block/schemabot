@@ -1252,7 +1252,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 			if !parked.runFullPoll(ctx, c.storage, apply, time.Now(), logger) {
 				continue
 			}
-			pending, err := loadPendingControlOperations(ctx, c.storage, apply)
+			pending, readStart, err := c.loadPendingControlOperationsWithin(ctx, apply, &controlReadOutage)
 			if err != nil {
 				if ctx.Err() != nil {
 					logger.Info("drive context cancelled while reading pending control requests; handing the apply back for another driver to claim",
@@ -1260,13 +1260,13 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 					return taskHandover
 				}
 				now := time.Now()
-				if controlReadOutage.recordFailure(now, c.controlReadOutageWindow()) {
+				if controlReadOutage.recordFailure(readStart, now, c.controlReadOutageWindow()) {
 					logger.Error("pending control requests have been unreadable for the lease staleness window; this driver halts the engine and hands the apply back for another driver to claim",
 						"task_id", task.TaskIdentifier, "table", task.TableName,
 						"consecutive_read_failures", controlReadOutage.failures, "failing_for", controlReadOutage.failingFor(now), "error", err)
 					return taskHandover
 				}
-				nextPollWait = c.progressPollWait(controlReadOutage.failures)
+				nextPollWait = controlReadOutage.nextPollWait(c.progressPollWait(controlReadOutage.failures), now, c.controlReadOutageWindow())
 				logger.Warn("pending control request read failed; the engine work keeps running and the drive reads again at the next poll",
 					"task_id", task.TaskIdentifier, "table", task.TableName,
 					"consecutive_read_failures", controlReadOutage.failures, "failing_for", controlReadOutage.failingFor(now), "next_poll_in", nextPollWait, "error", err)

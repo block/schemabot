@@ -111,7 +111,10 @@ Storage failures during a drive fall into three deliberate categories:
    halts the engine work it runs in process (OW-3), so it instead keeps that
    work running and reads again at the next poll, backing off like a failed
    progress poll. A run of failed reads that lasts the lease staleness window
-   hands the apply back for another driver to claim. In a full outage the
+   hands the apply back for another driver to claim. The run is measured from
+   the start of its first read, and each read and each wait is cut off at
+   what is left of the window, so a read that hangs cannot hold the drive
+   past it while the heartbeat still succeeds. In a full outage the
    heartbeat has failed for that same window and cancelled the drive already.
 
 3. **Terminal-state writes: error out, never fabricate.** A failure to persist

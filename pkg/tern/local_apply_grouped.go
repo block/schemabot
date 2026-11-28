@@ -785,18 +785,18 @@ func applyQuiesceDecision(projectedApplyState string) (quiesce, retryablePause, 
 // requests the drive could not see. Inside the lease staleness window the
 // engine work keeps running and the next tick reads again; past it the drive
 // hands the apply back for another driver to claim.
-func (c *LocalClient) atomicControlReadFailed(ctx context.Context, logger *slog.Logger, apply *storage.Apply, ps *atomicPollState, point string, err error) bool {
+func (c *LocalClient) atomicControlReadFailed(ctx context.Context, logger *slog.Logger, apply *storage.Apply, ps *atomicPollState, point string, readStart time.Time, err error) bool {
 	if c.driveCancelled(ctx, apply, "while reading pending control requests "+point) {
 		return true
 	}
 	now := time.Now()
-	if ps.controlReadOutage.recordFailure(now, c.controlReadOutageWindow()) {
+	if ps.controlReadOutage.recordFailure(readStart, now, c.controlReadOutageWindow()) {
 		logger.Error("pending control requests have been unreadable for the lease staleness window; this driver halts the engine and hands the apply back for another driver to claim",
 			append(apply.MutableLogAttrs(), "read_point", point, "consecutive_read_failures", ps.controlReadOutage.failures,
 				"failing_for", ps.controlReadOutage.failingFor(now), "error", err)...)
 		return true
 	}
-	ps.nextPollWait = c.progressPollWait(ps.controlReadOutage.failures)
+	ps.nextPollWait = ps.controlReadOutage.nextPollWait(c.progressPollWait(ps.controlReadOutage.failures), now, c.controlReadOutageWindow())
 	logger.Warn("pending control request read failed; the engine work keeps running and the drive reads again at the next poll",
 		append(apply.MutableLogAttrs(), "read_point", point, "consecutive_read_failures", ps.controlReadOutage.failures,
 			"failing_for", ps.controlReadOutage.failingFor(now), "next_poll_in", ps.nextPollWait, "error", err)...)
@@ -819,11 +819,14 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	if c.driveCancelled(ctx, apply, "before a progress tick") {
 		return true
 	}
-	pendingBeforeProgress, err := loadPendingControlOperations(ctx, c.storage, apply)
+	// A run of failed reads ends only at the read after the progress sync,
+	// the one revert handling and settlement act on. Ending it here would
+	// let a tick whose later read fails every time keep the run from ever
+	// reaching the window.
+	pendingBeforeProgress, readStart, err := c.loadPendingControlOperationsWithin(ctx, apply, &ps.controlReadOutage)
 	if err != nil {
-		return c.atomicControlReadFailed(ctx, logger, apply, ps, "before the progress check", err)
+		return c.atomicControlReadFailed(ctx, logger, apply, ps, "before the progress check", readStart, err)
 	}
-	ps.controlReadOutage.recordSuccess()
 	ps.parked.observe(pendingBeforeProgress)
 	if pendingBeforeProgress.has(storage.ControlOperationCancel, storage.ControlOperationStop) {
 		if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
@@ -1050,9 +1053,9 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	} else {
 		ps.progressWriteFailures = 0
 	}
-	pendingAfterProgress, err := loadPendingControlOperations(ctx, c.storage, apply)
+	pendingAfterProgress, readStart, err := c.loadPendingControlOperationsWithin(ctx, apply, &ps.controlReadOutage)
 	if err != nil {
-		return c.atomicControlReadFailed(ctx, logger, apply, ps, "after the progress sync", err)
+		return c.atomicControlReadFailed(ctx, logger, apply, ps, "after the progress sync", readStart, err)
 	}
 	ps.controlReadOutage.recordSuccess()
 	ps.parked.observe(pendingAfterProgress)
