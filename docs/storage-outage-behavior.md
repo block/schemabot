@@ -102,11 +102,24 @@ Storage failures during a drive fall into three deliberate categories:
    writes current progress. Mirroring is idempotent — a missed write costs
    staleness, nothing else.
 
-2. **Safety-gating reads: exit the drive attempt.** If the driver cannot read
-   pending control requests, it must not keep driving blind to a possible stop
-   or cancel. Both the local and remote drive loops exit "for operator retry"
-   on this failure, leaving the operation row claimable. The engine work is
-   unaffected by the supervisor exiting.
+2. **Safety-gating reads: act on nothing unseen, and bound the blindness.** If
+   the driver cannot read pending control requests, it acts on none of them
+   that poll. A request waits in storage until a drive reads it, so a failed
+   read delays a stop or cancel, by at most the lease staleness window, but
+   never loses one. Engine work keeps running through that delay, so an
+   engine that runs its own cutover, as a sequential apply without a deferred
+   cutover does, can finish its cutover before the stop is read. The remote drive loop
+   exits "for operator retry", leaving the operation row claimable; the remote
+   engine work is unaffected by the supervisor exiting. A local drive's exit
+   halts the engine work it runs in process (OW-3), so it instead keeps that
+   work running and reads again at the next poll, backing off like a failed
+   progress poll. A run of failed reads that lasts the lease staleness window
+   hands the apply back for another driver to claim. The run is measured from
+   the start of its first read, and each read and each wait is cut off at
+   what is left of the window, the read a drive held at a deferred cutover
+   makes included, so a read that hangs cannot hold the drive
+   past it while the heartbeat still succeeds. In a full outage the
+   heartbeat has failed for that same window and cancelled the drive already.
 
 3. **Terminal-state writes: error out, never fabricate.** A failure to persist
    a terminal state — a task's failure verdict as much as the apply's own
