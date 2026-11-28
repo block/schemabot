@@ -632,7 +632,9 @@ type DeploymentDriftEntry struct {
 	// Blocked is the number of changes this member will refuse at apply.
 	Blocked int
 	// Detail is a short human explanation for a diverged or errored member;
-	// empty for a member that passed.
+	// empty for a member that passed. It is plain text that can quote names
+	// from the schema files, such as an engine's refusal, so the comment
+	// escapes it rather than writing it as markdown.
 	Detail string
 }
 
@@ -3389,12 +3391,14 @@ func countCommentDDLBlocks(data PlanCommentData) int {
 }
 
 // driftDetailSuffix renders a deployment's drift detail as a trailing clause, or
-// an empty string when there is no detail.
+// an empty string when there is no detail. The detail can quote names from the
+// schema files, so it is written as markdownReason writes a reason: on one
+// line, with nothing in it able to start markdown of its own.
 func driftDetailSuffix(detail string) string {
 	if detail == "" {
 		return ""
 	}
-	return " — " + detail
+	return " — " + markdownReason(detail)
 }
 
 // writeBlockedChanges writes the section for statements the engine refuses,

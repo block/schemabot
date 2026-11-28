@@ -43,6 +43,34 @@ func freezeUntil(f apitypes.Freeze) string {
 	return ui.FreezeUntil(f.EndsAt)
 }
 
+// cancelledBeforeStart reports a planned freeze lifted before its window
+// opened: it never held anything.
+func cancelledBeforeStart(f apitypes.Freeze) bool {
+	return f.LiftedAt != nil && f.LiftedAt.Before(f.StartsAt)
+}
+
+// freezeWindowEnd is where a freeze's window actually ended: when it was
+// lifted before its planned end, the lift; otherwise its planned end. A
+// freeze cancelled before it started keeps its planned window and says so.
+func freezeWindowEnd(f apitypes.Freeze) string {
+	if cancelledBeforeStart(f) {
+		return freezeUntil(f) + ", cancelled at " + freezeTime(*f.LiftedAt) + " before it started"
+	}
+	if f.LiftedAt != nil && (f.EndsAt == nil || f.LiftedAt.Before(*f.EndsAt)) {
+		return "until lifted at " + freezeTime(*f.LiftedAt)
+	}
+	return freezeUntil(f)
+}
+
+// freezeLifted says who lifted a freeze, when, and why.
+func freezeLifted(f apitypes.Freeze) string {
+	lifted := fmt.Sprintf("by %s at %s", ui.TerminalSafeLine(f.LiftedBy), freezeTime(*f.LiftedAt))
+	if f.LiftReason != "" {
+		lifted += ": " + ui.TerminalSafeLine(f.LiftReason)
+	}
+	return lifted
+}
+
 // WriteFreezeCreated writes the confirmation of a new freeze.
 func WriteFreezeCreated(f apitypes.Freeze) {
 	state := "frozen"
@@ -100,9 +128,45 @@ func writeFreezeStopSweep(sweep *apitypes.FreezeStopSweep) {
 	}
 }
 
-// WriteFreezeLifted writes the confirmation of a lifted freeze.
+// WriteFreezeLifted writes the confirmation of a lifted freeze: who lifted
+// it, when, and why, as the freeze now records them.
 func WriteFreezeLifted(f apitypes.Freeze) {
-	fmt.Printf("✓ %s lifted.\n", ui.TerminalSafeLine(f.ID))
+	if f.LiftedAt == nil {
+		fmt.Printf("✓ %s lifted.\n", ui.TerminalSafeLine(f.ID))
+		return
+	}
+	if cancelledBeforeStart(f) {
+		fmt.Printf("✓ %s cancelled before it started, %s.\n", ui.TerminalSafeLine(f.ID), freezeLifted(f))
+	} else {
+		fmt.Printf("✓ %s lifted %s.\n", ui.TerminalSafeLine(f.ID), freezeLifted(f))
+	}
+	fmt.Printf("   Scope:  %s in %s\n", freezeScope(f), ui.TerminalSafeLine(f.Environment))
+}
+
+// FrozenRetrySummary names the freezes in effect that a retry's --override
+// placeholder is for, on one line, for output that shows no plan: a reader
+// of JSON sees why the retry needs a reason and what it overrides.
+func FrozenRetrySummary(environment string, freezes []apitypes.Freeze) string {
+	var held []string
+	for _, f := range freezes {
+		if f.InEffect {
+			held = append(held, fmt.Sprintf("%s (%s)", ui.TerminalSafeLine(f.ID), ui.TerminalSafeLine(f.Reason)))
+		}
+	}
+	return fmt.Sprintf("%s is frozen by %s, so replace the --override placeholder with why this change can't wait",
+		ui.TerminalSafeLine(environment), strings.Join(held, ", "))
+}
+
+// WriteFreezeOverrideUsed says an apply ran through a freeze on an override,
+// naming the request so its record is one command away. It writes nothing
+// when no override was used.
+func WriteFreezeOverrideUsed(overrideID, environment string) {
+	if overrideID == "" {
+		return
+	}
+	id := ui.TerminalSafeLine(overrideID)
+	fmt.Printf("%s %s is frozen; override %s let this change through. See it with '%s'.\n",
+		glyph.Frozen, ui.TerminalSafeLine(environment), id, cliname.Command("freeze", "override", id))
 }
 
 // writeFreezeRows prints one freeze under a heading. detail adds the fields
@@ -110,23 +174,24 @@ func WriteFreezeLifted(f apitypes.Freeze) {
 func writeFreezeRows(f apitypes.Freeze, heading string, detail bool) {
 	status := ""
 	switch {
+	case cancelledBeforeStart(f):
+		status = ", cancelled"
 	case f.LiftedAt != nil:
 		status = ", lifted"
 	case f.InEffect:
 		status = ", in effect"
 	}
 	fmt.Printf("%s%s  %s (%s%s)\n", heading, ui.TerminalSafeLine(f.ID), ui.TerminalSafeLine(f.Environment), freezeKind(f.Kind), status)
-	row := func(label, value string) { fmt.Printf("     %-9s %s\n", label+":", value) }
+	row := func(label, value string) { fmt.Printf("     %-10s %s\n", label+":", value) }
 	row("Scope", freezeScope(f))
-	row("Window", freezeTime(f.StartsAt)+" "+freezeUntil(f))
+	row("Window", freezeTime(f.StartsAt)+" "+freezeWindowEnd(f))
 	row("Reason", ui.TerminalSafeLine(f.Reason))
 	row("By", ui.TerminalSafeLine(f.CreatedBy))
-	if f.LiftedAt != nil {
-		lifted := fmt.Sprintf("by %s at %s", ui.TerminalSafeLine(f.LiftedBy), freezeTime(*f.LiftedAt))
-		if f.LiftReason != "" {
-			lifted += ": " + ui.TerminalSafeLine(f.LiftReason)
-		}
-		row("Lifted", lifted)
+	switch {
+	case cancelledBeforeStart(f):
+		row("Cancelled", freezeLifted(f))
+	case f.LiftedAt != nil:
+		row("Lifted", freezeLifted(f))
 	}
 	if detail {
 		row("Running", ui.TerminalSafeLine(f.Running)+" (applies already running in scope)")
@@ -143,7 +208,8 @@ func WriteFreezeShow(f apitypes.Freeze) {
 	writeFreezeRows(f, "Freeze ", true)
 }
 
-// WriteFreezeList writes the three freeze groups the API returns.
+// WriteFreezeList writes the freezes in effect, those scheduled, and those
+// that recently ended. The API lists each freeze in one group only.
 func WriteFreezeList(list apitypes.FreezeListResponse) {
 	groups := []struct {
 		title   string
@@ -151,7 +217,7 @@ func WriteFreezeList(list apitypes.FreezeListResponse) {
 	}{
 		{"In effect", list.InEffect},
 		{"Scheduled", list.Scheduled},
-		{"Recent", list.Recent},
+		{"Recently ended", list.Recent},
 	}
 	for i, group := range groups {
 		if i > 0 {

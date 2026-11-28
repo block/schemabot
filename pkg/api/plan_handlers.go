@@ -2414,10 +2414,14 @@ func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan
 	metrics.AdjustActiveApplies(ctx, 1, plan.Database, plan.Deployment, req.Environment)
 	s.wakeOperator(applyIdentifier, plan.Database, req.Environment)
 
-	return &apitypes.ApplyResponse{
+	resp := &apitypes.ApplyResponse{
 		Accepted: true,
 		ApplyID:  applyIdentifier,
-	}, storedApplyID, nil
+	}
+	if req.freezeOverride != nil {
+		resp.FreezeOverride = req.freezeOverride.Identifier
+	}
+	return resp, storedApplyID, nil
 }
 
 // isPinnedRollback reports whether req is the webhook's pinned PR rollback of
