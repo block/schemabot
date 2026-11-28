@@ -11,8 +11,9 @@ import (
 
 // Escape-emitting and prompting decisions hinge on this check, so it must say
 // yes only for a character device a person can be at: a regular file is where
-// a redirected pull lands, and the null device is the input cron, CI, and a
-// container started without a terminal give a command.
+// a redirected pull lands, and the null device is the input a container
+// started without a terminal, a systemd service, or a redirect from it gives
+// a command.
 func TestIsTerminal(t *testing.T) {
 	t.Run("a character device is a terminal", func(t *testing.T) {
 		f, err := os.Open("/dev/zero")

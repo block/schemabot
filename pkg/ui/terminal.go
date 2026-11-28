@@ -16,8 +16,9 @@ func IsTerminal(f *os.File) bool {
 	if info.Mode()&os.ModeCharDevice == 0 {
 		return false
 	}
-	// The null device is a character device too, and it is what cron, CI, and
-	// a container started without a terminal give a command as its input.
+	// The null device is a character device too, and it is the input a
+	// container started without a terminal, a systemd service, or a redirect
+	// from it gives a command.
 	// Nobody types into it or reads from it. If it cannot be found, f is
 	// treated as the terminal its mode says it is.
 	null, err := os.Stat(os.DevNull)
