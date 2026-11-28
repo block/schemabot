@@ -4027,6 +4027,22 @@ func (c *ServerConfig) TrustedCheckAppSlugsForRepo(repo string) []string {
 // from a misconfigured managed repository.
 var ErrRepoNotConfigured = errors.New("repository is not declared in the repos config")
 
+// RepoGitHubAppNotConfiguredError reports a repository declared in the repos
+// config whose github_app is empty (App is "") or names no entry in the apps
+// config. It is the broken App mapping ErrRepoNotConfigured is told apart from,
+// and like it, the operator fixes it in config; a retry cannot.
+type RepoGitHubAppNotConfiguredError struct {
+	Repo string
+	App  string
+}
+
+func (e *RepoGitHubAppNotConfiguredError) Error() string {
+	if e.App == "" {
+		return fmt.Sprintf("repository %q is missing github_app", e.Repo)
+	}
+	return fmt.Sprintf("repository %q references unknown github_app %q", e.Repo, e.App)
+}
+
 // ResolveGitHubAppForRepo returns the GitHub App that owns webhooks and
 // outbound GitHub API calls for the given repository.
 //
@@ -4048,11 +4064,11 @@ func (c *ServerConfig) ResolveGitHubAppForRepo(repo string) (ResolvedGitHubApp, 
 			return ResolvedGitHubApp{}, fmt.Errorf("repository %q: %w", repo, ErrRepoNotConfigured)
 		}
 		if repoConfig.GitHubApp == "" {
-			return ResolvedGitHubApp{}, fmt.Errorf("repository %q is missing github_app", repo)
+			return ResolvedGitHubApp{}, &RepoGitHubAppNotConfiguredError{Repo: repo}
 		}
 		appCfg, ok := c.Apps[repoConfig.GitHubApp]
 		if !ok {
-			return ResolvedGitHubApp{}, fmt.Errorf("repository %q references unknown github_app %q", repo, repoConfig.GitHubApp)
+			return ResolvedGitHubApp{}, &RepoGitHubAppNotConfiguredError{Repo: repo, App: repoConfig.GitHubApp}
 		}
 		return ResolvedGitHubApp{Name: repoConfig.GitHubApp, Config: appCfg}, nil
 	}

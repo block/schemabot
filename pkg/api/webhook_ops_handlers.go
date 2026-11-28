@@ -126,8 +126,8 @@ func (s *Service) writeWebhookOpsError(w http.ResponseWriter, operation, repo st
 	}
 	logAttrs := append([]any{"operation", operation, "repo", repo}, attrs...)
 	logAttrs = append(logAttrs, "error", err)
-	if errors.Is(err, ErrRepoNotConfigured) {
-		s.logger.Warn("webhook operator request failed: the repository is not declared in the repos config", logAttrs...)
+	if cause, ok := operatorFixableWebhookOpsCause(err); ok {
+		s.logger.Warn("webhook operator request failed: "+cause.reason, logAttrs...)
 	} else {
 		s.logger.Error("webhook operator request failed", logAttrs...)
 	}
@@ -137,18 +137,67 @@ func (s *Service) writeWebhookOpsError(w http.ResponseWriter, operation, repo st
 // webhookOpsFailureMessage is the 500 body of a webhook operator request that
 // failed inside SchemaBot. The cause stays in the server log. These requests
 // read state or replay what a webhook delivery would have done, so they can be
-// repeated. A repository missing from the repos config is named, since the
-// operator can fix that and a retry cannot.
+// repeated. A cause the operator can fix and a retry cannot is named instead,
+// with what to change.
 func webhookOpsFailureMessage(operation, repo string, err error) string {
 	subject := strings.ReplaceAll(operation, "_", " ") + " failed"
 	if repo != "" {
 		subject += fmt.Sprintf(" for repository %q", repo)
 	}
-	if errors.Is(err, ErrRepoNotConfigured) {
-		return subject + ": the repository is not declared in this server's repos config. " +
-			"Name a repository this server serves, or add it to the repos config."
+	if cause, ok := operatorFixableWebhookOpsCause(err); ok {
+		return subject + ": " + cause.remedy
 	}
 	return subject + ": SchemaBot hit an internal error. Retry in a moment. " + retryFailureTail
+}
+
+// errCheckRunBackfillUnavailable reports a synthesize request to a server that
+// runs no GitHub webhook pipeline to replay deliveries through.
+var errCheckRunBackfillUnavailable = errors.New("check run backfill is unavailable: no GitHub webhook runtime is configured")
+
+// webhookOpsFixableCause is a webhook operator failure the operator fixes and
+// a retry does not: reason is the server log's wording, remedy the response's.
+type webhookOpsFixableCause struct {
+	reason string
+	remedy string
+}
+
+// operatorFixableWebhookOpsCause reports whether err's cause is one the
+// operator fixes, and what they should do. Each remedy is text SchemaBot wrote
+// and carries nothing from the cause beyond configured names.
+func operatorFixableWebhookOpsCause(err error) (webhookOpsFixableCause, bool) {
+	if errors.Is(err, ErrRepoNotConfigured) {
+		return webhookOpsFixableCause{
+			reason: "the repository is not declared in the repos config",
+			remedy: "the repository is not declared in this server's repos config. " +
+				"Name a repository this server serves, or add it to the repos config.",
+		}, true
+	}
+	if appErr, ok := errors.AsType[*RepoGitHubAppNotConfiguredError](err); ok {
+		remedy := "the repos config gives this repository no github_app. " +
+			"Set its github_app to one of the apps in the server config."
+		if appErr.App != "" {
+			remedy = fmt.Sprintf("the repos config sets this repository's github_app to %q, which is not one of the apps in the server config. ", appErr.App) +
+				"Set its github_app to a configured App."
+		}
+		return webhookOpsFixableCause{reason: "the repository's github_app is not a configured App", remedy: remedy}, true
+	}
+	if errors.Is(err, ghclient.ErrAppNotInstalled) {
+		return webhookOpsFixableCause{
+			reason: "the GitHub App is not installed on the repository",
+			remedy: "the GitHub App that serves this repository is not installed on it. Install the App on the repository.",
+		}, true
+	}
+	if errors.Is(err, errCheckRunBackfillUnavailable) {
+		return webhookOpsFixableCause{
+			reason: "no GitHub webhook runtime is configured on this server",
+			remedy: "this server has no GitHub App configured, so it cannot replay webhook deliveries to create Check Runs. " +
+				"Configure a GitHub App on this server, or send the request to the SchemaBot server that receives this repository's webhooks.",
+		}, true
+	}
+	if text, ok := authoredMessage(err); ok {
+		return webhookOpsFixableCause{reason: "the request names something the operator must correct", remedy: text}, true
+	}
+	return webhookOpsFixableCause{}, false
 }
 
 type ChecksScanRequest = apitypes.ChecksScanRequest
@@ -217,6 +266,19 @@ const checksSynthesizeMaxMergeQueueHeadsPerRequest = 20
 // the queue is no longer testing. Nothing is posted on it.
 const mergeQueueHeadGoneOutcome = "skipped: no longer in the merge queue"
 
+// The texts a synthesize or scan response carries for a failure within it.
+// The cause can be a GitHub, storage, or SQL driver error carrying addresses
+// or credentials, so it goes to the server log beside the repository and the
+// PR or head, and the response says only what failed. The CLI shows each
+// after "failed: " or in its sentence about the merge queue.
+const (
+	prBackfillFailedText         = "SchemaBot could not recreate this PR's Check Runs; see the server log for the cause"
+	mergeQueueBackfillFailedText = "SchemaBot could not post the merge queue check on this head; see the server log for the cause"
+	mergeQueueUnlistedText       = "SchemaBot could not list the merge queue to verify this head, so nothing was posted; see the server log for the cause"
+	openPRHeadUncheckedText      = "SchemaBot could not check whether this head is also an open PR's head, so nothing was posted; see the server log for the cause"
+	mergeQueueUnreadText         = "SchemaBot could not read it; see the server log for the cause"
+)
+
 // checksDisabledSkipOutcome is the per-PR outcome when a synthesize request
 // names a repository whose Check Run publishing is turned off. A skip, not an
 // error: a fleet sweep that includes a disabled repo should keep going.
@@ -268,7 +330,7 @@ func executeChecksSynthesize(ctx context.Context, cfg *ServerConfig, backfiller 
 		return response, nil
 	}
 	if backfiller == nil {
-		return nil, fmt.Errorf("check run backfill is unavailable: no GitHub webhook runtime is configured")
+		return nil, errCheckRunBackfillUnavailable
 	}
 	if req.RateLimitFloorPercent < 0 || req.RateLimitFloorPercent > 99 {
 		return nil, webhookOpsRequestErrorf("rate_limit_floor_percent must be between 0 and 99; got %d", req.RateLimitFloorPercent)
@@ -360,8 +422,8 @@ func backfillPRsWithinBudget(ctx context.Context, rate coreRateLimitReader, back
 		if err != nil {
 			// Each PR's backfill is independent; report the failure and keep
 			// going so one bad PR does not strand the rest of the batch.
-			logger.Warn("check run backfill failed for PR", "repo", req.Repo, "pr", pr, "error", err)
-			result.Error = err.Error()
+			logger.Warn("check run backfill failed for PR", "repo", req.Repo, "pr", pr, "environment", req.Environment, "error", err)
+			result.Error = prBackfillFailedText
 		}
 		results = append(results, result)
 	}
@@ -399,9 +461,9 @@ func backfillMergeQueueWithinBudget(ctx context.Context, client mergeQueueSynthe
 	heads, err := client.ListMergeQueueHeads(ctx, req.Repo)
 	if err != nil {
 		logger.Warn("merge queue check backfill posting nothing: the merge queue could not be listed to verify the requested heads",
-			"repo", req.Repo, "heads", len(req.MergeQueueHeads), "error", err)
+			"repo", req.Repo, "head_shas", req.MergeQueueHeads, "error", err)
 		for _, head := range req.MergeQueueHeads {
-			results = append(results, ChecksMergeQueueResult{HeadSHA: head, Error: fmt.Sprintf("list merge queue to verify this head: %v", err)})
+			results = append(results, ChecksMergeQueueResult{HeadSHA: head, Error: mergeQueueUnlistedText})
 		}
 		return results
 	}
@@ -437,8 +499,9 @@ func backfillMergeQueueWithinBudget(ctx context.Context, client mergeQueueSynthe
 		if err != nil {
 			// Each merge group is independent; report the failure and keep
 			// going so one bad head does not strand the rest.
-			logger.Warn("merge queue check backfill failed for head", "repo", req.Repo, "head_sha", head, "error", err)
-			result.Error = err.Error()
+			logger.Warn("merge queue check backfill failed for head", "repo", req.Repo, "head_sha", head,
+				"environment", req.Environment, "check_name", req.CheckName, "error", err)
+			result.Error = mergeQueueBackfillFailedText
 		}
 		results = append(results, result)
 	}
@@ -453,7 +516,7 @@ func refuseMergeQueueHeadOfOpenPR(ctx context.Context, client mergeQueueSynthesi
 	if err != nil {
 		logger.Warn("merge queue check backfill posting nothing on a head it could not check against open PR heads",
 			"repo", repo, "head_sha", head, "error", err)
-		return fmt.Sprintf("check whether this head is an open PR's head: %v", err)
+		return openPRHeadUncheckedText
 	}
 	if pr > 0 {
 		logger.Warn("merge queue check backfill refusing a head that is also an open PR's head; a passing merge queue check there would pass the PR's own required check",
@@ -663,7 +726,7 @@ func scanChecks(ctx context.Context, cfg *ServerConfig, store storage.Storage, r
 				"repo", req.Repo, "environment", req.Environment, "check_name", req.CheckName, "error", err)
 			response.MergeQueue = nil
 			response.MergeQueueScanned = 0
-			response.MergeQueueError = err.Error()
+			response.MergeQueueError = mergeQueueUnreadText
 		}
 	}
 	response.RateLimit = gitHubRateLimitSnapshot(ctx, installationClient, logger, "checks scan page")

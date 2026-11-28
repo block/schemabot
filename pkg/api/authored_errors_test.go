@@ -138,6 +138,7 @@ var unmarkedErrorTypes = map[string]string{
 	"RolloutRollbackUnsupportedError": "answers a rollback",
 	"RolloutUnrenderedError":          "answers POST /api/plan, which the webhook does not call",
 	"terminalControlError":            "answers a control request",
+	"RepoGitHubAppNotConfiguredError": "answers a webhook delivery or a webhook operator request, which names it in a message of its own",
 	"controlOperationHTTPError":       "answers a control request",
 }
 

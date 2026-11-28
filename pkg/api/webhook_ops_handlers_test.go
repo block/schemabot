@@ -174,8 +174,8 @@ func TestBackfillPRsWithinBudgetWithoutAReadableFloor(t *testing.T) {
 	}
 }
 
-// A PR whose backfill fails reports the error with the outcome, and the batch
-// keeps going.
+// A PR whose backfill fails reports that it failed with the outcome, and the
+// batch keeps going. The cause stays in the server log.
 func TestBackfillPRsWithinBudgetReportsFailuresAndContinues(t *testing.T) {
 	t.Parallel()
 
@@ -184,7 +184,7 @@ func TestBackfillPRsWithinBudgetReportsFailuresAndContinues(t *testing.T) {
 		ChecksSynthesizeRequest{Repo: "octo/repo", PRs: []int{1, 2}}, 7, discardLogger())
 
 	require.Len(t, results, 2)
-	assert.Equal(t, ChecksSynthesizeResult{PR: 1, Outcome: "config discovery failed", Error: "boom"}, results[0])
+	assert.Equal(t, ChecksSynthesizeResult{PR: 1, Outcome: "config discovery failed", Error: prBackfillFailedText}, results[0])
 	assert.Equal(t, ChecksSynthesizeResult{PR: 2, Outcome: "auto-plan started"}, results[1])
 }
 
@@ -1544,7 +1544,7 @@ func TestExecuteChecksScanReportsAMergeQueueItCannotList(t *testing.T) {
 	response, err := executeChecksScanWith(t.Context(), checksScanTestConfig(RepoConfig{GitHubApp: "main"}), nil,
 		ChecksScanRequest{Repo: "octo/repo", MergeQueue: true}, discardLogger(), resolve)
 	require.NoError(t, err)
-	assert.Equal(t, "scan merge queue of octo/repo for missing checks: 502 Bad Gateway", response.MergeQueueError)
+	assert.Equal(t, mergeQueueUnreadText, response.MergeQueueError)
 	assert.Zero(t, response.MergeQueueScanned)
 	assert.Empty(t, response.MergeQueue)
 }
@@ -1594,7 +1594,7 @@ func TestBackfillMergeQueuePostsOnlyOnLiveHeads(t *testing.T) {
 	assert.Equal(t, []ChecksMergeQueueResult{
 		{HeadSHA: "group-412", Outcome: "posted passing merge queue check"},
 		{HeadSHA: "merged-group", Outcome: mergeQueueHeadGoneOutcome},
-		{HeadSHA: "group-418", Error: "create check run: 502 Bad Gateway"},
+		{HeadSHA: "group-418", Error: mergeQueueBackfillFailedText},
 	}, results)
 }
 
@@ -1611,8 +1611,8 @@ func TestBackfillMergeQueuePostsNothingWhenTheQueueCannotBeListed(t *testing.T) 
 
 	assert.Empty(t, backfiller.mergeQueueCalls)
 	assert.Equal(t, []ChecksMergeQueueResult{
-		{HeadSHA: "group-412", Error: "list merge queue to verify this head: 502 Bad Gateway"},
-		{HeadSHA: "group-418", Error: "list merge queue to verify this head: 502 Bad Gateway"},
+		{HeadSHA: "group-412", Error: mergeQueueUnlistedText},
+		{HeadSHA: "group-418", Error: mergeQueueUnlistedText},
 	}, results)
 }
 
@@ -1650,7 +1650,7 @@ func TestBackfillMergeQueueRefusesAnOpenPRsHead(t *testing.T) {
 
 	assert.Empty(t, backfiller.mergeQueueCalls)
 	assert.Equal(t, []ChecksMergeQueueResult{
-		{HeadSHA: "group-412", Error: "check whether this head is an open PR's head: 502 Bad Gateway"},
+		{HeadSHA: "group-412", Error: openPRHeadUncheckedText},
 	}, results)
 }
 
