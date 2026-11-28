@@ -133,7 +133,7 @@ jobs:
         run: CGO_ENABLED=0 GOOS=linux go build -o /dev/null ./pkg/cmd ./cmd/localscale
       # Only pushes to main save the cache. A cache saved from a pull request
       # or merge queue ref is readable only from that ref, so it helps no
-      # other run, and at about a gigabyte each those copies fill the
+      # run outside that ref, and at about a gigabyte each those copies fill the
       # repository's cache quota and evict main's entry, the one every other
       # run restores. Without it every job compiles from scratch, and the
       # race-enabled unit tests then overrun their job timeout.

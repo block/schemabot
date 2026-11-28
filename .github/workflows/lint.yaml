@@ -119,6 +119,11 @@ jobs:
           # findings. Disable it here; the hermetic step below runs the same
           # check against the vendored copy of the schema instead.
           verify: false
+          # The action saves its own analysis cache after the run. Only pushes
+          # to main save it, for the reason test.yaml gives for the Go cache:
+          # a pull request or merge queue ref's copy is readable only from
+          # that ref and draws on the same quota as main's entry.
+          skip-save-cache: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main') }}
       # Expose the pinned golangci-lint binary on PATH for the verify step
       # below via the action's documented install-only contract, instead of
       # relying on the lint step above leaving it there as a side effect.
