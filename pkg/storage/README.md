@@ -28,7 +28,7 @@ type Storage interface {
 | `PlanStore` | Schema change plans (DDL, original schema for rollback) |
 | `ApplyStore` | Schema change execution state, heartbeat-based leasing |
 | `TaskStore` | Individual DDL tasks within an apply, progress tracking |
-| `ApplyLogStore` | Audit trail (state transitions, errors, progress events) |
+| `ApplyLogStore` | Event log (state transitions, errors, progress events); the entries of long-settled applies can be purged, so it is not a permanent record |
 | `ControlRequestStore` | Durable user control intent that can be recovered by drivers |
 | `CheckStore` | GitHub status check state |
 | `SettingsStore` | Admin-level key-value settings |

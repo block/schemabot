@@ -21,6 +21,14 @@ import (
 // long two drivers can run the same engine work concurrently.
 const ApplyLeaseStaleAfter = time.Minute
 
+// MaxApplyLogPurgeBatch is the most entries one
+// ApplyLogStore.DeleteForSettledAppliesOlderThan call may delete. The delete
+// binds one placeholder per entry, so a ceiling well under the MySQL and
+// PostgreSQL placeholder limits keeps one configured value from building a
+// statement the server refuses, and it bounds how long one delete holds row
+// locks.
+const MaxApplyLogPurgeBatch = 10000
+
 // ApplyDriveStallAfter bounds how long a drive may go without mirroring any
 // task progress to storage before its driver presumes the drive goroutine is
 // wedged and cancels the run. A healthy drive's poll loop writes every task row
@@ -2275,7 +2283,9 @@ type ReapedOperation struct {
 
 // ApplyLogStore manages apply log entries for debugging and audit.
 // Logs capture state transitions, errors, and events during schema changes.
-// Logs are kept forever for audit purposes.
+// Logs of a stopped or in-flight apply are kept for as long as the apply can
+// still change. Logs of a settled apply are kept for audit purposes until a
+// retention sweep removes them with DeleteForSettledAppliesOlderThan.
 //
 // Ordering contract: every read returns entries ordered by created_at
 // ascending, with ties on created_at broken by ascending id so entries keep
@@ -2301,6 +2311,25 @@ type ApplyLogStore interface {
 	// ordered by created_at ascending (ties broken by ascending id) so the
 	// result reads chronologically.
 	List(ctx context.Context, filter ApplyLogFilter) ([]*ApplyLog, error)
+
+	// DeleteForSettledAppliesOlderThan deletes at most limit log entries that
+	// belong to an apply settled more than age ago, and returns how many it
+	// deleted. It takes the applies that settled longest ago first, and makes no
+	// promise about the order of one apply's entries. Settled means one of
+	// state.SettledApplyStates
+	// (completed, failed, cancelled, reverted), and the age is measured from the
+	// apply's completed_at. It never deletes an entry of a stopped apply, which
+	// can be resumed, or of any in-flight apply, however old their entries are,
+	// and it never deletes an entry of an apply with no completed_at. An apply a
+	// driver still holds a fresh lease on, on the apply or on any operation, also
+	// keeps its entries: under a rollout one deployment's failure settles the
+	// apply while a sibling is still driven.
+	//
+	// The cutoff is evaluated on the database clock rather than the caller's, so
+	// the same age cuts at the same instant on every pod. A non-positive age or
+	// limit, or a limit above MaxApplyLogPurgeBatch, is an error and deletes
+	// nothing.
+	DeleteForSettledAppliesOlderThan(ctx context.Context, age time.Duration, limit int) (int64, error)
 }
 
 // ControlRequestStore manages durable user control requests.
