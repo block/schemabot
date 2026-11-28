@@ -129,6 +129,10 @@ type reportedError struct{ err error }
 func (e *reportedError) Error() string   { return e.err.Error() }
 func (e *reportedError) Unwrap() []error { return []error{ErrSilent, e.err} }
 
+// InJSONResponse marks the error as one a --json response on stdout carries,
+// which main still writes on stderr for the person at the terminal.
+func (e *reportedError) InJSONResponse() bool { return true }
+
 // CLIConfig represents the schemabot.yaml configuration file for CLI commands.
 // Database and Type are row-identity keys: LoadCLIConfig folds them with
 // storage.CanonicalKey so the CLI names the same identity the server stores,

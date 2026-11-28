@@ -8,6 +8,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
+	"os"
 	"testing"
 
 	"github.com/alecthomas/kong"
@@ -261,7 +262,42 @@ func TestReportFailureWritesOneJSONDocumentForAJSONCommand(t *testing.T) {
 	})
 	t.Run("already reported", func(t *testing.T) {
 		var out bytes.Buffer
-		reportFailure(&out, true, templates.ANSIRed, fmt.Errorf("%w: %w", commands.ErrSilent, errors.New("refusing to converge storage schema")))
+		stderr := captureMainStderr(t, func() {
+			reportFailure(&out, true, "", fmt.Errorf("%w: %w", commands.ErrSilent, errors.New("refusing to converge storage schema")))
+		})
 		assert.Empty(t, out.String(), "the command's own response is the whole of stdout")
+		assert.Empty(t, stderr, "a silent error was already shown in full")
 	})
+	t.Run("carried in the response", func(t *testing.T) {
+		var out bytes.Buffer
+		stderr := captureMainStderr(t, func() {
+			reportFailure(&out, true, "", inJSONResponseError{errors.New("refusing to converge storage schema")})
+		})
+		assert.Empty(t, out.String(), "the command's own response is the whole of stdout")
+		assert.Equal(t, "Error: refusing to converge storage schema\n", stderr, "the person at the terminal still reads why")
+	})
+}
+
+// inJSONResponseError stands in for an error a command returns after writing
+// it inside its --json response.
+type inJSONResponseError struct{ err error }
+
+func (e inJSONResponseError) Error() string        { return e.err.Error() }
+func (e inJSONResponseError) Unwrap() []error      { return []error{commands.ErrSilent, e.err} }
+func (e inJSONResponseError) InJSONResponse() bool { return true }
+
+// captureMainStderr returns what fn writes to os.Stderr.
+func captureMainStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	read, write, err := os.Pipe()
+	require.NoError(t, err)
+	original := os.Stderr
+	os.Stderr = write
+	fn()
+	os.Stderr = original
+	require.NoError(t, write.Close())
+	captured, err := io.ReadAll(read)
+	require.NoError(t, err)
+	require.NoError(t, read.Close())
+	return string(captured)
 }

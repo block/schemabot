@@ -224,10 +224,16 @@ func main() {
 // reportFailure reports err where whoever ran the command reads it: as a
 // jsonError on stdout for a command run with --json, so a script parses the
 // failure, and as an errorLine on stderr otherwise. ErrSilent means the
-// command already wrote the error in full, such as inside its own JSON
-// response, so nothing is added and only the exit status is left to report.
+// command already wrote the error in full, so nothing goes to stdout. When it
+// wrote the error inside its own --json response, the sentence still goes to
+// stderr, where the person at the terminal reads it and a program parsing
+// stdout does not.
 func reportFailure(stdout io.Writer, asJSON bool, color string, err error) {
 	if errors.Is(err, commands.ErrSilent) {
+		var inResponse interface{ InJSONResponse() bool }
+		if errors.As(err, &inResponse) && inResponse.InJSONResponse() {
+			fmt.Fprint(os.Stderr, errorLine(color, "Error", err))
+		}
 		return
 	}
 	if asJSON {
