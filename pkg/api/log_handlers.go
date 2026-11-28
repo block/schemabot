@@ -84,6 +84,10 @@ func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, datab
 			s.writeError(w, http.StatusNotFound, "apply not found")
 			return
 		}
+		if database != "" && apply.Database != database {
+			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("apply %s is for database %s, not %s; drop the database from the path or use that apply's database", apply.ApplyIdentifier, apply.Database, database))
+			return
+		}
 	} else {
 		// Get the most recent apply for this database/environment
 		if environment == "" {
