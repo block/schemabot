@@ -3,6 +3,7 @@ package commands
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -250,7 +251,7 @@ func showApplyByID(endpoint, applyID string, outputJSON, showLoader bool) error 
 		return loadErr
 	})
 	if err != nil {
-		if client.IsNotFound(err) && !deploymentNotConfigured(err) {
+		if serverHasNoSuchApply(err) {
 			return applyNotFound(applyID)
 		}
 		return err
@@ -291,16 +292,16 @@ func applyNotFound(applyID string) error {
 		applyID, cliname.Command("status"))}
 }
 
-// deploymentNotConfigured reports whether the server answered that it has no
-// configuration for the apply's deployment. That answer is a 404 like an
-// unknown apply's, but the apply exists, so it is an error to report and not
-// an absence.
-func deploymentNotConfigured(err error) bool {
+// serverHasNoSuchApply reports whether the server answered that it has no
+// record of the apply. Only the API's own not_found code says that: a 404 for
+// a missing deployment means the apply exists, and a 404 with no code comes
+// from a proxy or a server without the route, so neither is an absence.
+func serverHasNoSuchApply(err error) bool {
 	var apiErr *client.APIError
 	if !errors.As(err, &apiErr) {
 		return false
 	}
-	return apiErr.ErrorCode == apitypes.ErrCodeDeploymentNotFound
+	return apiErr.Status == http.StatusNotFound && apiErr.ErrorCode == apitypes.ErrCodeNotFound
 }
 
 func applyHistoryDataFromResponse(a *apitypes.ApplyHistoryResponse) templates.ApplyHistoryData {

@@ -148,7 +148,7 @@ func main() {
 			connection, err := client.ResolveLocalConnection(localCtx, cli.Endpoint, cli.Profile, cli.Token, version)
 			cancelLocal()
 			if err != nil {
-				fmt.Fprint(os.Stderr, errorLine("", "Error", err))
+				reportFailure(os.Stdout, jsonOutputRequested(ctx), "", err)
 				os.Exit(1)
 			}
 			if connection != nil {
@@ -165,7 +165,7 @@ func main() {
 			// failure; a non-empty token with an error is a non-fatal warning (the
 			// returned token is still usable and re-login can fix it).
 			if token == "" {
-				fmt.Fprint(os.Stderr, errorLine(templates.ANSIRed, "Error", err))
+				reportFailure(os.Stdout, jsonOutputRequested(ctx), templates.ANSIRed, err)
 				os.Exit(1)
 			}
 			fmt.Fprint(os.Stderr, errorLine(templates.ANSIYellow, "Warning", err))
@@ -213,19 +213,28 @@ func main() {
 	signal.Stop(sigCh)
 	cancelRun()
 	if err != nil {
-		// ErrSilent means the error was already displayed, so only the status
-		// is left to report. A command may ask for its own status when a caller
-		// scripting it needs to tell two successful-but-different outcomes
-		// apart (see commands.ExitCodeFor); anything else exits 1.
-		if !errors.Is(err, commands.ErrSilent) {
-			if jsonOutputRequested(ctx) {
-				writeJSONError(os.Stdout, err)
-			} else {
-				fmt.Fprint(os.Stderr, errorLine(templates.ANSIRed, "Error", err))
-			}
-		}
+		// A command may ask for its own status when a caller scripting it
+		// needs to tell two successful-but-different outcomes apart (see
+		// commands.ExitCodeFor); anything else exits 1.
+		reportFailure(os.Stdout, jsonOutputRequested(ctx), templates.ANSIRed, err)
 		os.Exit(commands.ExitCodeFor(err))
 	}
+}
+
+// reportFailure reports err where whoever ran the command reads it: as a
+// jsonError on stdout for a command run with --json, so a script parses the
+// failure, and as an errorLine on stderr otherwise. ErrSilent means the
+// command already wrote the error in full, such as inside its own JSON
+// response, so nothing is added and only the exit status is left to report.
+func reportFailure(stdout io.Writer, asJSON bool, color string, err error) {
+	if errors.Is(err, commands.ErrSilent) {
+		return
+	}
+	if asJSON {
+		writeJSONError(stdout, err)
+		return
+	}
+	fmt.Fprint(os.Stderr, errorLine(color, "Error", err))
 }
 
 // errorLine is the line main writes to the operator's terminal to report err:

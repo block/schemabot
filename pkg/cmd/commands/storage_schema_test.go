@@ -1188,6 +1188,8 @@ func TestStorageApplyCmd_RefusalIsReportedAsJSON(t *testing.T) {
 			})
 
 			require.Error(t, err)
+			assert.ErrorIs(t, err, ErrSilent, "the response on stdout carries the refusal, so main adds no JSON error after it")
+			assert.Equal(t, 1, ExitCodeFor(err))
 			assert.Equal(t, []string{"POST /api/storage/schema/plan"}, *routes, "a refusal converges nothing")
 			assert.NotContains(t, out, tc.human, "a program reads this surface, so the refusal is the response shape")
 
@@ -1267,4 +1269,44 @@ func TestStorageApplyCmd_ResolvesTheNamedReleaseOnce(t *testing.T) {
 	assert.Equal(t, source, applied.SchemaSource)
 	assert.Contains(t, applied.SchemaFiles, "applies.sql",
 		"and the schema that was read is the schema that converges")
+}
+
+// A --json convergence that leaves a manual change behind exits non-zero with
+// the response as the whole of stdout. The remaining half names the change, so
+// main adds no JSON error after it and a program parses one document.
+func TestStorageApplyCmd_JSONConvergenceLeavingManualChangesIsOneDocument(t *testing.T) {
+	plan := &apitypes.StorageSchemaReport{
+		Dialect: "postgres", Database: "schemabot", Host: "db-1.example",
+		SchemaSource: "the schema embedded in v1.4.0",
+		Outstanding: []apitypes.StorageSchemaStatement{
+			{Table: "applies", Operation: "create_table", DDL: `CREATE TABLE "applies" ("id" bigint PRIMARY KEY)`},
+		},
+	}
+	remaining := &apitypes.StorageSchemaReport{
+		Dialect: "postgres", Database: "schemabot", Host: "db-1.example",
+		SchemaSource: "the schema embedded in v1.4.0",
+		Manual: []apitypes.StorageSchemaStatement{{
+			Table:     "checks",
+			Operation: "add_column",
+			DDL:       `ALTER TABLE "checks" ADD COLUMN "head_sha" varchar(64) NOT NULL`,
+			Reason:    "definition is NOT NULL without a DEFAULT",
+		}},
+	}
+	endpoint, _ := storageSchemaTestServer(t, plan, plan, remaining)
+
+	var err error
+	out := captureStdout(func() {
+		cmd := StorageApplyCmd{AutoApprove: true, JSON: true}
+		err = cmd.Run(t.Context(), &Globals{Endpoint: endpoint})
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "schemabot on db-1.example (postgres) was not converged")
+	assert.ErrorIs(t, err, ErrSilent, "the response on stdout carries the manual change, so main adds no JSON error after it")
+	assert.Equal(t, 1, ExitCodeFor(err))
+
+	var response apitypes.StorageSchemaApplyResponse
+	require.NoError(t, json.Unmarshal([]byte(out), &response), "the whole of stdout is the response: %q", out)
+	require.NotNil(t, response.Remaining)
+	assert.Equal(t, remaining.Manual, response.Remaining.Manual)
 }

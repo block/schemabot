@@ -1596,8 +1596,12 @@ $ schemabot databases --json
 ```
 
 A `--json` command that fails exits non-zero and writes the error to stdout
-as JSON, in place of the text error on stderr. `code` is the API's error code
-when there is one, and is left out otherwise:
+as JSON, in place of the text error on stderr. That includes a failure to
+resolve the server or its token before the command runs. A command whose
+response already carries the failure, such as a refused `storage apply` or a
+`checks backfill` that needs attention, writes only that response. Flags the
+CLI cannot parse are still reported as text on stderr. `code` is the API's
+error code when there is one, and is left out otherwise:
 
 ```console
 $ schemabot status apply-0000000000000000 --json

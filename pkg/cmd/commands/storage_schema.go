@@ -432,14 +432,18 @@ func (cmd *StorageApplyCmd) Run(ctx context.Context, g *Globals) error {
 		if err := encodeStorageSchemaConvergence(planned, remaining); err != nil {
 			return err
 		}
-	} else if err := outputStorageSchemaConvergence(planned, remaining, cmd.AutoApprove, cmd.rerunWithAllowUnsafe()); err != nil {
+		// The manual changes left behind are in the response's remaining half.
+		return reportedInJSONResponse(storageSchemaConvergenceOutcome(remaining))
+	}
+	if err := outputStorageSchemaConvergence(planned, remaining, cmd.AutoApprove, cmd.rerunWithAllowUnsafe()); err != nil {
 		return err
 	}
 	return storageSchemaConvergenceOutcome(remaining)
 }
 
 // reportRefusal hands a refused convergence back in the shape the caller asked
-// for, and returns the refusal either way.
+// for, and returns the refusal either way. Under --json the response is the
+// whole of stdout, so the refusal is returned already reported.
 //
 // A refusal under --json is the case a program most needs to read: nothing ran,
 // so every statement the plan found is still outstanding, which is why the
@@ -456,7 +460,7 @@ func (cmd *StorageApplyCmd) reportRefusal(report *apitypes.StorageSchemaReport, 
 	if err := encodeStorageSchemaConvergence(report, report); err != nil {
 		return err
 	}
-	return refusal
+	return reportedInJSONResponse(refusal)
 }
 
 func encodeStorageSchemaConvergence(planned, remaining *apitypes.StorageSchemaReport) error {

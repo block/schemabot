@@ -246,3 +246,22 @@ func TestJSONOutputRequestedReadsTheCommandsJSONFlag(t *testing.T) {
 		})
 	}
 }
+
+// A failure main reports for a --json command, including one from startup
+// before the command runs, such as a bearer token that cannot be resolved, is
+// a single JSON document on stdout. A command that already wrote its response
+// with the failure in it, such as a refused storage apply or a checks backfill
+// that needs attention, returns its error as already reported, and main adds
+// nothing after that response.
+func TestReportFailureWritesOneJSONDocumentForAJSONCommand(t *testing.T) {
+	t.Run("startup failure", func(t *testing.T) {
+		var out bytes.Buffer
+		reportFailure(&out, true, templates.ANSIRed, errors.New("no token configured for profile \"missing\"; run schemabot login"))
+		assert.JSONEq(t, `{"error":{"message":"no token configured for profile \"missing\"; run schemabot login"}}`, out.String())
+	})
+	t.Run("already reported", func(t *testing.T) {
+		var out bytes.Buffer
+		reportFailure(&out, true, templates.ANSIRed, fmt.Errorf("%w: %w", commands.ErrSilent, errors.New("refusing to converge storage schema")))
+		assert.Empty(t, out.String(), "the command's own response is the whole of stdout")
+	})
+}
