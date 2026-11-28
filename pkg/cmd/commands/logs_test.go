@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -126,13 +127,14 @@ func TestRunFollowLoop(t *testing.T) {
 	var rendersMu sync.Mutex
 	var renders []bool
 	state := &followState{}
-	emit := func(logs []*client.LogEntry, initial bool) {
+	emit := func(logs []*client.LogEntry, initial bool) error {
 		rendersMu.Lock()
 		renders = append(renders, initial)
 		rendersMu.Unlock()
 		for _, log := range state.advance(logs) {
 			printed <- log
 		}
+		return nil
 	}
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -194,7 +196,7 @@ func TestRunFollowLoop(t *testing.T) {
 // command immediately rather than tailing nothing.
 func TestRunFollowLoopInitialFetchFails(t *testing.T) {
 	fetch, _ := scriptedFetch([]followFetchResult{{err: fmt.Errorf("endpoint unreachable")}})
-	err := runFollowLoop(t.Context(), fetch, func([]*client.LogEntry, bool) {}, 3, fastFollowPacing())
+	err := runFollowLoop(t.Context(), fetch, func([]*client.LogEntry, bool) error { return nil }, 3, fastFollowPacing())
 	require.ErrorContains(t, err, "fetch initial log window")
 	require.ErrorContains(t, err, "endpoint unreachable")
 }
@@ -231,7 +233,7 @@ func TestRunFollowLoopWaitsTheBackoffOnlyAfterAFailedPoll(t *testing.T) {
 		sleep:     func(_ context.Context, d time.Duration) { waits = append(waits, d) },
 	}
 
-	err := runFollowLoop(t.Context(), fetch, func([]*client.LogEntry, bool) {}, 3, pacing)
+	err := runFollowLoop(t.Context(), fetch, func([]*client.LogEntry, bool) error { return nil }, 3, pacing)
 
 	require.ErrorContains(t, err, "apply not found")
 	assert.Len(t, limits(), 6, "every scripted poll ran")
@@ -296,7 +298,7 @@ func TestRunFollowLoopStopsOnPermanentFailure(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), followTestDeadline)
 			defer cancel()
 
-			err := runFollowLoop(ctx, fetch, func([]*client.LogEntry, bool) {}, 3, fastFollowPacing())
+			err := runFollowLoop(ctx, fetch, func([]*client.LogEntry, bool) error { return nil }, 3, fastFollowPacing())
 
 			require.Error(t, err)
 			require.NoError(t, ctx.Err(), "the loop must end on the failure, not on the test deadline")
@@ -321,7 +323,7 @@ func TestRunFollowLoopGivesUpAfterConsecutiveTransientFailures(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), followTestDeadline)
 	defer cancel()
 
-	err := runFollowLoop(ctx, fetch, func([]*client.LogEntry, bool) {}, 3, fastFollowPacing())
+	err := runFollowLoop(ctx, fetch, func([]*client.LogEntry, bool) error { return nil }, 3, fastFollowPacing())
 
 	require.Error(t, err)
 	require.NoError(t, ctx.Err(), "the loop must give up on its own, not on the test deadline")
@@ -356,7 +358,7 @@ func TestRunFollowLoopSuccessResetsTheFailureRun(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), followTestDeadline)
 	defer cancel()
 
-	err := runFollowLoop(ctx, fetch, func([]*client.LogEntry, bool) {}, 3, pacing)
+	err := runFollowLoop(ctx, fetch, func([]*client.LogEntry, bool) error { return nil }, 3, pacing)
 
 	require.ErrorContains(t, err, "apply not found")
 	require.NoError(t, ctx.Err())
@@ -385,7 +387,7 @@ func TestRunFollowLoopInterruptDuringFailedPollIsNotAFailure(t *testing.T) {
 		return nil, followAPIError(http.StatusNotFound, "apply not found")
 	}
 
-	err := runFollowLoop(ctx, fetch, func([]*client.LogEntry, bool) {}, 3, fastFollowPacing())
+	err := runFollowLoop(ctx, fetch, func([]*client.LogEntry, bool) error { return nil }, 3, fastFollowPacing())
 
 	require.NoError(t, err)
 	assert.Equal(t, 2, polls)
@@ -597,6 +599,15 @@ func deploymentFollowSource(target, externalID string, ids ...int64) *apitypes.D
 	return source
 }
 
+// advanceReadable runs one poll with at least one readable source through
+// state, which never fails the poll.
+func advanceReadable(t *testing.T, state *deploymentFollowState, result *apitypes.DeploymentLogsResponse) ([]deploymentFollowBatch, []string) {
+	t.Helper()
+	batches, warnings, err := state.advance(result)
+	require.NoError(t, err)
+	return batches, warnings
+}
+
 func deploymentFollowError(target, externalID, message string) *apitypes.DeploymentLogError {
 	return &apitypes.DeploymentLogError{
 		ExternalID: externalID,
@@ -617,7 +628,7 @@ func deploymentFollowError(target, externalID, message string) *apitypes.Deploym
 func TestDeploymentFollowStateAdvance(t *testing.T) {
 	state := newDeploymentFollowState()
 
-	batches, warnings := state.advance(&apitypes.DeploymentLogsResponse{
+	batches, warnings := advanceReadable(t, state, &apitypes.DeploymentLogsResponse{
 		Sources: []*apitypes.DeploymentLogSource{deploymentFollowSource("target-a", "remote-1", 1, 2)},
 	})
 	require.Len(t, batches, 1)
@@ -630,7 +641,7 @@ func TestDeploymentFollowStateAdvance(t *testing.T) {
 	// A second source appears with ids overlapping the first source's: its
 	// entries are all new (independent id sequence), and batches become
 	// labeled. The first source's overlapping window dedupes as usual.
-	batches, warnings = state.advance(&apitypes.DeploymentLogsResponse{
+	batches, warnings = advanceReadable(t, state, &apitypes.DeploymentLogsResponse{
 		Sources: []*apitypes.DeploymentLogSource{
 			deploymentFollowSource("target-a", "remote-1", 2, 3),
 			deploymentFollowSource("target-b", "remote-2", 1, 2),
@@ -647,7 +658,7 @@ func TestDeploymentFollowStateAdvance(t *testing.T) {
 	assert.Empty(t, warnings)
 
 	// A fully-overlapping poll surfaces nothing for either source.
-	batches, warnings = state.advance(&apitypes.DeploymentLogsResponse{
+	batches, warnings = advanceReadable(t, state, &apitypes.DeploymentLogsResponse{
 		Sources: []*apitypes.DeploymentLogSource{
 			deploymentFollowSource("target-a", "remote-1", 3),
 			deploymentFollowSource("target-b", "remote-2", 2),
@@ -666,7 +677,7 @@ func TestDeploymentFollowStateCarriesPerSourceTruncation(t *testing.T) {
 
 	truncated := deploymentFollowSource("target-a", "remote-1", 1, 2)
 	truncated.Truncated = true
-	batches, _ := state.advance(&apitypes.DeploymentLogsResponse{
+	batches, _ := advanceReadable(t, state, &apitypes.DeploymentLogsResponse{
 		Sources: []*apitypes.DeploymentLogSource{
 			truncated,
 			deploymentFollowSource("target-b", "remote-2", 1),
@@ -691,7 +702,7 @@ func TestDeploymentFollowStateFirstRenderPerSource(t *testing.T) {
 	// beyond its window.
 	initial := deploymentFollowSource("target-a", "remote-1", 1, 2)
 	initial.Truncated = true
-	batches, warnings := state.advance(&apitypes.DeploymentLogsResponse{
+	batches, warnings := advanceReadable(t, state, &apitypes.DeploymentLogsResponse{
 		Sources: []*apitypes.DeploymentLogSource{initial},
 		Errors:  []*apitypes.DeploymentLogError{deploymentFollowError("target-b", "remote-2", "Data-plane logs could not be read; check server logs and retry.")},
 	})
@@ -705,7 +716,7 @@ func TestDeploymentFollowStateFirstRenderPerSource(t *testing.T) {
 	// holds: its first render arrives late but still carries the signal.
 	recovered := deploymentFollowSource("target-b", "remote-2", 7, 8)
 	recovered.Truncated = true
-	batches, _ = state.advance(&apitypes.DeploymentLogsResponse{
+	batches, _ = advanceReadable(t, state, &apitypes.DeploymentLogsResponse{
 		Sources: []*apitypes.DeploymentLogSource{
 			deploymentFollowSource("target-a", "remote-1", 2, 3),
 			recovered,
@@ -723,7 +734,7 @@ func TestDeploymentFollowStateFirstRenderPerSource(t *testing.T) {
 	// than the last printed one and the read hit its bound.
 	outrun := deploymentFollowSource("target-a", "remote-1", 9, 10)
 	outrun.Truncated = true
-	batches, _ = state.advance(&apitypes.DeploymentLogsResponse{
+	batches, _ = advanceReadable(t, state, &apitypes.DeploymentLogsResponse{
 		Sources: []*apitypes.DeploymentLogSource{outrun},
 	})
 	require.Len(t, batches, 1)
@@ -733,7 +744,7 @@ func TestDeploymentFollowStateFirstRenderPerSource(t *testing.T) {
 	// An overlapping later window proves continuity even at its bound.
 	overlap := deploymentFollowSource("target-a", "remote-1", 10, 11)
 	overlap.Truncated = true
-	batches, _ = state.advance(&apitypes.DeploymentLogsResponse{
+	batches, _ = advanceReadable(t, state, &apitypes.DeploymentLogsResponse{
 		Sources: []*apitypes.DeploymentLogSource{overlap},
 	})
 	require.Len(t, batches, 1)
@@ -752,18 +763,18 @@ func TestDeploymentFollowStateWarnings(t *testing.T) {
 		Errors:  []*apitypes.DeploymentLogError{deploymentFollowError("target-b", "remote-2", "Data-plane logs could not be read; check server logs and retry.")},
 	}
 
-	batches, warnings := state.advance(failing)
+	batches, warnings := advanceReadable(t, state, failing)
 	require.Len(t, batches, 1)
 	assert.Equal(t, "target-a / spirit (remote-1)", batches[0].label, "a failing source still counts toward the fan-out, so the readable one is labeled")
 	require.Len(t, warnings, 1)
 	assert.Equal(t, "target-b / spirit (remote-2): Data-plane logs could not be read; check server logs and retry.", warnings[0])
 
 	// The same failure on the next poll is not repeated.
-	_, warnings = state.advance(failing)
+	_, warnings = advanceReadable(t, state, failing)
 	assert.Empty(t, warnings)
 
 	// The source recovers, then fails again: the relapse is reported.
-	_, warnings = state.advance(&apitypes.DeploymentLogsResponse{
+	_, warnings = advanceReadable(t, state, &apitypes.DeploymentLogsResponse{
 		Sources: []*apitypes.DeploymentLogSource{
 			deploymentFollowSource("target-a", "remote-1"),
 			deploymentFollowSource("target-b", "remote-2", 5),
@@ -771,9 +782,167 @@ func TestDeploymentFollowStateWarnings(t *testing.T) {
 	})
 	assert.Empty(t, warnings)
 
-	_, warnings = state.advance(failing)
+	_, warnings = advanceReadable(t, state, failing)
 	require.Len(t, warnings, 1)
 	assert.Equal(t, "target-b / spirit (remote-2): Data-plane logs could not be read; check server logs and retry.", warnings[0])
+}
+
+// deploymentSourceRefused is a source error the server's logs endpoint sends
+// with the given code and reason.
+func deploymentSourceRefused(target, externalID, code, reason, message string) *apitypes.DeploymentLogError {
+	sourceErr := deploymentFollowError(target, externalID, message)
+	sourceErr.Code = code
+	sourceErr.Reason = reason
+	return sourceErr
+}
+
+// remoteLogNotFound is the refusal the server sends for a source whose data
+// plane has no log for the apply.
+func remoteLogNotFound(target, externalID string) *apitypes.DeploymentLogError {
+	return deploymentSourceRefused(target, externalID, "RemoteLogNotFound", "remote_log_not_found", "The selected data plane has no log for this apply; check server logs.")
+}
+
+// remoteLogReadFailed is the failure the server sends for a source whose
+// data-plane read failed in transport or storage.
+func remoteLogReadFailed(target, externalID string) *apitypes.DeploymentLogError {
+	return deploymentFollowError(target, externalID, "Data-plane logs could not be read; check server logs and retry.")
+}
+
+// runDeploymentFollow drives a data-plane tail through the real render step
+// with the scripted answers, one per poll, and returns what it printed and how
+// it ended. Once the script runs out the tail is interrupted, which ends it
+// normally, so a tail the answers never end returns a nil error.
+func runDeploymentFollow(t *testing.T, script []*apitypes.DeploymentLogsResponse, pacing followPacing) (stdout, stderr string, polls int, err error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), followTestDeadline)
+	defer cancel()
+	fetch := func(int) (*apitypes.DeploymentLogsResponse, error) {
+		polls++
+		if polls >= len(script) {
+			cancel()
+			return script[len(script)-1], nil
+		}
+		return script[polls-1], nil
+	}
+	stdout = captureOutput(t, func() {
+		stderr = captureStderr(t, func() {
+			err = runFollowLoop(ctx, fetch, newDeploymentFollowEmit(), 10, pacing)
+		})
+	})
+	require.NotErrorIs(t, ctx.Err(), context.DeadlineExceeded, "the tail must end on its own or on the scripted interrupt, not on the test deadline")
+	return stdout, stderr, polls, err
+}
+
+// A data-plane tail whose every source is refused for a reason a retry cannot
+// change ends with an error naming the reason and exits 1, whether the sources
+// were refused from the first read or became unreadable later. It does not
+// keep polling with nothing to print, which would read as an apply with
+// nothing to say.
+func TestFollowDeploymentLogsEndsWhenNoSourceCanEverBeRead(t *testing.T) {
+	readable := &apitypes.DeploymentLogsResponse{
+		Sources: []*apitypes.DeploymentLogSource{deploymentFollowSource("target-a", "remote-1", 1)},
+		Errors:  []*apitypes.DeploymentLogError{remoteLogNotFound("target-b", "remote-2")},
+	}
+	refusedBoth := func(code, reason string) *apitypes.DeploymentLogsResponse {
+		return &apitypes.DeploymentLogsResponse{Errors: []*apitypes.DeploymentLogError{
+			deploymentSourceRefused("target-a", "remote-1", code, reason, "refused"),
+			deploymentSourceRefused("target-b", "remote-2", code, reason, "refused"),
+		}}
+	}
+	tests := []struct {
+		name      string
+		script    []*apitypes.DeploymentLogsResponse
+		reason    string
+		wantPolls int
+	}{
+		{name: "refused from the first read", script: []*apitypes.DeploymentLogsResponse{refusedBoth("RemoteLogNotFound", "remote_log_not_found"), readable}, reason: "remote_log_not_found", wantPolls: 1},
+		{name: "data plane lost the apply", script: []*apitypes.DeploymentLogsResponse{readable, refusedBoth("RemoteLogNotFound", "remote_log_not_found"), readable}, reason: "remote_log_not_found", wantPolls: 2},
+		{name: "data plane needs an upgrade", script: []*apitypes.DeploymentLogsResponse{readable, refusedBoth("UnsupportedCapability", "upgrade_required"), readable}, reason: "upgrade_required", wantPolls: 2},
+		{name: "records cannot be decoded", script: []*apitypes.DeploymentLogsResponse{readable, refusedBoth("MalformedRemoteLog", "malformed_remote_log"), readable}, reason: "malformed_remote_log", wantPolls: 2},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, stderr, polls, err := runDeploymentFollow(t, tc.script, fastFollowPacing())
+
+			require.Error(t, err)
+			assert.Equal(t, 1, ExitCodeFor(err))
+			assert.ErrorContains(t, err, "stopped following logs: no data-plane log source could be read")
+			assert.ErrorContains(t, err, "target-a / spirit (remote-1): refused ("+tc.reason+")")
+			assert.ErrorContains(t, err, "target-b / spirit (remote-2): refused ("+tc.reason+")")
+			assert.Equal(t, tc.wantPolls, polls, "the tail ends on the poll that found every source refused, with no retry")
+			assert.NotContains(t, stderr, "failed to fetch logs", "a refusal for good is not retried")
+		})
+	}
+}
+
+// A data-plane tail whose sources all fail to be read for a reason that may
+// clear spends the same budget of failed polls a server it cannot reach does:
+// it warns with the attempt count, keeps polling, and prints the entries once a
+// source answers. One source that may still recover keeps the poll retryable
+// even when the other is refused for good. A tail whose sources never recover
+// ends after the budget, naming why.
+func TestFollowDeploymentLogsRetriesWhenNoSourceCanBeReadForNow(t *testing.T) {
+	failing := &apitypes.DeploymentLogsResponse{Errors: []*apitypes.DeploymentLogError{
+		remoteLogReadFailed("target-a", "remote-1"),
+		remoteLogNotFound("target-b", "remote-2"),
+	}}
+
+	t.Run("sources recover", func(t *testing.T) {
+		recovered := &apitypes.DeploymentLogsResponse{
+			Sources: []*apitypes.DeploymentLogSource{deploymentFollowSource("target-a", "remote-1", 1, 2)},
+			Errors:  []*apitypes.DeploymentLogError{remoteLogNotFound("target-b", "remote-2")},
+		}
+		var waits []int
+		pacing := fastFollowPacing()
+		pacing.retryWait = func(_ error, failures int) time.Duration {
+			waits = append(waits, failures)
+			return time.Millisecond
+		}
+
+		stdout, stderr, _, err := runDeploymentFollow(t, []*apitypes.DeploymentLogsResponse{failing, failing, failing, recovered, recovered}, pacing)
+
+		require.NoError(t, err, "a tail whose sources recover keeps going until interrupted")
+		assert.Equal(t, []int{1, 2, 3}, waits, "the initial poll and the two after it each spend one failure")
+		assert.Contains(t, stderr, "Warning: failed to fetch logs (attempt 1/10), retrying in 1ms: no data-plane log source could be read: target-a / spirit (remote-1): Data-plane logs could not be read; check server logs and retry. (remote_log_read_failed)")
+		assert.Contains(t, stderr, "attempt 3/10")
+		assert.NotContains(t, stderr, "attempt 4/10")
+		assert.Contains(t, stdout, "entry 1")
+		assert.Contains(t, stdout, "entry 2")
+		assert.Equal(t, 1, strings.Count(stderr, "Warning: target-b / spirit (remote-2): The selected data plane has no log for this apply"),
+			"once a source is readable, the refused one beside it is reported once")
+	})
+
+	t.Run("sources never recover", func(t *testing.T) {
+		_, _, polls, err := runDeploymentFollow(t, []*apitypes.DeploymentLogsResponse{failing, failing, failing, failing, failing, failing, failing, failing, failing, failing, failing, failing}, fastFollowPacing())
+
+		require.Error(t, err)
+		assert.Equal(t, 1, ExitCodeFor(err))
+		assert.ErrorContains(t, err, "stopped following logs after 10 consecutive failed polls")
+		assert.ErrorContains(t, err, "(remote_log_read_failed)")
+		assert.Equal(t, maxConsecutiveProgressFailures, polls, "the initial poll counts as the first failure")
+	})
+}
+
+// A data-plane tail with one readable source keeps printing it while the other
+// source is refused for good, and reports the refused source once rather than
+// on every poll or as a failed poll.
+func TestFollowDeploymentLogsKeepsPrintingBesideARefusedSource(t *testing.T) {
+	poll := func(ids ...int64) *apitypes.DeploymentLogsResponse {
+		return &apitypes.DeploymentLogsResponse{
+			Sources: []*apitypes.DeploymentLogSource{deploymentFollowSource("target-a", "remote-1", ids...)},
+			Errors:  []*apitypes.DeploymentLogError{remoteLogNotFound("target-b", "remote-2")},
+		}
+	}
+
+	stdout, stderr, polls, err := runDeploymentFollow(t, []*apitypes.DeploymentLogsResponse{poll(1), poll(1, 2), poll(2, 3), poll(3)}, fastFollowPacing())
+
+	require.NoError(t, err)
+	assert.Equal(t, 4, polls)
+	for _, entry := range []string{"entry 1", "entry 2", "entry 3"} {
+		assert.Equal(t, 1, strings.Count(stdout, entry), "%s prints once", entry)
+	}
+	assert.Equal(t, "Warning: target-b / spirit (remote-2): The selected data plane has no log for this apply; check server logs.\n", stderr,
+		"the refused source is warned about once, and no poll counts as failed")
 }
 
 // A followed read opens with the scope it is narrowed to, so an operator
@@ -888,7 +1057,7 @@ func TestShowDeploymentLogsDropsTerminalEscapes(t *testing.T) {
 func TestDeploymentFollowStateDropsTerminalEscapes(t *testing.T) {
 	state := newDeploymentFollowState()
 
-	batches, warnings := state.advance(&apitypes.DeploymentLogsResponse{
+	batches, warnings := advanceReadable(t, state, &apitypes.DeploymentLogsResponse{
 		Sources: []*apitypes.DeploymentLogSource{
 			deploymentFollowSource("target-a", "remote-1\x1b\n", 1),
 			deploymentFollowSource("target-a", "remote-1", 1),
