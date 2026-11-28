@@ -24,9 +24,12 @@ const scratchSchemaPrefix = "pgsprite_scratch_"
 // by the target's owners and can name anything, so it stays in the cause,
 // which only the server log records.
 //
-// Any other error, or one already refused, is returned as it came.
+// It takes precedence over a refusal already in the chain, such as a planner
+// decline that quotes the server's message, because that message would carry
+// the raised text onto the pull request. Any other error is returned as it
+// came.
 func databaseCodeRefusal(database string, err error) error {
-	if err == nil || engine.IsPlanRefused(err) {
+	if err == nil {
 		return err
 	}
 	pgErr, ok := errors.AsType[*pgconn.PgError](err)
