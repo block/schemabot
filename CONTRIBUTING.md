@@ -49,6 +49,10 @@ prints at the end are the demonstration. It builds the LocalScale image first;
 
 See [docs/architecture.md](./docs/architecture.md) for an overview of how SchemaBot works.
 
+## Docs
+
+The README and the guides in `docs/` are also published as a website at [block.github.io/schemabot](https://block.github.io/schemabot/), along with an [llms.txt](https://block.github.io/schemabot/llms.txt) index for AI tools. A new guide needs an entry in both `nav` and `extra.descriptions` in `mkdocs.yml`. Run `make docs-site` to build the site locally. The build fails on a broken link or a guide missing from `mkdocs.yml`.
+
 ## Releases
 
 Maintainers cut releases by pushing a `vX.Y.Z` tag. See [docs/release.md](./docs/release.md) for the process and the compatibility checks that run before a tag is published.

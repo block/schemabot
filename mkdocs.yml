@@ -1,0 +1,205 @@
+# The documentation website, published to GitHub Pages by
+# .github/workflows/docs-site.yaml. Build it locally with `make docs-site`.
+# The pages come from README.md and docs/; scripts/docs-site/build.py stages
+# them into docs_dir, so edit the sources, not the staged copies.
+site_name: SchemaBot
+site_url: https://block.github.io/schemabot/
+site_description: >-
+  SchemaBot applies database schema changes safely through pull requests or a
+  CLI. Declare your schema in SQL files, review the exact change, and apply it
+  online to MySQL, Vitess on PlanetScale, or PostgreSQL.
+repo_url: https://github.com/block/schemabot
+repo_name: block/schemabot
+docs_dir: build/docs-site/src
+site_dir: build/docs-site/html
+
+theme:
+  name: material
+  logo: assets/schemabot-avatar.svg
+  favicon: assets/schemabot-avatar.svg
+  features:
+    - content.code.copy
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      # GitHub-style anchors, so a link that works on GitHub works here.
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+
+validation:
+  links:
+    not_found: warn
+    anchors: warn
+    unrecognized_links: warn
+
+# Every doc under docs/ must be listed here exactly once; the build fails
+# otherwise. Each top-level entry is a section of the site and of llms.txt.
+nav:
+  - Home: index.md
+  - Get started:
+      - vision.md
+      - init.md
+      - pre-merge-workflow.md
+      - cli.md
+      - ai-agents.md
+  - Databases:
+      - engines.md
+      - mysql.md
+      - postgresql.md
+      - vitess.md
+      - strata-engine.md
+  - Run SchemaBot:
+      - configuration.md
+      - github-app-setup.md
+      - auth.md
+      - namespaces.md
+      - schema-intelligence.md
+      - lint-and-safety-levels.md
+      - check-runs.md
+      - apply-lifecycle.md
+      - direct-execution.md
+      - freeze.md
+      - pending-drops.md
+      - throttle.md
+      - storage-schema.md
+      - storage-outage-behavior.md
+      - target-credential-self-heal.md
+  - How it works:
+      - architecture.md
+      - invariants.md
+      - grpc-control-edge-cases.md
+      - partitioned-parent-index-flow.md
+      - inspiration.md
+      - release.md
+
+# One sentence per page, used for the page's meta description (what search
+# engines show) and for its entry in llms.txt (what AI tools read to decide
+# which page answers a question). Every page in nav needs one.
+extra:
+  descriptions:
+    index.md: >-
+      Declare your database schema in SQL files and apply changes safely
+      through pull requests or a CLI, on MySQL, Vitess on PlanetScale, and
+      PostgreSQL.
+    vision.md: >-
+      Where SchemaBot is headed: every database evolving safely, with people
+      and coding agents shipping schema changes they can trust.
+    init.md: >-
+      Bring an existing MySQL or PostgreSQL database into SchemaBot with
+      `schemabot init`, starting from its live schema.
+    pre-merge-workflow.md: >-
+      Take a schema change from your first edit to a merged pull request:
+      plan, review, apply before merge, and deploy your code onto a ready
+      database.
+    cli.md: >-
+      Inspect databases, plan and apply schema changes, and follow or control
+      them from the terminal, including structured output for scripts and
+      agents.
+    ai-agents.md: >-
+      Let AI coding agents read schemas and prepare schema changes while
+      people keep control of what runs in production.
+    engines.md: >-
+      How SchemaBot runs a schema change on each database, and what each
+      engine supports: progress, throttling, cutover, stop, and rollback.
+    mysql.md: >-
+      Online MySQL schema changes with Spirit: instant DDL where possible,
+      online table copies otherwise, throttling, cutover, and primary key
+      choices.
+    postgresql.md: >-
+      What SchemaBot supports on PostgreSQL today through pg-sprite, while
+      support is in beta, and which tables and changes it refuses.
+    vitess.md: >-
+      Run Vitess schema changes on PlanetScale through branches and deploy
+      requests, with per-shard progress and the token permissions SchemaBot
+      needs.
+    strata-engine.md: >-
+      The experimental Strata engine for schema changes across many MySQL
+      shards, which is not yet available for open-source use.
+    configuration.md: >-
+      Configure the SchemaBot server: local and gRPC modes, environments,
+      storage, rate limits, and engine settings.
+    github-app-setup.md: >-
+      Create the GitHub App, receive webhooks, and add schemabot.yaml to a
+      repository so pull requests get schema change plans and checks.
+    auth.md: >-
+      Control who can view schemas and run schema changes, for people, CI,
+      and services calling SchemaBot.
+    namespaces.md: >-
+      How declarative schema files are organized by MySQL schema, Vitess
+      keyspace, or PostgreSQL schema, including per-target overrides.
+    schema-intelligence.md: >-
+      Ask SchemaBot what is in your databases, how it got there, and what is
+      changing now, through the CLI or its JSON API.
+    lint-and-safety-levels.md: >-
+      How plans rank lint findings by severity, which ones block an apply,
+      and what counts as an unsafe change.
+    check-runs.md: >-
+      How GitHub Check Runs gate pull request merges on schema changes, and
+      why they fail closed when SchemaBot is unsure.
+    apply-lifecycle.md: >-
+      What each terminal apply state means, which ones have a way back, and
+      how to recover when a schema change fails.
+    direct-execution.md: >-
+      How MySQL statements the online copy cannot run, such as dropping a
+      primary key, run directly on small tables and are blocked on large ones.
+    freeze.md: >-
+      Hold new schema changes in an environment during a code freeze or an
+      incident, and let an urgent change through with a second person's
+      approval.
+    pending-drops.md: >-
+      An opt-in quarantine for MySQL that renames a dropped table instead of
+      destroying it, so it can be restored until a retention period ends.
+    throttle.md: >-
+      Where each engine documents how it slows or pauses a schema change to
+      protect the database under load.
+    storage-schema.md: >-
+      How SchemaBot keeps its own bookkeeping database in shape across
+      deploys, adding what is missing and never destroying state.
+    storage-outage-behavior.md: >-
+      How a SchemaBot server behaves when its own storage database is
+      unreachable, during a failover, credential rotation, or network
+      partition.
+    target-credential-self-heal.md: >-
+      The design for checking database credentials at startup and recovering
+      when a target's credentials are rotated.
+    architecture.md: >-
+      How the pieces of SchemaBot fit together, following a schema change
+      from pull request to finished apply.
+    invariants.md: >-
+      The safety rules SchemaBot enforces in shipped code, why each one
+      matters, and where it is enforced.
+    grpc-control-edge-cases.md: >-
+      A maintainer worksheet on edge cases in stop, start, and cutover
+      requests over the gRPC data plane.
+    partitioned-parent-index-flow.md: >-
+      The design decision for building indexes online on partitioned
+      PostgreSQL tables.
+    inspiration.md: >-
+      The projects and ideas that shaped SchemaBot.
+    release.md: >-
+      What a release tag guarantees, the checks run before each release, and
+      what to read before upgrading.

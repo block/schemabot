@@ -130,48 +130,48 @@ are examples of each stage, not a transcript of one apply.
 
 1. **Edit the table's `.sql` file and open a PR.**
 2. **SchemaBot plans automatically.** It posts the DDL diff as a PR comment,
-   stamped with the commit it was computed from, and re-plans on every new
-   commit. When the files already match the live schema there is nothing to
-   plan, so no comment is posted and the passing check is the signal.
+    stamped with the commit it was computed from, and re-plans on every new
+    commit. When the files already match the live schema there is nothing to
+    plan, so no comment is posted and the passing check is the signal.
 
-   ![Step 2: the plan comment, showing the DDL SchemaBot will run and the command to apply it](../assets/pr-mockups/pre-merge-1-plan.png)
+    ![Step 2: the plan comment, showing the DDL SchemaBot will run and the command to apply it](../assets/pr-mockups/pre-merge-1-plan.png)
 
 3. **Apply to staging** by commenting `schemabot apply -e staging`. SchemaBot
-   acknowledges the command with a 👀 reaction, re-plans the current head,
-   checks the configured gates, takes the database lock, and starts the apply.
-   The reaction acknowledges the request; it does not mean the change completed.
+    acknowledges the command with a 👀 reaction, re-plans the current head,
+    checks the configured gates, takes the database lock, and starts the apply.
+    The reaction acknowledges the request; it does not mean the change completed.
 
-   ![Step 3: the apply command and SchemaBot's apply comment, with the lock acquired](../assets/pr-mockups/pre-merge-2-apply.png)
+    ![Step 3: the apply command and SchemaBot's apply comment, with the lock acquired](../assets/pr-mockups/pre-merge-2-apply.png)
 
 4. **Watch the status comment.** SchemaBot edits one progress comment in place
-   while the apply runs. Depending on the engine and phase, it shows rows,
-   percent complete, an ETA, and available controls. An ETA is an estimate;
-   use the throttle reason to understand why a copy is slowing down.
+    while the apply runs. Depending on the engine and phase, it shows rows,
+    percent complete, an ETA, and available controls. An ETA is an estimate;
+    use the throttle reason to understand why a copy is slowing down.
 
-   ![Step 4: the status comment with a progress bar, row counts, and an ETA](../assets/pr-mockups/pre-merge-3-status.png)
+    ![Step 4: the status comment with a progress bar, row counts, and an ETA](../assets/pr-mockups/pre-merge-3-status.png)
 
 5. **The completion comment lands.** When the change is live, a summary posts
-   at the bottom of the timeline with the DDL that ran and the apply ID.
+    at the bottom of the timeline with the DDL that ran and the apply ID.
 
-   ![Step 5: the completion comment confirming the schema change is live](../assets/pr-mockups/pre-merge-4-applied.png)
+    ![Step 5: the completion comment confirming the schema change is live](../assets/pr-mockups/pre-merge-4-applied.png)
 
 6. **Apply to production** by commenting `schemabot apply -e production`. The
-   same three comments follow, for the production database. With staging first in the
-   promotion order, its check must pass before production can apply. An enabled
-   [review gate](configuration.md#review-gate) also requires an approving review
-   before an apply, including staging where configured.
+    same three comments follow, for the production database. With staging first in the
+    promotion order, its check must pass before production can apply. An enabled
+    [review gate](configuration.md#review-gate) also requires an approving review
+    before an apply, including staging where configured.
 7. **The checks turn green.** When the schema work is complete in the required
-   environments, the schema checks pass. The PR can merge once its other
-   required checks and reviews pass too.
+    environments, the schema checks pass. The PR can merge once its other
+    required checks and reviews pass too.
 
-   ![Step 7: every check green, including SchemaBot (staging) and SchemaBot (production), and the merge button enabled](../assets/pr-mockups/pre-merge-5-checks.png)
+    ![Step 7: every check green, including SchemaBot (staging) and SchemaBot (production), and the merge button enabled](../assets/pr-mockups/pre-merge-5-checks.png)
 
 8. **Merge.** Merging records the desired state the databases already run.
 
-   ![Step 8: the pull request merged](../assets/pr-mockups/pre-merge-6-merged.png)
+    ![Step 8: the pull request merged](../assets/pr-mockups/pre-merge-6-merged.png)
 
 9. **Deploy as usual.** For a compatible addition, the code rolls out onto a
-   database that already has the shape it expects.
+    database that already has the shape it expects.
 
 The full command set, with every flag, is in the help comment
 (`schemabot help` on any PR) and in
@@ -403,36 +403,36 @@ other developer's tests read the same tables, and what you apply is still
 there after your PR closes.
 
 - **Keep changes compatible.** Test schema additions with the code already
-  running in staging. A new required column or uniqueness constraint can
-  break existing writes even though nothing was removed. Drop a column in a
-  later PR, once no code reads or writes it.
+    running in staging. A new required column or uniqueness constraint can
+    break existing writes even though nothing was removed. Drop a column in a
+    later PR, once no code reads or writes it.
 - **To test dropping an index, hide it instead.** For an eligible MySQL secondary
-  index, the schema file can declare:
+    index, the schema file can declare:
 
-  ```sql
-  CREATE TABLE `orders` (
-    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
-    `status` varchar(32) NOT NULL,
-    PRIMARY KEY (`id`),
-    KEY `idx_status` (`status`) INVISIBLE
-  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
-  ```
+    ```sql
+    CREATE TABLE `orders` (
+      `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+      `status` varchar(32) NOT NULL,
+      PRIMARY KEY (`id`),
+      KEY `idx_status` (`status`) INVISIBLE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+    ```
 
-  SchemaBot plans the edit as ``ALTER TABLE `orders` ALTER INDEX `idx_status`
-  INVISIBLE``, which is metadata-only. MySQL keeps maintaining the index while
-  the optimizer stops using it, so real traffic shows you what the drop would
-  cost. Deleting the keyword and applying again brings the index back with no
-  rebuild.
+    SchemaBot plans the edit as ``ALTER TABLE `orders` ALTER INDEX `idx_status`
+    INVISIBLE``, which is metadata-only. MySQL keeps maintaining the index while
+    the optimizer stops using it, so real traffic shows you what the drop would
+    cost. Deleting the keyword and applying again brings the index back with no
+    rebuild.
 - **Prove a new index with `EXPLAIN`.** The mirror habit for index adds: once
-  the staging apply completes, run `EXPLAIN` on the queries the index is meant
-  to serve and confirm the optimizer actually chooses it. An index the planner
-  never picks is pure write overhead, and staging is the cheapest place to
-  learn that, before production pays the row copy to build it.
+    the staging apply completes, run `EXPLAIN` on the queries the index is meant
+    to serve and confirm the optimizer actually chooses it. An index the planner
+    never picks is pure write overhead, and staging is the cheapest place to
+    learn that, before production pays the row copy to build it.
 - **Add early.** A feature's schema usually settles long before its code does.
-  Once you know which columns you need, put the schema change in its own PR,
-  apply it, and merge it. Then build the feature against a schema that is
-  already in place. If schema and code are already tangled in one branch, pull
-  the `.sql` changes out into a separate PR.
+    Once you know which columns you need, put the schema change in its own PR,
+    apply it, and merge it. Then build the feature against a schema that is
+    already in place. If schema and code are already tangled in one branch, pull
+    the `.sql` changes out into a separate PR.
 
 ## The safety gates in the loop
 

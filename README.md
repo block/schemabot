@@ -100,7 +100,7 @@ Follow progress, choose cutover timing, and pause, resume, cancel, or roll back 
 
 ## Docs
 
-Guides and reference:
+Guides and reference, also published as a website at [block.github.io/schemabot](https://block.github.io/schemabot/):
 
 - [Vision](./docs/vision.md): See what we’re building toward
 - [Quick start](#quick-start): Try it on your machine

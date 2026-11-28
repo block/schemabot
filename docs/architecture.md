@@ -63,8 +63,8 @@ SchemaBot has three layers:
 - **GitHub PR Comments**: Trigger schema changes via PR comments (`schemabot plan -e staging`). See [GitHub App Setup](./github-app-setup.md)
 - **API** ([`pkg/api`](../pkg/api/)): HTTP service that manages routes, server lifecycle, and Tern client pools
 - **Tern** ([`pkg/tern`](../pkg/tern/)): Schema change orchestration — two implementations:
-  - `LocalClient`: Embedded engine (single-process, for easy deployments (recommended to start))
-  - `GRPCClient`: Delegates work to remote deployments (for distributed / multi-tenant architectures)
+    - `LocalClient`: Embedded engine (single-process, for easy deployments (recommended to start))
+    - `GRPCClient`: Delegates work to remote deployments (for distributed / multi-tenant architectures)
 - **Engine** ([`pkg/engine`](../pkg/engine/)): Stateless executor interface for schema change backends
 - **Storage** ([`pkg/storage`](../pkg/storage/)): Interface-based persistence (locks, plans, applies, tasks, logs, settings). MySQL implementation in [`pkg/storage/mysqlstore`](../pkg/storage/mysqlstore/), PostgreSQL implementation in [`pkg/storage/postgresstore`](../pkg/storage/postgresstore/). [Storage Outage Behavior](storage-outage-behavior.md) covers what each component does when storage is unavailable
 
@@ -93,9 +93,9 @@ schemabot skip-revert <apply_id> -e staging # Finalize (Vitess)
 2. SchemaBot auto-runs `plan` and posts a PR comment with the DDL diff
 3. On new commits, SchemaBot re-plans and updates the comment
 4. Developer triggers apply via PR comment:
-   - `schemabot apply -e staging` — SchemaBot plans, locks, and posts a confirmation footer
-   - `schemabot apply-confirm -e staging` — confirms and starts execution
-   Options like `--defer-cutover` are passed in the apply step (see [Apply Options](#apply-options))
+    - `schemabot apply -e staging` — SchemaBot plans, locks, and posts a confirmation footer
+    - `schemabot apply-confirm -e staging` — confirms and starts execution
+    Options like `--defer-cutover` are passed in the apply step (see [Apply Options](#apply-options))
 5. SchemaBot posts progress updates as the schema change executes
 6. If `--defer-cutover` was used, developer triggers cutover via `schemabot cutover`
 7. On PR merge/close, SchemaBot cleans up stored PR state and releases locks
@@ -823,25 +823,25 @@ Two properties matter for display:
    reports `running` until it has (`stopAwaitsRunner`), since that runner can
    still change the target on its way out.
 3. Builds per-table `engine.TableProgress` in `buildSpiritTableProgress()`:
-   - Each table's `State` is the raw Spirit phase string (`copyRows`, `applyChangeset`, ...).
-   - Calculates `Progress` percent (clamped 0–100) and preserves raw `RowsCopied`
-     so renderers can detect when the initial estimate was exceeded.
-   - Sets `ETASeconds` on tables still copying only when the runner reports a ready estimate.
-   - When `IsComplete` is true, reconciles `RowsTotal = RowsCopied` (the estimate
-     was never a count; the copied total is ground truth once the copy finishes)
-     and sets `Progress` to 100. The table keeps the runner phase while the
-     runner is in an active post-copy phase (`spiritPostCopyPhase`: applying the
-     changeset, restoring indexes, analyzing, checksumming, post-checksum,
-     cutting over) — only outside those phases does it report `"completed"`,
-     meaning "done copying while other tables copy".
-   - Stamps the runner-wide checksum estimate (`ChecksumRowsChecked`/`Total`) on
-     every table unconditionally — Spirit populates it only during the verification
-     phase, and every copy is complete by then.
-   - Stamps the runner-wide throttle status (`Throttled`/`ThrottleReason`) on the
-     tables participating in paced work — a table still copying, or every table
-     during the verification (`tableInPacedPhase`) — so a completed table is never
-     rendered as paused by another table's copy. The reason passes through
-     `engine.SanitizeThrottleReason` so it can never break an operator surface.
+    - Each table's `State` is the raw Spirit phase string (`copyRows`, `applyChangeset`, ...).
+    - Calculates `Progress` percent (clamped 0–100) and preserves raw `RowsCopied`
+      so renderers can detect when the initial estimate was exceeded.
+    - Sets `ETASeconds` on tables still copying only when the runner reports a ready estimate.
+    - When `IsComplete` is true, reconciles `RowsTotal = RowsCopied` (the estimate
+      was never a count; the copied total is ground truth once the copy finishes)
+      and sets `Progress` to 100. The table keeps the runner phase while the
+      runner is in an active post-copy phase (`spiritPostCopyPhase`: applying the
+      changeset, restoring indexes, analyzing, checksumming, post-checksum,
+      cutting over) — only outside those phases does it report `"completed"`,
+      meaning "done copying while other tables copy".
+    - Stamps the runner-wide checksum estimate (`ChecksumRowsChecked`/`Total`) on
+      every table unconditionally — Spirit populates it only during the verification
+      phase, and every copy is complete by then.
+    - Stamps the runner-wide throttle status (`Throttled`/`ThrottleReason`) on the
+      tables participating in paced work — a table still copying, or every table
+      during the verification (`tableInPacedPhase`) — so a completed table is never
+      rendered as paused by another table's copy. The reason passes through
+      `engine.SanitizeThrottleReason` so it can never break an operator surface.
 4. Sets `ProgressResult.ResumedFromCheckpoint` from `Progress.Resume`, which the
    drive turns into a one-per-claim "resumed from checkpoint" timeline event
    (`logEngineResumeOnce`).

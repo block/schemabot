@@ -32,7 +32,7 @@ E2E_GRPC_MD_RUN ?= TestGRPCMultiDeploy
 # reproducing on CI runners.
 export COMPOSE_BAKE := false
 
-.PHONY: help lint lint-fix setup docs-toc check-docs-toc docs-assets templates check-templates check-terminology check-vulnerabilities test test-unit test-consumer-module test-e2e test-e2e-grpc test-e2e-grpc-multideploy test-e2e-k8s test-e2e-k8s-multi-target test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-telemetry up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-full demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
+.PHONY: help lint lint-fix setup docs-toc check-docs-toc docs-assets docs-site templates check-templates check-terminology check-vulnerabilities test test-unit test-consumer-module test-e2e test-e2e-grpc test-e2e-grpc-multideploy test-e2e-k8s test-e2e-k8s-multi-target test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-telemetry up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-full demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
 
 # Multi-line message definitions
 define HELP_HEADER
@@ -196,6 +196,19 @@ docs-assets: templates ## Re-render the PR mock-ups and animations the docs embe
 	@python3 scripts/render-pr-mockups.py --prepared
 	@bash scripts/render-pr-demo.sh
 	@python3 scripts/render-animation.py assets/src/pipeline-never-waits.html assets/pipeline-never-waits.gif
+
+# The docs website's Python dependencies live in a virtualenv under build/,
+# rebuilt whenever the pinned requirements change.
+DOCS_SITE_VENV := build/docs-site/venv
+
+$(DOCS_SITE_VENV)/.installed: scripts/docs-site/requirements.txt
+	@python3 -m venv --clear $(DOCS_SITE_VENV)
+	@$(DOCS_SITE_VENV)/bin/pip install --quiet --disable-pip-version-check --require-hashes -r scripts/docs-site/requirements.txt
+	@touch $@
+
+docs-site: $(DOCS_SITE_VENV)/.installed ## Build the docs website and llms.txt into build/docs-site/html; preview with python3 -m http.server -d build/docs-site/html
+	@$(DOCS_SITE_VENV)/bin/python -B -m unittest discover -s scripts/docs-site -p 'test_build.py'
+	@$(DOCS_SITE_VENV)/bin/python scripts/docs-site/build.py --mkdocs $(DOCS_SITE_VENV)/bin/mkdocs
 
 templates: build ## Regenerate TEMPLATES.md from the current binary
 	@scripts/update-templates.sh

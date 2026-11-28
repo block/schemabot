@@ -1,0 +1,230 @@
+"""Checks for the docs site build. Run with `make docs-site`, or directly:
+python3 -B -m unittest discover -s scripts/docs-site -p 'test_build.py'
+(needs PyYAML, which `make docs-site` installs with MkDocs)."""
+
+import runpy
+import tempfile
+import unittest
+from pathlib import Path
+
+BUILD = runpy.run_path(str(Path(__file__).with_name("build.py")))
+BuildError = BUILD["BuildError"]
+Page = BUILD["Page"]
+SITE_URL = "https://example.github.io/schemabot/"
+
+
+class LinkTests(unittest.TestCase):
+    """Links resolve against the repository and point at the right copy."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        for path in ["README.md", "docs/cli.md", "docs/auth.md", "assets/demo.gif",
+                     "CONTRIBUTING.md", "pkg/api/service.go", "examples/README.md"]:
+            (self.root / path).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / path).write_text("x")
+
+    def site(self, text, source="docs/cli.md"):
+        links = BUILD["SiteLinks"]()
+        return BUILD["rewrite_links"](text, source, self.root, links), links
+
+    def published(self, text, source="docs/cli.md"):
+        return BUILD["rewrite_links"](text, source, self.root, BUILD["PublishedLinks"](SITE_URL))
+
+    def test_doc_links_point_at_the_staged_page(self):
+        out, _ = self.site("See [auth](auth.md#tokens) and [home](../README.md#quick-start).")
+        self.assertEqual(out, "See [auth](auth.md#tokens) and [home](index.md#quick-start).")
+
+    def test_readme_links_into_docs_drop_the_directory(self):
+        out, _ = self.site("[CLI](./docs/cli.md#plan)", source="README.md")
+        self.assertEqual(out, "[CLI](cli.md#plan)")
+
+    def test_assets_are_recorded_for_publishing(self):
+        out, links = self.site('![demo](../assets/demo.gif)')
+        self.assertEqual(out, '![demo](assets/demo.gif)')
+        self.assertEqual(links.assets, {"assets/demo.gif"})
+
+    def test_html_attributes_point_at_the_rendered_urls(self):
+        # MkDocs leaves raw HTML alone, and every page but the home page
+        # renders one directory down.
+        out, links = self.site('<img src="../assets/demo.gif"> <a href="auth.md#tokens">a</a> '
+                               '<a href="../README.md">home</a> <a href="cli.md">self</a>')
+        self.assertEqual(out, '<img src="../assets/demo.gif"> <a href="../auth/#tokens">a</a> '
+                              '<a href="../">home</a> <a href="../cli/">self</a>')
+        self.assertEqual(links.assets, {"assets/demo.gif"})
+
+    def test_html_attributes_on_the_home_page(self):
+        out, links = self.site('<img src="./assets/demo.gif"> <a href="./docs/cli.md">CLI</a> '
+                               '<a href="README.md#quick-start">top</a>', source="README.md")
+        self.assertEqual(out, '<img src="assets/demo.gif"> <a href="cli/">CLI</a> '
+                              '<a href="./#quick-start">top</a>')
+        self.assertEqual(links.assets, {"assets/demo.gif"})
+
+    def test_other_repository_files_point_at_github(self):
+        out, _ = self.site("[code](../pkg/api/service.go) [dir](../pkg/api) [guide](../CONTRIBUTING.md#setup)")
+        self.assertEqual(
+            out,
+            "[code](https://github.com/block/schemabot/blob/main/pkg/api/service.go) "
+            "[dir](https://github.com/block/schemabot/tree/main/pkg/api) "
+            "[guide](https://github.com/block/schemabot/blob/main/CONTRIBUTING.md#setup)",
+        )
+
+    def test_external_and_in_page_links_are_untouched(self):
+        text = "[a](https://planetscale.com/docs) [b](#local-mode) [c](mailto:x@example.com)"
+        self.assertEqual(self.site(text)[0], text)
+
+    def test_links_inside_fenced_code_are_untouched(self):
+        text = "```markdown\n[missing](nowhere.md)\n```\n~~~\n[also](gone.md)\n~~~\n[auth](auth.md)\n"
+        out, _ = self.site(text)
+        self.assertIn("[missing](nowhere.md)", out)
+        self.assertIn("[also](gone.md)", out)
+        self.assertTrue(out.endswith("[auth](auth.md)\n"))
+
+    def test_a_link_to_a_missing_file_fails_the_build(self):
+        with self.assertRaisesRegex(BuildError, r"docs/cli.md: link 'gone.md' points at docs/gone.md"):
+            self.site("[gone](gone.md)")
+
+    def test_a_link_outside_the_repository_fails_the_build(self):
+        with self.assertRaisesRegex(BuildError, "outside the repository"):
+            self.site("[up](../../secret.md)")
+
+    def test_published_copies_link_to_the_html_pages(self):
+        out = self.published("[auth](auth.md#tokens) [home](../README.md) ![d](../assets/demo.gif)")
+        self.assertEqual(
+            out,
+            f"[auth]({SITE_URL}auth/#tokens) [home]({SITE_URL}) ![d]({SITE_URL}assets/demo.gif)",
+        )
+
+
+class StagingTests(unittest.TestCase):
+    def test_toc_block_is_removed(self):
+        text = (
+            "# Guide\n\n<!-- BEGIN TOC (auto-generated by `make docs-toc`; max-depth=3) -->\n"
+            "- [Start](#start)\n<!-- END TOC (auto-generated by `make docs-toc`) -->\n\n## Start\n"
+        )
+        self.assertEqual(BUILD["strip_toc"](text), "# Guide\n\n## Start\n")
+
+    def test_details_blocks_render_their_markdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            page = Page(section="Run", staged="cli.md", source="docs/cli.md")
+            out = BUILD["stage_site_page"](
+                '<details open>\n<summary>Output</summary>\n\n**bold**\n</details>\n',
+                page, 'Use the "CLI".', Path(tmp), BUILD["SiteLinks"](),
+            )
+        self.assertTrue(out.startswith('---\ndescription: "Use the \\"CLI\\"."\n---\n\n'))
+        self.assertIn('<details markdown="1" open>', out)
+
+    def test_home_page_gets_a_title(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            page = Page(section="Home", staged="index.md", source="README.md")
+            out = BUILD["stage_site_page"]("<h1>SchemaBot</h1>\n", page, "d", Path(tmp), BUILD["SiteLinks"]())
+        self.assertIn('title: "SchemaBot"', out)
+
+
+    def test_list_content_indented_four_spaces_passes(self):
+        text = (
+            "1. **Plan.**\n    The plan comment.\n\n    ![plan](plan.png)\n\n"
+            "2. **Apply.**\n    - nested\n\n    ```bash\n  schemabot apply\n    ```\n"
+        )
+        BUILD["check_list_indentation"](text, "docs/guide.md")
+
+    def test_list_content_indented_three_spaces_fails(self):
+        text = "1. **Plan.**\n   The plan comment.\n\n   ![plan](plan.png)\n\n2. **Apply.**\n"
+        with self.assertRaisesRegex(BuildError, r"docs/guide.md:4: indent list content by four spaces"):
+            BUILD["check_list_indentation"](text, "docs/guide.md")
+
+    def test_a_nested_list_indented_two_spaces_fails(self):
+        with self.assertRaisesRegex(BuildError, r"docs/guide.md:2: "):
+            BUILD["check_list_indentation"]("- Tern:\n  - LocalClient\n", "docs/guide.md")
+
+    def test_fenced_code_contents_are_not_checked(self):
+        BUILD["check_list_indentation"]("```yaml\nenvironments:\n\n  - staging\n```\n", "docs/guide.md")
+
+
+class StagingDirTests(unittest.TestCase):
+    def test_a_directory_inside_build_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(BUILD["staging_dir"]("build/docs-site/src", root), (root / "build/docs-site/src").resolve())
+
+    def test_a_source_directory_is_refused_before_anything_is_deleted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            guide = root / "docs" / "guide.md"
+            guide.parent.mkdir()
+            guide.write_text("# Guide\n")
+            for docs_dir in ("docs", ".", "build", "build/../docs", "/tmp"):
+                with self.subTest(docs_dir=docs_dir):
+                    with self.assertRaisesRegex(BuildError, "docs_dir must be a directory inside build/"):
+                        BUILD["staging_dir"](docs_dir, root)
+            self.assertEqual(guide.read_text(), "# Guide\n")
+
+
+class NavTests(unittest.TestCase):
+    NAV = [{"Home": "index.md"}, {"Guides": ["cli.md", {"Auth": "auth.md"}]}]
+
+    def pages(self):
+        return BUILD["pages_from_nav"](self.NAV)
+
+    def test_nav_flattens_in_order_with_sections(self):
+        self.assertEqual(
+            [(p.section, p.staged, p.source) for p in self.pages()],
+            [("Home", "index.md", "README.md"), ("Guides", "cli.md", "docs/cli.md"),
+             ("Guides", "auth.md", "docs/auth.md")],
+        )
+
+    def test_a_nested_nav_section_fails_with_a_message(self):
+        with self.assertRaisesRegex(BuildError, "'Guides'.*nested sections are not supported"):
+            BUILD["pages_from_nav"]([{"Guides": [{"More": ["cli.md"]}]}])
+        with self.assertRaisesRegex(BuildError, "'Guides' must be a file or a list of files"):
+            BUILD["pages_from_nav"]([{"Guides": {"cli": "cli.md"}}])
+
+    def test_a_doc_missing_from_nav_fails(self):
+        with self.assertRaisesRegex(BuildError, "missing from mkdocs.yml nav.*docs/new.md"):
+            BUILD["check_nav_complete"](self.pages(), ["auth.md", "cli.md", "new.md"])
+
+    def test_a_doc_listed_twice_fails(self):
+        pages = self.pages() + [Page(section="Again", staged="cli.md", source="docs/cli.md")]
+        with self.assertRaisesRegex(BuildError, "more than once.*cli.md"):
+            BUILD["check_nav_complete"](pages, ["auth.md", "cli.md"])
+
+    def test_a_nav_entry_without_a_file_fails(self):
+        with self.assertRaisesRegex(BuildError, "do not exist: auth.md"):
+            BUILD["check_nav_complete"](self.pages(), ["cli.md"])
+
+    def test_every_page_needs_a_description(self):
+        with self.assertRaisesRegex(BuildError, "missing from extra.descriptions.*auth.md"):
+            BUILD["check_descriptions"](self.pages(), {"index.md": "a", "cli.md": "b"})
+        with self.assertRaisesRegex(BuildError, "not in nav: old.md"):
+            BUILD["check_descriptions"](
+                self.pages(), {"index.md": "a", "cli.md": "b", "auth.md": "c", "old.md": "d"})
+
+    def test_llms_txt_lists_pages_by_section(self):
+        config = {"site_name": "SchemaBot", "site_description": "Safe schema changes.", "site_url": SITE_URL}
+        out = BUILD["build_llms_txt"](
+            config, self.pages(),
+            {"index.md": "Start here.", "cli.md": "Use the CLI.", "auth.md": "Control access."},
+            {"index.md": "SchemaBot", "cli.md": "Use the CLI", "auth.md": "Authentication"},
+        )
+        self.assertTrue(out.startswith("# SchemaBot\n\n> Safe schema changes.\n"))
+        self.assertIn(
+            f"## Guides\n\n- [Use the CLI]({SITE_URL}cli.md): Use the CLI.\n"
+            f"- [Authentication]({SITE_URL}auth.md): Control access.\n",
+            out,
+        )
+
+
+class RepositoryTests(unittest.TestCase):
+    """The checked-in mkdocs.yml covers every doc in this repository."""
+
+    def test_nav_and_descriptions_cover_every_doc(self):
+        config = BUILD["load_config"](BUILD["CONFIG_PATH"])
+        pages = BUILD["pages_from_nav"](config["nav"])
+        docs = sorted(p.name for p in (BUILD["REPO_ROOT"] / "docs").glob("*.md"))
+        BUILD["check_nav_complete"](pages, docs)
+        BUILD["check_descriptions"](pages, config["extra"]["descriptions"])
+
+
+if __name__ == "__main__":
+    unittest.main()

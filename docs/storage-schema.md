@@ -640,49 +640,49 @@ schema change, when the tables carry a long history, or when a pod is not
 starting.
 
 1. **Before the roll, ask the new release what it will run.** Exit status 0
-   means that release's boot has nothing to do. Where the tag cannot be fetched,
-   `--schema-dir ./pkg/schema/mysql` against a checkout answers with no network.
+    means that release's boot has nothing to do. Where the tag cannot be fetched,
+    `--schema-dir ./pkg/schema/mysql` against a checkout answers with no network.
 
-   ```bash
-   schemabot storage plan --deployment west -e production --release v1.4.0
-   ```
+    ```bash
+    schemabot storage plan --deployment west -e production --release v1.4.0
+    ```
 
 2. **Decide whether the boot should do it.** Additive DDL inside the five-minute
-   budget is fine when the tables are small, and not when they are not: on MySQL
-   an index added to an existing storage table copies the table, and every pod in
-   the roll pays it. Converge once, ahead of the roll, naming the release you are
-   about to roll: the files come from the tag, so any binary you have to hand
-   converges it.
+    budget is fine when the tables are small, and not when they are not: on MySQL
+    an index added to an existing storage table copies the table, and every pod in
+    the roll pays it. Converge once, ahead of the roll, naming the release you are
+    about to roll: the files come from the tag, so any binary you have to hand
+    converges it.
 
-   ```bash
-   schemabot storage apply --release v1.4.0 --dsn "$STORAGE_DSN"
-   ```
+    ```bash
+    schemabot storage apply --release v1.4.0 --dsn "$STORAGE_DSN"
+    ```
 
-   It prompts, with the notice from [Converging a release before it
-   rolls](#converging-a-release-before-it-rolls), and `--auto-approve` is
-   refused here. This takes the work out of the roll *and* out of the boot's
-   budget: `apply` is the same bootstrap running under an hour rather than five
-   minutes, so a build a boot could not have finished is exactly what this step
-   is for. Expect the bootstrap lock to be held throughout — pods booting in
-   that window will not come up, which is why this belongs ahead of a roll
-   rather than during one. A build too slow even for the hour has to be created
-   by hand instead; see [Pre-creating indexes on a long-lived
-   database](#pre-creating-indexes-on-a-long-lived-database).
+    It prompts, with the notice from [Converging a release before it
+    rolls](#converging-a-release-before-it-rolls), and `--auto-approve` is
+    refused here. This takes the work out of the roll *and* out of the boot's
+    budget: `apply` is the same bootstrap running under an hour rather than five
+    minutes, so a build a boot could not have finished is exactly what this step
+    is for. Expect the bootstrap lock to be held throughout — pods booting in
+    that window will not come up, which is why this belongs ahead of a roll
+    rather than during one. A build too slow even for the hour has to be created
+    by hand instead; see [Pre-creating indexes on a long-lived
+    database](#pre-creating-indexes-on-a-long-lived-database).
 
 3. **On MySQL, if you converged ahead of the roll, re-check right before it.** A
-   table, column, or index you created early survives a boot of the current
-   release — but **an index does not survive a boot of a release from before
-   indexes were protected**, for the reason in [What is never
-   automatic](#what-is-never-automatic). PostgreSQL has no such gap.
+    table, column, or index you created early survives a boot of the current
+    release — but **an index does not survive a boot of a release from before
+    indexes were protected**, for the reason in [What is never
+    automatic](#what-is-never-automatic). PostgreSQL has no such gap.
 
 4. **After the roll, confirm through the API, per deployment.** Name the release
-   that just rolled, and exit status 0 is the confirmation that its storage
-   converged.
+    that just rolled, and exit status 0 is the confirmation that its storage
+    converged.
 
-   ```bash
-   schemabot storage plan --release v1.4.0                                  # this server's storage
-   schemabot storage plan --release v1.4.0 --deployment west -e production  # a data plane's storage
-   ```
+    ```bash
+    schemabot storage plan --release v1.4.0                                  # this server's storage
+    schemabot storage plan --release v1.4.0 --deployment west -e production  # a data plane's storage
+    ```
 
 During a MySQL rollback window the plan reports the newer release's tables,
 columns, and indexes as refused destructive statements and exits 2. That is the

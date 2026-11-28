@@ -1,0 +1,67 @@
+name: docs-site
+on:
+  # Deploys only when something the site is built from changes.
+  push:
+    branches:
+      - main
+    paths:
+      - README.md
+      - docs/**
+      - assets/**
+      - mkdocs.yml
+      - Makefile
+      - scripts/docs-site/**
+      - .github/workflows/docs-site.yaml
+  # Builds on every PR, because the docs link to source files: a PR that
+  # renames or deletes a linked file fails here, not on a later docs PR.
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  # Builds the site on every PR, so a broken link or a doc missing from
+  # mkdocs.yml fails review instead of the deploy.
+  build:
+    name: "Docs site"
+    runs-on: ubuntu-latest
+    concurrency:
+      group: docs-site-build-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          persist-credentials: false
+      - name: Configure Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Build the docs site
+        run: make docs-site
+      - name: Upload the site for GitHub Pages
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: build/docs-site/html
+
+  # Publishes the site from main. GitHub Pages must be set to deploy from
+  # GitHub Actions in the repository settings.
+  deploy:
+    name: "Deploy docs site"
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    # Never cancel a deploy part-way; a newer one waits its turn.
+    concurrency:
+      group: docs-site-deploy
+      cancel-in-progress: false
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
