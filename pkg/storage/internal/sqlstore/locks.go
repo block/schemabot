@@ -416,13 +416,29 @@ func (s *lockStore) unmatchedPinnedReleaseCause(ctx context.Context, id int64, d
 	return storage.ErrLockIntentChanged
 }
 
+// isPinnedLockRow reports whether the lock row held for a database is the row
+// a pinned release read: the same row ID, still under the same owner and
+// pending plan. Owner and pending plan compare byte-exact, as ReleaseByID's
+// delete predicate does.
+func isPinnedLockRow(held *storage.Lock, id int64, owner, pendingPlanID string) bool {
+	return held.ID == id && held.Owner == owner && held.PendingPlanID == pendingPlanID
+}
+
 // ReleaseByIDIfUnused deletes the lock row ReleaseByID would, but decides
-// under that row's lock whether an apply still records it. The row is locked
-// with the same predicate ReleaseByID deletes by; an apply create that locks
-// the row to verify its lock intent therefore either committed before this
-// transaction read the applies, and is seen, or waits for this transaction and
-// then finds the row gone. The applies are read without locking them, so the
-// release never holds a lock row while waiting on an apply row.
+// under that row's lock whether an apply still records it. An apply create
+// that locks the row to verify its lock intent therefore either committed
+// before this transaction read the applies, and is seen, or waits for this
+// transaction and then finds the row gone. The applies are read without
+// locking them, so the release never holds a lock row while waiting on an
+// apply row.
+//
+// The row is locked by its database key, the way the apply create's lock
+// intent check and the other lock writers reach it, and only then compared
+// with the row the caller read. Locking it by row ID instead would take the
+// row's index entries in the opposite order from the create, and on MySQL two
+// transactions each holding one entry while waiting for the other deadlock:
+// whichever is chosen to fail returns a deadlock error instead of the outcome
+// the race actually had.
 func (s *lockStore) ReleaseByIDIfUnused(ctx context.Context, id int64, database, dbType, owner, pendingPlanID string) error {
 	database = storage.CanonicalKey(database)
 	dbType = storage.CanonicalKey(dbType)
@@ -436,18 +452,22 @@ func (s *lockStore) ReleaseByIDIfUnused(ctx context.Context, id int64, database,
 	}
 	defer rollbackTx(ctx, tx, op)
 
-	var lockedID int64
+	var locked storage.Lock
 	err = tx.QueryRowContext(ctx, `
-		SELECT id FROM locks
-		WHERE id = ? AND database_name = ? AND database_type = ? AND `+s.dialect.BinaryEquals("owner")+` AND `+s.dialect.BinaryEquals("pending_plan_id")+`
+		SELECT id, owner, pending_plan_id FROM locks
+		WHERE database_name = ? AND database_type = ?
 		FOR UPDATE
-	`, id, database, dbType, owner, pendingPlanID).Scan(&lockedID)
+	`, database, dbType).Scan(&locked.ID, &locked.Owner, &locked.PendingPlanID)
 	if errors.Is(err, sql.ErrNoRows) {
 		rollbackTx(ctx, tx, op)
 		return s.unmatchedPinnedReleaseCause(ctx, id, database, dbType, owner)
 	}
 	if err != nil {
 		return fmt.Errorf("lock row for %s: %w", op, err)
+	}
+	if !isPinnedLockRow(&locked, id, owner, pendingPlanID) {
+		rollbackTx(ctx, tx, op)
+		return s.unmatchedPinnedReleaseCause(ctx, id, database, dbType, owner)
 	}
 
 	// Unsettled, not merely non-terminal: a stopped apply is terminal but can
