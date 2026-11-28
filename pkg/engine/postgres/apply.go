@@ -623,7 +623,7 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		// grant, and only the log carries it: the detail is kept generic
 		// because it is published to GitHub.
 		logger.Warn("PostgreSQL schema change refused",
-			"namespace", change.namespace, "table", change.table, "reason", r.reason, "error", err)
+			append([]any{"namespace", change.namespace, "table", change.table, "reason", r.reason, "error", err}, catalogErrorLogAttrs(err)...)...)
 		publish(progressResult(engine.StateFailed, "refused", started, change, recoveryContextDetail(err, r.detail)))
 		return
 	}
@@ -638,7 +638,8 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		logger.Warn("PostgreSQL native-safe schema change lost its lock budget; the drive will retry",
 			"namespace", change.namespace, "table", change.table, "error", err)
 	default:
-		logger.Error("PostgreSQL native-safe schema change failed", "namespace", change.namespace, "table", change.table, "error", err)
+		logger.Error("PostgreSQL native-safe schema change failed",
+			append([]any{"namespace", change.namespace, "table", change.table, "error", err}, catalogErrorLogAttrs(err)...)...)
 	}
 	result := progressResult(engine.StateFailed, "failed", started, change, failure.detail)
 	result.Retryable = failure.retryable
@@ -700,6 +701,12 @@ func classifyApplyFailure(err error, table string, validates *schemadiff.Constra
 	if detail, ok := duplicateKeyDetail(err, table); ok {
 		return applyFailure{detail: detail}
 	}
+	// An object that depends on what the statement drops keeps depending on
+	// it until someone changes that object, so a retry meets the same
+	// refusal.
+	if detail, ok := dependentObjectsDetail(err, table); ok {
+		return applyFailure{detail: detail}
+	}
 	if detail, ok := missingGrantDetail(err, table); ok {
 		return applyFailure{detail: detail, retryable: true}
 	}
@@ -720,6 +727,73 @@ func missingGrantDetail(err error, table string) (string, bool) {
 	return sanitizeReasonText(fmt.Sprintf(
 		"the engine role lacks a privilege the statement on %q needs, such as REFERENCES on the table a foreign key references; the server log names it; grant it, then retry",
 		table)), true
+}
+
+// catalogErrorLogAttrs returns the server's DETAIL and HINT for a refusal
+// whose detail names catalog objects rather than row values: the objects
+// that depend on what a statement drops, or the privilege a statement
+// lacks. The operator-facing detail cuts a long list of dependents and
+// leaves the privilege out, so the log carries them whole. Other SQLSTATEs
+// return nothing, since a constraint violation's DETAIL quotes the rows'
+// values.
+func catalogErrorLogAttrs(err error) []any {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return nil
+	}
+	switch pgErr.Code {
+	case sqlstateDependentObjectsStillExist, sqlstateInsufficientPrivilege:
+		var attrs []any
+		if pgErr.Detail != "" {
+			attrs = append(attrs, "server_detail", pgErr.Detail)
+		}
+		if pgErr.Hint != "" {
+			attrs = append(attrs, "server_hint", pgErr.Hint)
+		}
+		return attrs
+	default:
+		return nil
+	}
+}
+
+// sqlstateDependentObjectsStillExist is the SQLSTATE the server raises when
+// a statement would drop something other objects depend on, such as a
+// column a publication's column list or row filter names. A retype that a
+// dependent blocks raises a different, generic SQLSTATE, so it is not
+// classified here and keeps the retryable default.
+const sqlstateDependentObjectsStillExist = "2BP01"
+
+// maxDependentObjectsDetailLen bounds the server's list of dependent objects
+// carried in an apply's failure detail. The server lists every dependent, so
+// the list is cut on a rune boundary rather than trusted to fit a status line.
+const maxDependentObjectsDetailLen = 300
+
+// dependentObjectsDetail names a statement the server refused because other
+// objects depend on what it drops. The plan refuses the
+// dependents it can read before the apply starts; this covers the ones only
+// the server sees. The server's DETAIL names those objects and nothing else,
+// no row values, so the detail carries it: the owner of a hosted deployment
+// cannot read the server log, and the dependents are what they have to
+// change.
+func dependentObjectsDetail(err error, table string) (string, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateDependentObjectsStillExist {
+		return "", false
+	}
+	// The server puts each dependent on its own line; joining them with a
+	// comma keeps two of them from reading as one sentence.
+	dependents := singleLine(strings.Join(strings.FieldsFunc(pgErr.Detail, func(r rune) bool { return r == '\n' }), ", "))
+	if dependents == "" {
+		return sanitizeReasonText(fmt.Sprintf(
+			"other objects depend on what the statement on %q drops, such as a publication that names the column; the server log names them; remove the dependency, then apply again",
+			table)), true
+	}
+	if runes := []rune(dependents); len(runes) > maxDependentObjectsDetailLen {
+		dependents = string(runes[:maxDependentObjectsDetailLen-1]) + "…"
+	}
+	return sanitizeReasonText(fmt.Sprintf(
+		"other objects depend on what the statement on %q drops: %s; remove the dependency, then apply again",
+		table, dependents)), true
 }
 
 // sqlstateForeignKeyViolation is the SQLSTATE the server raises when a row
@@ -1092,6 +1166,18 @@ func committedCreatePrefixDetail(err error, table string) (string, bool) {
 	return sanitizeReasonText(detail), true
 }
 
+// privilegeRemedy is the statement that provisions the access a privilege
+// refusal names, with the refusal's hint. The catalog check that failed is
+// how the engine proved the access missing, not something the reader runs,
+// so it is left out.
+func privilegeRemedy(err *preflight.PrivilegeError) string {
+	remedy := "provision with: " + err.Grant
+	if err.Hint != "" {
+		remedy += "; " + err.Hint
+	}
+	return remedy
+}
+
 // refusalForCause holds classifyRefusal's cause-to-refusal mapping; causes
 // and remedies leave unsanitized and classifyRefusal sanitizes the composed
 // detail at its return.
@@ -1110,13 +1196,9 @@ func refusalForCause(err error, table string) *refusal {
 			// would send them hunting for an object the target lacks.
 			object = "in the schema that would hold table " + quotedTable(table)
 		}
-		remedy := fmt.Sprintf("provision with: %s (verified by: %s)", privilegeErr.Grant, privilegeErr.Check)
-		if privilegeErr.Hint != "" {
-			remedy += "; " + privilegeErr.Hint
-		}
 		return &refusal{reason: "insufficient-privileges",
 			cause:         fmt.Sprintf("the engine role lacks access for %s %s", privilegeErr.Tier, object),
-			remedy:        remedy,
+			remedy:        privilegeRemedy(privilegeErr),
 			provisionable: true}
 	}
 	// An invalid-index verdict is decided by its own code, never by the build

@@ -2327,7 +2327,8 @@ its state so the retry uses the same execution authority.
 
 *Enforced:* `pkg/cmd/commands/init.go`, `pkg/cmd/commands/init_publish_darwin.go`,
 `pkg/cmd/commands/init_publish_linux.go`, `pkg/cmd/commands/init_publish_other.go`,
-`pkg/cmd/commands/init_sample.go`, and `pkg/localdemo/database.go`.
+`pkg/cmd/commands/init_sample.go`, `pkg/localdemo/database.go`, and
+`pkg/localdemo/vitess.go`.
 
 ### AZ-10: A freeze holds every new change it covers
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -78,14 +79,6 @@ func ensureVitess(ctx context.Context, project, version string, report func(stri
 	if err := requireLocalDocker(ctx); err != nil {
 		return Database{}, err
 	}
-	storage, err := ensureSQL(ctx, sqlSample{
-		project: project, engine: "mysql", label: "vitess-storage",
-		seed: "CREATE DATABASE schemabot;\n", seedStage: "Preparing SchemaBot's own database",
-	}, report)
-	if err != nil {
-		return Database{}, fmt.Errorf("prepare the sample's state database: %w", err)
-	}
-
 	name, err := sampleName(project, "vitess")
 	if err != nil {
 		return Database{}, err
@@ -96,9 +89,39 @@ func ensureVitess(ctx context.Context, project, version string, report func(stri
 	if err != nil {
 		return Database{}, err
 	}
-	if strings.TrimSpace(string(listed)) == "" {
+	needsCluster := strings.TrimSpace(string(listed)) == ""
+
+	// The cluster image and the state database are independent: one is
+	// downloaded, the other is a second container that starts and seeds itself.
+	// Download while the state database comes up, so the state database costs
+	// nothing on the run where the download dominates setup.
+	var pulled chan error
+	cancelPull := context.CancelFunc(func() {})
+	if needsCluster {
+		var pullCtx context.Context
+		pullCtx, cancelPull = context.WithCancel(ctx)
+		defer cancelPull()
+		pulled = make(chan error, 1)
+		go func() { pulled <- ensureImage(pullCtx, image) }()
+	}
+
+	storage, err := ensureSQL(ctx, sqlSample{
+		project: project, engine: "mysql", label: "vitess-storage",
+		seed: "CREATE DATABASE schemabot;\n", seedStage: "Preparing SchemaBot's own database",
+	}, report)
+	if err != nil {
+		return Database{}, errors.Join(
+			fmt.Errorf("prepare the sample's state database: %w", err),
+			abandonPull(pulled, cancelPull),
+		)
+	}
+
+	if needsCluster {
+		// The stage is reported here rather than when the download starts, so
+		// the printed stages follow the state database's in the order setup
+		// waits on them.
 		report("Preparing " + image + " (downloading if needed)")
-		if err = ensureImage(ctx, image); err != nil {
+		if err = <-pulled; err != nil {
 			return Database{}, err
 		}
 		// The API port and the proxy ports are reserved as one block, so the
@@ -212,6 +235,26 @@ func sampleProxyBase(c container) (int, error) {
 		return 0, fmt.Errorf("proxy port %d is published on %q: %w", sampleProxyPortStart, bindings[0].HostPort, err)
 	}
 	return port, nil
+}
+
+// abandonPull settles the cluster image download when setup stops before it
+// needs the image. A download that already failed returns its own error, so
+// both causes reach the user at once instead of the second only on the retry.
+// One still running is cancelled and waited for, so no docker pull outlives
+// setup; the error it then returns is the cancellation this function caused,
+// which says nothing about the image, so it is not reported.
+func abandonPull(pulled <-chan error, cancel context.CancelFunc) error {
+	if pulled == nil {
+		return nil
+	}
+	select {
+	case err := <-pulled:
+		return err
+	default:
+	}
+	cancel()
+	<-pulled
+	return nil
 }
 
 // sampleProxyPortMap reads what host port each of the container's proxy ports
