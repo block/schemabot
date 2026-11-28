@@ -253,7 +253,10 @@ func TestDrainContextEndsWithTheCallersContext(t *testing.T) {
 // so the drain releases the change and returns nil instead of the context's
 // error. The run has returned and the context has ended before the drain
 // starts, so the drain must prefer the return every time; the attempts repeat
-// it so a drain that picked between the two at random would fail.
+// it so a drain that picked between the two at random would fail. A run that
+// returns only after the wait has begun races the context, which no test
+// can schedule; runExit.wait checks for the return again when the context
+// ends for that case.
 func TestDrainContextWithAnEndedCallerAndNoRunnerAliveReleasesTheChange(t *testing.T) {
 	ended, cancel := context.WithCancel(t.Context())
 	cancel()

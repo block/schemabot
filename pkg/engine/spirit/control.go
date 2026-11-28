@@ -148,10 +148,9 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 // runner that will not come down would hold the operator's request forever.
 // A cancelled runner normally returns within seconds: what it waits out is
 // its in-flight copy and checksum statements and, during a cutover, a table
-// lock wait bounded by the cutover lock wait timeout. Two minutes holds
-// several of those, matching the PostgreSQL engine's cancel settle wait. A
-// runner still alive by then is reported as not settled, and the request is
-// sent again.
+// lock wait bounded by the cutover lock wait timeout. The ceiling is set to
+// hold several of those. A runner still alive by then is reported as not
+// settled, and the driver that holds the apply sends the request again.
 const interruptedRunnerSettleCeiling = 2 * time.Minute
 
 // waitForInterruptedRunner waits for the runner a stop or cancel has just
@@ -191,7 +190,10 @@ func waitForInterruptedRunner(ctx context.Context, exit runExit, settleTimeout t
 			"settle_timeout", settleTimeout,
 			"waited", waited,
 		)
-		return &engine.NotSettledError{Err: fmt.Errorf("%s on database %s tables %v: the runner has not returned within the %s settle ceiling: %w; send the %s again once it has", operation, database, tables, settleTimeout, err, operation)}
+		// The ceiling's own deadline error is left off: the caller's context
+		// has not ended, so the error must not read as it having done so to
+		// anything that tests for context.DeadlineExceeded.
+		return &engine.NotSettledError{Err: fmt.Errorf("%s on database %s tables %v: the runner has not returned within the %s settle ceiling; send the %s again once it has", operation, database, tables, settleTimeout, operation)}
 	}
 	logger.Warn(operation+" wait ended at the caller's context before the runner returned; the schema change stays tracked and the "+operation+" can be sent again",
 		"operation", operation,

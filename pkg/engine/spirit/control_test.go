@@ -432,7 +432,7 @@ func TestControlWaitForAStuckRunnerEndsAtTheSettleCeiling(t *testing.T) {
 			assert.False(t, engine.IsAlreadyCompleted(err))
 			assert.False(t, engine.IsSettledOutcome(err))
 			assert.False(t, engine.IsUnsupportedOperation(err))
-			assert.ErrorIs(t, err, context.DeadlineExceeded)
+			assert.NotErrorIs(t, err, context.DeadlineExceeded, "the caller's context has not ended, so the error must not read as if it had")
 			assert.Contains(t, err.Error(), "the runner has not returned within the 50ms settle ceiling")
 			assert.Contains(t, err.Error(), "database testdb")
 			assert.Equal(t, control.wantState, rm.state)
