@@ -717,6 +717,28 @@ func (s *webhookEventStore) DeleteTerminalOlderThan(ctx context.Context, age tim
 	return deleted, nil
 }
 
+// CountTerminalOlderThan counts the rows DeleteTerminalOlderThan may delete for
+// the same age, using the same cutoff and state predicate so a dry run reports
+// what a real purge would remove.
+func (s *webhookEventStore) CountTerminalOlderThan(ctx context.Context, age time.Duration) (int64, error) {
+	if age.Microseconds() <= 0 {
+		return 0, fmt.Errorf("count terminal webhook events: age must be positive, got %s", age)
+	}
+
+	cutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(age.Microseconds())), IntervalMicrosecond)
+	var count int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM webhook_events
+		WHERE received_at < `+cutoff+` AND state IN (`+placeholders(len(storage.WebhookEventStatesTerminal))+`)
+	`, stringArgs(storage.WebhookEventStatesTerminal)...).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count terminal webhook events older than %s: %w", age, err)
+	}
+	return count, nil
+}
+
 func scanWebhookEvent(row *sql.Row) (*storage.WebhookEvent, error) {
 	event, err := scanWebhookEventInto(row)
 	if errors.Is(err, sql.ErrNoRows) {

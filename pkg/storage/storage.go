@@ -777,6 +777,13 @@ type WebhookEventStore interface {
 	// rows than limit. An age or limit that is not positive is an error and
 	// deletes nothing.
 	DeleteTerminalOlderThan(ctx context.Context, age time.Duration, limit int) (int64, error)
+
+	// CountTerminalOlderThan returns how many rows DeleteTerminalOlderThan
+	// would be free to delete for the same age: terminal rows received more than
+	// age ago, measured on the database clock. It changes nothing, so a dry run
+	// can report what a purge would remove. An age that is not positive is an
+	// error.
+	CountTerminalOlderThan(ctx context.Context, age time.Duration) (int64, error)
 }
 
 // PlanListPosition is a plan's place in the newest-first plan listing: its
@@ -1349,6 +1356,15 @@ type ApplyStore interface {
 	// reconcile takes around it.
 	WithBranchReconcileElection(ctx context.Context, fn func(context.Context) error) error
 
+	// WithStorageRetentionElection runs fn on the one instance elected to
+	// purge old rows from SchemaBot's own tables this pass, under an advisory
+	// lock held for as long as fn runs. ErrStorageRetentionBusy reports that
+	// another instance holds the lock, and fn does not run. The lock is an
+	// efficiency gate, not a safety one: every purge delete is idempotent and
+	// repeats its own state and age predicate, so two instances running at once
+	// would be correct, just wasteful.
+	WithStorageRetentionElection(ctx context.Context, fn func(context.Context) error) error
+
 	// FindMissingSummaryComment returns GitHub-backed applies that recently
 	// reached a terminal state (including stopped, judged by updated_at since a
 	// resumable stop keeps completed_at NULL) but whose progress comment was
@@ -1443,6 +1459,11 @@ var ErrRetryableExpiryBusy = errors.New("another instance is expiring retryable 
 // reconcile lock, so this pass did no work. It is an expected outcome on every
 // instance but one, not a failure.
 var ErrBranchReconcileBusy = errors.New("another instance is reconciling engine branches")
+
+// ErrStorageRetentionBusy reports that another instance holds the storage
+// retention lock, so this pass did no work. It is an expected outcome on every
+// instance but one, not a failure.
+var ErrStorageRetentionBusy = errors.New("another instance is purging old storage rows")
 
 // ErrEndedOperationStopBusy reports that another instance holds the lock for
 // listing applies held by an ended operation this pass.

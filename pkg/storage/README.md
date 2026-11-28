@@ -63,13 +63,14 @@ The apply store supports crash recovery through heartbeat-based leasing:
 
 `webhook_events` stores the full JSON payload of every accepted delivery, so it
 grows without bound if never pruned. Terminal rows (`completed`, `failed`,
-`failed_permanent`, `superseded`) are kept for dedup and forensics but only
-need to outlive GitHub's redelivery window (GitHub retains deliveries for 30
-days). The intended retention policy
-is a periodic sweep that deletes terminal rows older than ~30 days, keyed on
-`idx_received_at`; it will land with the reconciliation/observability work
-rather than in the initial inbox. Until then the table is append-mostly and
-growth is bounded by webhook volume, not by retries.
+`failed_permanent`, `superseded`) are kept for forensics and because the
+reconciler counts a head as covered by its row, so they must outlive the
+reconcile lookback. GitHub lets an operator redeliver only deliveries from the
+past 3 days, and a redelivery reopens a terminal row anyway, so dedup needs
+nothing longer. `DeleteTerminalOlderThan` deletes such rows in batches, keyed on
+`idx_received_at`; the periodic sweep that calls it is not wired up yet. Until
+then the table is append-mostly and growth is bounded by webhook volume, not by
+retries.
 
 ## Key Types
 

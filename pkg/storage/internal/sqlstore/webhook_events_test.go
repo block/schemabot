@@ -227,9 +227,21 @@ func assertDeleteTerminalOlderThan(t *testing.T, store storage.Storage, db *sql.
 		seed("young-"+state, state, young)
 	}
 
+	counted, err := store.WebhookEvents().CountTerminalOlderThan(ctx, retention)
+	require.NoError(t, err)
+	assert.Equal(t, int64(len(oldTerminal)), counted, "the count sees the rows a purge may delete, and no others")
+	for _, age := range []time.Duration{0, -time.Hour} {
+		_, err = store.WebhookEvents().CountTerminalOlderThan(ctx, age)
+		require.Error(t, err, "age %s", age)
+	}
+	require.True(t, exists("old-"+storage.WebhookEventCompleted), "counting must delete nothing")
+
 	deleted, err = store.WebhookEvents().DeleteTerminalOlderThan(ctx, retention, 100)
 	require.NoError(t, err)
 	assert.Equal(t, int64(len(oldTerminal)), deleted, "one old row per terminal state")
+	counted, err = store.WebhookEvents().CountTerminalOlderThan(ctx, retention)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), counted, "nothing terminal and old is left to count")
 	for _, state := range oldTerminal {
 		assert.False(t, exists("old-"+state), "old %s row must be deleted", state)
 		assert.True(t, exists("young-"+state), "young %s row must be kept", state)
