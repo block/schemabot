@@ -508,19 +508,6 @@ runs.
 | Tell the user why a change was blocked or refused, in SchemaBot's words | Any DDL run against the cluster outside SchemaBot, and anything done in the PlanetScale console |
 | Report a failure SchemaBot will retry, and check on it again | Deleting a branch, or approving a deploy request |
 
-Recognize each outcome by its signal:
-
-| Outcome | Signal |
-|---|---|
-| Blocked plan | The plan Check Run fails, and the plan comment names the table and the reason. `--allow-unsafe` accepts a destructive change; it does not make a blocked one runnable |
-| Rejected on the branch | The apply fails with the statement Vitess refused. Nothing reached the production branch, and applying the same plan again meets the same rejection |
-| Cancelled | Permanent. There is nothing to resume, and a new apply starts a new deploy request |
-| Reverted in the console | SchemaBot reads the deploy request's state, so the revert is reported, not overwritten |
-
-`cancel` deserves its own line, because it is the one control operation here
-that cannot be undone: it ends the deploy request for good, and the change
-starts again as a new one. The command policy routes it like any other control
-command, and nothing about this engine loosens that.
-
 An agent with the [SchemaBot agent skill](ai-agents.md#install-the-agent-skill)
-already follows these rules.
+follows these rules. Its [Vitess](../skills/schemabot/references/refusals-and-failures.md#vitess) reference has the signal of
+each outcome and what the agent does next.

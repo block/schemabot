@@ -47,6 +47,7 @@ No plan comment can mean the files already match the live database; read the Sch
 | [Agent command policy](references/command-policy.md) | Before posting or handing over any command |
 | [Authoring schema changes](references/authoring.md) | Finding or editing schema files, adding tables and columns, choosing the layout for an engine |
 | [PR workflow and commands](references/pr-workflow.md) | Opening or reading a SchemaBot PR, reading check states, controlling an apply in flight, review requirements |
+| [Refusals, blocks, and failures](references/refusals-and-failures.md) | A plan is blocked, an apply is refused or failed, a freeze holds a change, or an apply reached a final state |
 | [PR locks and blockers](references/pr-blockers.md) | A plan or check is missing or stale, a command is refused, the database is locked, the branch is behind, or a database has drifted from its files |
 | [Change behavior](references/change-behavior.md) | Instant versus copy-based execution, busy tables, deferred cutover, drops, renames, deploy order |
 | [Recovery](references/recovery.md) | Stopping or undoing a change, the Vitess revert window, trying a change in a shared staging database |

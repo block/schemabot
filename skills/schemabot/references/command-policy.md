@@ -79,14 +79,14 @@ Stop. Do not apply again, look for a flag, or try another environment, deploymen
 - When no safe form exists, such as a PostgreSQL column type change that rewrites the table, say so. That change needs a separately reviewed process that a person runs.
 - A `401` or `403` means the account lacks access. Say which permission is missing. Never try other credentials or turn off authentication.
 
-You may run `freeze list` and `freeze show` to check on a freeze.
+You may run `freeze list` and `freeze show` to check on a freeze. [Refusals, blocks, and failures](refusals-and-failures.md) lists each outcome's signal and next step.
 
 ## Never act outside SchemaBot
 
 Every change goes through SchemaBot, so it is planned, reviewed, and recorded. Never change the database another way, in any environment. Give the user the command instead.
 
 - Never run DDL against the database or cluster yourself.
-- On PostgreSQL, never drop an invalid index or cancel a backend. A failed index build can leave an invalid index behind; the next apply removes it once it proves no build still holds it. Dropping it by hand can race a build the server is still running.
+- On PostgreSQL, never drop an invalid index, cancel a backend, or run the `GRANT` a refusal names. A failed index build can leave an invalid index behind; the next apply removes it once it proves no build still holds it. Dropping it by hand can race a build the server is still running.
 - On Vitess, never act in the PlanetScale console: do not delete a branch, or approve or revert a deploy request.
 
 ## The user can opt out
