@@ -1165,10 +1165,15 @@ Retrying sooner is refused the same way, so SchemaBot retries at the reset
 time GitHub reports, plus up to 30 seconds, and for three hours after the
 event arrived that wait does not use up an attempt. After that each refusal
 uses one of the five attempts, so a delivery that GitHub keeps refusing still
-ends. While a delivery waits for the reset, its head can carry no SchemaBot
-check, or the check it already had, because the same limit refuses the check
-write. Make the SchemaBot check a required status check so that a head with no
-check cannot be merged in the meantime.
+ends. If GitHub refuses a retry with a reset the delivery has already waited
+for, the SchemaBot server's clock is ahead of GitHub's. The next retry then
+waits as long as that reset is overdue on the server's clock, at least 10
+seconds and at most 10 minutes, so each wait roughly doubles instead of
+asking GitHub again every few seconds. A warning naming the reset and the
+server's time is logged. While a delivery waits for the reset, its head can
+carry no SchemaBot check, or the check it already had, because the same limit
+refuses the check write. Make the SchemaBot check a required status check so
+that a head with no check cannot be merged in the meantime.
 
 The read is made once, before cleanup starts. A PR that reopens while cleanup
 is already running is not seen by that cleanup, which finishes as if the PR

@@ -85,7 +85,8 @@ func TestDurableWebhookDriverRetriesPrimaryRateLimitAtResetWithoutChargingAttemp
 
 // The wait is bounded by the same horizon as the quota reserve's: a reset
 // further out than GitHub's hourly window allows is a garbled reading, and one
-// that has passed is retried after the short floor instead of at once.
+// that passed after the delivery became due is retried after the short floor
+// instead of at once.
 func TestDurableWebhookDriverBoundsPrimaryRateLimitWait(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -109,7 +110,9 @@ func TestDurableWebhookDriverBoundsPrimaryRateLimitWait(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			before := time.Now()
-			store := driveRateLimitedDelivery(t, durablePullRequestEvent(t), primaryRateLimitError(&tc.resetAt))
+			event := durablePullRequestEvent(t)
+			event.ReceivedAt = before.Add(-5 * time.Minute)
+			store := driveRateLimitedDelivery(t, event, primaryRateLimitError(&tc.resetAt))
 
 			require.Len(t, store.failedUncharged, 1)
 			failure := <-store.failedUncharged
@@ -119,6 +122,183 @@ func TestDurableWebhookDriverBoundsPrimaryRateLimitWait(t *testing.T) {
 			assert.LessOrEqual(t, wait, tc.wantMax)
 		})
 	}
+}
+
+// skewedClaim is the result of one claim driven by driveRateLimitedClaimAt, with
+// its retry time on the scenario's pod clock.
+type skewedClaim struct {
+	disposition string // "uncharged", "charged", or "completed"
+	retryAt     time.Time
+	logs        string
+}
+
+// driveRateLimitedClaimAt drives one claim of event as if the pod's clock read
+// podNow. The driver reads the real clock, so the event's times and GitHub's
+// reset are moved by the gap between the two clocks, and the recorded retry
+// time is moved back. A nil resetAt means GitHub serves the claim. The rate
+// limit's retry jitter is pinned to rateLimitJitter.
+func driveRateLimitedClaimAt(t *testing.T, podNow time.Time, event storage.WebhookEvent, resetAt *time.Time) skewedClaim {
+	t.Helper()
+	shift := time.Since(podNow)
+	event.ReceivedAt = event.ReceivedAt.Add(shift)
+	if event.RetryAfter != nil {
+		retryAfter := event.RetryAfter.Add(shift)
+		event.RetryAfter = &retryAfter
+	}
+	processErr := error(nil)
+	if resetAt != nil {
+		shiftedReset := resetAt.Add(shift)
+		processErr = primaryRateLimitError(&shiftedReset)
+	}
+
+	store := newScriptedWebhookEventStore(&event)
+	h := newDurableDriverHandler(t, store, nil, nil)
+	var logs bytes.Buffer
+	h.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	h.durableWebhookRetryJitterOverride = func(limit time.Duration) time.Duration {
+		if limit == primaryRateLimitRetryJitter {
+			return rateLimitJitter
+		}
+		return 0
+	}
+	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+		return true, processErr
+	}
+	require.True(t, h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0"))
+
+	claim := skewedClaim{logs: logs.String()}
+	switch {
+	case len(store.completed) == 1:
+		claim.disposition = "completed"
+		return claim
+	case len(store.failedUncharged) == 1:
+		claim.disposition = "uncharged"
+		failure := <-store.failedUncharged
+		require.NotNil(t, failure.retryAfter)
+		claim.retryAt = failure.retryAfter.Add(-shift)
+	case len(store.failed) == 1:
+		claim.disposition = "charged"
+		failure := <-store.failed
+		require.NotNil(t, failure.retryAfter)
+		claim.retryAt = failure.retryAfter.Add(-shift)
+	default:
+		require.Fail(t, "the claim recorded no completion or retryable failure")
+	}
+	return claim
+}
+
+// clockSkewLogLine returns the one log line that reports the pod's clock is
+// ahead of GitHub's, or nil when there is none.
+func clockSkewLogLine(t *testing.T, logs string) map[string]any {
+	t.Helper()
+	var found map[string]any
+	for line := range strings.Lines(logs) {
+		var entry map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &entry))
+		msg, _ := entry["msg"].(string)
+		if !strings.Contains(msg, "this pod's clock is ahead of GitHub's") {
+			continue
+		}
+		require.Nil(t, found, "more than one clock skew line: %s", logs)
+		found = entry
+	}
+	return found
+}
+
+// The pod's clock runs two minutes ahead of GitHub's, and GitHub says the
+// installation's limit resets at 12:00:00 by its own clock. The first refusal
+// arrives at 12:01:00 on the pod, so the reset looks a minute past, and the
+// delivery retries after the short floor without spending an attempt. GitHub
+// refuses the retry with the same 12:00:00 reset: the delivery already waited
+// out that reset, so the retry now waits as long as the reset is overdue
+// rather than polling again after the floor, still without spending an
+// attempt, and a warning names the skew. A retry that GitHub refuses with a
+// later reset has met a new rate limit window and waits for that reset.
+func TestDurableWebhookDriverBacksOffPrimaryRateLimitResetAlreadyWaitedOut(t *testing.T) {
+	reset := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
+	event := *durablePullRequestEvent(t)
+	event.ReceivedAt = reset.Add(-30 * time.Second)
+
+	firstClaimAt := reset.Add(time.Minute)
+	first := driveRateLimitedClaimAt(t, firstClaimAt, event, &reset)
+	require.Equal(t, "uncharged", first.disposition)
+	assert.WithinDuration(t, firstClaimAt.Add(quotaReserveRetryFloor+rateLimitJitter), first.retryAt, time.Second,
+		"a reset that passed after the delivery became due is retried after the floor")
+	assert.Nil(t, clockSkewLogLine(t, first.logs), "the first refusal of a reset is not a sign of skew")
+
+	retried := event
+	retried.RetryAfter = &first.retryAt
+	secondClaimAt := first.retryAt
+
+	t.Run("the same reset again waits as long as it is overdue", func(t *testing.T) {
+		second := driveRateLimitedClaimAt(t, secondClaimAt, retried, &reset)
+
+		require.Equal(t, "uncharged", second.disposition)
+		overdue := secondClaimAt.Sub(reset)
+		assert.WithinDuration(t, secondClaimAt.Add(overdue+rateLimitJitter), second.retryAt, time.Second,
+			"the retry waits the %s the reset is overdue, not the %s floor", overdue, quotaReserveRetryFloor)
+
+		line := clockSkewLogLine(t, second.logs)
+		require.NotNil(t, line, "the repeated reset logs the skew: %s", second.logs)
+		assert.Equal(t, "WARN", line["level"])
+		assert.Equal(t, event.DeliveryID, line["delivery_id"])
+		assert.Equal(t, event.Repository, line["repo"])
+		assert.Equal(t, event.TenantID, line["installation_id"])
+		assert.Equal(t, "rate_limit_deferred", line["disposition"])
+		loggedTime := func(key string) time.Time {
+			value, ok := line[key].(string)
+			require.True(t, ok, "%s is logged", key)
+			parsed, err := time.Parse(time.RFC3339, value)
+			require.NoError(t, err)
+			return parsed
+		}
+		resetLogged := loggedTime("reset_time")
+		assert.WithinDuration(t, resetLogged.Add(overdue), loggedTime("pod_now"), time.Second)
+		assert.WithinDuration(t, resetLogged.Add(overdue), loggedTime("due_since"), time.Second)
+	})
+
+	t.Run("a later reset is a new window and waits for it", func(t *testing.T) {
+		nextReset := reset.Add(time.Hour)
+		second := driveRateLimitedClaimAt(t, secondClaimAt, retried, &nextReset)
+
+		require.Equal(t, "uncharged", second.disposition)
+		assert.WithinDuration(t, nextReset.Add(rateLimitJitter), second.retryAt, time.Second)
+		assert.Nil(t, clockSkewLogLine(t, second.logs), "a later reset is not a sign of skew")
+	})
+}
+
+// GitHub says the installation's limit resets at 12:00:00 by its clock, 59
+// minutes away, and the pod's clock runs an hour ahead, so on the pod that
+// reset is already past when the delivery arrives and stays past for the whole
+// hour GitHub keeps refusing. The delivery is claimed a handful of times in
+// that hour, never spending an attempt, and runs once GitHub's clock reaches
+// the reset, instead of being claimed every few seconds until then.
+func TestDurableWebhookDriverBoundsClaimsUnderClockSkew(t *testing.T) {
+	const skew = time.Hour
+	githubReset := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
+	event := *durablePullRequestEvent(t)
+	event.ReceivedAt = githubReset.Add(-59 * time.Minute).Add(skew)
+
+	const maxClaims = 12
+	podNow := event.ReceivedAt
+	claims := 0
+	for {
+		claims++
+		require.LessOrEqual(t, claims, maxClaims, "a pod clock %s ahead of GitHub's took more than %d claims", skew, maxClaims)
+		var refusal *time.Time
+		if podNow.Add(-skew).Before(githubReset) {
+			refusal = &githubReset
+		}
+		claim := driveRateLimitedClaimAt(t, podNow, event, refusal)
+		if claim.disposition == "completed" {
+			break
+		}
+		require.Equal(t, "uncharged", claim.disposition, "claim %d", claims)
+		require.True(t, claim.retryAt.After(podNow), "claim %d retries later", claims)
+		event.RetryAfter = &claim.retryAt
+		podNow = claim.retryAt
+	}
+	assert.False(t, podNow.Add(-skew).Before(githubReset), "the delivery ran once GitHub's clock reached the reset")
 }
 
 // A delivery that GitHub keeps refusing cannot be rescheduled forever. Within
