@@ -8,8 +8,6 @@ import (
 	"github.com/block/schemabot/pkg/lintguidance"
 )
 
-const primaryKeyDocURL = "https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key"
-
 // guidanceScope is the lint rules one comment discloses for one plan, with the
 // dialect that decides which guides apply. A comment links a guide only for a
 // finding it shows, so a reader never meets a link with nothing above it that

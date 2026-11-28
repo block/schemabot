@@ -167,6 +167,42 @@ func TestPlanRollout_SameDirectDDLUnderDifferentReasonsSplitsGroups(t *testing.T
 	}
 }
 
+// Every target is planned with the same drop_tables list, so the rollout
+// reports an entry as naming no table only when no target, the primary
+// included, has the table. Here the primary has neither listed table, and the
+// other target still has legacy_orders: only legacy_jobs is reported. Beside a
+// target that could not be planned nothing is reported, since what that
+// target holds is unknown.
+func TestPlanRollout_UnmatchedDropTablesListsOnlyEntriesNoTargetMatched(t *testing.T) {
+	ddl := "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
+	reviewed := func() *ternv1.PlanResponse {
+		plan := reviewedUsersPlan(ddl)
+		plan.UnmatchedDropTables = []string{"legacy_orders", "legacy_jobs"}
+		return plan
+	}
+	memberDiff := alterUsersDiff(ddl)
+	memberDiff.UnmatchedDropTables = []string{"legacy_jobs"}
+
+	cases := map[string]struct {
+		client *mockTernClient
+		want   []string
+	}{
+		"other target has one table": {client: &mockTernClient{planDiffResp: memberDiff}, want: []string{"legacy_jobs"}},
+		"other target not planned":   {client: &mockTernClient{planDiffErr: errors.New("dial target")}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			svc := multiTargetService(t, tc.client, reviewedPlanStore(t, reviewed(), "testapp-001"))
+
+			rollout, err := svc.planRollout(t.Context(), planDiffReq(t), reviewed(),
+				&apitypes.PlanResponse{Deployment: "eu", Target: "testapp-001"})
+			require.NoError(t, err)
+			require.NotNil(t, rollout)
+			assert.Equal(t, tc.want, rollout.UnmatchedDropTables)
+		})
+	}
+}
+
 // A target that could not be planned joins no group: it is listed for
 // attention with a fixed detail, because the raw error can carry hostnames and
 // dial failures that do not belong in a response.

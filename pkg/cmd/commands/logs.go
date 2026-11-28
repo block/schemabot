@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -202,7 +203,7 @@ func followLogs(ctx context.Context, endpoint, database, environment, applyID st
 	fetch := func(limit int) (*apitypes.LogsResponse, error) {
 		return client.GetLogsCtx(ctx, endpoint, database, environment, applyID, scope, limit)
 	}
-	emit := func(result *apitypes.LogsResponse, initial bool) {
+	emit := func(result *apitypes.LogsResponse, initial bool) error {
 		switch {
 		case initial:
 			printLogTruncationNotice(result.Truncated, len(result.Logs))
@@ -210,6 +211,7 @@ func followLogs(ctx context.Context, endpoint, database, environment, applyID st
 			printFollowGapNotice()
 		}
 		printLogs(state.advance(result.Logs))
+		return nil
 	}
 	return runFollowLoop(ctx, fetch, emit, initialLimit, defaultFollowPacing)
 }
@@ -233,15 +235,26 @@ func scopeHeader(scope client.LogScope) string {
 func followDeploymentLogs(ctx context.Context, endpoint, applyID, deployment string, scope client.LogScope, initialLimit int) error {
 	fmt.Printf("Following data-plane logs for %s on %s%s... (Ctrl+C to stop)\n\n", applyID, deployment, scopeHeader(scope))
 
-	state := newDeploymentFollowState()
 	fetch := func(limit int) (*apitypes.DeploymentLogsResponse, error) {
 		return client.GetDeploymentLogsCtx(ctx, endpoint, applyID, deployment, scope, limit)
 	}
+	return runFollowLoop(ctx, fetch, newDeploymentFollowEmit(), initialLimit, defaultFollowPacing)
+}
+
+// newDeploymentFollowEmit returns the render step of a data-plane tail: each
+// poll's new entries per source on stdout and each source's new failure once
+// on stderr. A poll with no readable source prints nothing and returns the
+// error the follow loop judges like any other failed poll.
+func newDeploymentFollowEmit() func(result *apitypes.DeploymentLogsResponse, initial bool) error {
+	state := newDeploymentFollowState()
 	// The loop-wide initial flag is unused here: each source owes the
 	// truncation notice to its own first successful read, which for a source
 	// that failed the initial fan-out arrives on a later poll.
-	emit := func(result *apitypes.DeploymentLogsResponse, _ bool) {
-		batches, warnings := state.advance(result)
+	return func(result *apitypes.DeploymentLogsResponse, _ bool) error {
+		batches, warnings, err := state.advance(result)
+		if err != nil {
+			return err
+		}
 		for _, batch := range batches {
 			if batch.label != "" {
 				fmt.Printf("%s%s%s\n", templates.ANSIDim, batch.label, templates.ANSIReset)
@@ -257,8 +270,8 @@ func followDeploymentLogs(ctx context.Context, endpoint, applyID, deployment str
 		for _, warning := range warnings {
 			fmt.Fprintf(os.Stderr, "Warning: %s\n", warning)
 		}
+		return nil
 	}
-	return runFollowLoop(ctx, fetch, emit, initialLimit, defaultFollowPacing)
 }
 
 // followState tracks the newest log entry already printed so each poll prints
@@ -350,8 +363,10 @@ func deploymentFollowSourceKey(target string, operations []*apitypes.LogOperatio
 
 // advance returns each source's entries newer than the last printed ones, in
 // the chronological order the server delivered them, plus the warnings to
-// surface for sources that could not be read this poll.
-func (s *deploymentFollowState) advance(result *apitypes.DeploymentLogsResponse) ([]deploymentFollowBatch, []string) {
+// surface for sources that could not be read this poll. A poll in which no
+// source could be read returns a *deploymentSourcesUnreadableError instead,
+// so the follow loop treats it as a failed poll rather than a quiet one.
+func (s *deploymentFollowState) advance(result *apitypes.DeploymentLogsResponse) ([]deploymentFollowBatch, []string, error) {
 	firstRender := make(map[string]bool)
 	for _, source := range result.Sources {
 		key := deploymentFollowSourceKey("", source.Operations, source.ExternalID)
@@ -366,6 +381,12 @@ func (s *deploymentFollowState) advance(result *apitypes.DeploymentLogsResponse)
 	}
 	for _, sourceErr := range result.Errors {
 		s.seen[deploymentFollowSourceKey(sourceErr.Target, sourceErr.Operations, sourceErr.ExternalID)] = true
+	}
+	if unreadable := unreadableSourcesError(result); unreadable != nil {
+		// The per-source warnings are left unrecorded: the failed-poll warning
+		// already names every source, and a source that fails on beside a
+		// recovered one is then still reported once.
+		return nil, nil, unreadable
 	}
 
 	// Label batches once more than one source exists, so interleaved tails
@@ -401,7 +422,63 @@ func (s *deploymentFollowState) advance(result *apitypes.DeploymentLogsResponse)
 		s.lastWarned[key] = warning
 		warnings = append(warnings, warning)
 	}
-	return batches, warnings
+	return batches, warnings, nil
+}
+
+// deploymentSourcesUnreadableError is a poll the server answered without a
+// single readable data-plane source. It is permanent when every source was
+// refused for a reason a retry cannot change, and transient otherwise.
+type deploymentSourcesUnreadableError struct {
+	permanent bool
+	// failures names each source with its message and reason, cleaned of
+	// control runes, since all of it comes from the response.
+	failures []string
+}
+
+func (e *deploymentSourcesUnreadableError) Error() string {
+	return "no data-plane log source could be read: " + strings.Join(e.failures, "; ")
+}
+
+// unreadableSourcesError returns the failure of a poll in which every source
+// the server tried failed, or nil when at least one source was read. One source
+// that may still recover keeps the whole poll transient, so only a tail whose
+// every source is refused for good ends at once.
+func unreadableSourcesError(result *apitypes.DeploymentLogsResponse) *deploymentSourcesUnreadableError {
+	if len(result.Sources) > 0 || len(result.Errors) == 0 {
+		return nil
+	}
+	unreadable := &deploymentSourcesUnreadableError{permanent: true}
+	for _, sourceErr := range result.Errors {
+		if !isPermanentDeploymentLogError(sourceErr) {
+			unreadable.permanent = false
+		}
+		unreadable.failures = append(unreadable.failures, fmt.Sprintf("%s: %s (%s)",
+			deploymentLogSourceLabel(sourceErr.Target, sourceErr.Operations, sourceErr.ExternalID),
+			ui.TerminalSafeInline(sourceErr.Message), ui.TerminalSafeInline(sourceErr.Reason)))
+	}
+	return unreadable
+}
+
+// isPermanentDeploymentLogError reports whether a source's read failure, as
+// the server's logs endpoint classifies it, will come back the same on every
+// poll. A source only reaches the data-plane read once the data plane has
+// accepted its apply and returned the apply's id, so a data plane that then
+// finds no log for that apply, target or shard has lost it rather than not
+// reached it yet. A data plane that predates log, target or shard reads needs
+// an upgrade, and records SchemaBot could not decode come back on the next
+// read. A read that failed in transport or storage, and any code or reason
+// this CLI does not know, may recover and is retried.
+func isPermanentDeploymentLogError(sourceErr *apitypes.DeploymentLogError) bool {
+	switch {
+	case sourceErr.Code == apitypes.DeploymentLogCodeNotFound && sourceErr.Reason == apitypes.DeploymentLogReasonNotFound:
+		return true
+	case sourceErr.Code == apitypes.DeploymentLogCodeUnsupported && sourceErr.Reason == apitypes.DeploymentLogReasonUpgradeRequired:
+		return true
+	case sourceErr.Code == apitypes.DeploymentLogCodeMalformed && sourceErr.Reason == apitypes.DeploymentLogReasonMalformed:
+		return true
+	default:
+		return false
+	}
 }
 
 // followPacing sets how long a tail waits before its next poll: interval after
@@ -425,6 +502,8 @@ var defaultFollowPacing = followPacing{interval: followInterval, retryWait: prog
 // already shown; it is told whether it is rendering the initial window, which
 // is the only one bounded by the operator's own limit. The initial fetch must
 // succeed — a broken endpoint should fail the command, not tail nothing.
+// emit returns an error for an answer that carried nothing readable, and that
+// poll, the initial one included, counts as failed under the rule below.
 // fetch is expected to abandon its read once ctx is cancelled, so an interrupt
 // ends the tail at once rather than after the in-flight read answers.
 //
@@ -435,7 +514,7 @@ var defaultFollowPacing = followPacing{interval: followInterval, retryWait: prog
 // refused, or one transient failure too many, ends the tail with an error:
 // retrying cannot change the answer, and a tail that prints nothing looks like
 // an apply with nothing to say.
-func runFollowLoop[T any](ctx context.Context, fetch func(limit int) (T, error), emit func(result T, initial bool), initialLimit int, pacing followPacing) error {
+func runFollowLoop[T any](ctx context.Context, fetch func(limit int) (T, error), emit func(result T, initial bool) error, initialLimit int, pacing followPacing) error {
 	result, err := fetch(initialLimit)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -445,10 +524,22 @@ func runFollowLoop[T any](ctx context.Context, fetch func(limit int) (T, error),
 		}
 		return fmt.Errorf("fetch initial log window: %w", err)
 	}
-	emit(result, true)
 
 	wait := pacing.interval
 	failures := 0
+	if err := emit(result, true); err != nil {
+		if ctx.Err() != nil {
+			// A read the operator's Ctrl-C landed on is part of the interrupt,
+			// even when its answer had nothing readable in it.
+			return nil
+		}
+		failures++
+		var stopErr error
+		wait, stopErr = followFailureOutcome(err, failures, pacing)
+		if stopErr != nil {
+			return stopErr
+		}
+	}
 	for {
 		pacing.sleep(ctx, wait)
 		if ctx.Err() != nil {
@@ -456,12 +547,16 @@ func runFollowLoop[T any](ctx context.Context, fetch func(limit int) (T, error),
 			return nil
 		}
 		result, err := fetch(followFetchLimit)
+		if err == nil {
+			err = emit(result, false)
+		}
+		if err != nil && ctx.Err() != nil {
+			// A poll the operator's Ctrl-C landed on is part of the interrupt,
+			// not a failure of the endpoint, whether the read failed or its
+			// answer had nothing readable in it.
+			return nil
+		}
 		if err != nil {
-			if ctx.Err() != nil {
-				// A poll the operator's Ctrl-C landed on is part of the interrupt,
-				// not a failure of the endpoint.
-				return nil
-			}
 			failures++
 			var stopErr error
 			wait, stopErr = followFailureOutcome(err, failures, pacing)
@@ -472,7 +567,6 @@ func runFollowLoop[T any](ctx context.Context, fetch func(limit int) (T, error),
 		}
 		failures = 0
 		wait = pacing.interval
-		emit(result, false)
 	}
 }
 
@@ -482,7 +576,7 @@ func runFollowLoop[T any](ctx context.Context, fetch func(limit int) (T, error),
 // Otherwise it warns on stderr, which keeps stdout to the log lines, and
 // returns the wait before the next poll.
 func followFailureOutcome(err error, failures int, pacing followPacing) (time.Duration, error) {
-	if !isRetryableFetchError(err) {
+	if !isRetryableFollowFailure(err) {
 		return 0, fmt.Errorf("stopped following logs: %w", err)
 	}
 	if failures >= maxConsecutiveProgressFailures {
@@ -492,6 +586,18 @@ func followFailureOutcome(err error, failures int, pacing followPacing) (time.Du
 	fmt.Fprintf(os.Stderr, "Warning: failed to fetch logs (attempt %d/%d), retrying in %s: %s\n",
 		failures, maxConsecutiveProgressFailures, wait, ui.TerminalSafeInline(err.Error()))
 	return wait, nil
+}
+
+// isRetryableFollowFailure reports whether a failed follow poll is worth
+// retrying. A poll the server answered with no readable data-plane source is
+// judged by why its sources failed; any other failure is judged the way the
+// watches judge a failed fetch.
+func isRetryableFollowFailure(err error) bool {
+	var unreadable *deploymentSourcesUnreadableError
+	if errors.As(err, &unreadable) {
+		return !unreadable.permanent
+	}
+	return isRetryableFetchError(err)
 }
 
 // printLogs formats and prints log entries. An entry's level, message and

@@ -81,6 +81,37 @@ func TestRollupDeploymentDiffs_AllMatchIsClean(t *testing.T) {
 	}
 }
 
+// A mirrored rollup reports the drop_tables entries every member listed as
+// naming no table. A member that could not be planned keeps none, even when
+// its diff arrived with a list, so the rollup reports nothing rather than an
+// entry that member's table may still need.
+func TestRollupDeploymentDiffs_MirroredUnmatchedDropTables(t *testing.T) {
+	change := "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
+	member := func(name string, unmatched ...string) DeploymentPlanDiff {
+		d := rollupDeployment(name, rollupAlterUsers(change))
+		d.UnmatchedDropTables = unmatched
+		return d
+	}
+
+	t.Run("listed by every member", func(t *testing.T) {
+		diffs := []DeploymentPlanDiff{member("eu", "legacy_jobs", "legacy_orders"), member("us", "legacy_jobs")}
+		rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
+		require.NoError(t, err)
+		require.True(t, rollup.Clean)
+		assert.Equal(t, []string{"legacy_jobs"}, rollup.UnmatchedDropTables())
+	})
+
+	t.Run("errored member that reported a list", func(t *testing.T) {
+		broken := member("us", "legacy_jobs")
+		broken.Err = assert.AnError
+		diffs := []DeploymentPlanDiff{member("eu", "legacy_jobs"), broken}
+		rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanMirrored)
+		require.NoError(t, err)
+		assert.False(t, rollup.Clean)
+		assert.Empty(t, rollup.UnmatchedDropTables())
+	})
+}
+
 func TestRollupDeploymentDiffs_BlockedCountsDoNotAffectDrift(t *testing.T) {
 	const statement = "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
 	change := func(blocked bool) *ternv1.SchemaChange {

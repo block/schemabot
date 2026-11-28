@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/block/schemabot/pkg/ui"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -26,7 +27,7 @@ func TestRelatedGuidanceAggregatesRulesAcrossEnvironments(t *testing.T) {
 	}
 	out := RenderMultiEnvPlanComment(data)
 	assert.Equal(t, 1, strings.Count(out, "📖 **Related guidance:**"))
-	assert.Equal(t, 1, strings.Count(out, primaryKeyDocURL))
+	assert.Equal(t, 1, strings.Count(out, ui.PrimaryKeyDocURL))
 	assert.Equal(t, 1, strings.Count(out, "#renaming-a-column-or-table"))
 	assert.Contains(t, out, ")\n- [Renaming a column or table](")
 	assert.Greater(t, strings.Index(out, "📖 **Related guidance:**"), strings.LastIndex(out, "</details>"))
@@ -39,7 +40,7 @@ func TestRelatedGuidanceAggregatesRulesAcrossEnvironments(t *testing.T) {
 
 	data.Errors = map[string]string{"production": "Plan unavailable"}
 	out = RenderMultiEnvPlanComment(data)
-	assert.NotContains(t, out, primaryKeyDocURL, "failed environments must not contribute stale guidance")
+	assert.NotContains(t, out, ui.PrimaryKeyDocURL, "failed environments must not contribute stale guidance")
 }
 
 func TestRelatedGuidanceIgnoresUnknownAndLockedFindings(t *testing.T) {
@@ -67,11 +68,11 @@ func TestRelatedGuidanceSkipsFindingsTheCommentWithholds(t *testing.T) {
 	var withheld strings.Builder
 	writeRelatedGuidance(&withheld, data.disclosesNonErrorsOnly())
 	assert.Contains(t, withheld.String(), "#renaming-a-column-or-table", "the shown finding keeps its guide")
-	assert.NotContains(t, withheld.String(), primaryKeyDocURL, "the withheld finding contributes no link")
+	assert.NotContains(t, withheld.String(), ui.PrimaryKeyDocURL, "the withheld finding contributes no link")
 
 	var shown strings.Builder
 	writeRelatedGuidance(&shown, data.disclosesEverySeverity())
-	assert.Contains(t, shown.String(), primaryKeyDocURL, "a comment that shows every severity links both")
+	assert.Contains(t, shown.String(), ui.PrimaryKeyDocURL, "a comment that shows every severity links both")
 }
 
 // Rename guidance applies to Vitess too, while the primary-key guide is MySQL-specific.
@@ -79,5 +80,5 @@ func TestRelatedGuidanceVitessRename(t *testing.T) {
 	var out strings.Builder
 	writeRelatedGuidance(&out, guidanceScope{rules: []string{"rename_column", "primary_key"}})
 	assert.Contains(t, out.String(), "[Renaming a column or table]")
-	assert.NotContains(t, out.String(), primaryKeyDocURL)
+	assert.NotContains(t, out.String(), ui.PrimaryKeyDocURL)
 }

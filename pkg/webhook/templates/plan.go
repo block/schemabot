@@ -532,6 +532,13 @@ type DeploymentDriftData struct {
 	// confirms names every copy the apply destroys, wherever it is. Set only
 	// for a clean rollup, the only one whose targets' plans an apply runs.
 	DiscardedCopies []TargetExistingCopy
+	// UnmatchedDropTables are the drop_tables entries that name no live table
+	// on any target, primary included, in the order the config lists them.
+	// PlanCommentData.UnmatchedDropTables describes the primary target alone,
+	// and an entry it lists can still drop a table on another target. Empty
+	// when a target could not be planned or the rollup was not computed,
+	// since what that target holds is unknown.
+	UnmatchedDropTables []string
 }
 
 // TargetExistingCopy is an unfinished copy on one rollout target.
@@ -1844,14 +1851,14 @@ func writeUnmatchedDropTables(sb *strings.Builder, entries []string) {
 }
 
 // shownUnmatchedDropTables is the unmatched drop_tables entries the plan
-// reports. A rollout plan reports none: the entries describe the primary
-// target alone, while every other member is planned with the same list and
-// drops a table it still has, so a line saying the entry drops nothing could
-// sit beside that member's DROP and tell the reader to remove the entry the
-// drop depends on.
+// reports. A rollout plan reports the entries no target matched: the plan's
+// own list describes the primary target alone, while every other target is
+// planned with the same list and can drop a table it still has, so a line
+// saying the entry drops nothing could sit beside that target's DROP and tell
+// the reader to remove the entry the drop depends on.
 func (d PlanCommentData) shownUnmatchedDropTables() []string {
 	if d.DeploymentDrift != nil {
-		return nil
+		return d.DeploymentDrift.UnmatchedDropTables
 	}
 	return d.UnmatchedDropTables
 }
@@ -1885,7 +1892,7 @@ func multiEnvHasUnmatchedDropTables(data MultiEnvPlanCommentData) bool {
 // drop_tables entries narrowed to those every environment's plan reports, so
 // no section tells the reader to remove an entry another environment still
 // drops a table for (see presentation.UnmatchedDropTablesInEveryPlan). A
-// rollout plan reports no entries, so beside one nothing is reported.
+// rollout plan takes part with the entries no target of it matched.
 func withUnmatchedDropTablesInEveryPlan(data MultiEnvPlanCommentData) map[string]*PlanCommentData {
 	var lists [][]string
 	for _, env := range data.Environments {
@@ -1906,6 +1913,13 @@ func withUnmatchedDropTablesInEveryPlan(data MultiEnvPlanCommentData) map[string
 		}
 		copied := *plan
 		copied.UnmatchedDropTables = common
+		// A rollout's section reads its own list, so it is narrowed too, on
+		// a copy that leaves the caller's data untouched.
+		if plan.DeploymentDrift != nil {
+			drift := *plan.DeploymentDrift
+			drift.UnmatchedDropTables = common
+			copied.DeploymentDrift = &drift
+		}
 		narrowed[env] = &copied
 	}
 	return narrowed

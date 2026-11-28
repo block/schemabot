@@ -1063,9 +1063,14 @@ prints the newest entries again and does not resume from the last line shown.
 Ctrl-C ends following normally. Without `-f`, Ctrl-C abandons the read and
 exits 130, as other commands do when interrupted before their output.
 
-With `--deployment`, a source whose logs could not be read is reported as a
-warning while the other sources keep printing. That warning does not end
-following, even when every poll fails the same way.
+With `--deployment`, a source whose logs could not be read is reported once as
+a warning while the other sources keep printing. A poll in which no source can
+be read counts as a failed poll. If every source is refused for a reason a
+retry cannot change, such as a data plane that has no log for the apply or
+needs an upgrade, following stops at once with a non-zero exit and the error
+names the reason. If any source failed in a way that can clear, the poll is
+retried with backoff like a server it cannot reach, and following stops after
+the same run of failed polls.
 
 In local mode, omit `--deployment`: the stored log includes engine activity.
 In gRPC mode, add it with a deployment name from the apply's progress to read

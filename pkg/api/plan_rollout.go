@@ -119,6 +119,7 @@ func (s *Service) planRollout(ctx context.Context, req PlanRequest, primaryPlan 
 	}
 	rollout := planRolloutResponse(rollup, "database", req.Database, "environment", req.Environment, "plan_id", primaryPlan.GetPlanId())
 	rollout.ShapeRefusal = rolloutShapeRefusal(req.Database, req.Environment, targets)
+	rollout.UnmatchedDropTables = rollup.UnmatchedDropTables()
 	if len(rollout.Attention) == 0 {
 		refused, err := s.rolloutApplyRefusals(ctx, req.Environment, primaryPlan.GetPlanId(), targets)
 		if err != nil {
