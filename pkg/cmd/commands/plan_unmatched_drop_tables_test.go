@@ -295,59 +295,70 @@ func dropJobsOld() []*apitypes.SchemaChangeResponse {
 	}}
 }
 
-// A rollout plan reports no unmatched drop_tables entry: the primary's entries
-// say nothing about the other targets, and here the other target drops the
-// table the primary reports as missing. The output shows that target's DROP
-// and no line telling the reader to remove the entry it depends on, in the
-// plan layout, the apply layout, and a multi-environment plan.
-func TestWritePlanBody_RolloutReportsNoUnmatchedDropTables(t *testing.T) {
-	rollout := func() *apitypes.PlanResponse {
-		return &apitypes.PlanResponse{
-			Database: "orders",
-			Engine:   "spirit",
-			Changes:  []*apitypes.SchemaChangeResponse{},
-			Rollout: &apitypes.PlanRolloutResponse{
-				Members:     2,
-				Independent: true,
-				Groups: []*apitypes.PlanMemberGroupResponse{
-					{Members: paymentsTargets(1, 1), Primary: true, Changes: []*apitypes.SchemaChangeResponse{}},
-					{Members: paymentsTargets(2, 2), Changes: dropJobsOld()},
-				},
+// unmatchedDropTablesRollout is a two-target rollout whose primary target has
+// neither _jobs_old nor _jobs_olds, while the other target still has _jobs_old
+// and drops it. The primary's own list names both entries, and the rollout's
+// lists only the entry no target matched.
+func unmatchedDropTablesRollout() *apitypes.PlanResponse {
+	return &apitypes.PlanResponse{
+		Database: "orders",
+		Engine:   "spirit",
+		Changes:  []*apitypes.SchemaChangeResponse{},
+		Rollout: &apitypes.PlanRolloutResponse{
+			Members:     2,
+			Independent: true,
+			Groups: []*apitypes.PlanMemberGroupResponse{
+				{Members: paymentsTargets(1, 1), Primary: true, Changes: []*apitypes.SchemaChangeResponse{}},
+				{Members: paymentsTargets(2, 2), Changes: dropJobsOld()},
 			},
-			UnmatchedDropTables: []string{"_jobs_old", "_jobs_olds"},
-		}
+			UnmatchedDropTables: []string{"_jobs_olds"},
+		},
+		UnmatchedDropTables: []string{"_jobs_old", "_jobs_olds"},
 	}
+}
 
+// A rollout plan reports an unmatched drop_tables entry only when no target
+// has the table. _jobs_old is missing on the primary target, but the other
+// target drops it, so the output shows that DROP and no line telling the
+// reader to remove the entry it depends on. _jobs_olds names no table on
+// either target, so it is reported once. This holds in the plan layout, the
+// apply layout, and a multi-environment plan.
+func TestWritePlanBody_RolloutReportsOnlyEntriesNoTargetMatched(t *testing.T) {
 	for name, isApply := range map[string]bool{"plan": false, "apply": true} {
 		t.Run(name, func(t *testing.T) {
-			out := stripAnsi(captureStdout(func() { writePlanBody(rollout(), isApply) }))
+			out := stripAnsi(captureStdout(func() { writePlanBody(unmatchedDropTablesRollout(), isApply) }))
 			assert.Contains(t, out, "DROP TABLE `_jobs_old`", out)
-			assert.NotContains(t, out, "names no table", out)
+			assert.NotContains(t, out, `entry "_jobs_old" names no table`, out)
+			assert.Equal(t, 1, strings.Count(out, cliUnmatchedDropLine+"\n"), out)
 		})
 	}
 
 	t.Run("multi-environment", func(t *testing.T) {
-		staging := &apitypes.PlanResponse{Engine: "spirit", UnmatchedDropTables: []string{"_jobs_olds"}}
+		staging := &apitypes.PlanResponse{Engine: "spirit", UnmatchedDropTables: []string{"_jobs_old", "_jobs_olds"}}
 		out := stripAnsi(captureStdout(func() {
-			outputMultiEnvPlanResult(map[string]*apitypes.PlanResponse{"staging": staging, "production": rollout()}, "orders", "orders")
+			outputMultiEnvPlanResult(map[string]*apitypes.PlanResponse{"staging": staging, "production": unmatchedDropTablesRollout()}, "orders", "orders")
 		}))
 		assert.Contains(t, out, "DROP TABLE `_jobs_old`", out)
-		assert.NotContains(t, out, "names no table", out)
+		assert.NotContains(t, out, `entry "_jobs_old" names no table`, out)
+		assert.Equal(t, 2, strings.Count(out, cliUnmatchedDropLine+"\n"), "each environment's section reports the entry no target matched:\n%s", out)
 	})
 }
 
 // Apply against a rollout with nothing to reconcile on any target returns
-// before the plan body, and like the body it reports no unmatched entry.
-func TestApplyCmd_RolloutReportsNoUnmatchedDropTablesOnCleanPlan(t *testing.T) {
+// before the plan body, so it reports the entries no target matched itself:
+// _jobs_olds, which names no table on either target, and not _jobs_old,
+// which only the primary target lacks.
+func TestApplyCmd_RolloutReportsEntriesNoTargetMatchedOnCleanPlan(t *testing.T) {
 	plan := &apitypes.PlanResponse{
 		Engine:  "mysql",
 		Changes: []*apitypes.SchemaChangeResponse{},
 		Rollout: &apitypes.PlanRolloutResponse{
-			Members:     2,
-			Independent: true,
-			Groups:      []*apitypes.PlanMemberGroupResponse{{Members: paymentsTargets(1, 2), Primary: true, Changes: []*apitypes.SchemaChangeResponse{}}},
+			Members:             2,
+			Independent:         true,
+			Groups:              []*apitypes.PlanMemberGroupResponse{{Members: paymentsTargets(1, 2), Primary: true, Changes: []*apitypes.SchemaChangeResponse{}}},
+			UnmatchedDropTables: []string{"_jobs_olds"},
 		},
-		UnmatchedDropTables: []string{"_jobs_olds"},
+		UnmatchedDropTables: []string{"_jobs_old", "_jobs_olds"},
 	}
 	body, err := json.Marshal(plan)
 	require.NoError(t, err)
@@ -366,7 +377,8 @@ func TestApplyCmd_RolloutReportsNoUnmatchedDropTablesOnCleanPlan(t *testing.T) {
 	out := stripAnsi(captureStdout(func() { _ = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) }))
 
 	assert.Contains(t, out, "No changes. Your schema is up-to-date.", out)
-	assert.NotContains(t, out, "names no table", out)
+	assert.NotContains(t, out, `entry "_jobs_old" names no table`, out)
+	assert.Equal(t, 1, strings.Count(out, cliUnmatchedDropLine+"\n"), out)
 }
 
 // A drop_tables list with many entries that name no table names the first

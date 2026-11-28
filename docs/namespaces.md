@@ -560,10 +560,11 @@ yet in production, staging's plan is clean and production's still drops the
 table, so the entry is not listed: it is still needed for production. The
 first 20 entries get a line each, and one more line counts the rest.
 
-A plan of an environment that rolls out to several targets lists no such
-entries, and neither does a plan of several environments that includes one.
-The planner reports them for the primary target alone, and another
-target may still have the table and plan its drop.
+The same rule holds across the targets of an environment that rolls out to
+several. Every target is planned with the same list, so an entry is listed
+only when no target has the table. While one target still has it and plans
+its drop, the entry is not listed. If a target could not be planned, no entry
+is listed, since what that target holds is unknown.
 
 ### Rules
 

@@ -2642,8 +2642,12 @@ type PlanDiffResponse struct {
 	// diff could meet, so a caller can tell a clean target from a data plane
 	// that never looked or whose lookup failed.
 	ExistingCopiesReported bool `protobuf:"varint,7,opt,name=existing_copies_reported,json=existingCopiesReported,proto3" json:"existing_copies_reported,omitempty"`
-	unknownFields          protoimpl.UnknownFields
-	sizeCache              protoimpl.SizeCache
+	// The drop_tables entries that name no live table on this target, the same
+	// list PlanResponse carries. A data plane that predates the field leaves it
+	// empty, which reads as every entry having matched.
+	UnmatchedDropTables []string `protobuf:"bytes,8,rep,name=unmatched_drop_tables,json=unmatchedDropTables,proto3" json:"unmatched_drop_tables,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *PlanDiffResponse) Reset() {
@@ -2723,6 +2727,13 @@ func (x *PlanDiffResponse) GetExistingCopiesReported() bool {
 		return x.ExistingCopiesReported
 	}
 	return false
+}
+
+func (x *PlanDiffResponse) GetUnmatchedDropTables() []string {
+	if x != nil {
+		return x.UnmatchedDropTables
+	}
+	return nil
 }
 
 // ApplyRequest requests execution of a previously generated plan.
@@ -6176,7 +6187,7 @@ const file_tern_proto_rawDesc = "" +
 	"\x06shards\x18\x06 \x03(\v2\x12.tern.v1.ShardPlanR\x06shards\x12>\n" +
 	"\x0fexisting_copies\x18\a \x03(\v2\x15.tern.v1.ExistingCopyR\x0eexistingCopies\x12:\n" +
 	"\rexempt_tables\x18\b \x03(\v2\x15.tern.v1.ExemptTablesR\fexemptTables\x122\n" +
-	"\x15unmatched_drop_tables\x18\t \x03(\tR\x13unmatchedDropTables\"\xeb\x02\n" +
+	"\x15unmatched_drop_tables\x18\t \x03(\tR\x13unmatchedDropTables\"\x9f\x03\n" +
 	"\x10PlanDiffResponse\x12'\n" +
 	"\x06engine\x18\x01 \x01(\x0e2\x0f.tern.v1.EngineR\x06engine\x12/\n" +
 	"\achanges\x18\x02 \x03(\v2\x15.tern.v1.SchemaChangeR\achanges\x12?\n" +
@@ -6184,7 +6195,8 @@ const file_tern_proto_rawDesc = "" +
 	"\x06errors\x18\x04 \x03(\tR\x06errors\x12*\n" +
 	"\x06shards\x18\x05 \x03(\v2\x12.tern.v1.ShardPlanR\x06shards\x12>\n" +
 	"\x0fexisting_copies\x18\x06 \x03(\v2\x15.tern.v1.ExistingCopyR\x0eexistingCopies\x128\n" +
-	"\x18existing_copies_reported\x18\a \x01(\bR\x16existingCopiesReported\"\xd6\x06\n" +
+	"\x18existing_copies_reported\x18\a \x01(\bR\x16existingCopiesReported\x122\n" +
+	"\x15unmatched_drop_tables\x18\b \x03(\tR\x13unmatchedDropTables\"\xd6\x06\n" +
 	"\fApplyRequest\x12\x17\n" +
 	"\aplan_id\x18\x01 \x01(\tR\x06planId\x12<\n" +
 	"\aoptions\x18\x02 \x03(\v2\".tern.v1.ApplyRequest.OptionsEntryR\aoptions\x12I\n" +

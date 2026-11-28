@@ -131,6 +131,11 @@ type DeploymentRollupEntry struct {
 	// member's findings are its own, not the primary's. Empty for a member that
 	// errored, which has no plan for them to describe.
 	LintViolations []*ternv1.LintViolation
+
+	// UnmatchedDropTables are the drop_tables entries that name no live table
+	// on this member. Empty for a member that errored, whose tables are
+	// unknown.
+	UnmatchedDropTables []string
 }
 
 // markErrored classifies a member as errored and drops the plan it was
@@ -150,6 +155,7 @@ func (e *DeploymentRollupEntry) markErrored(err error) {
 	e.ChangeSet = tern.ChangeSet{}
 	e.PlanFingerprint = ""
 	e.LintViolations = nil
+	e.UnmatchedDropTables = nil
 }
 
 // PlanRollup aggregates every rollout member's review-time classification for a
@@ -244,6 +250,7 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedMembers []routing
 			ExistingCopies:         d.ExistingCopies,
 			ExistingCopiesReported: d.ExistingCopiesReported,
 			LintViolations:         d.LintViolations,
+			UnmatchedDropTables:    d.UnmatchedDropTables,
 		}
 		switch {
 		case d.Err != nil:
@@ -355,6 +362,7 @@ func rollupIndependentMembers(diffs []DeploymentPlanDiff) PlanRollup {
 			ExistingCopies:         d.ExistingCopies,
 			ExistingCopiesReported: d.ExistingCopiesReported,
 			LintViolations:         d.LintViolations,
+			UnmatchedDropTables:    d.UnmatchedDropTables,
 		}
 		switch {
 		case d.Err != nil:

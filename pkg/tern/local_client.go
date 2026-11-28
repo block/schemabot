@@ -1895,6 +1895,9 @@ func (c *LocalClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*t
 		// caller refuses to discard what it cannot see.
 		ExistingCopies:         c.protoExistingCopies(result, c.runningCopiesForPlan(ctx, result, req.Environment, localPlanTarget(req, c.config.Database))),
 		ExistingCopiesReported: result.ExistingCopiesChecked,
+		// The caller reports a rollout's entry as naming no table only when
+		// every member's diff says so, so each member reports its own.
+		UnmatchedDropTables: result.UnmatchedDropTables,
 	}, nil
 }
 

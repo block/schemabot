@@ -186,10 +186,11 @@ func deploymentDriftPreview(rollup api.PlanRollup) *templates.DeploymentDriftDat
 	}
 	independent := rollup.Planning == api.PlanIndependent
 	data := &templates.DeploymentDriftData{
-		Deployments: entries,
-		Clean:       rollup.Clean,
-		Computed:    true,
-		Independent: independent,
+		Deployments:         entries,
+		Clean:               rollup.Clean,
+		Computed:            true,
+		Independent:         independent,
+		UnmatchedDropTables: rollup.UnmatchedDropTables(),
 	}
 	// Grouping describes the targets that were planned, so it is only meaningful
 	// once every one of them was. A blocked rollup lists each member on its own

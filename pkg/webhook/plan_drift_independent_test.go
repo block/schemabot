@@ -586,3 +586,61 @@ func TestDeploymentPlanGroups_MatchRefusalsAcrossTargetsOnNamespaceAndSteps(t *t
 		})
 	}
 }
+
+// The repository lists legacy_orders under drop_tables, and every target is
+// planned with that list. When one target still has the table and drops it,
+// the comment shows the DROP and says nothing about the entry naming no
+// table, whichever target is the primary. When no target has the table, the
+// comment says the entry drops nothing, once.
+func TestReviewDriftComment_UnmatchedDropTablesOnlyWhenNoTargetHasTheTable(t *testing.T) {
+	const line = "`drop_tables` entry `legacy_orders` names no table on the target"
+	hasTable := func(target string) api.DeploymentPlanDiff {
+		return api.DeploymentPlanDiff{
+			DatabaseType: "mysql", Deployment: "commerce", Target: target,
+			Changes: []*ternv1.SchemaChange{{
+				Namespace: "orders",
+				TableChanges: []*ternv1.TableChange{{
+					TableName: "legacy_orders", Ddl: "DROP TABLE `legacy_orders`",
+					ChangeType: ternv1.ChangeType_CHANGE_TYPE_DROP, Namespace: "orders",
+				}},
+			}},
+		}
+	}
+	lacksTable := func(target string) api.DeploymentPlanDiff {
+		return api.DeploymentPlanDiff{
+			DatabaseType: "mysql", Deployment: "commerce", Target: target,
+			UnmatchedDropTables: []string{"legacy_orders"},
+		}
+	}
+
+	cases := []struct {
+		name     string
+		diffs    []api.DeploymentPlanDiff
+		wantDrop bool
+		wantLine int
+	}{
+		{name: "the primary has the table", diffs: []api.DeploymentPlanDiff{hasTable("orders_a"), lacksTable("orders_b")}, wantDrop: true},
+		{name: "another target has the table", diffs: []api.DeploymentPlanDiff{lacksTable("orders_a"), hasTable("orders_b")}, wantDrop: true},
+		{name: "no target has the table", diffs: []api.DeploymentPlanDiff{lacksTable("orders_a"), lacksTable("orders_b")}, wantLine: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rollup, err := api.RollupDeploymentDiffs(tc.diffs, driftMembers(tc.diffs), api.PlanIndependent)
+			require.NoError(t, err)
+			require.True(t, rollup.Clean)
+
+			out := templates.RenderPlanComment(templates.PlanCommentData{
+				Database:            "orders",
+				Environment:         "staging",
+				IsMySQL:             true,
+				DatabaseType:        "mysql",
+				UnmatchedDropTables: tc.diffs[0].UnmatchedDropTables,
+				DeploymentDrift:     deploymentDriftPreview(rollup),
+			})
+			if tc.wantDrop {
+				assert.Contains(t, out, "DROP TABLE `legacy_orders`", out)
+			}
+			assert.Equal(t, tc.wantLine, strings.Count(out, line), out)
+		})
+	}
+}
