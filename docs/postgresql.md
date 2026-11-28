@@ -1105,43 +1105,9 @@ people keep control of what runs.
 | Tell the user why a change was blocked or refused, in SchemaBot's words | Dropping an invalid index, or ending a backend with `pg_cancel_backend` |
 | Report a failure SchemaBot will retry, and check on it again | The `GRANT` a refusal names, and changes to the `postgres.*` server settings |
 
-Recognize each outcome by its signal:
-
-| Outcome | Signal |
-|---|---|
-| Blocked plan | The plan Check Run fails, and the plan comment names each blocked table with the reason. No flag unblocks it: `--allow-unsafe` accepts a destructive change, but it does not make a blocked change runnable |
-| Refused at apply time | The apply fails and names what to change. Applying the same plan again meets the same refusal |
-| Retryable failure | The apply names what it is waiting for, such as a build that is still running. SchemaBot retries it on the next drive |
-| Changed since review | A table, column, or constraint the plan drops changed after review, so the drop does not run. An automatic apply posts a new plan in a new comment. Nobody has reviewed it, so the agent asks the user before confirming, per the command policy for `apply-confirm` |
-
-When SchemaBot blocks or refuses a change, the agent:
-
-1. Stops. It does not apply again, look for a flag, or try another
-   environment or credential.
-2. Tells the user the reason SchemaBot gave.
-3. Rewrites the schema files into the safe steps the reason names, when it
-   names them, and shows the user the new plan.
-4. Tells the user when no safe form exists, such as for a column type change
-   that rewrites the table. That change needs a separately reviewed process
-   that a person runs.
-
-A plan that drops a column and adds one on the same table is almost always a
-rename, and it deletes the old column's values. The agent says so before
-anyone applies it with `--allow-unsafe`, and offers the add, copy, and
-drop-later steps instead.
-
-A failed index build can leave an invalid index behind. Leave it in place: the
-next apply removes it once it proves no build still holds it. Dropping it by
-hand can race a build the server is still running.
-
-You can copy this into your agent's instructions:
-
-> - If SchemaBot blocks or refuses a PostgreSQL change, stop. Tell me the
->   reason it gave.
-> - You may rewrite the schema files into the safe steps SchemaBot names and
->   plan again. Show me the new plan.
-> - Never run DDL against the database yourself, drop an invalid index, or
->   cancel a backend. Give me the command instead.
+An agent with the [SchemaBot agent skill](ai-agents.md#install-the-agent-skill)
+follows these rules. Its [PostgreSQL](../skills/schemabot/references/refusals-and-failures.md#postgresql) reference has the
+signal of each outcome and what the agent does next.
 
 ## Schema pull
 
