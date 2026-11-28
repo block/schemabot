@@ -2642,8 +2642,7 @@ func TestEngineApplyConcurrentIndexRecoveryFailureIsNotCompletion(t *testing.T) 
 	require.Equal(t, engine.StateFailed, progress.State, "progress: %+v", progress)
 	assert.Equal(t, "refused", progress.Metadata["phase"])
 	assert.False(t, progress.Retryable, "a build the table's rows violate fails the same way on every rerun")
-	assert.Equal(t, `recovering abandoned invalid index "public"."orders_ref_key" failed: `+
-		`index "public"."orders_ref_key" was not built: rows duplicate its key (23505), and its invalid leftover was dropped; `+
+	assert.Equal(t, `index "public"."orders_ref_key" was not built: rows duplicate its key (23505), and its invalid leftover was dropped; `+
 		`correct the rows, then re-run`, progress.ErrorMessage)
 	assert.NotContains(t, progress.ErrorMessage, "ref-collision", "the server's unique-violation text never reaches the operator surface")
 	assertNoInvalidIndexOn(t, db, "orders")

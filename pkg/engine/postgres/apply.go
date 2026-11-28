@@ -1023,16 +1023,39 @@ func dataFaultIndexWording(invalidErr *executor.InvalidIndexError, cleanup *data
 		remedyRest:  ", then re-run",
 	}
 	const rerunRemoves = ", then re-run; the rerun removes the invalid index once it proves no build holds it"
+	const operatorDrops = "an operator must drop it"
 	switch {
-	case cleanup != nil && len(cleanup.dropped) > 0:
-		w.causeAfter += ", and its invalid leftover was dropped"
-	case cleanup != nil && len(cleanup.skipped) > 0:
+	case cleanup != nil && cleanup.cleaned && len(cleanup.skipped) > 0 && len(cleanup.dropped) > 0:
+		// The sweep dropped some entries and stepped over others, and its
+		// report does not say which one was this build's, so the cause
+		// claims neither and names what is left.
+		w.causeAfter += ", and invalid indexes the server refuses to drop concurrently stay quarantined"
+		w.lead = "an operator must drop them"
+		w.remedyRest = fmt.Sprintf(", named %s (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run",
+			quarantinedNames(cleanup.skipped))
+	case cleanup != nil && cleanup.cleaned && len(cleanup.skipped) > 0:
 		w.causeAfter += ", and its invalid leftover, quarantined, " + leftoverStillChecks(invalidErr.Build)
-		w.lead = "an operator must drop it"
+		w.lead = operatorDrops
 		w.remedyRest = fmt.Sprintf(", named %s, since the server refuses to drop it concurrently (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run",
 			quarantinedNames(cleanup.skipped))
+	case cleanup != nil && cleanup.cleaned && len(cleanup.dropped) > 0:
+		w.causeAfter += ", and its invalid leftover was dropped"
 	case cleanup != nil && cleanup.cleaned:
 		w.causeAfter += ", and its invalid leftover was already gone"
+	case cleanup != nil && cleanup.existing != nil:
+		// The drop failed after it found the leftover, possibly after it
+		// quarantined it under a new name, which the rerun's build does not
+		// meet; the operator is pointed at the name it holds now.
+		w.causeAfter += ", and its invalid leftover " + leftoverStillChecks(invalidErr.Build)
+		w.lead = operatorDrops
+		w.remedyRest = fmt.Sprintf(", named %q.%q (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run",
+			cleanup.existing.Schema, cleanup.existing.Index)
+	case cleanup != nil:
+		// The drop failed without saying where the leftover is: it may
+		// still hold the name, or the drop may have quarantined it first.
+		w.causeAfter += ", and its invalid leftover " + leftoverStillChecks(invalidErr.Build)
+		w.lead = operatorDrops
+		w.remedyRest = ", under this name or a pgsprite_abandoned_<oid> name (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run"
 	case errors.Is(invalidErr.Cleanup, executor.ErrBuildLeftInvalidIndex):
 		w.causeAfter += ", and its invalid leftover " + leftoverStillChecks(invalidErr.Build)
 		w.remedyRest = rerunRemoves
@@ -2697,22 +2720,37 @@ func cleanupDataFaultIndex(ctx context.Context, pool *pgxpool.Pool, change nativ
 	report, cleanupErr := concurrentIndex.drop(cleanupCtx, pool, change.sql,
 		executor.ConcurrentBudget{CallerOwned: true})
 	if cleanupErr != nil {
-		logger.Error("PostgreSQL could not remove the invalid index a concurrent build left after failing on the table's rows; it still checks every write",
+		// A drop that fails after it quarantined the entry reports the
+		// entry under its quarantine name; that is where it still checks
+		// writes. A failure typed without an index leaves where it is
+		// uncertain.
+		outcome := &dataFaultIndexCleanupError{err: buildErr, verdict: invalidErr}
+		var cleanupVerdict *executor.InvalidIndexError
+		if errors.As(cleanupErr, &cleanupVerdict) {
+			outcome.existing = cleanupVerdict
+			logger.Error("PostgreSQL could not remove the invalid index a concurrent build left after failing on the table's rows; it still checks every write",
+				"namespace", change.namespace, "table", change.table,
+				"index_schema", cleanupVerdict.Schema, "index", cleanupVerdict.Index,
+				"build_index", invalidErr.Index, "error", cleanupErr)
+			return outcome
+		}
+		logger.Error("PostgreSQL could not remove the invalid index a concurrent build left after failing on the table's rows; it still checks every write under its name or a pgsprite_abandoned_<oid> name",
 			"namespace", change.namespace, "table", change.table,
 			"index_schema", invalidErr.Schema, "index", invalidErr.Index, "error", cleanupErr)
-		return &dataFaultIndexCleanupError{err: buildErr, verdict: invalidErr}
+		return outcome
 	}
 	switch {
+	case len(report.Skipped) > 0:
+		logger.Warn("PostgreSQL left quarantined invalid indexes on the table after a concurrent build failed on the table's rows; the server refuses to drop them concurrently and they still check every write",
+			"namespace", change.namespace, "table", change.table,
+			"index_schema", invalidErr.Schema, "index", invalidErr.Index,
+			"quarantined", quarantinedNames(report.Skipped),
+			"dropped", len(report.Dropped), "skipped", len(report.Skipped), "duration", report.Duration)
 	case len(report.Dropped) > 0:
 		logger.Info("PostgreSQL removed the invalid index a concurrent build left after failing on the table's rows",
 			"namespace", change.namespace, "table", change.table,
 			"index_schema", invalidErr.Schema, "index", invalidErr.Index,
 			"dropped", len(report.Dropped), "duration", report.Duration)
-	case len(report.Skipped) > 0:
-		logger.Warn("PostgreSQL could not drop the invalid index a concurrent build left after failing on the table's rows concurrently; it stays quarantined and still checks every write",
-			"namespace", change.namespace, "table", change.table,
-			"index_schema", invalidErr.Schema, "index", invalidErr.Index,
-			"skipped", len(report.Skipped), "duration", report.Duration)
 	default:
 		logger.Info("PostgreSQL found the invalid index a concurrent build left after failing on the table's rows already gone",
 			"namespace", change.namespace, "table", change.table,
@@ -2735,13 +2773,15 @@ func dataFaultLeftOwnIndex(change nativeApply, invalidErr *executor.InvalidIndex
 // own error, which stays the outcome and stays reachable to errors.As. When
 // the cleanup ran to completion, dropped and skipped are the executor's own
 // account of it, and the detail claims no more than they prove; a cleanup
-// that failed leaves cleaned false and the leftover named as still in place.
+// that failed leaves cleaned false and the leftover named as still in place,
+// under existing when the failure said where it is.
 type dataFaultIndexCleanupError struct {
-	err     error
-	verdict *executor.InvalidIndexError
-	cleaned bool
-	dropped []executor.DroppedIndex
-	skipped []executor.QuarantinedIndex
+	err      error
+	verdict  *executor.InvalidIndexError
+	existing *executor.InvalidIndexError
+	cleaned  bool
+	dropped  []executor.DroppedIndex
+	skipped  []executor.QuarantinedIndex
 }
 
 func (e *dataFaultIndexCleanupError) Error() string { return e.err.Error() }
@@ -3010,13 +3050,18 @@ func nameConcurrentIndexBound(err error, bound, elapsed time.Duration) error {
 // invalid index a failed recovery was clearing, so a failure typed without
 // the index — a lock budget lost to a build still holding the table, a pool
 // too small for the recovery's extra session — still names the entry the
-// retry acts on. A failure that is itself an invalid-index verdict never
-// reaches here: that arm is decided first and already names the index. The
-// prefix is kept short so the remedy's lead survives the narrowest operator
-// surface, which truncates the detail from the tail.
+// retry acts on. A failure that carries an invalid-index verdict of its own,
+// such as the rebuild failing on the table's rows, is left unprefixed: its
+// detail already names the index, and the prefix would push the remedy's
+// lead past the narrowest operator surface, which truncates the detail from
+// the tail.
 func recoveryContextDetail(err error, detail string) string {
 	var recoveryErr *indexRecoveryError
 	if !errors.As(err, &recoveryErr) {
+		return detail
+	}
+	var ownVerdict *executor.InvalidIndexError
+	if errors.As(recoveryErr.err, &ownVerdict) {
 		return detail
 	}
 	return sanitizeReasonText(fmt.Sprintf("recovering abandoned invalid index %q.%q failed: %s",

@@ -1475,6 +1475,10 @@ func TestEveryRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
 			pastFirstStep: true, namesIndex: true},
 		"invalid index the rows violate, left quarantined": {cause: quarantinedDataFaultLeftover(widest),
 			pastFirstStep: true, namesIndex: true},
+		"invalid index the rows violate, beside another quarantined entry": {cause: mixedDataFaultSweep(widest),
+			pastFirstStep: true, namesIndex: true},
+		"invalid index the rows violate, drop failed after quarantining it": {cause: failedDataFaultDrop(widest),
+			pastFirstStep: true, namesIndex: true},
 		"invalid index the rows violate, not proven its own": {cause: &executor.InvalidIndexError{Schema: widest, Index: widest, Table: widest,
 			Build: &pgconn.PgError{Code: "23505"}, Cleanup: executor.ErrAbandonmentUnproven},
 			pastFirstStep: true, namesIndex: true},
@@ -4068,6 +4072,17 @@ func TestRecoveryFailureDetailNamesTheAbandonedIndex(t *testing.T) {
 		assert.Equal(t, executor.CodeInvalidIndexUnproven, got.Code())
 	})
 
+	t.Run("a rebuild that fails on the table's rows keeps its own detail unprefixed", func(t *testing.T) {
+		rows := &executor.InvalidIndexError{Schema: "public", Index: "orders_ref_idx", Table: "orders",
+			Build: &pgconn.PgError{Code: "23505"}, Cleanup: executor.ErrBuildLeftInvalidIndex}
+		err := wrap(&dataFaultIndexCleanupError{err: rows, verdict: rows, cleaned: true,
+			dropped: []executor.DroppedIndex{{Schema: "public", Index: "pgsprite_abandoned_42", IndexOID: 42}}})
+		r := classifyRefusal(err, "orders")
+		require.NotNil(t, r)
+		detail := recoveryContextDetail(err, r.detail)
+		assert.Equal(t, `index "public"."orders_ref_idx" was not built: rows duplicate its key (23505), and its invalid leftover was dropped; correct the rows, then re-run`, detail)
+	})
+
 	t.Run("a failure outside any recovery is left alone", func(t *testing.T) {
 		detail := recoveryContextDetail(errors.New("connection reset"), "PostgreSQL schema change failed; see server logs")
 		assert.Equal(t, "PostgreSQL schema change failed; see server logs", detail)
@@ -4523,6 +4538,27 @@ func quarantinedDataFaultLeftover(name string) error {
 		skipped: []executor.QuarantinedIndex{{Schema: name, Index: "pgsprite_abandoned_42", IndexOID: 42}}}
 }
 
+// mixedDataFaultSweep is quarantinedDataFaultLeftover where the sweep also
+// dropped another entry, so the wording cannot say which one was the build's.
+func mixedDataFaultSweep(name string) error {
+	cleanup := func() *dataFaultIndexCleanupError {
+		target := &dataFaultIndexCleanupError{}
+		_ = errors.As(quarantinedDataFaultLeftover(name), &target)
+		return target
+	}()
+	cleanup.dropped = []executor.DroppedIndex{{Schema: name, Index: "pgsprite_abandoned_41", IndexOID: 41}}
+	return cleanup
+}
+
+// failedDataFaultDrop is a unique build that failed on duplicate rows whose
+// cleanup quarantined the leftover under name and then failed to drop it.
+func failedDataFaultDrop(name string) error {
+	verdict := &executor.InvalidIndexError{Schema: name, Index: name, Table: name,
+		Build: &pgconn.PgError{Code: "23505"}, Cleanup: executor.ErrBuildLeftInvalidIndex}
+	return &dataFaultIndexCleanupError{err: verdict, verdict: verdict,
+		existing: &executor.InvalidIndexError{Schema: name, Index: name, Table: name, Cleanup: executor.ErrInvalidIndexBuildInFlight}}
+}
+
 // A unique build that fails on duplicate rows leaves an invalid index that
 // PostgreSQL still maintains on every write, so it rejects writes that
 // duplicate its key although the live schema declares no such rule. The
@@ -4563,10 +4599,28 @@ func TestBuildIndexConcurrentlyDropsTheIndexADataFaultLeft(t *testing.T) {
 			detail: `index "public"."users_email_idx" was not built: rows duplicate its key (23505), and its invalid leftover, quarantined, still rejects writes that duplicate its key; ` +
 				`an operator must drop it, named "public"."pgsprite_abandoned_42", since the server refuses to drop it concurrently (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run`,
 		},
-		"drop failed": {
+		"dropped one entry and stepped over another": {
+			verdict: own(duplicate), drops: 1,
+			drop: func() (executor.IndexRecoveryReport, error) {
+				return executor.IndexRecoveryReport{
+					Dropped: []executor.DroppedIndex{{Schema: "public", Index: "pgsprite_abandoned_41", IndexOID: 41}},
+					Skipped: []executor.QuarantinedIndex{{Schema: "public", Index: "pgsprite_abandoned_42", IndexOID: 42}},
+				}, nil
+			},
+			detail: `index "public"."users_email_idx" was not built: rows duplicate its key (23505), and invalid indexes the server refuses to drop concurrently stay quarantined; ` +
+				`an operator must drop them, named "public"."pgsprite_abandoned_42" (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run`,
+		},
+		"drop failed after quarantining the leftover": {
+			verdict: own(duplicate), drops: 1,
+			drop: dropFailed(&executor.InvalidIndexError{Schema: "public", Index: "pgsprite_abandoned_42", Table: "users",
+				BuilderPID: 7, Cleanup: executor.ErrInvalidIndexBuildInFlight}),
+			detail: `index "public"."users_email_idx" was not built: rows duplicate its key (23505), and its invalid leftover still rejects writes that duplicate its key; ` +
+				`an operator must drop it, named "public"."pgsprite_abandoned_42" (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run`,
+		},
+		"drop failed without saying where the leftover is": {
 			verdict: own(duplicate), drop: dropFailed(errors.New("lock not granted")), drops: 1,
 			detail: `index "public"."users_email_idx" was not built: rows duplicate its key (23505), and its invalid leftover still rejects writes that duplicate its key; ` +
-				`correct the rows, then re-run; the rerun removes the invalid index once it proves no build holds it`,
+				`an operator must drop it, under this name or a pgsprite_abandoned_<oid> name (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run`,
 		},
 		"not proven its own": {
 			verdict: &executor.InvalidIndexError{Schema: "public", Index: "users_email_idx", Table: "users",
