@@ -1055,7 +1055,7 @@ combined with `--json`.
 
 The first read is not retried: if it fails, the command fails at once. After
 that, following stops with a non-zero exit when the server gives an answer a
-retry cannot change, such as `apply not found` or a refused token. A server it
+retry cannot change, such as an apply ID the server never stored, or a refused token. A server it
 cannot reach is retried with backoff, the same way the watchers retry, and
 following stops with a non-zero exit once polls have kept failing for a few
 minutes in a row. Run the same `logs` command again to keep following: it

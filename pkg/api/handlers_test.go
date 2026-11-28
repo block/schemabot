@@ -1339,6 +1339,26 @@ func TestHandleLogsReportsTruncatedWindow(t *testing.T) {
 	assert.Equal(t, "entry 12", response.Logs[2].Message)
 }
 
+// Logs for an apply ID the server never stored are a typed not_found error
+// that names the ID, so a --json caller can branch on the code and an
+// operator sees which ID to check.
+func TestHandleLogsReportsAnUnknownApplyAsNotFound(t *testing.T) {
+	service := New(&mockStorageWithApplyStores{
+		applies:   &staticApplyStore{},
+		applyLogs: &windowedApplyLogStore{},
+	}, testServerConfig(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-missing", nil)
+	w := httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+
+	require.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
+	var resp apitypes.ErrorResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, apitypes.ErrCodeNotFound, resp.ErrorCode)
+	assert.Equal(t, `no schema change found for apply "apply-missing" on this server`, resp.Error)
+}
+
 // An apply whose whole history fits the window is reported complete, so the
 // truncation marker means something when it does appear.
 func TestHandleLogsReportsCompleteWindow(t *testing.T) {

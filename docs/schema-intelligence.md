@@ -2320,6 +2320,11 @@ older entries exist; increasing the limit reads further back. There is no
 pagination cursor. Remote deployment logs cap the window at 999 entries per
 source, so increasing the limit cannot always recover the whole lifecycle.
 
+An `apply_id` the server never stored answers `404` with `error_code`
+`not_found` and a message that names the ID. `schemabot logs <apply_id>`
+exits non-zero for it, and with `--json` writes
+`{"error": {"code": "not_found", "message": "…"}}` to stdout.
+
 ### Read one target's log
 
 A multi-target apply writes every target's lifecycle into one log. Add
