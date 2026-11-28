@@ -233,7 +233,17 @@ func (h *Handler) recoveryTargetCovered(ctx context.Context, store storage.Webho
 		if err != nil {
 			return false, fmt.Errorf("read observed target delivery: %w", err)
 		}
-		if delivery != nil && delivery.State != storage.WebhookEventSuperseded {
+		if delivery == nil {
+			// The inbox purge deletes finished rows once they pass the
+			// retention age, so the delivery that recorded this target can be
+			// gone. The head is covered and the target has not changed since,
+			// so a missing row is no reason to evaluate the PR again; doing so
+			// would re-plan a planned head or replay a dead-lettered failure.
+			h.logger.Debug("PR target observation names a delivery the webhook inbox no longer holds; the head is covered and the target is unchanged, so no recovery is queued",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "delivery_id", observed.DeliveryID)
+			return true, nil
+		}
+		if delivery.State != storage.WebhookEventSuperseded {
 			if delivery.State != storage.WebhookEventFailed {
 				return true, nil
 			}

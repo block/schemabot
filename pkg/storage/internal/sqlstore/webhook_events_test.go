@@ -400,15 +400,23 @@ func assertPurgeKeepsNewestCoveringRow(t *testing.T, store storage.Storage, db *
 	require.True(t, reopened, "the redelivery reopens the completed row with a fresh received_at")
 	_, err = db.ExecContext(ctx, rebind(`UPDATE webhook_events SET state = ? WHERE delivery_id = ?`), completed, "redelivered-older-head")
 	require.NoError(t, err)
+	// 16: a delivery for the earlier head that arrives after the current head
+	// was planned finds the head moved and ends superseded, so it is not a
+	// newer covering row and the current head's row is kept.
+	seed("before-late-arrival", 16, "head-1", "synchronize", completed, old, old)
+	seed("current-before-late-arrival", 16, "head-2", "synchronize", completed, old, old)
+	seed("late-arrival-earlier-head", 16, "head-1", "synchronize", storage.WebhookEventSuperseded, old, old)
 
 	wantDeleted := []string{
 		"completed-older", "permanent-older", "failed-newest", "superseded-newest",
 		"failed-alone", "superseded-alone", "closed-alone",
+		"before-late-arrival", "late-arrival-earlier-head",
 	}
 	wantKept := []string{
 		"only-completed", "completed-newest", "permanent-newest", "older-than-pending",
 		storage.SynthesizedWebhookDeliveryIDPrefix + "permanent-only", "kept-beneath-failed",
 		"pending-newest", "failed-in-cool-off", "redelivered-older-head", "current-head",
+		"current-before-late-arrival",
 	}
 
 	counted, err := store.WebhookEvents().CountTerminalOlderThan(ctx, retention)
@@ -438,6 +446,7 @@ func assertPurgeKeepsNewestCoveringRow(t *testing.T, store storage.Storage, db *
 	assert.True(t, covered(5, "head-1"), "the covering row beneath uncovering newer rows still covers its head")
 	assert.True(t, covered(10, "head-1"), "a failed row in its cool-off still covers its head")
 	assert.True(t, covered(11, "head-2"), "a redelivered older head must not expose the current head")
+	assert.True(t, covered(16, "head-2"), "a late delivery for an earlier head must not expose the current head")
 
 	// Once the newer row completes, it justifies deleting the older one.
 	assert.True(t, exists("older-than-pending"), "a newer pending row must not justify the delete")
