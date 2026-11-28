@@ -234,6 +234,8 @@ func TestBuildPartitionedIndexDropsTheLeftoverAPartitionDataFaultLeft(t *testing
 		verdict *executor.InvalidIndexError
 		drop    dropScript
 		drops   int
+		// sql replaces the reviewed statement when set.
+		sql string
 		// detail is the data-fault refusal's detail; empty when the
 		// failure is not refused as a data fault.
 		detail string
@@ -254,6 +256,14 @@ func TestBuildPartitionedIndexDropsTheLeftoverAPartitionDataFaultLeft(t *testing
 			drop: dropFailed(errors.New("lock not granted")),
 			detail: `index "public"."users_email_idx_p123" ("users_2026") was not built: rows duplicate its key (23505), and its invalid leftover still rejects writes that duplicate its key; ` +
 				`an operator must drop it, under this name or a pgsprite_abandoned_<oid> name (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run`,
+		},
+		"no drop statement for the partition": {
+			// A statement pg-sprite cannot make a partition's drop from
+			// leaves the leftover under the name its build gave it.
+			verdict: leaf(duplicate, executor.ErrBuildLeftInvalidIndex, "users_2026"),
+			sql:     "CREATE TABLE public.users_archive (id bigint)",
+			detail: `index "public"."users_email_idx_p123" ("users_2026") was not built: rows duplicate its key (23505), and its invalid leftover still rejects writes that duplicate its key; ` +
+				`an operator must drop it, named "public"."users_email_idx_p123" (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run`,
 		},
 		"not a data fault": {
 			verdict: leaf(&pgconn.PgError{Code: "40P01"}, executor.ErrBuildLeftInvalidIndex, "users_2026"),
@@ -278,8 +288,12 @@ func TestBuildPartitionedIndexDropsTheLeftoverAPartitionDataFaultLeft(t *testing
 				func() error { return errors.New("no rebuild is expected") }, drop)
 			scriptPartitionedIndex(t, func(context.Context) error { return tc.verdict })
 
+			change := partitionedIndexChange(time.Hour)
+			if tc.sql != "" {
+				change.sql = tc.sql
+			}
 			err := buildPartitionedIndex(t.Context(), dbconn.Config{}, nil, preflight.PreflightedTable{},
-				partitionedIndexChange(time.Hour), newTestTracker(t), slog.New(slog.DiscardHandler))
+				change, newTestTracker(t), slog.New(slog.DiscardHandler))
 
 			require.Error(t, err)
 			require.Len(t, calls.drop, tc.drops)
