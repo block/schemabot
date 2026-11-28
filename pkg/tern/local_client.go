@@ -2024,15 +2024,20 @@ func (c *LocalClient) planWithEngine(ctx context.Context, req *ternv1.PlanReques
 		return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
 	}
 	if c.config.Type != storage.DatabaseTypeMySQL {
-		// Files that leave out structure the target has can mean "leave it
-		// alone" rather than "remove it", so the engine is handed what
-		// SchemaBot last applied to tell a removed declaration from one never
-		// made. The MySQL family plans everything a file leaves out as a
-		// removal, so it needs no history.
-		applied, err := c.appliedSchemaFiles(ctx, req.Environment, schemaFiles)
-		if err != nil {
-			return nil, err
+		// A PostgreSQL file that leaves out structure the target has can mean
+		// "leave it alone" rather than "remove it", so the engine is handed
+		// what SchemaBot last applied to tell a removed declaration from one
+		// never made. The MySQL family plans everything a file leaves out as a
+		// removal, so no other engine reads the history.
+		var applied schema.SchemaFiles
+		if c.config.Type == storage.DatabaseTypePostgres {
+			var err error
+			applied, err = c.appliedSchemaFiles(ctx, req.Environment, schemaFiles)
+			if err != nil {
+				return nil, err
+			}
 		}
+		var err error
 		engineSchemaFiles := schemaFiles
 		if c.remapsPostgresNamespaces() {
 			engineSchemaFiles, err = c.physicalSchemaFiles(schemaFiles)
@@ -2147,6 +2152,11 @@ func (c *LocalClient) enginePlanRequest(req *ternv1.PlanRequest, database string
 // for no other. An empty environment matches nothing rather than every
 // environment, so a plan that names none never reads another environment's
 // history.
+//
+// Only the newest appliedHistoryWindow completed applies are read, since
+// every plan and every re-plan pays for the walk. A namespace none of them
+// addressed, such as one added since, is treated as never applied: the
+// engine then reads its files as written, as it did before any history.
 func (c *LocalClient) appliedSchemaFiles(ctx context.Context, environment string, schemaFiles schema.SchemaFiles) (schema.SchemaFiles, error) {
 	if environment == "" {
 		c.logger.Debug("plan names no environment; the engine plans without the schema files last applied",
@@ -2168,6 +2178,9 @@ func (c *LocalClient) appliedSchemaFiles(ctx context.Context, environment string
 		return nil, fmt.Errorf("load the applies of database %q in %s: %w", c.config.Database, environment, err)
 	}
 	completed := completedNewestFirst(applies)
+	if len(completed) > appliedHistoryWindow {
+		completed = completed[:appliedHistoryWindow]
+	}
 	applied := make(schema.SchemaFiles)
 	for _, apply := range completed {
 		if len(applied) == len(schemaFiles) {
@@ -2234,6 +2247,10 @@ func (c *LocalClient) appliedPlanIDs(ctx context.Context, apply *storage.Apply) 
 	}
 	return planIDs, nil
 }
+
+// appliedHistoryWindow bounds how many completed applies, newest first, a
+// plan reads for the files SchemaBot last applied.
+const appliedHistoryWindow = 25
 
 // completedNewestFirst returns the completed applies of applies, the most
 // recently completed first.

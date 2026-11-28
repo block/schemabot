@@ -59,8 +59,27 @@ func TestEnginePlanRefusesRowSecurityTheFileNoLongerDeclares(t *testing.T) {
 		var refused *engine.PlanRefusedError
 		require.True(t, errors.As(err, &refused), "a removed declaration is a refusal the file's author fixes: %v", err)
 		assert.Contains(t, err.Error(), `"public"/"h_plain.sql"`)
-		assert.Contains(t, err.Error(), `add ALTER TABLE "h_plain" DISABLE ROW LEVEL SECURITY; to turn off row level security and drop policy "read all" on table "h_plain", or put the file's row security clauses back to keep them`)
-		assert.Contains(t, err.Error(), `SchemaBot applied them, and a file without row security clauses leaves them in place`)
+		assert.Contains(t, err.Error(), `add ALTER TABLE "h_plain" DISABLE ROW LEVEL SECURITY; to turn off row level security and drop policy "read all" on table "h_plain", or declare the row security the table keeps`)
+		assert.Contains(t, err.Error(), `The schema file SchemaBot last applied declared this table's row security, and a file without row security clauses leaves it as it is`)
+	})
+
+	// Each form of row security declaration counts: ENABLE with FORCE, and
+	// a DISABLE the table has since lost to a hand-enabled policy. The
+	// refusal claims only that the file declared the table's row security,
+	// which holds for both.
+	t.Run("every row security declaration counts", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		reset(t, ctx)
+		for name, file := range map[string]string{
+			"ENABLE with FORCE": plainTable + ` ALTER TABLE h_plain ENABLE ROW LEVEL SECURITY; ALTER TABLE h_plain FORCE ROW LEVEL SECURITY;`,
+			"DISABLE alone":     plainRLSDisabled,
+		} {
+			_, err := plan(t, ctx, plainTable, appliedWith(file))
+			var refused *engine.PlanRefusedError
+			require.True(t, errors.As(err, &refused), "%s: %v", name, err)
+			assert.Contains(t, err.Error(), `on table "h_plain"`, name)
+		}
 	})
 
 	t.Run("a file under a new name is matched by its table", func(t *testing.T) {

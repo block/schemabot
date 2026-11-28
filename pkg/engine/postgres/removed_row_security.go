@@ -24,7 +24,10 @@ import (
 // refused instead, naming the two ways to say what the file means.
 
 // rowSecurityLastApplied returns the tables of namespace whose schema file,
-// in the files last applied, declared row security. A stored file that no
+// in the files last applied, declared row security. A file that declared
+// only DISABLE ROW LEVEL SECURITY counts too: its author managed the table's
+// row security, so a later file that drops the declaration while the table
+// has row security again is just as ambiguous. A stored file that no
 // longer parses is logged and skipped: it was admitted when it was applied,
 // and refusing every later plan over it would leave no plan that could
 // replace it.
@@ -77,8 +80,8 @@ type removedRowSecurityError struct {
 }
 
 func (e *removedRowSecurityError) Error() string {
-	return fmt.Sprintf("add ALTER TABLE %s DISABLE ROW LEVEL SECURITY; to %s on table %q, or put the file's row security clauses back to keep them. "+
-		"SchemaBot applied them, and a file without row security clauses leaves them in place",
+	return fmt.Sprintf("add ALTER TABLE %s DISABLE ROW LEVEL SECURITY; to %s on table %q, or declare the row security the table keeps. "+
+		"The schema file SchemaBot last applied declared this table's row security, and a file without row security clauses leaves it as it is",
 		pgx.Identifier{e.table}.Sanitize(), removalOf(e.live), e.table)
 }
 

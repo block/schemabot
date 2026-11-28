@@ -2,6 +2,8 @@ package tern
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"testing"
 	"time"
@@ -9,6 +11,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/engine"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -123,4 +127,80 @@ func TestAppliedSchemaFilesTakesEachNamespaceFromItsLastCompletedApply(t *testin
 	none, err := client.appliedSchemaFiles(t.Context(), "staging", schema.SchemaFiles{"billing": audit})
 	require.NoError(t, err)
 	assert.Nil(t, none, "a namespace no completed apply covered has no files last applied")
+}
+
+// A plan reads only the newest completed applies for the files last applied.
+// A namespace that only an older apply covered is treated as never applied,
+// so a plan never walks the whole history.
+func TestAppliedSchemaFilesReadsOnlyTheNewestApplies(t *testing.T) {
+	now := time.Now()
+	history := &appliedHistoryStorage{plans: map[int64]*storage.Plan{}}
+	for i := range appliedHistoryWindow + 1 {
+		id := int64(i + 1)
+		completed := now.Add(-time.Duration(i) * time.Minute)
+		history.applies = append(history.applies, &storage.Apply{
+			ID: id, ApplyIdentifier: fmt.Sprintf("apply-%d", id), PlanID: id,
+			State: state.Apply.Completed, CompletedAt: &completed,
+		})
+		history.plans[id] = &storage.Plan{SchemaFiles: schema.SchemaFiles{"public": appliedNamespace("users.sql", fmt.Sprintf("-- v%d", id))}}
+	}
+	oldest := history.applies[appliedHistoryWindow]
+	history.plans[oldest.PlanID].SchemaFiles["billing"] = appliedNamespace("invoices.sql", "CREATE TABLE invoices (id bigint)")
+	client := &LocalClient{
+		config:  LocalConfig{Database: "testapp", Type: storage.DatabaseTypePostgres},
+		storage: history,
+		logger:  slog.Default(),
+	}
+
+	applied, err := client.appliedSchemaFiles(t.Context(), "staging", schema.SchemaFiles{
+		"public":  appliedNamespace("users.sql", ""),
+		"billing": appliedNamespace("invoices.sql", ""),
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, schema.SchemaFiles{"public": appliedNamespace("users.sql", "-- v1")}, applied,
+		"billing, covered only by an apply past the window, reads as never applied")
+}
+
+// historyUnavailableStorage fails every read of apply history.
+type historyUnavailableStorage struct{ storage.Storage }
+
+func (historyUnavailableStorage) Applies() storage.ApplyStore { return historyUnavailableApplies{} }
+
+type historyUnavailableApplies struct{ storage.ApplyStore }
+
+func (historyUnavailableApplies) GetByDatabase(context.Context, string, string, string) ([]*storage.Apply, error) {
+	return nil, errors.New("apply history unavailable")
+}
+
+// Only PostgreSQL reads the files last applied, so a Vitess plan neither pays
+// for the history nor fails when it cannot be read.
+func TestPlanWithEngineReadsAppliedHistoryOnlyForPostgres(t *testing.T) {
+	var seen *engine.PlanRequest
+	eng := fakePlanEngine{planFn: func(_ context.Context, req *engine.PlanRequest) (*engine.PlanResult, error) {
+		seen = req
+		return &engine.PlanResult{NoChanges: true}, nil
+	}}
+	files := schema.SchemaFiles{"commerce": appliedNamespace("users.sql", "CREATE TABLE users (id bigint)")}
+	req := &ternv1.PlanRequest{Environment: "staging"}
+
+	vitess := &LocalClient{
+		config:            LocalConfig{Database: "testapp", Type: storage.DatabaseTypeVitess},
+		planetscaleEngine: eng,
+		storage:           historyUnavailableStorage{},
+		logger:            slog.Default(),
+	}
+	_, err := vitess.planWithEngine(t.Context(), req, "testapp", files)
+	require.NoError(t, err, "a Vitess plan does not read apply history")
+	require.NotNil(t, seen)
+	assert.Nil(t, seen.AppliedSchemaFiles)
+
+	postgres := &LocalClient{
+		config:         LocalConfig{Database: "testapp", Type: storage.DatabaseTypePostgres},
+		postgresEngine: eng,
+		storage:        historyUnavailableStorage{},
+		logger:         slog.Default(),
+	}
+	_, err = postgres.planWithEngine(t.Context(), req, "testapp", files)
+	require.ErrorContains(t, err, "apply history unavailable", "a PostgreSQL plan fails closed without its history")
 }
