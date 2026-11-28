@@ -575,6 +575,28 @@ and `TestGitHubAppPermissionsAreRequiredOrGatedByConfig`
 (`pkg/api/github_app_permissions_test.go`), which fails when the setup guide lists a permission that
 is neither one existing installs grant nor optional behind a server config key.
 
+### AV-18: SchemaBot deletes its own rows only once nothing still reads them
+
+SchemaBot deletes a row from its own storage only when the work the row records is finished and no
+reader still depends on it. Work that is still waiting, running, or retrying is never deleted, and
+neither is the newest finished row a reader treats as proof the work was done. An older finished
+row may go once a newer one proves the same thing; a reader that misses it can only do work again,
+never skip work. Deletion runs from the
+maintenance loop, never from a request handler, and each delete repeats its own eligibility test, so
+the rule holds even when two instances delete at once.
+
+*Breaks if violated:* an acknowledged delivery is lost before it runs (AV-7), or the webhook
+reconciler finds no proof that a pull request's head was planned and plans it again, replaying a
+failure that was dead-lettered on purpose. *Enforced:* the storage retention pass
+(`pkg/api/storage_retention.go`); the purge predicate `webhookPurgeCandidate`, which deletes only
+terminal rows and keeps the newest row covering each pull request
+(`pkg/storage/internal/sqlstore/webhook_events.go`); `StorageRetentionWebhookEvents`
+(`pkg/api/config.go`), which refuses a webhook inbox window shorter than GitHub's redelivery limit;
+`validateStorageRetentionWindows` (`pkg/serve/serve.go`, called from `Build`), which refuses to
+start with a window shorter than `ReconcileInboxCoverageWindow` (`pkg/webhook/durable_reconcile.go`);
+and `TestStorageRetentionPassPurgesOnlyOldFinishedRowsOnMySQL` and its PostgreSQL
+twin (`pkg/api/storage_retention_integration_test.go`).
+
 ## Merge gate (MG)
 
 The GitHub Check Run gate is the tier-0 safety feature: it is what stands between a schema PR

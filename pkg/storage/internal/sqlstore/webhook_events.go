@@ -809,7 +809,10 @@ func webhookPurgeCandidateArgs() []any {
 // a row that Redeliver reopened, or that a newer covering row no longer
 // justifies deleting, between the two statements is not deleted. The
 // predicate sits in a derived table because MySQL rejects a DELETE whose
-// subquery reads the table it deletes from.
+// subquery reads the table it deletes from. The row's own age and state are
+// also tested on the DELETE's target: when a Redeliver that reopened the row
+// commits while the DELETE waits for its lock, PostgreSQL re-reads only the
+// target row against the DELETE's own conditions, not the subquery's.
 func (s *webhookEventStore) DeleteTerminalOlderThan(ctx context.Context, age time.Duration, limit int) (int64, error) {
 	if age.Microseconds() <= 0 {
 		return 0, fmt.Errorf("delete terminal webhook events: age must be positive, got %s", age)
@@ -854,12 +857,15 @@ func (s *webhookEventStore) DeleteTerminalOlderThan(ctx context.Context, age tim
 		s.hooks.afterPurgeSelect()
 	}
 
-	deleteArgs := make([]any, 0, len(ids)+len(webhookPurgeCandidateArgs()))
+	deleteArgs := make([]any, 0, len(storage.WebhookEventStatesTerminal)+len(ids)+len(webhookPurgeCandidateArgs()))
+	deleteArgs = append(deleteArgs, stringArgs(storage.WebhookEventStatesTerminal)...)
 	deleteArgs = append(deleteArgs, ids...)
 	deleteArgs = append(deleteArgs, webhookPurgeCandidateArgs()...)
 	result, err := s.db.ExecContext(ctx, `
 		DELETE FROM webhook_events
-		WHERE id IN (
+		WHERE received_at < `+cutoff+`
+			AND state IN (`+placeholders(len(storage.WebhookEventStatesTerminal))+`)
+			AND id IN (
 			SELECT purgeable.id FROM (
 				SELECT c.id AS id
 				FROM webhook_events c
