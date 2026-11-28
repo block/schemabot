@@ -103,6 +103,9 @@ type Server struct {
 	proxyAdvertiseHost string         // host in password responses (may differ from bind host)
 	portAlloc          *portAllocator // nil when using OS-assigned ports
 	proxyPortMap       map[int]int    // internal container port → external host port; populated by the testcontainer's POST /admin/proxy-port-map endpoint after container startup
+	// proxyPortOffset translates a bound proxy port to the host port it is
+	// published on when no proxyPortMap entry names it; zero leaves it as bound.
+	proxyPortOffset int
 
 	// edgeAddrs maps "org/database" → edge proxy listen address for vtgate MySQL.
 	// In production PlanetScale, this is the "Edge" — the public MySQL endpoint
@@ -163,6 +166,12 @@ type Config struct {
 	ProxyHost          string // Bind host for branch proxies (default: "0.0.0.0" standalone, "127.0.0.1" test)
 	ProxyAdvertiseHost string // Override host in password responses (default: derived from request Host header)
 	ProxyPortRange     [2]int // [start, end] port range (default: [19100, 19199] standalone, [0,0] = OS-assigned test)
+	// ProxyAdvertisePortStart is the host port the first port of ProxyPortRange
+	// is published on, when the whole range is published as one block at an
+	// offset. Each proxy port is then advertised at the same offset, from the
+	// moment the server starts, so a restarted container never hands out a
+	// port only the container can reach. Zero advertises the ports as bound.
+	ProxyAdvertisePortStart int
 	// BranchTLSMode controls TLS on branch proxy endpoints, matching PlanetScale behavior.
 	//   - "none" (default): plain TCP
 	//   - "tls": server-side TLS with self-signed certs (matches vanilla PlanetScale)
@@ -322,6 +331,10 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		proxyHost = "127.0.0.1"
 	}
 	proxyAdvertiseHost := cfg.ProxyAdvertiseHost // empty = derive from request Host header
+	proxyPortOffset, err := advertisedPortOffset(cfg.ProxyAdvertisePortStart, proxyPortRange)
+	if err != nil {
+		return nil, err
+	}
 	var pa *portAllocator
 	if proxyPortRange[0] > 0 && proxyPortRange[1] >= proxyPortRange[0] {
 		pa = newPortAllocator(proxyPortRange[0], proxyPortRange[1])
@@ -352,6 +365,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		activeDeployCancels:   make(map[deployRequest]activeDeployExecution),
 		proxyHost:             proxyHost,
 		proxyAdvertiseHost:    proxyAdvertiseHost,
+		proxyPortOffset:       proxyPortOffset,
 		portAlloc:             pa,
 		shutdownCtx:           shutdownCtx,
 		shutdownCancel:        shutdownCancel,
@@ -884,16 +898,19 @@ func (s *Server) proxyAdvertiseAddr(proxy *branchProxy, r *http.Request) string 
 		return addr
 	}
 
-	// Translate internal → external port if a port map is configured.
-	s.proxyMu.Lock()
-	if s.proxyPortMap != nil {
-		if internalPort, err := strconv.Atoi(proxyPort); err == nil {
-			if externalPort, ok := s.proxyPortMap[internalPort]; ok {
-				proxyPort = strconv.Itoa(externalPort)
-			}
+	// Translate internal → external port: a posted port map entry wins, then
+	// the configured offset of the published block.
+	if internalPort, err := strconv.Atoi(proxyPort); err == nil {
+		s.proxyMu.Lock()
+		externalPort, mapped := s.proxyPortMap[internalPort]
+		s.proxyMu.Unlock()
+		switch {
+		case mapped:
+			proxyPort = strconv.Itoa(externalPort)
+		case s.proxyPortOffset != 0:
+			proxyPort = strconv.Itoa(internalPort + s.proxyPortOffset)
 		}
 	}
-	s.proxyMu.Unlock()
 
 	// Explicit override takes priority.
 	if s.proxyAdvertiseHost != "" {
@@ -1119,6 +1136,22 @@ func (s *Server) initMetadata(ctx context.Context) error {
 func (s *Server) handleGetEdges(w http.ResponseWriter, _ *http.Request) error {
 	s.writeJSON(w, s.edgeAddrs)
 	return nil
+}
+
+// advertisedPortOffset is the distance from each bound proxy port to the host
+// port it is published on, given the host port the range's first port is
+// published on. The published block must fit in the port space.
+func advertisedPortOffset(advertiseStart int, portRange [2]int) (int, error) {
+	if advertiseStart == 0 {
+		return 0, nil
+	}
+	if portRange[0] <= 0 || portRange[1] < portRange[0] {
+		return 0, fmt.Errorf("proxy_advertise_port_start %d needs a fixed proxy port range", advertiseStart)
+	}
+	if last := advertiseStart + portRange[1] - portRange[0]; advertiseStart < 1 || last > 65535 {
+		return 0, fmt.Errorf("proxy_advertise_port_start %d publishes the proxy range past port 65535", advertiseStart)
+	}
+	return advertiseStart - portRange[0], nil
 }
 
 // handleProxyPortMap sets the internal → external port mapping for branch proxies.

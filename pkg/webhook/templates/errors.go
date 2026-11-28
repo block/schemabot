@@ -2,7 +2,6 @@ package templates
 
 import (
 	"fmt"
-	"html"
 	"strings"
 	"text/template"
 
@@ -625,10 +624,10 @@ func RenderGenericError(data SchemaErrorData) string {
 		return offerSupportChannel(refusal)
 	}
 	// The error detail is untrusted engine or infrastructure error text:
-	// sanitize it, escape HTML, and keep a multi-line message inside the
-	// blockquote so it cannot leak endpoints, inject markup, or escape into
-	// the surrounding comment structure.
-	data.ErrorDetail = quoteBlockLines(html.EscapeString(sanitizeCommentError(data.ErrorDetail)))
+	// sanitize it, escape HTML, write mentions as code, and keep a multi-line
+	// message inside the blockquote so it cannot leak endpoints, inject markup,
+	// notify anyone, or escape into the surrounding comment structure.
+	data.ErrorDetail = quoteBlockLines(errorDetailMarkdown(sanitizeCommentError(data.ErrorDetail)))
 	return offerSupportChannel(renderTemplate(tmplGenericError, data))
 }
 

@@ -8,9 +8,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"go/ast"
-	"go/parser"
-	"go/token"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,7 +15,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -292,7 +288,7 @@ func vitessDemo() Demo {
 		})
 	}
 	plan := renderPlan(false)
-	confirm := renderPlan(true) + applyPrompt()
+	confirm := renderPlan(true) + t.ApplyPrompt
 	frames := []Frame{
 		{3, "schemabot plan -s ./schema -e staging", "Review the change for the commerce keyspace", plan},
 		{2, "schemabot apply -s ./schema -e staging --defer-deploy", "Review the plan before creating the deploy request", confirm + "▌"},
@@ -320,7 +316,7 @@ func freezeDemo() Demo {
 		t.WriteEnvironmentHeader("production")
 		t.WriteNamespaceChanges([]t.NamespaceChange{{Namespace: "shop", Changes: changes}}, true, "shop", schema.DialectMySQL)
 		t.WritePlanSummary(changes)
-	}) + applyPrompt()
+	}) + t.ApplyPrompt
 	freeze := apitypes.Freeze{
 		ID: "freeze-abc", Environment: "production", Kind: "on_demand", Running: "continue",
 		StartsAt: time.Date(2026, 1, 15, 14, 30, 0, 0, time.UTC), Reason: "Holiday code freeze",
@@ -343,40 +339,6 @@ func freezeDemo() Demo {
 		{4, `schemabot unfreeze freeze-abc --reason "Holidays are over"`, "The holidays are over: lift the freeze", lifted},
 	}
 	return Demo{Name: "cli-freeze", Title: "Freeze production for a code freeze or an incident", Height: 740, Bar: "shop · production", Frames: frames}
-}
-
-// Read the confirmation text from the actual apply command so this fixture
-// fails when the command stops using that prompt rather than silently drifting.
-func applyPrompt() string {
-	_, file, _, _ := runtime.Caller(0)
-	source, err := parser.ParseFile(token.NewFileSet(), filepath.Join(filepath.Dir(file), "../commands/apply.go"), nil, 0)
-	if err != nil {
-		panic(err)
-	}
-	var prompt string
-	ast.Inspect(source, func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		name, ok := call.Fun.(*ast.Ident)
-		if !ok || name.Name != "confirmAction" {
-			return true
-		}
-		literal, ok := call.Args[0].(*ast.BasicLit)
-		if !ok {
-			panic("apply prompt is no longer a literal")
-		}
-		prompt, err = strconv.Unquote(literal.Value)
-		if err != nil {
-			panic(err)
-		}
-		return false
-	})
-	if prompt == "" {
-		panic("apply confirmation not found")
-	}
-	return prompt
 }
 
 // followLogView uses the actual logs command, API client, and colored formatter.
@@ -959,7 +921,7 @@ func rolloutStopDemo() Demo {
 // splitAtConfirmation separates the plan and prompt the apply command printed
 // from what it printed once confirmed, so the renderer can type the answer.
 func splitAtConfirmation(output string) (string, string) {
-	prompt := applyPrompt()
+	prompt := t.ApplyPrompt
 	before, after, found := strings.Cut(output, prompt)
 	if !found {
 		panic("apply prompt missing: " + output)
@@ -1030,7 +992,7 @@ func main() {
 		})
 	}
 	plan := renderPlan(false)
-	confirm := renderPlan(true) + applyPrompt()
+	confirm := renderPlan(true) + t.ApplyPrompt
 	demos := []Demo{{Name: "cli-plan-apply", Title: "Review the plan. Follow the change.", Frames: []Frame{
 		{4, "schemabot plan -s ./schema -e staging", "See the DDL before running it", plan},
 		{2, "schemabot apply -s ./schema -e staging", "Review the plan and type yes to confirm", confirm + "▌"},

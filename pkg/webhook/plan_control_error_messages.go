@@ -4,6 +4,11 @@ import (
 	"errors"
 	"fmt"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
 )
 
@@ -65,6 +70,53 @@ func planHeadVerificationFailedMessage(database string) string {
 		return planNotStartedMessage("read the latest commit of this pull request")
 	}
 	return planNotStartedMessage(fmt.Sprintf("read the latest commit of this pull request for `%s`", database))
+}
+
+// controlOperationFailureMessage is the PR comment detail for a control command
+// whose operation returned an error. A rejection or failure that carries text
+// SchemaBot wrote for the requester is shown as it stands, and a remote data
+// plane that did not answer is named as such. Any other failure's text can
+// carry storage, driver, or engine detail, so it stays in the server log and
+// the line names only the command and what to do next. The command may
+// already be recorded and carried out by the apply's driver, so the line
+// asks the requester to check the apply before running the command again.
+func controlOperationFailureMessage(err error, command, applyID, environment string) string {
+	if message, ok := stopUnsupportedMessage(api.ControlOperationErrorCode(err), applyID, environment); ok {
+		return message
+	}
+	if message, ok := api.AuthoredControlFailureMessage(err); ok {
+		return message
+	}
+	if remoteErr, ok := errors.AsType[*api.RemoteDeploymentUnavailableError](err); ok {
+		return userFacingRemoteUnavailableError(remoteErr.Deployment, remoteErr.Target)
+	}
+	if status.Code(err) == codes.Unavailable {
+		return userFacingRemoteUnavailableError("", "")
+	}
+	return fmt.Sprintf("SchemaBot could not complete the %s command for apply `%s`. "+
+		"It may already be recorded, so check the progress comment for this apply before running the command again; "+
+		"the SchemaBot server logs have the cause.", command, applyID)
+}
+
+// stopUnsupportedMessage is the PR comment line for a stop refused because
+// the engine cannot pause the schema change, from the refusal's error code.
+// The server's message names CLI commands, and progress is not a PR comment
+// command, so the line names cancel as the comment to post and otherwise
+// points at the progress comment, which follows the apply to its end.
+func stopUnsupportedMessage(code, applyID, environment string) (string, bool) {
+	cancel := fmt.Sprintf("`schemabot cancel %s -e %s`", applyID, environment)
+	follow := fmt.Sprintf("the progress comment for apply `%s` follows it to the end", applyID)
+	switch code {
+	case apitypes.ErrCodeStopUnsupportedCancel:
+		return "This schema change can't be paused. To end it, comment " + cancel + ".", true
+	case apitypes.ErrCodeStopUnsupportedFinishes:
+		return "This schema change can't be paused, and it finishes on its own; " + follow + ".", true
+	case apitypes.ErrCodeStopUnsupported:
+		return "This schema change can't be paused. If it is a single index build, end it by commenting " + cancel +
+			". Anything else finishes on its own, and " + follow + ".", true
+	default:
+		return "", false
+	}
 }
 
 // controlApplyLookupFailedMessage is the PR comment line for a control command

@@ -7,7 +7,7 @@
 #   CGO_ENABLED=0 GOOS=linux go build -o bin/localscale-linux-$(go env GOARCH) ./cmd/localscale
 #   docker build -f deploy/local/Dockerfile.localscale -t localscale:latest .
 
-FROM ghcr.io/block/vitess/vttestserver:24.0.5-block.2-mysql84
+FROM ghcr.io/block/vitess/vttestserver:24.0.5-block.3-mysql84
 
 # The binary is cross-compiled outside this file rather than in a build stage,
 # so each platform's leg copies in the binary built for it. TARGETARCH is the

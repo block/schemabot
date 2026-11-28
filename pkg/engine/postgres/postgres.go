@@ -62,6 +62,7 @@ type Engine struct {
 	// the production value.
 	optimisticApplyCeiling     time.Duration
 	concurrentIndexMaxDuration time.Duration
+	validateMaxDuration        time.Duration
 
 	// execute is a test seam standing in for executeOptimistic, so the apply
 	// drive — accept, claim, execute, terminal publish — can be exercised
@@ -89,6 +90,14 @@ type trackedApply struct {
 	// PostgreSQL change an operator can cancel, so the shape decides the
 	// answer before any server is asked.
 	cancellableBuild bool
+	// haltable records that a shutdown or a drive handing the apply back
+	// ends this apply's work rather than waiting for it: an index build or a
+	// constraint validation, which can run for hours. It is wider than
+	// cancellableBuild, which decides only what an operator can cancel.
+	haltable bool
+	// validationBound is set for a constraint validation: how long its scan
+	// may run before it is cut off.
+	validationBound time.Duration
 	// partitionedBuild records that the build runs one concurrent build per
 	// partition. A cancel signal reaches only the partition build in flight,
 	// which can finish before the signal lands, so Cancel also ends the
@@ -144,12 +153,23 @@ const DefaultConcurrentIndexMaxDuration = 24 * time.Hour
 // is not a build anyone waits for; it is the absence of a bound.
 const MaxConcurrentIndexMaxDuration = time.Duration(math.MaxInt32) * time.Millisecond
 
+// DefaultValidateMaxDuration bounds one VALIDATE CONSTRAINT scan. The scan
+// takes SHARE UPDATE EXCLUSIVE, so reads and writes continue through it, and
+// on a large table it is long by design, like a concurrent index build.
+const DefaultValidateMaxDuration = 24 * time.Hour
+
 // MinConcurrentIndexMaxDuration is the smallest bound the engine accepts for
 // one concurrent index build: statement_timeout is an integer millisecond
 // count, so anything shorter rounds to zero on the server, which disables
 // the timer instead of tightening it. The executor refuses such a budget as
 // unbounded; the engine never hands it one.
 const MinConcurrentIndexMaxDuration = time.Millisecond
+
+// MinValidateMaxDuration is the smallest bound the engine accepts for one
+// VALIDATE CONSTRAINT scan. The validation's lock wait gets half its bound
+// when the bound is shorter than the lock budget, and that half has to be a
+// whole millisecond for the server to honor it.
+const MinValidateMaxDuration = 2 * time.Millisecond
 
 // New creates a new PostgreSQL engine.
 func New() *Engine {
@@ -193,7 +213,27 @@ func NewWithOptions(tableSizeLimit int64, concurrentIndexMaxDuration time.Durati
 		tableSizeLimit:             tableSizeLimit,
 		optimisticApplyCeiling:     optimisticApplyCeiling,
 		concurrentIndexMaxDuration: concurrentIndexMaxDuration,
+		validateMaxDuration:        DefaultValidateMaxDuration,
 	}
+}
+
+// WithValidateMaxDuration sets the bound one VALIDATE CONSTRAINT scan runs
+// under. It is normalized as NewWithOptions normalizes the concurrent index
+// bound: a bound that is not positive adopts DefaultValidateMaxDuration, and
+// one outside what the server's statement_timeout can hold is clamped into
+// range. Server config validation refuses those values before they reach
+// here.
+func (e *Engine) WithValidateMaxDuration(d time.Duration) *Engine {
+	switch {
+	case d <= 0:
+		d = DefaultValidateMaxDuration
+	case d < MinValidateMaxDuration:
+		d = MinValidateMaxDuration
+	case d > MaxConcurrentIndexMaxDuration:
+		d = MaxConcurrentIndexMaxDuration
+	}
+	e.validateMaxDuration = d
+	return e
 }
 
 // NewForTarget creates a PostgreSQL engine with the target information needed
@@ -221,6 +261,12 @@ func (e *Engine) TableSizeLimit() int64 {
 // runs under, for wiring verification and observability.
 func (e *Engine) ConcurrentIndexMaxDuration() time.Duration {
 	return e.concurrentIndexMaxDuration
+}
+
+// ValidateMaxDuration exposes the bound one VALIDATE CONSTRAINT scan runs
+// under, for wiring verification and observability.
+func (e *Engine) ValidateMaxDuration() time.Duration {
+	return e.validateMaxDuration
 }
 
 // Name returns the engine identifier.
@@ -319,6 +365,10 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		schemaChange := engine.SchemaChange{Namespace: namespace}
 		files := sortedKeys(ns.Files)
 		desiredTables := make(map[string]bool, len(files))
+		// rowSecurityTables are the tables whose file declares row security,
+		// so the rollback baseline declares their live row security too, even
+		// when the live table has none.
+		rowSecurityTables := make(map[string]bool)
 		// Enum label additions lead the namespace's changes, whichever file
 		// sorts first. The apply runs the changes one at a time in this
 		// order, each committed before the next starts, so every label the
@@ -339,22 +389,37 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 				enumChanges = append(enumChanges, changes...)
 				continue
 			}
+			var report pgplan.Report
+			var table string
 			if rowSecurity, ok := file.RowSecurity(); ok {
-				rlsChanges, err := planRowSecurityOperation(ctx, pool, namespace, rowSecurity)
+				rowSecurityTables[rowSecurity.Table()] = true
+				// A file whose row security matches the live table plans its
+				// table definition like any other file, below. A row security
+				// delta, or a table that does not exist yet, is one reviewed
+				// operation of its own.
+				tableReport, matched, err := planRowSecurityTableDefinition(ctx, pool, namespace, rowSecurity)
 				if err != nil {
 					return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
 				}
-				desiredTables[file.Table()] = true
-				schemaChange.TableChanges = append(schemaChange.TableChanges, rlsChanges...)
-				continue
-			}
-			desired, ok := file.Schema()
-			if !ok {
-				return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: the parse admitted no planner input", namespace, filename)
-			}
-			report, table, err := planPostgresDefinition(ctx, pool, namespace, desired)
-			if err != nil {
-				return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
+				if !matched {
+					rlsChanges, err := planRowSecurityOperation(ctx, pool, namespace, rowSecurity, tableOwner)
+					if err != nil {
+						return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
+					}
+					desiredTables[file.Table()] = true
+					schemaChange.TableChanges = append(schemaChange.TableChanges, rlsChanges...)
+					continue
+				}
+				report, table = tableReport, rowSecurity.Table()
+			} else {
+				desired, ok := file.Schema()
+				if !ok {
+					return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: the parse admitted no planner input", namespace, filename)
+				}
+				report, table, err = planPostgresDefinition(ctx, pool, namespace, desired)
+				if err != nil {
+					return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
+				}
 			}
 			desiredTables[table] = true
 			crossNamespace, err := crossNamespaceForeignKeysForDrops(ctx, pool, namespace, report)
@@ -414,7 +479,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			// Only a namespace with changes needs a rollback baseline, so
 			// the render is paid once per changed namespace rather than for
 			// every namespace the schema files declare.
-			schemaChange.OriginalFiles, schemaChange.RollbackBlockers, err = captureOriginalFiles(ctx, pool, req.Database, namespace, desiredTables, ignored)
+			schemaChange.OriginalFiles, schemaChange.RollbackBlockers, err = captureOriginalFiles(ctx, pool, req.Database, namespace, desiredTables, rowSecurityTables, ignored)
 			schemaChange.OriginalFilesCaptured = len(schemaChange.RollbackBlockers) == 0
 			if err != nil {
 				return nil, err
@@ -476,8 +541,8 @@ func refuseTableDeclaredTwice(namespace string, files map[string]pgstatement.Des
 // not, so its cost grows with the namespace rather than with the change; the
 // introspections run concurrently within the pool's ceiling, so the wall
 // time grows more slowly than the table count does.
-func captureOriginalFiles(ctx context.Context, pool *pgxpool.Pool, database, namespace string, declared map[string]bool, ignored engine.IgnoredTables) (files map[string]string, blockers []engine.RollbackBlocker, err error) {
-	originalTables, renderErrors, err := renderPostgresTables(ctx, pool, database, namespace, rollbackBaseline(declared, ignored))
+func captureOriginalFiles(ctx context.Context, pool *pgxpool.Pool, database, namespace string, declared, rowSecurityDeclared map[string]bool, ignored engine.IgnoredTables) (files map[string]string, blockers []engine.RollbackBlocker, err error) {
+	originalTables, renderErrors, err := renderPostgresTables(ctx, pool, database, namespace, rollbackBaseline(declared, rowSecurityDeclared, ignored))
 	if err != nil {
 		return nil, nil, fmt.Errorf("capture original PostgreSQL schema in namespace %q: %w", namespace, err)
 	}
@@ -606,16 +671,22 @@ func tableChanges(report pgplan.Report, crossNamespaceForeignKeys []string, pars
 			if err != nil {
 				return nil, nil, nil, fmt.Errorf("record the reviewed validation for table %q: %w", report.Table, err)
 			}
-			if validationMetadata != nil {
-				if metadata == nil {
-					metadata = validationMetadata
-				} else {
-					maps.Copy(metadata, validationMetadata)
-				}
+			adoptionMetadata, unrecordedAdoption, err := stepAdoptionMetadata(statement, sql)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("record the reviewed index adoption for table %q: %w", report.Table, err)
 			}
+			replacementMetadata, err := stepReplacementMetadata(statement, sql)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("record the replacement index for table %q: %w", report.Table, err)
+			}
+			metadata = mergeStepMetadata(metadata, validationMetadata, adoptionMetadata, replacementMetadata)
 			if unrecordedDrop && stepMode == "" {
 				stepMode = engine.ExecutionModeBlocked
 				stepReason = fmt.Sprintf("statement for table %q drops an object the planner did not record, so the apply cannot check that it is still the object this plan reviewed; make the change outside SchemaBot", table)
+			}
+			if unrecordedAdoption && stepMode == "" {
+				stepMode = engine.ExecutionModeBlocked
+				stepReason = fmt.Sprintf("statement for table %q makes a constraint take over an index the planner did not record, so the apply cannot check that it is still the index this plan reviewed; make the change outside SchemaBot", table)
 			}
 			if unrecordedValidation && stepMode == "" {
 				stepMode = engine.ExecutionModeBlocked
@@ -629,7 +700,7 @@ func tableChanges(report pgplan.Report, crossNamespaceForeignKeys []string, pars
 				Operation:     operation,
 				DDL:           sql,
 				IsUnsafe:      statement.Destructive,
-				UnsafeReason:  destructiveReason(statement.Destructive, table),
+				UnsafeReason:  destructiveReason(statement, table),
 				ExecutionMode: stepMode,
 				ModeReason:    engine.SanitizeBlockedCause(stepReason),
 				Metadata:      metadata,
@@ -946,7 +1017,7 @@ func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, datab
 	reason := engine.SanitizeBlockedCause(singleLine(fmt.Sprintf("statement for table %q: %s", report.Table, r.detail)))
 	var sizeErr *preflight.SizeError
 	if errors.As(err, &sizeErr) {
-		if err := blockRewriteSteps(changes, reason, partitionedIndexBuildSteps(report), catalogOnlySteps(report)); err != nil {
+		if err := blockRewriteSteps(changes, reason, partitionedIndexBuildSteps(report), catalogOnlySteps(report), fullCopySteps(report)); err != nil {
 			if fullyBlocked {
 				slog.Warn("PostgreSQL table size check could not classify a blocked step; existing blocked plan verdicts remain unchanged",
 					"database", database,
@@ -984,20 +1055,29 @@ func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, datab
 // each is bounded by the concurrent index duration envelope rather than the
 // table size ceiling: a concurrent index build, and a step the planner routed
 // to the partitioned index build, named by partitionedBuilds, which builds one
-// partition at a time under that envelope per partition. A step pg-sprite
-// proved changes only the catalog, named by catalogOnly, keeps its verdict
-// too: it reads and writes no rows, so its cost does not grow with the
-// table. An earlier blocked verdict retains its reason and gains the
-// independent size cause so the operator can resolve both without another
-// planning round trip.
+// partition at a time under that envelope per partition. A concurrent index
+// drop keeps its verdict because it reads no rows and rewrites nothing: it
+// waits out the table's open transactions and removes the index's files. A
+// step pg-sprite proved changes only the catalog, named by catalogOnly, keeps
+// its verdict too: it reads and writes no rows, so its cost does not grow
+// with the table. A reviewed VALIDATE CONSTRAINT, one carrying the planner's
+// record of the constraint it validates, keeps its verdict as well: its scan
+// grows with the table but holds SHARE UPDATE EXCLUSIVE, so reads and writes
+// continue through it, and it is bounded by the validation duration instead
+// of the size ceiling. An earlier blocked verdict retains its reason and gains
+// the independent size cause so the operator can resolve both without another
+// planning round trip. A step that needs a full copy of the table, named by
+// fullCopy, does not: SchemaBot does not run it at any size, so raising the
+// limit would not unblock it.
 // parser.Classify in tableChanges parsed every rendered statement, including
 // blocked steps, with the same single-statement requirements used here. A
 // statement that now fails to classify is therefore an invariant violation.
 // Every step is classified before any verdict is written, so a caller that
 // keeps the plan on that error keeps it exactly as it was rather than with
 // the size cause on some steps and not others.
-func blockRewriteSteps(changes []engine.TableChange, reason string, partitionedBuilds, catalogOnly map[string]bool) error {
+func blockRewriteSteps(changes []engine.TableChange, reason string, partitionedBuilds, catalogOnly, fullCopy map[string]bool) error {
 	durationBounded := make([]bool, len(changes))
+	indexDrop := make([]bool, len(changes))
 	for i := range changes {
 		if changes[i].ExecutionMode != "" && changes[i].ExecutionMode != engine.ExecutionModeBlocked {
 			continue
@@ -1006,7 +1086,14 @@ func blockRewriteSteps(changes []engine.TableChange, reason string, partitionedB
 		if err != nil {
 			return fmt.Errorf("classify planned statement for table %q: %w", changes[i].Table, err)
 		}
-		durationBounded[i] = concurrentIndex || partitionedBuilds[changes[i].DDL]
+		reviewedValidation, err := reviewedValidationStep(changes[i])
+		if err != nil {
+			return fmt.Errorf("classify planned statement for table %q: %w", changes[i].Table, err)
+		}
+		durationBounded[i] = concurrentIndex || partitionedBuilds[changes[i].DDL] || reviewedValidation
+		if indexDrop[i], err = concurrentIndexDropStatement(changes[i].DDL); err != nil {
+			return fmt.Errorf("classify planned statement for table %q: %w", changes[i].Table, err)
+		}
 	}
 	for i := range changes {
 		if changes[i].ExecutionMode != "" && changes[i].ExecutionMode != engine.ExecutionModeBlocked {
@@ -1015,7 +1102,13 @@ func blockRewriteSteps(changes []engine.TableChange, reason string, partitionedB
 		if durationBounded[i] {
 			continue
 		}
+		if indexDrop[i] {
+			continue
+		}
 		if catalogOnly[changes[i].DDL] {
+			continue
+		}
+		if fullCopyKeepsItsVerdict(changes[i], fullCopy) {
 			continue
 		}
 		if changes[i].ExecutionMode == engine.ExecutionModeBlocked {
@@ -1029,6 +1122,35 @@ func blockRewriteSteps(changes []engine.TableChange, reason string, partitionedB
 		changes[i].ModeReason = reason
 	}
 	return nil
+}
+
+// fullCopyKeepsItsVerdict reports whether a step is one the planner routed to
+// a full copy and already carries a blocked verdict, which is the only case
+// the size cause skips. A full-copy step that reaches the size check without
+// one takes the size verdict like any other step, so the exemption never
+// leaves a step on an oversized table runnable.
+func fullCopyKeepsItsVerdict(change engine.TableChange, fullCopy map[string]bool) bool {
+	return fullCopy[change.DDL] && change.ExecutionMode == engine.ExecutionModeBlocked
+}
+
+// fullCopySteps returns the planned steps of every statement the planner
+// routed to its copy-and-swap backend, keyed by the DDL tableChanges renders
+// for them. SchemaBot blocks each of them as needing a full copy of the table.
+func fullCopySteps(report pgplan.Report) map[string]bool {
+	steps := make(map[string]bool)
+	for _, statement := range report.Statements {
+		if statement.Backend != router.BackendCopyAndSwap {
+			continue
+		}
+		rendered := statement.ExecSQL
+		if len(rendered) == 0 {
+			rendered = []string{statement.SQL}
+		}
+		for _, sql := range rendered {
+			steps[sql] = true
+		}
+	}
+	return steps
 }
 
 // partitionedIndexBuildSteps returns the planned steps the planner routed to
@@ -1077,6 +1199,19 @@ func concurrentIndexStatement(sql string) (bool, error) {
 		return false, fmt.Errorf("parse PostgreSQL statement: %w", err)
 	}
 	return statement.Kind() == pgstatement.KindCreateIndex && statement.Concurrent(), nil
+}
+
+// concurrentIndexDropStatement reports whether sql is a single DROP INDEX
+// CONCURRENTLY of one index, the shape the apply runs through pg-sprite's
+// concurrent index drop. The plan and apply paths share this classification
+// so the two agree on which drops run outside the table size ceiling.
+func concurrentIndexDropStatement(sql string) (bool, error) {
+	statement, err := pgstatement.ParseOne(sql)
+	if err != nil {
+		return false, fmt.Errorf("parse PostgreSQL statement: %w", err)
+	}
+	return statement.Kind() == pgstatement.KindDropIndex && statement.Concurrent() &&
+		statement.IndexTarget() == pgstatement.IndexTargetSingleRelation, nil
 }
 
 // undeclaredTableDrops surfaces every live table in the namespace that no
@@ -1369,8 +1504,8 @@ func singleLine(s string) string {
 
 // executionVerdict maps one planned statement to the verdict the operator
 // reviews. A planner value outside the vocabulary this mapping knows — a plan
-// contract, a disposition, a create shape cause, or a guidance code the planner
-// added after the mapping was written — still renders a blocked placeholder,
+// contract, a disposition, a create shape cause, a refusal reason, or a
+// guidance code the planner added after the mapping was written — still renders a blocked placeholder,
 // and is reported on the verdict so the caller can log it with the
 // identifiers this function does not have.
 func executionVerdict(formatVersion int, statement pgplan.Statement, table string, crossNamespaceForeignKeys []string) stepVerdict {
@@ -1404,7 +1539,7 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 	switch statement.Disposition {
 	case router.DispositionUnavailable:
 		if statement.Backend == router.BackendCopyAndSwap {
-			return blocked(fmt.Sprintf("statement for table %q requires copy-and-swap, which is unavailable", table))
+			return blocked(copyAndSwapRefusalReason(table))
 		}
 		return blocked(fmt.Sprintf("statement for table %q requires an execution path SchemaBot's PostgreSQL support does not provide yet", table))
 	case router.DispositionRewriteRequired:
@@ -1429,12 +1564,20 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 		if statement.Kind == schemadiff.ChangeSetGeneratedExpression {
 			return blocked(generatedExpressionRefusalReason(table))
 		}
+		reason, unknownReason, ok := operationRefusalReason(statement.Decisions, table)
+		if ok {
+			return blocked(reason)
+		}
 		refused := blocked(fmt.Sprintf("statement for table %q is refused: it cannot be executed safely as written", table))
-		// An absent cause is a refusal from outside the create path and the
-		// generic sentence is the right one; only a cause the mapping has no
-		// sentence for is vocabulary that moved.
-		if statement.Cause != "" {
+		// An absent cause is a refusal from outside the create path and an
+		// absent refused decision leaves nothing to name, so the generic
+		// sentence is the right one; only a cause or a refusal reason the
+		// mapping has no sentence for is vocabulary that moved.
+		switch {
+		case statement.Cause != "":
 			refused.unrecognized = &unrecognizedPlannerVocabulary{kind: "create_shape_cause", value: string(statement.Cause)}
+		case unknownReason != "":
+			refused.unrecognized = &unrecognizedPlannerVocabulary{kind: "refusal_reason", value: string(unknownReason)}
 		}
 		return refused
 	case router.DispositionExecute:
@@ -1443,7 +1586,7 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 		// statement is blocked in SchemaBot's words rather than reported as
 		// vocabulary that moved.
 		if statement.Backend == router.BackendCopyAndSwap {
-			return blocked(fmt.Sprintf("statement for table %q requires copy-and-swap, which SchemaBot's PostgreSQL support does not run yet", table))
+			return blocked(copyAndSwapRefusalReason(table))
 		}
 		// Execute on anything but the native route with native steps is a
 		// route or backend this build does not run, or a plan with nothing
@@ -1481,6 +1624,16 @@ func executionContractVerdict(execution planner.Execution, table string) (stepVe
 			mode:   engine.ExecutionModeBlocked,
 			reason: blockingIndexDropReason(table),
 		}, false
+	case planner.ExecutionPartitionedKeyBuild:
+		return stepVerdict{
+			mode:   engine.ExecutionModeBlocked,
+			reason: partitionedKeyBuildReason(table),
+		}, false
+	case planner.ExecutionPartitionedForeignKeyBuild:
+		return stepVerdict{
+			mode:   engine.ExecutionModeBlocked,
+			reason: partitionedForeignKeyBuildReason(table),
+		}, false
 	default:
 		return stepVerdict{
 			mode:         engine.ExecutionModeBlocked,
@@ -1496,6 +1649,24 @@ func executionContractVerdict(execution planner.Execution, table string) (stepVe
 // finishes.
 func blockingIndexDropReason(table string) string {
 	return fmt.Sprintf("statement for table %q drops an index of a partitioned table, which PostgreSQL cannot do without blocking reads and writes on the table and every partition until it finishes; drop the index outside SchemaBot when that lock is acceptable, then re-plan", table)
+}
+
+// partitionedKeyBuildReason is the sentence for adding a primary key or
+// unique constraint to a partitioned table. Only the engine's partition by
+// partition build adds it online, and SchemaBot does not run that build, so
+// the step is blocked rather than run as written, which would build every
+// partition's index while reads and writes on the whole tree wait.
+func partitionedKeyBuildReason(table string) string {
+	return fmt.Sprintf("statement for table %q adds a primary key or unique constraint to a partitioned table, which SchemaBot cannot yet add without blocking reads and writes on the table and every partition while each partition's index builds; add the key outside SchemaBot, then re-plan", table)
+}
+
+// partitionedForeignKeyBuildReason is the sentence for adding a foreign key
+// to a partitioned table on a server that cannot add it NOT VALID. Only the
+// engine's partition by partition build adds it online, and SchemaBot does
+// not run that build, so the step is blocked rather than run as written,
+// which would validate every partition while writes to the whole tree wait.
+func partitionedForeignKeyBuildReason(table string) string {
+	return fmt.Sprintf("statement for table %q adds a foreign key to a partitioned table, which SchemaBot cannot yet add on this PostgreSQL version without blocking writes to the table and every partition while each partition is checked; add the foreign key outside SchemaBot, then re-plan", table)
 }
 
 // partitionedIndexShapeVerdict runs the partitioned index build's own shape
@@ -1641,6 +1812,14 @@ func foreignKeyChangeRefusalReason(kind schemadiff.ChangeKind, table string, cro
 	return reason
 }
 
+// copyAndSwapRefusalReason refuses a statement only a full copy of the table
+// can run. Whether the planning library has that route open or not, SchemaBot
+// does not drive it, so both read the same and name the two ways forward.
+func copyAndSwapRefusalReason(table string) string {
+	return fmt.Sprintf("statement for table %q: the change needs a full copy of the table, which SchemaBot's PostgreSQL support does not run yet; "+
+		"reach the same schema without rewriting the table, such as a new column filled in batches, or make this change outside SchemaBot", table)
+}
+
 // generatedExpressionRefusalReason renders the planner's refusal of a changed
 // stored generated column expression. Replacing the expression recomputes
 // every row under a lock that blocks reads and writes, and there is no online
@@ -1653,9 +1832,18 @@ func generatedExpressionRefusalReason(table string) string {
 	return fmt.Sprintf("statement for table %q changes a stored generated column's expression, which rewrites every row under a lock that blocks reads and writes, so SchemaBot does not apply it; to keep the live expression, declare it in the schema file and re-plan; to change it, declare the live expression to apply the rest of the plan first, then run this statement (PostgreSQL 17 or later) outside SchemaBot through a separately reviewed process and put the new expression back in the file", table)
 }
 
-func destructiveReason(destructive bool, table string) string {
-	if !destructive {
+// destructiveReason is the reviewer-facing reason a destructive step needs
+// --allow-unsafe. The drop that completes an index replacement names the
+// index that replaces it: the old index goes only while the new definition is
+// built and valid, so what the reviewer accepts is that the old definition
+// stops applying, not that the table loses the index.
+func destructiveReason(statement pgplan.Statement, table string) string {
+	if !statement.Destructive {
 		return ""
+	}
+	if replaced := statement.Drops; statement.ReplacedBy != "" && replaced != nil {
+		return fmt.Sprintf("statement replaces index %q on table %q with the definition built as %q: the old index is dropped only while that index is valid, and from then on its old definition no longer applies",
+			replaced.Name, table, statement.ReplacedBy)
 	}
 	return fmt.Sprintf("statement removes live structure from table %q", table)
 }
@@ -1763,26 +1951,27 @@ func applyGoroutineExited(tracked *trackedApply) bool {
 }
 
 // HaltForShutdown brings this instance's in-flight concurrent index builds
-// down so the process can exit without leaving them running on the target
-// under a lease nobody renews. A concurrent build has no checkpoint: halting
-// it cancels the statement, and the invalid index it leaves is what the next
-// driver to claim the apply meets as abandoned debris and recovers before its
-// own build. Plain DDL is left to finish — its statements are bounded by
-// their own lock and statement timeouts, and interrupting a create set
-// mid-sequence would leave a committed prefix no later drive can complete.
+// and constraint validations down so the process can exit without leaving
+// them running on the target under a lease nobody renews. Neither has a
+// checkpoint: halting one cancels the statement. The invalid index a build
+// leaves is what the next driver to claim the apply meets as abandoned debris
+// and recovers before its own build; a cancelled validation rolls back and
+// leaves the constraint NOT VALID, still checking new writes, for the next
+// driver to validate. Plain DDL is left to finish — its statements are
+// bounded by their own lock and statement timeouts, and interrupting a create
+// set mid-sequence would leave a committed prefix no later drive can complete.
 //
 // This is not an operator cancel: no cancel is recorded on the tracked
-// applies, so the outcome the drive publishes for a halted build is the
-// failure its leftover index describes, and the apply stays active for
-// another driver to claim. The wait is bounded by ctx so a build that will
+// applies, so the outcome the drive publishes for halted work is a retryable
+// failure, and the apply stays active for another driver to claim. The wait is bounded by ctx so a build that will
 // not come down reports that the target may still be held instead of holding
 // shutdown open.
 func (e *Engine) HaltForShutdown(ctx context.Context) error {
 	e.mu.Lock()
-	halted := e.cancelIndexBuildsLocked(func(*trackedApply) bool { return true })
+	halted := e.haltLongRunningWorkLocked(func(*trackedApply) bool { return true })
 	e.mu.Unlock()
 	if halted > 0 {
-		slog.Info("PostgreSQL engine halting index builds for shutdown", "builds", halted)
+		slog.Info("PostgreSQL engine halting index builds and constraint validations for shutdown", "applies", halted)
 	}
 
 	// Wait off the calling goroutine so work that will not come down bounds
@@ -1807,7 +1996,7 @@ func (e *Engine) HaltForShutdown(ctx context.Context) error {
 func (e *Engine) HaltWorkOwnedBy(ctx context.Context, owner string) error {
 	e.mu.Lock()
 	owned := func(tracked *trackedApply) bool { return tracked.owner == owner }
-	halted := e.cancelIndexBuildsLocked(owned)
+	halted := e.haltLongRunningWorkLocked(owned)
 	var pending []chan struct{}
 	for _, tracked := range e.progress {
 		if owned(tracked) {
@@ -1816,7 +2005,7 @@ func (e *Engine) HaltWorkOwnedBy(ctx context.Context, owner string) error {
 	}
 	e.mu.Unlock()
 	if halted > 0 {
-		slog.Info("PostgreSQL engine halting the index builds a drive started as it returns", "builds", halted)
+		slog.Info("PostgreSQL engine halting the index builds and constraint validations a drive started as it returns", "applies", halted)
 	}
 
 	for _, done := range pending {
@@ -1829,12 +2018,13 @@ func (e *Engine) HaltWorkOwnedBy(ctx context.Context, owner string) error {
 	return nil
 }
 
-// cancelIndexBuildsLocked ends the running index builds that
-// selected picks and returns how many it ended. The caller holds e.mu.
-func (e *Engine) cancelIndexBuildsLocked(selected func(*trackedApply) bool) int {
+// haltLongRunningWorkLocked ends the running index builds and constraint
+// validations that selected picks and returns how many it ended. The caller
+// holds e.mu.
+func (e *Engine) haltLongRunningWorkLocked(selected func(*trackedApply) bool) int {
 	halted := 0
 	for _, tracked := range e.progress {
-		if selected(tracked) && tracked.cancellableBuild && !tracked.result.State.IsTerminal() && tracked.cancelApply != nil {
+		if selected(tracked) && tracked.haltable && !tracked.result.State.IsTerminal() && tracked.cancelApply != nil {
 			tracked.cancelApply()
 			halted++
 		}
@@ -1842,17 +2032,17 @@ func (e *Engine) cancelIndexBuildsLocked(selected func(*trackedApply) bool) int 
 	return halted
 }
 
-// StopUnsupportedReason is why PostgreSQL declines every stop. The control
-// plane refuses a stop with the same text, so the refusal and a stored stop's
-// ErrorMessage agree.
-const StopUnsupportedReason = "stop is not supported for PostgreSQL schema changes: concurrent index builds have no resumable midpoint, and other statements commit or fail on their own"
+// stopUnsupportedReason is why PostgreSQL declines a stop that reaches the
+// engine. The control plane refuses a stop before recording it, with the
+// command to use instead, so this is the record for a stop that got past it.
+const stopUnsupportedReason = "PostgreSQL can't pause a schema change: an index build has no point to resume from, and other statements commit or fail on their own"
 
 // Stop declines: a concurrent index build has no resumable midpoint, so stop
 // would be a permanent cancel under a misleading name. Other PostgreSQL DDL
 // also has no engine phase to pause. The typed decline lets the control path
 // resolve a durable stop request terminally instead of retrying it.
 func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, engine.NewUnsupportedOperationError(StopUnsupportedReason)
+	return nil, engine.NewUnsupportedOperationError(stopUnsupportedReason)
 }
 
 // Start declines: PostgreSQL schema changes cannot be stopped, so there is

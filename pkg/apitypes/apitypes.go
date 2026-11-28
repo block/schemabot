@@ -4,6 +4,7 @@
 package apitypes
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -103,7 +104,11 @@ const (
 	ErrCodeRateLimited             = "rate_limited"              // Caller or target exceeded its request budget; retry after the advertised delay
 	ErrCodeUnsafeOptInRequired     = "unsafe_opt_in_required"    // Plan carries an unsafe change; retry with allow_unsafe=true to consent to it
 	ErrCodePlanBlocked             = "plan_blocked"              // Plan carries a change the engine refuses; no retry or option can apply it
+	ErrCodeSchemaRefused           = "schema_refused"            // Plan refused for the declared schema as written; follow the remedy the error names, then plan again, since an immediate retry gets the same answer
 	ErrCodeAlreadyStopped          = "already_stopped"           // Stop refused: the schema change is already stopped and no start is queued behind it
+	ErrCodeStopUnsupportedCancel   = "stop_unsupported_cancel"   // Stop refused: the engine can't pause this schema change; cancel ends it
+	ErrCodeStopUnsupportedFinishes = "stop_unsupported_finishes" // Stop refused: the engine can't pause this schema change, which finishes on its own; follow its progress
+	ErrCodeStopUnsupported         = "stop_unsupported"          // Stop refused: the engine can't pause this schema change; cancel ends it, and progress follows it if it finishes on its own
 	ErrCodeDeferredCutoverCapacity = "deferred_cutover_capacity" // --defer-cutover refused: the apply would hold more drivers at its cutover than are left for deferred work; apply without the flag
 	ErrCodeChangeGateRefused       = "change_gate_refused"       // Apply, start or cutover refused by a change gate, such as a freeze; the blockers say why
 	ErrCodeChangeGateUnavailable   = "change_gate_unavailable"   // SchemaBot could not check the change gates, so nothing started; retry
@@ -1485,6 +1490,170 @@ func (r *PlanResponse) HasBlockedChanges() bool {
 	return r.FirstBlockedChange() != nil
 }
 
+// BlockedChange is a planned change its engine refuses to run. Statements on
+// one table refused for the same reason are named once, with how many there
+// are, and a change refused on several shards is named once, with the shards
+// it is refused on.
+type BlockedChange struct {
+	// Namespace is the change's namespace, or the plan's database for a change
+	// that names none.
+	Namespace string
+	// Table is the table's name, qualified with its namespace when the plan's
+	// blocked changes span more than one namespace, so two tables that share a
+	// name read apart.
+	Table  string
+	Reason string
+	// Steps is how many of the table's planned statements the reason refuses,
+	// counted once per shard.
+	Steps int
+	// Shards lists the shards the change is refused on, in plan order. It is
+	// empty for a change planned once for its namespace. TotalShards is the
+	// number of shards the plan covers in the namespace, so a renderer can say
+	// "all shards".
+	Shards      []string
+	TotalShards int
+}
+
+// BlockedChanges returns the plan's changes that carry the blocked verdict, in
+// plan order. Every surface that says a plan cannot be applied lists these,
+// so the CLI and the PR comment name the same changes for the same reasons.
+// A namespace with shard rows is read per shard, so a change refused on one
+// shard names it; a namespace without them is read from its namespace-level
+// changes, as RenderedTables reads a mixed plan.
+func (r *PlanResponse) BlockedChanges() []BlockedChange {
+	if r == nil {
+		return nil
+	}
+	shardsByNamespace := make(map[string][]*ShardPlanResponse)
+	var shardNamespaces []string
+	for _, sp := range r.Shards {
+		if sp == nil {
+			continue
+		}
+		if _, seen := shardsByNamespace[sp.Namespace]; !seen {
+			shardNamespaces = append(shardNamespaces, sp.Namespace)
+		}
+		shardsByNamespace[sp.Namespace] = append(shardsByNamespace[sp.Namespace], sp)
+	}
+
+	var grouped blockedChangeGroups
+	read := make(map[string]bool)
+	for _, sc := range r.Changes {
+		if sc == nil {
+			continue
+		}
+		shards, sharded := shardsByNamespace[sc.Namespace]
+		if sharded && !read[sc.Namespace] {
+			read[sc.Namespace] = true
+			grouped.addShards(cmp.Or(sc.Namespace, r.Database), shards)
+		}
+		// A refusal the shard rows do not carry is still the namespace's, and
+		// the apply gate refuses it, so the list names it beside the shards'.
+		// A namespace listed twice is read each time.
+		for _, t := range sc.TableChanges {
+			if !t.EngineBlocked() {
+				continue
+			}
+			namespace := cmp.Or(sc.Namespace, t.Namespace, r.Database)
+			if sharded && grouped.carriedByShards(namespace, t) {
+				continue
+			}
+			grouped.add(namespace, t).Steps++
+		}
+	}
+	// Shard rows for a namespace the namespace-level changes do not list are
+	// still the plan's work, so their refusals are listed too.
+	for _, ns := range shardNamespaces {
+		if !read[ns] {
+			grouped.addShards(cmp.Or(ns, r.Database), shardsByNamespace[ns])
+		}
+	}
+	return grouped.list()
+}
+
+// blockedChangeGroups collects blocked changes keyed by namespace, table and
+// reason, in the order each key is first seen.
+type blockedChangeGroups struct {
+	order []*BlockedChange
+	byKey map[[3]string]*BlockedChange
+}
+
+// add returns the group for the change's namespace, table and reason,
+// creating it on first sight.
+func (g *blockedChangeGroups) add(namespace string, t *TableChangeResponse) *BlockedChange {
+	k := [3]string{namespace, t.TableName, t.ModeReason}
+	if bc := g.byKey[k]; bc != nil {
+		return bc
+	}
+	if g.byKey == nil {
+		g.byKey = make(map[[3]string]*BlockedChange)
+	}
+	bc := &BlockedChange{Namespace: namespace, Table: t.TableName, Reason: withoutTableSubject(t.TableName, t.ModeReason)}
+	g.byKey[k] = bc
+	g.order = append(g.order, bc)
+	return bc
+}
+
+// carriedByShards reports whether a shard row already lists the change's
+// refusal, so the namespace-level copy of it is not counted twice.
+func (g *blockedChangeGroups) carriedByShards(namespace string, t *TableChangeResponse) bool {
+	bc := g.byKey[[3]string{namespace, t.TableName, t.ModeReason}]
+	return bc != nil && len(bc.Shards) > 0
+}
+
+// withoutTableSubject drops the engine's "statement for table "t"" lead-in
+// from each cause of a blocked reason. Every surface that lists blocked
+// changes names the table beside its reason, so the lead-in would say it
+// twice. A cause whose sentence continues from the lead-in, rather than after
+// a colon, keeps "the statement" as its subject.
+func withoutTableSubject(table, reason string) string {
+	subject := fmt.Sprintf("statement for table %q", table)
+	reason = strings.ReplaceAll(reason, subject+": ", "")
+	return strings.ReplaceAll(reason, subject+" ", "the statement ")
+}
+
+// addShards groups one namespace's blocked per-shard changes by table and
+// reason, so a change refused on several shards is listed once with them. Its
+// step count is the most statements any one shard carries for it.
+func (g *blockedChangeGroups) addShards(namespace string, shards []*ShardPlanResponse) {
+	for _, sp := range shards {
+		stepsOnShard := make(map[*BlockedChange]int)
+		for _, t := range sp.Changes {
+			if !t.EngineBlocked() {
+				continue
+			}
+			bc := g.add(namespace, t)
+			bc.TotalShards = len(shards)
+			if stepsOnShard[bc] == 0 {
+				bc.Shards = append(bc.Shards, sp.Shard)
+			}
+			stepsOnShard[bc]++
+			bc.Steps = max(bc.Steps, stepsOnShard[bc])
+		}
+	}
+}
+
+// list returns the groups in first-seen order, each table qualified with its
+// namespace when the groups span more than one.
+func (g *blockedChangeGroups) list() []BlockedChange {
+	if len(g.order) == 0 {
+		return nil
+	}
+	namespaces := make(map[string]bool)
+	for _, bc := range g.order {
+		namespaces[bc.Namespace] = true
+	}
+	out := make([]BlockedChange, 0, len(g.order))
+	for _, bc := range g.order {
+		change := *bc
+		if len(namespaces) > 1 && change.Namespace != "" {
+			change.Table = change.Namespace + "." + change.Table
+		}
+		out = append(out, change)
+	}
+	return out
+}
+
 // FirstBlockedChange returns the first planned change carrying the blocked
 // execution-mode verdict, namespace-level changes before per-shard ones, or
 // nil when there is none. A refusal names this change and its engine's reason,
@@ -1935,6 +2104,12 @@ type CancelResponse struct {
 	CancelledCount int64  `json:"cancelled_count"`
 	SkippedCount   int64  `json:"skipped_count"`
 	Status         string `json:"status,omitempty"`
+	// ControlRequestRevision is the revision of the cancel request this call
+	// recorded or joined. The progress API's control_requests entry for
+	// cancel carries the same revision until the request is re-armed by a
+	// later cancel, so a caller waiting on this cancel's outcome matches on
+	// it. Omitted when the cancel was not accepted.
+	ControlRequestRevision *int64 `json:"control_request_revision,omitempty"`
 }
 
 // StartResponse is the HTTP response for POST /api/start.
@@ -1997,6 +2172,42 @@ type ProgressResponse struct {
 	// the apply is stopped and the stop that stopped it was a freeze's (one
 	// with running "stop"), not an operator's.
 	StoppedByFreeze *FreezeStopRef `json:"stopped_by_freeze,omitempty"`
+	// ControlRequests is the latest request of each control operation made
+	// against this apply, so a caller that issued one can tell whether it took
+	// effect. Set only on apply-id lookups.
+	ControlRequests []ControlRequestOutcome `json:"control_requests,omitempty"`
+}
+
+// ControlRequestOutcome is where one control request against an apply stands.
+type ControlRequestOutcome struct {
+	// Operation is the control operation: "stop", "start", "cutover",
+	// "cancel", "revert", "skip_revert", or "release".
+	Operation string `json:"operation"`
+	// Status is "pending" until the schema change acts on the request, then
+	// "completed" when it took effect or "failed" when it did not.
+	Status string `json:"status"`
+	// Revision tells a request apart from an earlier one for the same
+	// operation: a new request after a settled one carries a higher revision.
+	Revision int64 `json:"revision"`
+	// ErrorMessage says why a failed request did not take effect.
+	ErrorMessage string `json:"error_message,omitempty"`
+	RequestedBy  string `json:"requested_by,omitempty"`
+	// SettledAt is when the request completed or failed, RFC 3339.
+	SettledAt string `json:"settled_at,omitempty"`
+}
+
+// ControlRequest returns the latest request of the named control operation,
+// or nil when none was made.
+func (r *ProgressResponse) ControlRequest(operation string) *ControlRequestOutcome {
+	if r == nil {
+		return nil
+	}
+	for i := range r.ControlRequests {
+		if r.ControlRequests[i].Operation == operation {
+			return &r.ControlRequests[i]
+		}
+	}
+	return nil
 }
 
 // FreezeStopRef names the freeze that stopped an apply.

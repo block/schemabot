@@ -41,7 +41,7 @@ func RenderControlRejections(rejections []ControlRejectionData) string {
 			fmt.Fprintf(&sb, " (requested by `%s`)", sanitizeCommentError(r.RequestedBy))
 		}
 		if msg := sanitizeCommentError(r.Message); msg != "" {
-			fmt.Fprintf(&sb, ": %s", quoteBlockLines(msg))
+			fmt.Fprintf(&sb, ": %s", quoteBlockLines(errorDetailMarkdown(msg)))
 		}
 		sb.WriteString("\n")
 	}

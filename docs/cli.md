@@ -581,8 +581,9 @@ Review the exact DDL and its consequences before providing it. Some changes
 are unsupported or blocked by the engine; the flag does not make them valid.
 `apply` and `rollback` refuse a blocked plan before they check or take a lock
 or ask for confirmation, for a single target, the whole rollout, or `--target`
-alike. The refusal follows the plan and names the plan, the first blocked
-table, and the engine's reason, one line per cause. Fix what the reason names:
+alike. The plan ends with every blocked table and the engine's reason, one
+line per cause, and the refusal counts them. With `-o json` the refusal lists
+them itself. Fix what each reason names:
 the statement, a grant on the target, or the server's policy. `--yield` has no
 lock to release on this refusal.
 
@@ -620,7 +621,11 @@ name the lock gets no release at all: the command keeps the lock and tells you
 to check `schemabot locks` and run `schemabot unlock` if nothing of yours runs
 under it. Locks span the
 database's environments; forcing one away from its owner is an administrative
-action, not a routine retry.
+action, not a routine retry. `unlock --force` and `apply --force` show who holds
+the lock and since when, then ask you to answer `yes` before they take it from
+another owner. A lock you hold yourself, or no lock, brings no question. `-y`
+skips the question, so scripts keep working. With no terminal to answer on and
+no `-y`, the command refuses, names the holder, and changes nothing.
 See [locks](schema-intelligence.md#check-locks) for the inspection request and
 response, and [access rules](auth.md#what-read-and-write-access-include) for
 who may act.
@@ -883,6 +888,17 @@ Pick the operation for the current state and engine:
 | `rollback` | Plan a new change toward the schema stored before an earlier apply |
 
 Support and timing differ by engine; see the [engine capability matrix](engines.md).
+
+`cancel` waits up to 30 seconds for the apply to end. It prints `Schema change
+cancelled` only once the apply is `cancelled`. If the apply is still running at
+the deadline, it prints `Cancel requested` and the `progress` command that
+watches it end. A new apply is refused until then. When the engine declines
+the cancel, for example a PostgreSQL step that commits or fails on its own, it
+prints `Cancel did not take effect` with the engine's reason: the change keeps
+running and finishes on its own. When another part of a rollout had already
+failed, the cancel ends the parts still running and the apply ends `failed`; it
+prints `Cancel took effect` and the `progress` command that shows what failed.
+The counts are tables, not steps.
 A request being accepted does not mean its effect has landed. `revert` and
 `skip-revert` say so directly: each reports the operation as requested, not
 done, and prints the `progress` command that follows it. Repeating a request

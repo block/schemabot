@@ -20,6 +20,8 @@ import (
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/storage/storagetest"
+	"github.com/block/schemabot/pkg/testutil"
 )
 
 // The behavioral suite for ApplyOperationStore lives in
@@ -1980,7 +1982,7 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsFailedRetryableWithinB
 	// A lone operation with tasks is driven under the parent lease, whose
 	// ClaimApplyByID moves the parent and the row out of failed_retryable.
 	task := createRetryableReapTask(t, store, apply, "task_op_retryable_ok", "users", state.Task.FailedRetryable, "copy failed")
-	attachTaskToOperation(t, task.TaskIdentifier, id)
+	attachTaskToOperation(t, store, task.TaskIdentifier, id)
 
 	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
@@ -2239,7 +2241,7 @@ func TestApplyOperationStore_FindNextApplyOperation_SingleOpRedispatchDoesNotCon
 	})
 	require.NoError(t, err)
 	task := createRetryableReapTask(t, store, apply, "task_op_singleop_budget", "users", state.Task.FailedRetryable, "copy failed")
-	attachTaskToOperation(t, task.TaskIdentifier, id)
+	attachTaskToOperation(t, store, task.TaskIdentifier, id)
 
 	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
@@ -2295,7 +2297,7 @@ func TestApplyOperationStore_FindNextApplyOperation_OperationLeaseRedispatchOfAL
 			setOperationAttempt(t, id, maxRecoveryAttempts-1)
 			if tc.withTask {
 				task := createRetryableReapTask(t, store, apply, "task_op_lone_lease", "users", state.Task.FailedRetryable, "copy failed")
-				attachTaskToOperation(t, task.TaskIdentifier, id)
+				attachTaskToOperation(t, store, task.TaskIdentifier, id)
 			}
 
 			claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
@@ -2729,6 +2731,70 @@ func TestApplyOperationStore_FindNextApplyOperation_FailedRetryableCrashRecovery
 	require.NotNil(t, persisted)
 	assert.Equal(t, "driver-a", persisted.LeaseOwner, "the recovering driver keeps the operation lease")
 	assert.Equal(t, first.LeaseToken, persisted.LeaseToken, "the recovering driver's lease token must not be rotated out from under it")
+}
+
+// A failed_retryable apply is due for its retry, and driver-a leases its
+// operation. driver-b polls before driver-a's parent claim commits. It must not
+// rotate driver-a's lease, or driver-a's first write under the retry is refused
+// and the retry waits out a staleness window. A lease driver-a gives back, or
+// one that goes stale because driver-a died, is driver-b's to take. Both
+// storage dialects hold the gate.
+func TestApplyOperationStore_FindNextApplyOperation_FailedRetryableRedispatchAdmitsOneDriver(t *testing.T) {
+	t.Run("MySQL", func(t *testing.T) {
+		clearTables(t)
+		testFailedRetryableRedispatchAdmitsOneDriver(t, NewMySQL(testDB))
+	})
+	t.Run("PostgreSQL", func(t *testing.T) {
+		_, db := testutil.StartPostgres(t, "retry_claim_lease")
+		applyPostgresTestSchema(t, db)
+		testFailedRetryableRedispatchAdmitsOneDriver(t, NewPostgres(db))
+	})
+}
+
+func testFailedRetryableRedispatchAdmitsOneDriver(t *testing.T, store *Storage) {
+	ctx := t.Context()
+	lock := storagetest.CreateLock(t, store, "testdb", storage.DatabaseTypeMySQL)
+	apply := storagetest.CreateApplyWithStateAndEnv(t, store, lock, "apply_op_fr_redispatch_one_driver", 1, state.Apply.FailedRetryable, "staging")
+	_, err := store.db.ExecContext(ctx, `UPDATE applies SET attempt = ?, updated_at = ? WHERE id = ?`,
+		maxRecoveryAttempts-1, time.Now().UTC(), apply.ID)
+	require.NoError(t, err)
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
+	})
+	require.NoError(t, err)
+	task := createRetryableReapTask(t, store, apply, "task_op_fr_redispatch_one_driver", "users", state.Task.FailedRetryable, "validate failed")
+	attachTaskToOperation(t, store, task.TaskIdentifier, id)
+
+	first, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+	require.NoError(t, err)
+	require.NotNil(t, first, "the retry must be claimable")
+	require.Equal(t, id, first.ID)
+
+	second, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+	require.NoError(t, err)
+	assert.Nil(t, second, "a peer must not re-lease an operation another driver just claimed for its retry")
+	persisted, err := store.ApplyOperations().Get(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, "driver-a", persisted.LeaseOwner)
+	assert.Equal(t, first.LeaseToken, persisted.LeaseToken, "the claiming driver's lease token must not be rotated")
+
+	released, err := store.ApplyOperations().ReleaseClaim(ctx, first.Lease())
+	require.NoError(t, err)
+	require.True(t, released)
+	handedOff, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+	require.NoError(t, err)
+	require.NotNil(t, handedOff, "a released retry must be claimable on the next poll")
+	assert.Equal(t, "driver-b", handedOff.LeaseOwner)
+
+	// driver-b dies holding the lease: the row is taken once its heartbeat is
+	// stale.
+	backdateOperationHeartbeat(t, store, id, 2*storage.ApplyLeaseStaleAfter)
+	recovered, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-c")
+	require.NoError(t, err)
+	require.NotNil(t, recovered, "a retry whose claimant died must be claimable once its lease is stale")
+	assert.Equal(t, "driver-c", recovered.LeaseOwner)
+	assert.Equal(t, state.ApplyOperation.FailedRetryable, recovered.State)
 }
 
 // TestApplyOperationStore_FindNextApplyOperation_FailedRetryableCrashRecoveryHandsOffOnRelease

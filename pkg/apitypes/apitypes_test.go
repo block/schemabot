@@ -744,3 +744,108 @@ func TestPlanResponse_RolloutBlockWithANullEntryFailsToDecode(t *testing.T) {
 	require.Len(t, resp.Rollout.Groups, 1)
 	assert.Equal(t, []string{"prod/payments-001", "prod/payments-002"}, resp.Rollout.Groups[0].Members)
 }
+
+// A plan whose blocked changes are in a sharded namespace and an unsharded one
+// lists both: the sharded namespace from its shard rows, the unsharded one from
+// its namespace-level changes. Tables are qualified with their namespace once
+// the refusals span two namespaces.
+func TestPlanResponse_BlockedChangesInShardedAndUnshardedNamespaces(t *testing.T) {
+	blocked := func(table, reason string) *TableChangeResponse {
+		return &TableChangeResponse{TableName: table, ExecutionMode: "blocked", ModeReason: reason}
+	}
+	plan := &PlanResponse{
+		Database: "orders",
+		Changes: []*SchemaChangeResponse{
+			{Namespace: "commerce", TableChanges: []*TableChangeResponse{blocked("events", "too large")}},
+			{Namespace: "lookup", TableChanges: []*TableChangeResponse{blocked("codes", "collation change")}},
+		},
+		Shards: []*ShardPlanResponse{
+			{Namespace: "commerce", Shard: "-80", Changes: []*TableChangeResponse{blocked("events", "too large")}},
+			{Namespace: "commerce", Shard: "80-", Changes: []*TableChangeResponse{{TableName: "events", ExecutionMode: "online"}}},
+		},
+	}
+	assert.Equal(t, []BlockedChange{
+		{Namespace: "commerce", Table: "commerce.events", Reason: "too large", Steps: 1, Shards: []string{"-80"}, TotalShards: 2},
+		{Namespace: "lookup", Table: "lookup.codes", Reason: "collation change", Steps: 1},
+	}, plan.BlockedChanges())
+}
+
+// The same table name refused in two namespaces is two relations to fix, so
+// each is listed under its own namespace with its own step count.
+func TestPlanResponse_BlockedChangesKeepNamespacesApart(t *testing.T) {
+	blocked := &TableChangeResponse{TableName: "events", ExecutionMode: "blocked", ModeReason: "too large"}
+	plan := &PlanResponse{
+		Database: "app",
+		Changes: []*SchemaChangeResponse{
+			{Namespace: "public", TableChanges: []*TableChangeResponse{blocked, blocked, blocked}},
+			{Namespace: "archive", TableChanges: []*TableChangeResponse{blocked}},
+		},
+	}
+	assert.Equal(t, []BlockedChange{
+		{Namespace: "public", Table: "public.events", Reason: "too large", Steps: 3},
+		{Namespace: "archive", Table: "archive.events", Reason: "too large", Steps: 1},
+	}, plan.BlockedChanges())
+}
+
+// A sharded namespace whose shard rows carry no verdict still lists the
+// refusal its namespace-level changes carry, since the apply gate refuses it.
+func TestPlanResponse_BlockedChangesFallBackToTheNamespaceView(t *testing.T) {
+	plan := &PlanResponse{
+		Database: "orders",
+		Changes: []*SchemaChangeResponse{
+			{Namespace: "commerce", TableChanges: []*TableChangeResponse{{TableName: "events", ExecutionMode: "blocked", ModeReason: "too large"}}},
+		},
+		Shards: []*ShardPlanResponse{
+			{Namespace: "commerce", Shard: "-80", Changes: []*TableChangeResponse{{TableName: "events"}}},
+		},
+	}
+	assert.Equal(t, []BlockedChange{{Namespace: "commerce", Table: "events", Reason: "too large", Steps: 1}}, plan.BlockedChanges())
+}
+
+// A sharded namespace lists the refusals its shard rows carry and, beside
+// them, the ones only its namespace-level changes carry, read from every entry
+// that names the namespace. A refusal both carry is listed once, from the
+// shards.
+func TestPlanResponse_BlockedChangesUnionShardAndNamespaceRefusals(t *testing.T) {
+	blocked := func(table, reason string) *TableChangeResponse {
+		return &TableChangeResponse{TableName: table, ExecutionMode: "blocked", ModeReason: reason}
+	}
+	plan := &PlanResponse{
+		Database: "orders",
+		Changes: []*SchemaChangeResponse{
+			{Namespace: "commerce", TableChanges: []*TableChangeResponse{blocked("events", "too large"), blocked("codes", "collation change")}},
+			{Namespace: "commerce", TableChanges: []*TableChangeResponse{blocked("refunds", "type narrowing")}},
+		},
+		Shards: []*ShardPlanResponse{
+			{Namespace: "commerce", Shard: "-80", Changes: []*TableChangeResponse{blocked("events", "too large")}},
+			{Namespace: "commerce", Shard: "80-", Changes: []*TableChangeResponse{blocked("events", "too large")}},
+		},
+	}
+	assert.Equal(t, []BlockedChange{
+		{Namespace: "commerce", Table: "events", Reason: "too large", Steps: 1, Shards: []string{"-80", "80-"}, TotalShards: 2},
+		{Namespace: "commerce", Table: "codes", Reason: "collation change", Steps: 1},
+		{Namespace: "commerce", Table: "refunds", Reason: "type narrowing", Steps: 1},
+	}, plan.BlockedChanges())
+}
+
+// A blocked change is listed beside its table, so each cause drops the
+// engine's lead-in naming that table, a cause whose sentence runs on from the
+// lead-in keeps "the statement" as its subject, and a cause about another
+// subject keeps its wording.
+func TestPlanResponse_BlockedChangesDropTableLeadIn(t *testing.T) {
+	reason := `statement for table "events": the table exceeds the size limit ‖ statement for table "events": run with a role that owns it ‖ statement for table "events" drops an object the planner did not record ‖ statement for table "orders": unrelated`
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{{
+			Namespace: "app",
+			TableChanges: []*TableChangeResponse{
+				{TableName: "events", ExecutionMode: "blocked", ModeReason: reason},
+				{TableName: "events", ExecutionMode: "blocked", ModeReason: reason},
+			},
+		}},
+	}
+	got := resp.BlockedChanges()
+	require.Len(t, got, 1)
+	assert.Equal(t, "events", got[0].Table)
+	assert.Equal(t, 2, got[0].Steps)
+	assert.Equal(t, `the table exceeds the size limit ‖ run with a role that owns it ‖ the statement drops an object the planner did not record ‖ statement for table "orders": unrelated`, got[0].Reason)
+}

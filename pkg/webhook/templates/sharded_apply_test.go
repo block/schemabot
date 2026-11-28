@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -186,7 +187,7 @@ func TestRenderShardedApplyComment_FailedSurfacesError(t *testing.T) {
 	assert.Contains(t, out, "## Schema Change Status")
 	assert.Contains(t, out, "> ❌ **First failure:** shard <code>-40</code> — "+failErr)
 	assert.Contains(t, out, failErr, "the error also appears in the failed shard's row")
-	assert.Contains(t, out, "To retry:")
+	assert.Contains(t, out, presentation.RetryLabel+":")
 }
 
 // An auto-retrying (failed_retryable) shard surfaces its error and the apply
@@ -439,7 +440,7 @@ func TestRenderShardedApplySummaryComment_FailedSurfacesErrorAndRetry(t *testing
 	assert.NotContains(t, out, "Applied successfully", "a failed apply writes no success line")
 	assert.Contains(t, out, "> ❌ **First failure:** shard <code>-40</code> — "+failErr)
 	assert.Contains(t, out, "| `80-` | ⏸️ not started |", "siblings that never started keep their final state in the results")
-	assert.Contains(t, out, "To retry:")
+	assert.Contains(t, out, presentation.RetryLabel+":")
 }
 
 // A completed sharded apply's summary has the regular summary's shape: the

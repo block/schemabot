@@ -6,8 +6,10 @@ import (
 	"database/sql"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/block/pg-sprite/pkg/schemadiff"
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -197,8 +199,10 @@ func TestEngineApplyForeignKeys(t *testing.T) {
 
 // An owner adds a foreign key that an existing row breaks. The apply adds the
 // key without checking existing rows, then fails at the validation, naming the
-// key and the fix. The key stays in place unvalidated, so new writes are
-// already checked. Once the owner fixes the row, the next plan is only the
+// key and the fix, and ends the apply rather than retrying it. The engine's
+// steps leave the key unvalidated, checking new writes; the drive's release
+// of a failed apply is what removes it. When the key stays, because it was
+// already on the table, the next plan once the owner fixes the row is only the
 // validation, and applying it completes.
 func TestEngineApplyForeignKeyOverABrokenRow(t *testing.T) {
 	const database = "apply_foreign_key_orphan_test"
@@ -219,7 +223,8 @@ func TestEngineApplyForeignKeyOverABrokenRow(t *testing.T) {
 	require.Len(t, outcomes, 2, "the add completes and the validation fails")
 	assert.Equal(t, engine.StateCompleted, outcomes[0].State, outcomes[0].ErrorMessage)
 	assert.Equal(t, engine.StateFailed, outcomes[1].State)
-	assert.Equal(t, `existing rows in "orders" break foreign key "orders_user_id_fkey"; the key is in place and checks new writes; fix those rows, then retry`, outcomes[1].ErrorMessage)
+	assert.Equal(t, `existing rows in "orders" break foreign key "orders_user_id_fkey"; fix those rows, then apply again`, outcomes[1].ErrorMessage)
+	assert.False(t, outcomes[1].Retryable, "a retry cannot pass until someone fixes the row, so the apply ends at once")
 	assert.False(t, foreignKeyValidated(t, db, "orders_user_id_fkey"), "the key stays in place, unvalidated")
 	_, err = db.ExecContext(t.Context(), `INSERT INTO public.orders VALUES (12, 98)`)
 	require.Error(t, err, "new writes are checked before the key is validated")
@@ -232,6 +237,136 @@ func TestEngineApplyForeignKeyOverABrokenRow(t *testing.T) {
 	assert.Equal(t, "ALTER TABLE public.orders VALIDATE CONSTRAINT orders_user_id_fkey", replan.Changes[0].TableChanges[0].DDL)
 
 	outcomes = applyPlannedSteps(t, eng, dsn, replan)
+	require.Len(t, outcomes, 1)
+	assert.Equal(t, engine.StateCompleted, outcomes[0].State, outcomes[0].ErrorMessage)
+	assert.True(t, foreignKeyValidated(t, db, "orders_user_id_fkey"))
+}
+
+// An owner adds a foreign key to a table whose validation scan outlasts the
+// deployment's validation bound. The apply adds the key, then the scan is
+// cancelled at the bound and the step is refused, naming the option that
+// grants more time. The key stays in place unvalidated and checks new writes.
+// Once the bound is raised, the next plan is only the validation, and
+// applying it completes. The bound is one the catalog drift check ahead of the
+// scan fits inside, so the refusal is the scan's own cut-off.
+func TestEngineApplyForeignKeyValidationPastItsBound(t *testing.T) {
+	const bound = 100 * time.Millisecond
+	const database = "apply_foreign_key_bound_test"
+	dsn, db := testutil.StartPostgres(t, database)
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint NOT NULL);
+		INSERT INTO public.users SELECT g FROM generate_series(1, 1000) g;
+		INSERT INTO public.orders SELECT g, 1 + g % 1000 FROM generate_series(1, 2000000) g;
+		ANALYZE public.orders`)
+	require.NoError(t, err)
+	files := map[string]string{
+		"users.sql":  "CREATE TABLE users (id bigint PRIMARY KEY)",
+		"orders.sql": "CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint NOT NULL REFERENCES users (id))",
+	}
+	eng := New().WithValidateMaxDuration(bound)
+
+	outcomes := applyPlannedSteps(t, eng, dsn, planForeignKeyFiles(t, eng, database, dsn, files))
+	require.Len(t, outcomes, 2, "the add completes and the validation is refused")
+	assert.Equal(t, engine.StateCompleted, outcomes[0].State, outcomes[0].ErrorMessage)
+	assert.Equal(t, engine.StateFailed, outcomes[1].State)
+	assert.Contains(t, outcomes[1].ErrorMessage, `constraint "orders_user_id_fkey" ran past postgres.validate_max_duration (100ms)`)
+	assert.Contains(t, outcomes[1].ErrorMessage, "raise postgres.validate_max_duration and re-run")
+	assert.False(t, foreignKeyValidated(t, db, "orders_user_id_fkey"), "the key stays in place, unvalidated")
+	_, err = db.ExecContext(t.Context(), `INSERT INTO public.orders VALUES (2000001, 5000)`)
+	require.Error(t, err, "new writes are checked before the key is validated")
+
+	raised := New()
+	replan := planForeignKeyFiles(t, raised, database, dsn, files)
+	require.Len(t, replan.Changes, 1)
+	require.Len(t, replan.Changes[0].TableChanges, 1)
+	assert.Equal(t, "ALTER TABLE public.orders VALIDATE CONSTRAINT orders_user_id_fkey", replan.Changes[0].TableChanges[0].DDL)
+	outcomes = applyPlannedSteps(t, raised, dsn, replan)
+	require.Len(t, outcomes, 1)
+	assert.Equal(t, engine.StateCompleted, outcomes[0].State, outcomes[0].ErrorMessage)
+	assert.True(t, foreignKeyValidated(t, db, "orders_user_id_fkey"))
+}
+
+// A table past the deployment's native-safe size ceiling has a foreign key
+// left NOT VALID. The plan validates it in place, and that step is not
+// blocked for the table's size: the scan lets reads and writes continue and
+// runs under the validation bound instead. Applying it validates the key.
+func TestEnginePlanValidationOnATablePastTheSizeCeiling(t *testing.T) {
+	const database = "plan_validation_size_test"
+	dsn, db := testutil.StartPostgres(t, database)
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint NOT NULL);
+		INSERT INTO public.users SELECT g FROM generate_series(1, 100) g;
+		INSERT INTO public.orders SELECT g, 1 + g % 100 FROM generate_series(1, 1000) g;
+		ALTER TABLE public.orders ADD CONSTRAINT orders_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users (id) NOT VALID`)
+	require.NoError(t, err)
+	files := map[string]string{
+		"users.sql":  "CREATE TABLE users (id bigint PRIMARY KEY)",
+		"orders.sql": "CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint NOT NULL REFERENCES users (id))",
+	}
+	eng := NewWithTableSizeLimit(1)
+
+	plan := planForeignKeyFiles(t, eng, database, dsn, files)
+	require.Len(t, plan.Changes, 1)
+	require.Len(t, plan.Changes[0].TableChanges, 1, "only the validation is left to run")
+	step := plan.Changes[0].TableChanges[0]
+	assert.Contains(t, step.DDL, "VALIDATE CONSTRAINT")
+	assert.Empty(t, step.ExecutionMode, step.ModeReason)
+
+	outcomes := applyPlannedSteps(t, eng, dsn, plan)
+	require.Len(t, outcomes, 1)
+	assert.Equal(t, engine.StateCompleted, outcomes[0].State, outcomes[0].ErrorMessage)
+	assert.True(t, foreignKeyValidated(t, db, "orders_user_id_fkey"))
+}
+
+// A deployment sets a validation bound shorter than the lock budget. The
+// validation queues behind another session's lock on the table, and its lock
+// wait, half the bound, ends before the bound's statement timer, so the step
+// fails as lock contention the drive retries, not as a scan that ran past its
+// bound. Once the lock is released, applying the validation again completes.
+func TestEngineApplyValidationBehindALockIsRetriedNotRefused(t *testing.T) {
+	const database = "apply_foreign_key_lock_wait_test"
+	dsn, db := testutil.StartPostgres(t, database)
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint NOT NULL);
+		INSERT INTO public.users SELECT g FROM generate_series(1, 100) g;
+		INSERT INTO public.orders SELECT g, 1 + g % 100 FROM generate_series(1, 1000) g`)
+	require.NoError(t, err)
+	files := map[string]string{
+		"users.sql":  "CREATE TABLE users (id bigint PRIMARY KEY)",
+		"orders.sql": "CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint NOT NULL REFERENCES users (id))",
+	}
+	plan := planForeignKeyFiles(t, New(), database, dsn, files)
+	require.Len(t, plan.Changes, 1)
+	require.Len(t, plan.Changes[0].TableChanges, 2, "the key is added NOT VALID, then validated")
+	add, validate := *plan, *plan
+	add.Changes = []engine.SchemaChange{{Namespace: plan.Changes[0].Namespace, TableChanges: plan.Changes[0].TableChanges[:1]}}
+	validate.Changes = []engine.SchemaChange{{Namespace: plan.Changes[0].Namespace, TableChanges: plan.Changes[0].TableChanges[1:]}}
+	outcomes := applyPlannedSteps(t, New(), dsn, &add)
+	require.Len(t, outcomes, 1)
+	require.Equal(t, engine.StateCompleted, outcomes[0].State, outcomes[0].ErrorMessage)
+
+	conn, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(conn)
+	tx, err := conn.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	_, err = tx.ExecContext(t.Context(), "LOCK TABLE public.orders IN SHARE UPDATE EXCLUSIVE MODE")
+	require.NoError(t, err)
+
+	short := New().WithValidateMaxDuration(600 * time.Millisecond)
+	outcomes = applyPlannedSteps(t, short, dsn, &validate)
+	require.Len(t, outcomes, 1)
+	assert.Equal(t, engine.StateFailed, outcomes[0].State)
+	assert.True(t, outcomes[0].Retryable, "lock contention is retried: %s", outcomes[0].ErrorMessage)
+	assert.Contains(t, outcomes[0].ErrorMessage, "retry once lock contention subsides")
+	assert.NotContains(t, outcomes[0].ErrorMessage, "validate_max_duration", "the scan never started, so the bound did not end it")
+	assert.False(t, foreignKeyValidated(t, db, "orders_user_id_fkey"))
+
+	require.NoError(t, tx.Rollback())
+	outcomes = applyPlannedSteps(t, short, dsn, &validate)
 	require.Len(t, outcomes, 1)
 	assert.Equal(t, engine.StateCompleted, outcomes[0].State, outcomes[0].ErrorMessage)
 	assert.True(t, foreignKeyValidated(t, db, "orders_user_id_fkey"))

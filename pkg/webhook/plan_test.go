@@ -1105,14 +1105,6 @@ func TestUserFacingErrorHidesTheTransportErrorOfAnUnreachableRemoteDeployment(t 
 	})
 }
 
-func TestUserFacingErrorPreservesNonGRPCErrors(t *testing.T) {
-	err := errors.New("invalid DDL")
-
-	got := userFacingError(err)
-
-	assert.Equal(t, "invalid DDL", got)
-}
-
 // A plan refused because SchemaBot could not read whether an apply still
 // needs a drop_tables entry shows a fixed line on the PR. The storage error
 // behind it, with its hosts and driver text, stays in the server log.
@@ -1141,25 +1133,6 @@ func TestUserFacingErrorExplainsConfigOutsideAllowedDirs(t *testing.T) {
 	assert.Contains(t, got, "SchemaBot found a `schemabot.yaml` configuration")
 	assert.Contains(t, got, "Schema directory: `services/orders/schema`")
 	assert.Contains(t, got, "`databases.orders.allowed_dirs`")
-}
-
-func TestUserFacingErrorDetailKeepsTheFormattedRemoteLine(t *testing.T) {
-	formatted := userFacingError(&api.RemoteDeploymentUnavailableError{
-		Deployment: "pie",
-		Target:     "orders-staging",
-		Err:        status.Error(codes.Unavailable, "dial tcp 10.1.2.3:3306: connect: connection refused"),
-	})
-
-	got := userFacingErrorDetail(formatted)
-
-	assert.Equal(t, "SchemaBot could not reach the remote deployment `pie` for target `orders-staging`. Run the command again once that deployment is healthy; if it fails again, the SchemaBot server logs have the cause.", got)
-}
-
-func TestUserFacingErrorDetailHidesAGRPCUnavailableStatusPassedAsText(t *testing.T) {
-	got := userFacingErrorDetail("rpc error: code = Unavailable desc = dial tcp 10.1.2.3:3306: connect: connection refused")
-
-	assert.Equal(t, "SchemaBot could not reach the remote schema change service. Run the command again once the service is healthy; if it fails again, the SchemaBot server logs have the cause.", got)
-	assert.NotContains(t, got, "10.1.2.3")
 }
 
 func TestRenderUnsafeChangesBlocked_UsedByApplyFlow(t *testing.T) {

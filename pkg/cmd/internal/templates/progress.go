@@ -184,20 +184,7 @@ func WriteProgress(data ProgressData) {
 	// Table progress (sorted: failed and halted first, then active, sharded before unsharded, finished last)
 	// Hide tables during branch setup phases (all tables are Queued, not meaningful)
 	if len(activeTables) > 0 && !state.IsSetupPhase(data.State) {
-		sort.SliceStable(activeTables, func(i, j int) bool {
-			pi := ui.TableStatePriority(state.NormalizeTaskStatus(activeTables[i].Status))
-			pj := ui.TableStatePriority(state.NormalizeTaskStatus(activeTables[j].Status))
-			if pi != pj {
-				return pi < pj
-			}
-			// Within the same priority, sharded tables (have shards) sort first
-			si := len(activeTables[i].Shards) > 0
-			sj := len(activeTables[j].Shards) > 0
-			if si != sj {
-				return si
-			}
-			return false
-		})
+		sortActiveTables(activeTables)
 
 		// Show keyspace headers for Vitess tables (any table with a namespace)
 		hasNamespaces := false
@@ -406,7 +393,7 @@ func FormatVSchemaDiff(diff, indent string) string {
 func writeFailureGuidance() {
 	fmt.Println()
 	fmt.Printf("%sTo recover:%s Fix the issue above, then run a new apply.\n", ANSIBold, ANSIReset)
-	fmt.Printf("The new apply will only process tables that haven't completed.\n")
+	fmt.Printf("The new apply %s.\n", presentation.NewApplyRunsWhatRemains)
 }
 
 // FormatProgressState formats the state for display with color.
@@ -729,13 +716,16 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		b.WriteString(formatTableParts(t))
 		return b.String()
 	case state.Apply.Cancelled:
-		if t.PercentComplete > 0 || t.RowsCopied > 0 {
+		cancelled := presentation.ReadCancelledTask(tableFacts(t), t.Started, t.ApplyFailed)
+		switch {
+		case t.PercentComplete > 0 || t.RowsCopied > 0:
 			cancelledPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 			bar := ui.ProgressBar(cancelledPercent, ui.ColorOrange)
-			writeTableLine(&b, t, "%s 🚫 Cancelled at %s%s", bar,
-				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), presentation.ShardCoverageSuffix(tableFacts(t)))
-		} else {
-			writeTableLine(&b, t, "🚫 Cancelled (not started)")
+			writeTableLine(&b, t, "%s 🚫 %s", bar, cancelled.Label)
+		case cancelled.NotRun:
+			writeTableLine(&b, t, "⏭️ %s", cancelled.Label)
+		default:
+			writeTableLine(&b, t, "🚫 %s", cancelled.Label)
 		}
 		if t.DDL != "" {
 			b.WriteString(formatTableDDL(t))
@@ -981,6 +971,103 @@ func WriteCancelSuccess(data CancelData) {
 	}
 	fmt.Println()
 	fmt.Printf("%sThis schema change cannot be resumed.%s\n", ANSIDim, ANSIReset)
+}
+
+// CancelPendingData contains data for rendering a cancel the server recorded
+// but the apply has not acted on yet.
+type CancelPendingData struct {
+	Database       string
+	Environment    string
+	ApplyID        string
+	CancelledCount int
+	// LookupErr is why the CLI could not read the apply's state while waiting,
+	// or nil when the apply was still active at the deadline.
+	LookupErr error
+}
+
+// WriteCancelPending writes the output of a cancel that is recorded but has
+// not ended the schema change yet. The apply keeps running until a driver
+// consumes the request, and a new apply is refused until it does, so the
+// output must not read as done.
+func WriteCancelPending(data CancelPendingData) {
+	fmt.Printf("%s%s⏳ Cancel requested%s\n", ANSIBold, ANSIYellow, ANSIReset)
+	fmt.Println()
+	fmt.Printf("Database:    %s\n", data.Database)
+	fmt.Printf("Environment: %s\n", data.Environment)
+	if data.CancelledCount > 0 {
+		fmt.Printf("Cancelling:  %d table(s)\n", data.CancelledCount)
+	}
+	fmt.Println()
+	if data.LookupErr != nil {
+		fmt.Printf("The cancel is recorded, but its state could not be read: %v\n", data.LookupErr)
+	} else {
+		fmt.Println("The cancel is recorded. The schema change is still running and ends when SchemaBot next picks it up.")
+	}
+	fmt.Println("A new apply is refused until it ends.")
+	fmt.Println()
+	fmt.Print(FormatNextCommand("To watch it end", ControlCommand("progress", data.ApplyID, data.Environment)))
+}
+
+// CancelDeclinedData contains data for rendering a cancel the schema change
+// declined.
+type CancelDeclinedData struct {
+	Database    string
+	Environment string
+	ApplyID     string
+	// Reason is the engine's reason the cancel did not take effect.
+	Reason string
+}
+
+// WriteCancelDeclined writes the output of a cancel the schema change
+// declined, such as a step that cannot be interrupted. The change keeps
+// running to its own end, so the output says the cancel did nothing.
+func WriteCancelDeclined(data CancelDeclinedData) {
+	fmt.Printf("%s%s%s Cancel did not take effect%s\n", ANSIBold, ANSIYellow, glyph.Refused, ANSIReset)
+	fmt.Println()
+	fmt.Printf("Database:    %s\n", data.Database)
+	fmt.Printf("Environment: %s\n", data.Environment)
+	fmt.Println()
+	if data.Reason != "" {
+		fmt.Println(data.Reason)
+	}
+	fmt.Println("The schema change keeps running and finishes on its own.")
+	fmt.Println()
+	fmt.Print(FormatNextCommand("To watch it finish", ControlCommand("progress", data.ApplyID, data.Environment)))
+}
+
+// CancelOvertakenData contains data for rendering a cancel the schema change
+// finished before acting on.
+type CancelOvertakenData struct {
+	Database    string
+	Environment string
+	ApplyID     string
+	State       string
+}
+
+// WriteCancelOvertaken writes the output of a cancel that arrived after the
+// schema change had already reached another terminal state.
+func WriteCancelOvertaken(data CancelOvertakenData) {
+	fmt.Printf("%sSchema change ended as %s before the cancel took effect%s\n", ANSIBold, data.State, ANSIReset)
+	fmt.Println()
+	fmt.Printf("Database:    %s\n", data.Database)
+	fmt.Printf("Environment: %s\n", data.Environment)
+	fmt.Println()
+	fmt.Print(FormatNextCommand("To see how it ended", ControlCommand("progress", data.ApplyID, data.Environment)))
+}
+
+// WriteCancelTookEffect writes the output of a cancel that ended every part of
+// the schema change still running, on an apply that ended in another state
+// because a part of it had already failed.
+func WriteCancelTookEffect(data CancelOvertakenData) {
+	fmt.Printf("%s%s✖ Cancel took effect%s\n", ANSIBold, ANSIOrange, ANSIReset)
+	fmt.Println()
+	fmt.Printf("Database:    %s\n", data.Database)
+	fmt.Printf("Environment: %s\n", data.Environment)
+	fmt.Println()
+	fmt.Printf("The parts still running were cancelled. The schema change ended %s because another part had already failed.\n", data.State)
+	fmt.Printf("%sThis schema change cannot be resumed.%s\n", ANSIDim, ANSIReset)
+	fmt.Println()
+	fmt.Print(FormatNextCommand("To see what failed", ControlCommand("progress", data.ApplyID, data.Environment)))
 }
 
 // StartData contains data for rendering start command output.

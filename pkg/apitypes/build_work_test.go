@@ -31,19 +31,19 @@ func TestParseBuildWork(t *testing.T) {
 	t.Run("malformed blocks done", func(t *testing.T) {
 		work, err := ParseBuildWork(map[string]string{"executor_operation": "concurrent-index-build", "blocks_done": "many"})
 		require.Error(t, err)
-		assert.Equal(t, BuildWork{}, work)
+		assert.Equal(t, BuildWork{Operation: "concurrent-index-build"}, work, "a malformed counter drops the counters, not the operation")
 	})
 
 	t.Run("present empty counter", func(t *testing.T) {
 		work, err := ParseBuildWork(map[string]string{"executor_operation": "concurrent-index-build", "blocks_done": "", "blocks_total": "10"})
 		require.ErrorContains(t, err, `blocks_done "" is not an integer`)
-		assert.Equal(t, BuildWork{}, work)
+		assert.Equal(t, BuildWork{Operation: "concurrent-index-build"}, work, "a malformed counter drops the counters, not the operation")
 	})
 
 	t.Run("negative counter", func(t *testing.T) {
 		work, err := ParseBuildWork(map[string]string{"executor_operation": "concurrent-index-build", "lockers_done": "-1"})
 		require.ErrorContains(t, err, "lockers_done -1 is negative")
-		assert.Equal(t, BuildWork{}, work)
+		assert.Equal(t, BuildWork{Operation: "concurrent-index-build"}, work, "a malformed counter drops the counters, not the operation")
 	})
 
 	t.Run("precise percent", func(t *testing.T) {
@@ -56,7 +56,7 @@ func TestParseBuildWork(t *testing.T) {
 		for _, raw := range []string{"", "most", "NaN", "-0.5", "100.01"} {
 			work, err := ParseBuildWork(map[string]string{"executor_operation": "concurrent-index-build", "percent": raw})
 			require.Error(t, err, "percent %q", raw)
-			assert.Equal(t, BuildWork{}, work, "percent %q", raw)
+			assert.Equal(t, BuildWork{Operation: "concurrent-index-build"}, work, "percent %q", raw)
 		}
 	})
 

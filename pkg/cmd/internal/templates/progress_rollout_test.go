@@ -692,7 +692,8 @@ func TestFormatRolloutFooter_FailureOnActiveRolloutOffersStopFirst(t *testing.T)
 }
 
 // Once a failed rollout is terminal its footer is the retry, and the label
-// says that the new apply reprocesses only the tables that haven't completed.
+// says that the new apply plans again from the live schema and runs only
+// what is not applied yet.
 func TestFormatRolloutFooter_TerminalFailureOffersRetryThatResumes(t *testing.T) {
 	data := targetRolloutData([]rolloutTarget{
 		completedTarget(),
@@ -700,7 +701,7 @@ func TestFormatRolloutFooter_TerminalFailureOffersRetryThatResumes(t *testing.T)
 	})
 
 	out := renderRollout(t, data)
-	assert.True(t, strings.HasSuffix(out, "To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:\n  schemabot apply -s <schema_dir> -e production\n"),
+	assert.True(t, strings.HasSuffix(out, "To retry once the failure above is resolved — a new apply plans again from the live schema and runs only what is not applied yet:\n  schemabot apply -s <schema_dir> -e production\n"),
 		"the retry closes the footer:\n%s", out)
 	assert.NotContains(t, out, "schemabot stop")
 	assert.NotContains(t, out, presentation.RetryOnceSettledNote)

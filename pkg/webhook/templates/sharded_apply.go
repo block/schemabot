@@ -999,7 +999,7 @@ func writeShardedFailure(sb *strings.Builder, data ShardedApplyData) {
 		if msg := presentation.InlineError(s.Error); msg == "" {
 			fmt.Fprintf(sb, "\n> %s **First failure:** shard <code>%s</code>\n", severity, shard)
 		} else {
-			fmt.Fprintf(sb, "\n> %s **First failure:** shard <code>%s</code> — %s\n", severity, shard, html.EscapeString(msg))
+			fmt.Fprintf(sb, "\n> %s **First failure:** shard <code>%s</code> — %s\n", severity, shard, errorDetailMarkdown(msg))
 		}
 		return
 	case len(failed) > 1:
@@ -1015,7 +1015,7 @@ func writeShardedFailure(sb *strings.Builder, data ShardedApplyData) {
 		return
 	}
 	if msg := presentation.InlineError(data.ErrorMessage); msg != "" {
-		fmt.Fprintf(sb, "\n> %s **Failure:** %s\n", failureSeverity(state.IsState(data.State, state.Apply.FailedRetryable)), html.EscapeString(msg))
+		fmt.Fprintf(sb, "\n> %s **Failure:** %s\n", failureSeverity(state.IsState(data.State, state.Apply.FailedRetryable)), errorDetailMarkdown(msg))
 	}
 }
 
@@ -1084,7 +1084,7 @@ func writeShardFailureReasons(sb *strings.Builder, failed []ShardStatus, totalSh
 			fmt.Fprintf(sb, "\n> %s **%s**\n", summary.Glyph(), subject)
 			return
 		}
-		fmt.Fprintf(sb, "\n> %s **%s:** %s\n", summary.Glyph(), subject, html.EscapeString(summary.Reasons[0].Reason))
+		fmt.Fprintf(sb, "\n> %s **%s:** %s\n", summary.Glyph(), subject, errorDetailMarkdown(summary.Reasons[0].Reason))
 		return
 	}
 	// Each reason's line names its shards, so the headline only counts them.
@@ -1092,7 +1092,7 @@ func writeShardFailureReasons(sb *strings.Builder, failed []ShardStatus, totalSh
 	for _, r := range summary.Reasons {
 		reason := presentation.NoReasonRecorded
 		if r.Reason != "" {
-			reason = html.EscapeString(r.Reason)
+			reason = errorDetailMarkdown(r.Reason)
 		}
 		fmt.Fprintf(sb, "> - %s: %s\n", planShardList(r.Names, totalShards), reason)
 	}
@@ -1121,7 +1121,7 @@ func writeFinalizerFailure(sb *strings.Builder, f *FinalizerFailure) {
 	if msg := presentation.InlineError(f.Error); msg == "" {
 		fmt.Fprintf(sb, "\n> %s **Failure:** finalizing keyspace <code>%s</code>\n", severity, keyspace)
 	} else {
-		fmt.Fprintf(sb, "\n> %s **Failure:** finalizing keyspace <code>%s</code> — %s\n", severity, keyspace, html.EscapeString(msg))
+		fmt.Fprintf(sb, "\n> %s **Failure:** finalizing keyspace <code>%s</code> — %s\n", severity, keyspace, errorDetailMarkdown(msg))
 	}
 }
 
@@ -1242,7 +1242,7 @@ func shardStatusCell(s ShardStatus) string {
 	}
 	if isShardFailureState(s.State) {
 		if msg := sanitizeCellError(s.Error); msg != "" {
-			cell = fmt.Sprintf("%s — %s", cell, html.EscapeString(msg))
+			cell = fmt.Sprintf("%s — %s", cell, errorDetailMarkdown(msg))
 		}
 	}
 	return cell
@@ -1265,7 +1265,7 @@ func writeShardedFooter(sb *strings.Builder, data ShardedApplyData) {
 			fmt.Fprintf(sb, "\n%s\n", presentation.RetryOnceSettledNote)
 		}
 	case state.IsState(data.State, state.Apply.Failed):
-		writeFooterAction(sb, "To retry:", AppendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
+		writeFooterAction(sb, presentation.RetryLabel+":", AppendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 	case state.IsState(data.State, state.Apply.FailedRetryable):
 		writeFooterAction(sb, "An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:", AppendTenantFlag(fmt.Sprintf("schemabot stop %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.IsState(data.State, state.Apply.Stopped):

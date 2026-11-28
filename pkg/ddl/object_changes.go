@@ -40,11 +40,16 @@ type SchemaObject struct {
 // dropping one of them destroys that index or constraint too. Where an index
 // part or a check is an expression rather than a column, the table itself is
 // referenced: the statement does not say which columns the expression reads.
+//
+// Validated lists the constraints a statement validates in a step of its own,
+// such as PostgreSQL's VALIDATE CONSTRAINT. The statement also lists its table
+// under Modified, since the step changes the table in place.
 type ObjectChanges struct {
 	Added      []SchemaObject
 	Dropped    []SchemaObject
 	Modified   []SchemaObject
 	Referenced []SchemaObject
+	Validated  []SchemaObject
 }
 
 func (c *ObjectChanges) add(kind SchemaObjectKind, name string) {
@@ -62,6 +67,12 @@ func (c *ObjectChanges) drop(kind SchemaObjectKind, name string) {
 func (c *ObjectChanges) modify(kind SchemaObjectKind, name string) {
 	if name != "" {
 		c.Modified = append(c.Modified, SchemaObject{Kind: kind, Name: name})
+	}
+}
+
+func (c *ObjectChanges) validate(kind SchemaObjectKind, name string) {
+	if name != "" {
+		c.Validated = append(c.Validated, SchemaObject{Kind: kind, Name: name})
 	}
 }
 
@@ -383,6 +394,9 @@ func alterCmdObjectChanges(changes *ObjectChanges, table string, cmd *pgproto.Al
 		}
 	case pgproto.AlterTableType_AT_DropConstraint:
 		changes.drop(ObjectConstraint, cmd.GetName())
+	case pgproto.AlterTableType_AT_ValidateConstraint:
+		changes.validate(ObjectConstraint, cmd.GetName())
+		changes.modify(ObjectTable, table)
 	default:
 		changes.modify(ObjectTable, table)
 	}

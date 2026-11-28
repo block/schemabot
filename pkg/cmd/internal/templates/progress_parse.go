@@ -140,6 +140,13 @@ type TableProgress struct {
 	// target left to run, so a target still pending on it never starts it and
 	// reads as not started rather than queued.
 	RolloutSettled bool
+	// ApplyFailed marks a table of an apply that ended failed. A table such an
+	// apply recorded cancelled before it started never ran because an earlier
+	// one failed, not because anyone cancelled it, so it reads as not run.
+	ApplyFailed bool
+	// Started reports that the engine began the table's change, which a step
+	// with no row progress, such as a validation, shows no other way.
+	Started bool
 	// Resuming marks a table of a resuming apply. While no target has moved
 	// it on from where the stop left it (presentation.AwaitingResume), its
 	// stopped progress is from before the stop and whether the copy continues
@@ -206,21 +213,21 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 	} else {
 		data.Step, data.StepsTotal, data.Statement = step.Step, step.StepsTotal, step.Statement
 	}
-	if work, err := apitypes.ParseBuildWork(result.Metadata); err != nil {
-		slog.Warn("progress output omits build work because the progress metadata is malformed", "apply_id", result.ApplyID, "error", err)
-	} else {
-		data.BuildWork = work
+	work, err := apitypes.ParseBuildWork(result.Metadata)
+	if err != nil {
+		slog.Warn("progress output omits part of the build work because the progress metadata is malformed", "apply_id", result.ApplyID, "error", err)
 	}
+	data.BuildWork = work
 	dialect := schema.DialectForDatabaseType(result.DatabaseType)
 
 	workByOperation := make(map[presentation.OperationRef]apitypes.BuildWork, len(result.Operations))
 	for _, op := range result.Operations {
-		if work, err := apitypes.ParseBuildWork(op.Metadata); err != nil {
-			slog.Warn("progress output omits an operation's build work because its progress metadata is malformed",
+		work, err := apitypes.ParseBuildWork(op.Metadata)
+		if err != nil {
+			slog.Warn("progress output omits part of an operation's build work because its progress metadata is malformed",
 				"apply_id", result.ApplyID, "deployment", op.Deployment, "operation_key", op.OperationKey, "error", err)
-		} else {
-			workByOperation[presentation.OperationRef{Deployment: op.Deployment, OperationKey: op.OperationKey}] = work
 		}
+		workByOperation[presentation.OperationRef{Deployment: op.Deployment, OperationKey: op.OperationKey}] = work
 		data.Operations = append(data.Operations, ProgressOperation{
 			Deployment:          op.Deployment,
 			OperationKey:        op.OperationKey,
@@ -271,6 +278,8 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			Throttled:           tbl.Throttled,
 			ThrottleReason:      ui.TerminalSafe(tbl.ThrottleReason),
 			IsInstant:           tbl.IsInstant,
+			ApplyFailed:         state.IsState(data.State, state.Apply.Failed),
+			Started:             tbl.StartedAt != "",
 		}
 		copies := make([]presentation.ShardCopy, 0, len(tbl.Shards))
 		for _, sh := range tbl.Shards {

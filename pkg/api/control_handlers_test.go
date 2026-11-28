@@ -279,7 +279,7 @@ func TestControlRoutesAnswerForTernClientFailure(t *testing.T) {
 				assert.Equal(t, tc.wantInternal, IsInternalControlError(err), operation)
 				assert.Equal(t, tc.wantTerminal, IsTerminalControlError(err), operation)
 				assert.Equal(t, tc.wantMessage, err.Error(), operation)
-				assert.Equal(t, tc.wantCode, controlOperationErrorCode(err), operation)
+				assert.Equal(t, tc.wantCode, ControlOperationErrorCode(err), operation)
 				assertTernClientFailureLogged(t, logBuf.Bytes(), tc.wantLogged, tc.wantLogDetail, operation)
 			}
 		})
@@ -423,7 +423,7 @@ func TestControlTernClientFailure(t *testing.T) {
 	t.Run("missing configuration entry is a terminal 404 with the deployment-not-found code", func(t *testing.T) {
 		err := controlTernClientFailure(apply, "ghost", fmt.Errorf("unknown deployment %q: %w", "ghost", errTernDeploymentNotConfigured))
 		assert.Equal(t, http.StatusNotFound, ControlOperationHTTPStatus(err))
-		assert.Equal(t, apitypes.ErrCodeDeploymentNotFound, controlOperationErrorCode(err))
+		assert.Equal(t, apitypes.ErrCodeDeploymentNotFound, ControlOperationErrorCode(err))
 		assert.Equal(t, notConfiguredMessage, err.Error())
 		assert.True(t, IsTerminalControlError(err))
 	})
@@ -442,10 +442,71 @@ func TestControlTernClientFailure(t *testing.T) {
 	t.Run("any other failure is a retryable 503 with a fixed message and the engine-unavailable code", func(t *testing.T) {
 		err := controlTernClientFailure(apply, "ghost", errors.New("resolve DSN for orders/staging: open /secrets/dsn: no such file"))
 		assert.Equal(t, http.StatusServiceUnavailable, ControlOperationHTTPStatus(err))
-		assert.Equal(t, apitypes.ErrCodeEngineUnavailable, controlOperationErrorCode(err))
-		assert.True(t, apitypes.IsRetryableErrorCode(controlOperationErrorCode(err)))
+		assert.Equal(t, apitypes.ErrCodeEngineUnavailable, ControlOperationErrorCode(err))
+		assert.True(t, apitypes.IsRetryableErrorCode(ControlOperationErrorCode(err)))
 		assert.Equal(t, controlEngineUnavailableMessage, err.Error())
 		assert.True(t, IsInternalControlError(err))
 		assert.False(t, IsTerminalControlError(err))
 	})
+}
+
+// A stop or cancel reports how many tables it acts on and how many it leaves
+// alone because they already finished. A table counts once however many tasks
+// it carries: the steps of a staged change on one table, or one task per shard.
+func TestStopRequestCountsCountTables(t *testing.T) {
+	task := func(id int64, namespace, table, taskState string) *storage.Task {
+		return &storage.Task{ID: id, Namespace: namespace, TableName: table, State: taskState}
+	}
+	cases := map[string]struct {
+		tasks       []*storage.Task
+		wantActive  int64
+		wantSkipped int64
+	}{
+		"staged change on one table with one step done": {
+			tasks: []*storage.Task{
+				task(1, "public", "users", state.Task.Completed),
+				task(2, "public", "users", state.Task.FailedRetryable),
+				task(3, "public", "users", state.Task.Pending),
+				task(4, "public", "users", state.Task.Pending),
+			},
+			wantActive: 1,
+		},
+		"one table done and one still running": {
+			tasks: []*storage.Task{
+				task(1, "app", "orders", state.Task.Completed),
+				task(2, "app", "customers", state.Task.Running),
+			},
+			wantActive:  1,
+			wantSkipped: 1,
+		},
+		"one table across shards": {
+			tasks: []*storage.Task{
+				task(1, "commerce", "orders", state.Task.Running),
+				task(2, "commerce", "orders", state.Task.Completed),
+			},
+			wantActive: 1,
+		},
+		"same table name in two namespaces": {
+			tasks: []*storage.Task{
+				task(1, "billing", "accounts", state.Task.Running),
+				task(2, "identity", "accounts", state.Task.Running),
+			},
+			wantActive: 2,
+		},
+		"tasks that name no table count one each": {
+			tasks: []*storage.Task{
+				task(1, "app", "", state.Task.Running),
+				task(2, "app", "", state.Task.Completed),
+			},
+			wantActive:  1,
+			wantSkipped: 1,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			active, skipped := stopRequestCounts(tc.tasks)
+			assert.Equal(t, tc.wantActive, active, "tables acted on")
+			assert.Equal(t, tc.wantSkipped, skipped, "tables already finished")
+		})
+	}
 }

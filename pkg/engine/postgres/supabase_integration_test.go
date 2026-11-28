@@ -129,7 +129,7 @@ func TestSupabaseEngine(t *testing.T) {
 		change := plan.Changes[0].TableChanges[0]
 		assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
 		assert.Contains(t, change.DDL, "title")
-		assert.Contains(t, change.ModeReason, "copy-and-swap")
+		assert.Contains(t, change.ModeReason, "needs a full copy of the table")
 		var dataType string
 		require.NoError(t, db.QueryRowContext(ctx, `
 			SELECT data_type FROM information_schema.columns

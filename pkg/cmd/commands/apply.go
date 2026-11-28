@@ -14,7 +14,6 @@ import (
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
-	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -36,7 +35,7 @@ type ApplyCmd struct {
 	Branch       string        `help:"Reuse existing PlanetScale branch (syncs with main, skips branch creation)" name:"branch"`
 	AllowUnsafe  bool          `help:"Allow destructive changes (DROP TABLE, DROP COLUMN, etc.)" name:"allow-unsafe"`
 	Override     string        `help:"Why this change can't wait. It lets the change through a freeze, or asks a freeze approver to, as the server's override policy says" name:"override"`
-	Force        bool          `help:"Force acquire lock (breaks existing lock from another owner)"`
+	Force        bool          `help:"Force acquire lock (breaks existing lock from another owner, after asking you to confirm unless -y is given)"`
 	Yield        bool          `help:"Release the lock once the apply has finished (kept while it is still running or stopped)"`
 	NoLock       bool          `help:"Don't hold a database lock during the operation" name:"no-lock"`
 	Output       OutputFormat  `short:"o" help:"Output format" default:"interactive" enum:"interactive,log,json"`
@@ -181,7 +180,7 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 	// unsafe opt-in makes it executable. It is checked before the member
 	// refusals, whose remedy is a rerun of the rollout that this verdict would
 	// refuse after those members had already changed.
-	if err := blockedPlanError("apply", planResult); err != nil {
+	if err := blockedPlanError("apply", planResult, cmd.Output != OutputFormatJSON); err != nil {
 		if cmd.Output != OutputFormatJSON {
 			// The refused statement is shown before the refusal, since the
 			// remedy, whichever the reason names, starts with reading it.
@@ -242,6 +241,32 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 		lockBefore = existingLock
 	}
 
+	// takeover is the lock another owner held when --force looked, before the
+	// plan and the prompt. The prompt names it and its answer covers only it.
+	// It stays nil under -y, which asks nothing, and when no other owner holds
+	// the lock.
+	var takeover *client.LockInfo
+	if cmd.Force && !cmd.AutoApprove {
+		var held *client.LockInfo
+		err := withLoading("Checking database lock...", cmd.Output != OutputFormatJSON, func() error {
+			var lockErr error
+			held, lockErr = client.GetLock(ep, cfg.Database, cfg.Type)
+			return lockErr
+		})
+		if err != nil {
+			return fmt.Errorf("check lock: %w", err)
+		}
+		if heldByAnotherOwner(held, owner) {
+			if !stdinIsTerminal() {
+				return errLockTakeoverNeedsApproval(cfg.Database, cfg.Type, held, "nothing was applied", "take it over")
+			}
+			if held.ID < 1 {
+				return errLockTakeoverUnidentified(cfg.Database, cfg.Type, held, "nothing was applied", "take it over")
+			}
+			takeover = held
+		}
+	}
+
 	// Step 2: Show the plan
 	OutputPlanResult(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir, true)
 	writeNarrowedTo(planResult)
@@ -256,10 +281,12 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 
 	// Step 3: Prompt for confirmation (unless auto-approve)
 	if !cmd.AutoApprove {
-		confirmed, err := confirmAction(
-			"\nDo you want to apply these changes? Only 'yes' will be accepted: ",
-			"\nApply cancelled.",
-		)
+		prompt, cancelMsg := templates.ApplyPrompt, "\nApply cancelled."
+		if takeover != nil {
+			templates.WriteLockTakeoverWarning(lockHolderData(cfg.Database, cfg.Type, takeover), templates.ApplyTakeoverConsequence)
+			prompt, cancelMsg = templates.ApplyTakeoverPrompt, "\nApply cancelled. The lock was not changed."
+		}
+		confirmed, err := confirmAction(prompt, cancelMsg)
 		if err != nil {
 			return err
 		}
@@ -297,7 +324,12 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 			if err != nil {
 				return fmt.Errorf("check existing lock: %w", err)
 			}
-			if existingLock != nil && existingLock.Owner != owner {
+			if heldByAnotherOwner(existingLock, owner) {
+				// The operator confirmed the lock shown at the prompt. A
+				// different lock now is one they were never shown.
+				if !cmd.AutoApprove && !sameLockHeld(takeover, existingLock) {
+					return errLockChangedSincePrompt(cfg.Database, cfg.Type, existingLock)
+				}
 				if err := withLoading("Releasing database lock...", cmd.Output != OutputFormatJSON, func() error {
 					return client.ForceReleaseLock(ep, cfg.Database, cfg.Type)
 				}); err != nil {
@@ -653,24 +685,20 @@ func blockUnsafeApply(planResult *apitypes.PlanResponse, database, environment, 
 }
 
 // blockedPlanError returns the refusal for a plan carrying a blocked
-// execution verdict, or nil when it carries none. It names the plan, the
-// first blocked table, and the engine's reason, which says what has to change:
-// the statement, the target's provisioning, or the server's policy. A reason
-// with several independent causes lists each on its own line, so an operator
-// fixing the first is not surprised by the second on the next attempt.
-func blockedPlanError(command string, plan *apitypes.PlanResponse) error {
-	change := plan.FirstBlockedChange()
-	if change == nil {
+// execution verdict, or nil when it carries none. When the output has just
+// listed the refused changes with their reasons, it counts them and points
+// there rather than repeat the first. Otherwise (JSON output) it lists every
+// refused table with its engine's reason, since it is all the reader sees.
+func blockedPlanError(command string, plan *apitypes.PlanResponse, listed bool) error {
+	changes := templates.BlockedChangeNotices(plan)
+	if len(changes) == 0 {
 		return nil
 	}
-	reason := change.ModeReason
-	if strings.TrimSpace(reason) == "" {
-		reason = "the engine refuses this statement"
+	refused := fmt.Sprintf("%s refused: %s the engine refuses to execute", command, templates.BlockedChangeCount(changes))
+	if listed {
+		return fmt.Errorf("%s (listed above)", refused)
 	}
-	if causes := engine.BlockedCauses(reason); len(causes) > 1 {
-		return fmt.Errorf("%s blocked: plan %s contains a blocked change for table %q:\n- %s", command, plan.PlanID, change.TableName, strings.Join(causes, "\n- "))
-	}
-	return fmt.Errorf("%s blocked: plan %s contains a blocked change for table %q: %s", command, plan.PlanID, change.TableName, reason)
+	return fmt.Errorf("%s:\n%s", refused, strings.Join(templates.BlockedChangeLines(changes), "\n"))
 }
 
 // rolloutAttentionSummary names each rollout member that needs attention with

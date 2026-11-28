@@ -125,6 +125,18 @@ func TestProgressFingerprintTracksBuildWork(t *testing.T) {
 		progressFingerprint([]*storage.ApplyOperation{{ID: 1, ProgressMetadata: `{"executor_operation":"concurrent-index-build","server_phase":"waiting for old snapshots","lockers_done":"1","lockers_total":"3"}`}}),
 		"build work without a position is still movement")
 	assert.Empty(t, progressFingerprint(building(`"blocks_done":"many"`)), "a malformed counter contributes nothing")
+
+	statement := func(extra string) []*storage.ApplyOperation {
+		return []*storage.ApplyOperation{{ID: 1, ProgressMetadata: `{"step":"1","steps_total":"1","executor_operation":"native-statement"` + extra + `}`}}
+	}
+	running := progressFingerprint(statement(""))
+	waited := func(ms string) string {
+		return progressFingerprint(statement(`,"lock_holder_pid":"9433","lock_holder_waited_ms":"` + ms + `","lock_holder_limit_ms":"30000"`))
+	}
+	assert.Equal(t, "1:1/1 native-statement@#0 b0/0 t0/0 l0/0 w9433@7s;", waited("7944"))
+	assert.NotEqual(t, running, waited("7944"), "a wait starting is movement")
+	assert.NotEqual(t, waited("7944"), waited("8100"), "the waited time ticking over a second is movement")
+	assert.Equal(t, waited("7944"), waited("7999"), "the comment reads whole seconds, so less is not")
 }
 
 // The progress comment's edit spacing grows with the comment's age, never

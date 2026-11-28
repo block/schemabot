@@ -13,7 +13,10 @@ import (
 type UnlockCmd struct {
 	Database string `short:"d" required:"" help:"Database name"`
 	Type     string `short:"t" help:"Database type registered with the server" default:"mysql"`
-	Force    bool   `help:"Force release lock (bypass ownership check)"`
+	Force    bool   `help:"Force release lock (bypass ownership check). Asks for confirmation before releasing another owner's lock"`
+	// AutoApprove answers the confirmation --force asks before it releases a
+	// lock another owner holds.
+	AutoApprove bool `short:"y" help:"Skip confirmation prompt" name:"auto-approve"`
 }
 
 // Run executes the unlock command.
@@ -44,6 +47,43 @@ func (cmd *UnlockCmd) Run(g *Globals) error {
 		if existingLock == nil {
 			reportNoLockFound(ep, database, dbType)
 			return nil
+		}
+
+		// Taking over another owner's lock is asked about before anything is
+		// sent to the server. A lock this command's owner holds is released
+		// without a question, as an owned release is.
+		if heldByAnotherOwner(existingLock, owner) && !cmd.AutoApprove {
+			if !stdinIsTerminal() {
+				return errLockTakeoverNeedsApproval(database, dbType, existingLock, "it was not released", "release it")
+			}
+			if existingLock.ID < 1 {
+				return errLockTakeoverUnidentified(database, dbType, existingLock, "it was not released", "release it")
+			}
+			templates.WriteLockTakeoverWarning(lockHolderData(database, dbType, existingLock), templates.UnlockTakeoverConsequence)
+			confirmed, err := confirmAction(templates.UnlockTakeoverPrompt, "\nLock not changed.")
+			if err != nil {
+				return err
+			}
+			if !confirmed {
+				return nil
+			}
+			// The answer covers the lock the prompt named. A lock released or
+			// taken again while the prompt was open is not that lock.
+			var current *client.LockInfo
+			if err := withLoading("Checking database lock...", true, func() error {
+				var lockErr error
+				current, lockErr = client.GetLock(ep, database, dbType)
+				return lockErr
+			}); err != nil {
+				return fmt.Errorf("check lock: %w", err)
+			}
+			if current == nil {
+				reportNoLockFound(ep, database, dbType)
+				return nil
+			}
+			if !sameLockHeld(existingLock, current) {
+				return errLockChangedSincePrompt(database, dbType, current)
+			}
 		}
 
 		if err := withLoading("Releasing database lock...", true, func() error {

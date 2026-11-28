@@ -1,17 +1,26 @@
 #!/usr/bin/env node
 // Render the illustrative PR timeline with one reusable browser session.
 // Requires Playwright and ImageMagick. The original pr-demo.gif is preserved.
-// Pass "postgres" to record the PostgreSQL workflow instead of MySQL.
+// Pass "postgres" or "vitess" to record that workflow instead of MySQL.
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
 const {execFileSync}=require('node:child_process');
 const {pathToFileURL}=require('node:url');
 const {chromium}=require('playwright');
 const engine=process.argv[2]||'mysql';
+// timing maps real recording seconds to scene seconds, so reading pauses stay
+// and the copy compresses. opening is a token the first frame's added diff
+// lines must carry. hold is the real second after which the settled merge view
+// repeats instead of repainting.
+const SQL_TIMING=[[0,0],[2,3],[4,7],[5,9],[6.5,10],[9.5,20],[10.5,21.5],[11.5,23],[13.5,25],[15.5,29],[18.5,32]];
 const ENGINES={
  // diffColors are the opening diff's deleted and added line backgrounds.
- mysql:{gif:'assets/pr-workflow-demo.gif',done:'100.00%',diffColors:['FFEBE9','FFCECB','DAFBE1','ACEEBB']},
+ mysql:{gif:'assets/pr-workflow-demo.gif',done:'100.00%',opening:'idx_email_created',diffColors:['FFEBE9','FFCECB','DAFBE1','ACEEBB'],timing:SQL_TIMING,hold:16.5},
  // The PostgreSQL diff only adds lines.
- postgres:{gif:'assets/pr-postgres-workflow-demo.gif',done:'95.00%',diffColors:['DAFBE1','ACEEBB']},
+ postgres:{gif:'assets/pr-postgres-workflow-demo.gif',done:'95.00%',opening:'idx_email_created',diffColors:['DAFBE1','ACEEBB'],timing:SQL_TIMING,hold:16.5},
+ // Vitess runs longer: the copy is followed by a cutover and an open revert
+ // window before the apply completes and the merge unblocks.
+ vitess:{gif:'assets/pr-vitess-workflow-demo.gif',done:'100.00%',opening:'note',diffColors:['DAFBE1','ACEEBB'],
+  timing:[[0,0],[2,3],[4,7],[5,9],[6.5,10],[9.5,20],[10.5,21.5],[13,24],[14,25.5],[16,27.5],[18,31.5],[21,34.5]],hold:19},
 };
 if(!ENGINES[engine])throw new Error(`Unknown engine ${engine}; expected one of ${Object.keys(ENGINES).join(', ')}`);
 (async()=>{
@@ -24,10 +33,10 @@ if(!ENGINES[engine])throw new Error(`Unknown engine ${engine}; expected one of $
   const url=pathToFileURL(path.join(root,'assets/src/pr-workflow-demo.html'));url.search=`engine=${engine}`;
   await page.goto(url.href);
   await page.evaluate(()=>Promise.all([...document.images].map(i=>i.decode())));
-  const frames=[],fps=20,introSeconds=4,duration=18.5+introSeconds;
-  let lastCamera;
   // Keep reading pauses, but compress copying to three seconds.
-  const timing=[[0,0],[2,3],[4,7],[5,9],[6.5,10],[9.5,20],[10.5,21.5],[11.5,23],[13.5,25],[15.5,29],[18.5,32]];
+  const timing=ENGINES[engine].timing,sceneEnd=timing[timing.length-1][1];
+  const frames=[],fps=20,introSeconds=4,duration=timing[timing.length-1][0]+introSeconds;
+  let lastCamera;
   function sceneTime(seconds){
    if(seconds<introSeconds)return -1;
    seconds-=introSeconds;
@@ -35,11 +44,11 @@ if(!ENGINES[engine])throw new Error(`Unknown engine ${engine}; expected one of $
     const [end,to]=timing[j], [start,from]=timing[j-1];
     if(seconds<=end)return from+(to-from)*(seconds-start)/(end-start);
    }
-   return 32;
+   return sceneEnd;
   }
   for(let i=0;i<=duration*fps;i++){
    // Hold the settled merge view without repainting identical DOM each frame.
-   if(i>(16.5+introSeconds)*fps){frames.push(frames[frames.length-1]);continue;}
+   if(i>(ENGINES[engine].hold+introSeconds)*fps){frames.push(frames[frames.length-1]);continue;}
    await page.evaluate(({t,dt})=>window.renderFrame(t,dt),{t:sceneTime(i/fps),dt:1/fps});
    const camera=await page.evaluate(()=>previousScroll);
    const t=sceneTime(i/fps);
@@ -48,7 +57,7 @@ if(!ENGINES[engine])throw new Error(`Unknown engine ${engine}; expected one of $
    }
    lastCamera=camera;
    if(i===0){
-    if(!(await page.locator('#diff-view').isVisible())||!(await page.locator('.code.added').allTextContents()).join(' ').includes('idx_email_created'))throw new Error('Opening frame must show the index diff');
+    if(!(await page.locator('#diff-view').isVisible())||!(await page.locator('.code.added').allTextContents()).join(' ').includes(ENGINES[engine].opening))throw new Error(`Opening frame must show the ${ENGINES[engine].opening} diff`);
    }
    if(i===introSeconds*fps){
     const checks=await page.locator('#checks').innerText();
@@ -84,6 +93,6 @@ if(!ENGINES[engine])throw new Error(`Unknown engine ${engine}; expected one of $
    held+=Number(delay);
   }
   if(held<200)throw new Error('Final GIF reading pause must last two seconds');
-  console.log(`Rendered 451 frames: approximately 22.5 seconds, including the file diff, ${ENGINES[engine].done} progress and merge`);
+  console.log(`Rendered ${frames.length} frames: approximately ${duration.toFixed(1)} seconds, including the file diff, ${ENGINES[engine].done} progress and merge`);
  } finally {if(browser)await browser.close();fs.rmSync(tmp,{recursive:true,force:true})}
 })().catch(e=>{console.error(e);process.exitCode=1});

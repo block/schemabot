@@ -331,9 +331,15 @@ drops, require a plan. See [lint and safety levels](lint-and-safety-levels.md#au
 ### Skip tables schema files cannot describe
 
 A PostgreSQL pull refuses the whole request when one table has a shape schema
-files cannot describe, such as a trigger or an `UNLOGGED` table. A caller that
-writes schema files can set `skip_unrepresentable_tables` to get every other
-table instead. Each skipped table comes back in `skipped_tables` with the reason.
+files cannot describe, such as an `UNLOGGED` table or a table that inherits from
+another. A caller that writes schema files can set `skip_unrepresentable_tables`
+to get every other table instead. Each skipped table comes back in
+`skipped_tables` with the reason.
+
+Triggers and comments do not make a table unrepresentable. The pulled file
+holds the table's columns, constraints, and indexes, and the triggers and
+comments stay on the live table, outside the file. Plans and applies neither
+read nor change them.
 
 ```http
 POST /api/pull
@@ -350,7 +356,7 @@ Content-Type: application/json
     "public": {
       "tables": {"orders": "CREATE TABLE orders (...);"},
       "skipped_tables": [
-        {"table": "accounts", "reason": "schema files cannot describe its trigger"}
+        {"table": "audit_log", "reason": "unlogged tables cannot be rendered as a desired schema"}
       ]
     }
   },
@@ -381,7 +387,7 @@ schemabot pull -d shop -e production
 ```sql
 -- Namespace `public` — 1 table
 -- ⚠️ Skipped 1 table, not in the output:
---   accounts: schema files cannot describe its trigger
+--   audit_log: unlogged tables cannot be rendered as a desired schema
 ```
 
 `schemabot onboard` and `schemabot init` set it too, and write each skipped
@@ -843,6 +849,30 @@ index. `percent` is the whole-build percent with two decimals, for example
 `"35.45"`, and is present only while the index build is the step in flight. Read an
 operation's own fields from there and match a table to its operation by
 `deployment` and `operation_key`.
+
+A PostgreSQL step that needs a lock first waits up to 30 seconds outside the
+lock queue for a session holding a conflicting lock on its table. While it
+waits, other readers and writers do not queue behind it. Once the wait runs
+out, the step requests its lock anyway, under its short lock timeout. During the
+wait, `metadata` names that session. `lock_holder_pid` is the process ID of the
+blocking session, not SchemaBot's own. `lock_holder_table` is the table it holds
+the lock on, `lock_holder_waited_ms` how long the step has waited so far, and
+`lock_holder_limit_ms` how long it waits before it requests its lock anyway.
+Each is a string, and the durations are in milliseconds. `lock_holder_table` is
+left out when the server reports no table name it can show. They disappear
+once the holder releases its lock or the wait ends:
+
+```json
+"metadata": {
+  "step": "1",
+  "steps_total": "1",
+  "lock_holder_pid": "48213",
+  "lock_holder_table": "orders",
+  "lock_holder_waited_ms": "12500",
+  "lock_holder_limit_ms": "30000"
+}
+```
+
 `engine` names the engine running the apply, in one of two forms depending on
 where the response comes from. While the data plane reports the apply's
 progress, it is the engine's display name: `Spirit`, `PlanetScale`, `Strata`, or
@@ -862,6 +892,29 @@ may still be in effect, and it refuses a start unless a freeze approver approves
 an override.
 The field is absent for an apply an operator stopped, and for one whose stop
 cannot be read, which reads as an ordinary stop.
+
+`control_requests` lists the latest request of each control operation made
+against the apply, so a caller that sent `stop`, `cancel`, or another control
+command can tell whether it took effect. Each entry carries the `operation`, a
+`status` of `pending`, `completed`, or `failed`, a `revision` that rises each
+time a new request follows a settled one, `requested_by`, and, once settled,
+`settled_at`. A `failed` entry's `error_message` says why the command did not
+take effect. A PostgreSQL step that commits or fails on its own, for example,
+declines a cancel and runs on. The field is absent when no control command was
+ever sent, and when the requests cannot be read.
+
+```json
+"control_requests": [
+  {
+    "operation": "cancel",
+    "status": "failed",
+    "revision": 0,
+    "error_message": "cancel is supported for PostgreSQL index builds only: this schema change runs as plain DDL that commits or fails on its own",
+    "requested_by": "cli:alice",
+    "settled_at": "2026-03-04T17:22:41Z"
+  }
+]
+```
 
 An unknown `apply_id` answers `404` with `error_code` `not_found`. When the apply
 exists but the server cannot read its progress from the data plane that runs it,
@@ -1651,9 +1704,10 @@ Error: plan plan-example-42 was made for environment "staging", not "production"
 A blocked execution verdict is a refusal, not a request for unsafe consent.
 For example, when the fresh plan contains a blocked key alteration on `users`,
 `apply` shows the plan and stops before prompting or locking, even with
-`--allow-unsafe --yield`. The refusal names the plan, the table, and the
+`--allow-unsafe --yield`. The plan ends with each refused table and the
 engine's reason, which says what has to change; here it is a grant on the
-target, not the schema files:
+target, not the schema files. The error counts the refused changes and points
+at that list:
 
 ```sh
 schemabot apply -s ./schema -e staging --allow-unsafe --yield
@@ -1673,14 +1727,20 @@ Staging
 
 📋 Plan: 1 table to alter
 
-Error: apply blocked: plan plan-example-43 contains a blocked change for table "users": dropping primary key is not supported; direct execution is enabled but SchemaBot lacks a grant it needs to end sessions blocking the statement: grant its database user SELECT on performance_schema, PROCESS, and CONNECTION_ADMIN (or SUPER), then plan again
+⛔ Cannot apply: 1 change the engine refuses to execute
+  - users: dropping primary key is not supported; direct execution is enabled but SchemaBot lacks a grant it needs to end sessions blocking the statement: grant its database user SELECT on performance_schema, PROCESS, and CONNECTION_ADMIN (or SUPER), then plan again
+
+An apply will fail on these statements. Each reason names its fix: make it and plan again, or contact your SchemaBot operators for help.
+
+Error: apply refused: 1 change the engine refuses to execute (listed above)
 ```
 
 A reason with several independent causes lists each on its own line. With
-`-o json` the plan is not rendered and the error alone carries the refusal.
+`-o json` the plan is not rendered, so the error lists every refused table
+with its reason, one per line, under the same count.
 This also applies to a whole rollout, where it is reported before any member
 the rollout refuses, to an apply narrowed with `--target`, and to `rollback`,
-whose refusal starts `rollback blocked:`. No apply is submitted and no lock is
+whose refusal starts `rollback refused:`. No apply is submitted and no lock is
 acquired or released.
 
 History records executions. Plans describe what was proposed.

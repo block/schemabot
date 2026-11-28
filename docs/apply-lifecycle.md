@@ -8,6 +8,7 @@
 - [The one rule](#the-one-rule)
 - [State reference](#state-reference)
 - [The retry budget](#the-retry-budget)
+- [Refused at plan time](#refused-at-plan-time)
 - [Refused before an apply exists](#refused-before-an-apply-exists)
 - [Recovering from a failed apply](#recovering-from-a-failed-apply)
 - [What cleans up after a failed rollout](#what-cleans-up-after-a-failed-rollout)
@@ -158,6 +159,11 @@ so in its reply, and a `stop` sent from anywhere else gets a "Start Withdrawn"
 comment on the PR.
 A `stop` on a `stopped` apply with no `start` waiting is refused with
 `409 already_stopped`.
+A `stop` on an apply whose engine has no paused phase, such as PostgreSQL, is
+refused with `400` before anything is recorded. The error code names the next
+step: `stop_unsupported_cancel` when `cancel` ends it, `stop_unsupported_finishes`
+when it finishes on its own and `progress` follows it, and `stop_unsupported`
+when SchemaBot can't tell which.
 
 ## The retry budget
 
@@ -238,6 +244,19 @@ Two things end the loop:
 Either way, the apply is then terminalized as permanent `failed`, and the
 normal recovery path applies: fix the cause, fresh plan, fresh apply. A new
 apply starts every operation with a full budget.
+
+## Refused at plan time
+
+`POST /api/plan` answers `422 schema_refused` when the engine cannot plan the
+schema files as written, or a schema file does not parse. The `error` names
+the remedy: usually a change to the files, sometimes a condition to wait for,
+such as a table to drop going quiet. Follow it, then plan again; repeating the
+request before then gets the same answer. A `5xx` is a server fault, and a
+retry may succeed.
+
+In a rollout, a member the engine refuses is listed under the rollout's
+members needing attention, with the refusal as its detail, and the response
+is `200` for the members that planned.
 
 ## Refused before an apply exists
 

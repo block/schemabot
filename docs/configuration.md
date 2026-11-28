@@ -1816,7 +1816,7 @@ change, so plan it before upgrading rather than after.
 The `postgres:` block sets the largest table on which the PostgreSQL engine
 will execute native-safe DDL whose cost scales with the table's existing data
 (`ALTER TABLE` and a blocking `CREATE INDEX`), the maximum duration of a
-concurrent index build, and the statement budget SchemaBot's own storage
+concurrent index build and of a constraint validation, and the statement budget SchemaBot's own storage
 connections run under.
 The size limit is expressed in bytes and defaults to 1 GiB:
 
@@ -1824,6 +1824,7 @@ The size limit is expressed in bytes and defaults to 1 GiB:
 postgres:
   native_safe_table_size_limit_bytes: 4294967296
   concurrent_index_max_duration: 24h
+  validate_max_duration: 24h
   statement_timeout: 30s
 ```
 
@@ -1834,8 +1835,9 @@ holding `ACCESS EXCLUSIVE`, and the size compared against the ceiling is the
 total relation size summed across the table's partition tree — indexes and
 TOAST included — so an index-heavy table cannot slip under it. Raising the
 ceiling converts an up-front refusal into a bounded attempt, not an unbounded
-lock. An oversized table appears in the plan comment's **Cannot apply** section;
-adjust `postgres.native_safe_table_size_limit_bytes` if operators decide the
+lock. An oversized table appears in the **Cannot apply** section of the plan
+comment and of `schemabot plan`, with its size against the ceiling and the
+option to change; adjust `postgres.native_safe_table_size_limit_bytes` if operators decide the
 target is safe for a bounded attempt. Every apply still runs under short
 `lock_timeout` and `statement_timeout` budgets, so above the ceiling it is the
 statement timeout, not the ceiling, that stops a runaway rewrite. A greenfield
@@ -1877,8 +1879,20 @@ a shorter value would round to zero on the server and switch the timer off),
 and durations above the largest `statement_timeout` PostgreSQL itself accepts
 (about 24 days); omit the option to use the default rather than setting `0`.
 
+`validate_max_duration` is a Go duration string and defaults to `24h`. It is
+the server-side `statement_timeout` of a `VALIDATE CONSTRAINT`, the scan that
+checks existing rows against a foreign key or check constraint added
+`NOT VALID`. The scan holds `SHARE UPDATE EXCLUSIVE`, so reads and writes
+continue while it runs. A scan that reaches the bound is cancelled and the
+step is refused; the constraint stays `NOT VALID` and keeps checking new
+writes. The scan's lock wait keeps the 3-second lock budget, or half the bound
+when the bound is shorter, so waiting behind other DDL is retried as lock
+contention rather than refused. It accepts `2ms` up to the same maximum as
+`concurrent_index_max_duration`.
+
 Concurrent index builds do not consult the size ceiling; their work is bounded
-by `concurrent_index_max_duration` instead.
+by `concurrent_index_max_duration` instead. Constraint validations do not
+either; theirs is bounded by `validate_max_duration`.
 
 The ceiling is process-wide: every PostgreSQL database this server drives
 shares the same value, and a database cannot override it in its own metadata.
@@ -2571,7 +2585,7 @@ The two value namespaces do not overlap and are verified by different systems, s
 
 The decision has two halves. The middleware admits any caller in `write_groups` or in any database's `operator_groups` to write-tier endpoints — it runs before the request body is parsed, so it cannot know the target. Each mutating handler then enforces the scope once the target database resolves: `plan` and `apply` from the request/stored plan, control operations (`stop`, `start`, `cutover`, `cancel`, `release`, `revert`, `skip-revert`, `rollback plan`) from the stored apply, and lock acquire/release from the named database (locks are operator controls in the same family as stop/cancel and have no environment dimension, so the grant applies database-wide). Operations with no single target database — settings mutation, checks scan/synthesize/repos — stay admin-only (`write_groups`). Operator members also get the read tier, deployment-wide.
 
-Two consequences of the environment-less lock grant are worth stating outright. First, a scoped operator's lock holds applies off **every** environment of their database, including environments outside `operator_environments` — an operator scoped to staging can still freeze production applies of their own database. That direction is fail-safe (a lock only ever prevents changes), so the grant deliberately allows it. Second, the reverse direction is not: force release (`force: true`) bypasses the lock ownership check, so it could undo another holder's safety brake — for example an admin's incident lock. Force release therefore stays admin-only (`write_groups`).
+Two consequences of the environment-less lock grant are worth stating outright. First, a scoped operator's lock holds applies off **every** environment of their database, including environments outside `operator_environments` — an operator scoped to staging can still freeze production applies of their own database. That direction is fail-safe (a lock only ever prevents changes), so the grant deliberately allows it. Second, the reverse direction is not: force release (`force: true`) bypasses the lock ownership check, so it could undo another holder's safety brake — for example an admin's incident lock. Force release therefore stays admin-only (`write_groups`). A force release that also sends `id`, the lock ID that `POST /api/locks/acquire` or `GET /api/locks` reported, removes only that lock, whoever owns it. If a different lock is held when the request arrives, the answer is a `409` that names the lock held now, nothing is released, and the lock stays held; if no lock is held, the answer is a `404`. Without `id`, a force release removes whichever lock is held.
 
 A scoped operator's normal release is held to who took the lock, not to the owner string it carries: that string is visible to anyone who can list locks, so sending it proves nothing. A lock acquired through `POST /api/locks/acquire` records its verified acquirer and which of the database's `operator_groups` that acquirer belonged to, and a scoped operator may release it only when they share at least one of those groups — a teammate can release a lock another member of their group took, and nobody outside the group can. A lock that records no acquirer (a PR apply's lock, a lock taken on a deployment with no `operator_groups`, a lock taken by a server version that did not record acquirers, or one taken through the loopback break-glass lane, whose identity headers are not proxy-verified) or whose acquirer held none of the database's operator groups belongs to no group, so a scoped operator cannot release it; a `write_groups` member can, by owner or with `force`. A scoped operator cannot create such a lock: an acquire from a scoped operator whose identity is not verified, as on the loopback break-glass lane, is refused with a `403` before anything is taken, since the lock would record no acquirer and they could never release or re-acquire it. The refusal is decided before the lock is read, so it also answers an unverified operator re-sending the owner of a lock their own group already holds: the lock stays held and unchanged, but the request is not told it holds it, because the groups of an unverified caller are only claimed. `schemabot apply` (unless `--no-lock` is set) and `schemabot rollback` take this lock before they start, so on the loopback break-glass lane they stop at the same refusal before changing anything; a deployment write group member can run them instead. A refused release is a `403` naming the groups that may release the lock, and the lock stays held. The release is decided against the lock row it read and deletes only that row, so a lock released and acquired again while the release runs is reported as a `409` and the new lock stays held. The same rule decides whether a scoped operator who acquires a lock already held under the owner they sent is told they hold it: re-acquiring a lock their own group took succeeds without changing it when their identity is verified, and sending the owner of another group's lock, or of a lock that belongs to no group, is a `403` naming the groups that may release it, with the lock unchanged. `write_groups` members, and every caller on a deployment without `operator_groups`, re-acquire and release by owner alone. A lock records its acquirer's groups when it is taken, while the caller's groups are read from the current configuration, so editing `operator_groups` strands locks: after a group is renamed, no scoped operator can release or re-acquire a lock taken under its old name, and an operator moved out of every group a lock recorded can no longer release or re-acquire the lock they took, until a `write_groups` member (or, for a moved operator, a remaining member of one of those groups) releases it.
 

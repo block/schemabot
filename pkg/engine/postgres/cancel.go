@@ -10,6 +10,7 @@ import (
 	"github.com/block/pg-sprite/pkg/progress"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // cancelSettleTimeout bounds how long Cancel waits for a signalled drive to
@@ -73,8 +74,9 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 		return e.settledCancel(key, tracked)
 	}
 	if !tracked.cancellableBuild {
+		bound := tracked.validationBound
 		e.mu.Unlock()
-		return nil, engine.NewUnsupportedOperationError("cancel is supported for PostgreSQL index builds only: this schema change runs as plain DDL that commits or fails on its own")
+		return nil, cancelUnsupported(bound)
 	}
 	tracker, logger, cancelApply, done, partitioned := tracked.tracker, tracked.logger, tracked.cancelApply, tracked.done, tracked.partitionedBuild
 	if err := ctx.Err(); err != nil {
@@ -275,4 +277,15 @@ func isCancellation(err error) bool {
 	return errors.Is(err, executor.ErrCancelledExternally) ||
 		errors.Is(err, executor.ErrCancelledByCaller) ||
 		errors.Is(err, context.Canceled)
+}
+
+// cancelUnsupported is the refusal for a cancel of a change that is not an
+// index build. A constraint validation can run for as long as its bound, so
+// the refusal names the bound and what is left if the scan runs out: the
+// constraint stays NOT VALID and still checks new writes.
+func cancelUnsupported(validationBound time.Duration) error {
+	if validationBound > 0 {
+		return engine.NewUnsupportedOperationError("cancel is supported for PostgreSQL index builds only: this constraint validation ends on its own within %s (validate_max_duration), and leaves the constraint NOT VALID if the scan does not finish", ui.FormatHumanDuration(validationBound))
+	}
+	return engine.NewUnsupportedOperationError("cancel is supported for PostgreSQL index builds only: this schema change runs as plain DDL that commits or fails on its own")
 }

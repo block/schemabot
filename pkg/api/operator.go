@@ -2911,6 +2911,35 @@ func (s *Service) handBackDeferredCutoverDrive(ctx context.Context, driverID int
 	s.releaseOperationClaim(releaseCtx, driverID, op, opLease)
 }
 
+// logFailedFinishedClaimRelease names what a lease left on a finished
+// operation holds up. Only a failed_retryable operation reads its lease: a
+// fresh one holds back the claim that takes its retry and the apply's
+// retryable expiry. A settled operation is out of progress by its state, so
+// its leftover lease holds up nothing. The in-memory operation carries the
+// state it was claimed in, not the one the drive ended it in, so the row is
+// read for it.
+func (s *Service) logFailedFinishedClaimRelease(ctx context.Context, driverID int, op *storage.ApplyOperation, releaseErr error) {
+	attrs := append(op.LogAttrs(), "driver", driverID, "error", releaseErr)
+	current, err := s.storage.ApplyOperations().Get(ctx, op.ID)
+	if err != nil {
+		s.logger.Warn("operator: failed to clear the lease on the operation this driver finished, and failed to read its state; if it ended failed_retryable, no driver claims its retry and this apply's retryable expiry is deferred until the leftover lease goes stale",
+			append(attrs, "read_error", err)...)
+		return
+	}
+	if current == nil {
+		s.logger.Warn("operator: failed to clear the lease on the operation this driver finished, and its row is gone; the lease holds up nothing",
+			attrs...)
+		return
+	}
+	if state.IsState(current.State, state.ApplyOperation.FailedRetryable) {
+		s.logger.Warn("operator: failed to clear the lease on the operation this driver finished; until the leftover lease goes stale, no driver claims this operation's retry and this apply's retryable expiry is deferred",
+			append(attrs, "operation_state", current.State)...)
+		return
+	}
+	s.logger.Warn("operator: failed to clear the lease on the operation this driver finished; it is settled, so the leftover lease holds up nothing and goes stale on its own",
+		append(attrs, "operation_state", current.State)...)
+}
+
 // releaseFinishedOperationClaim clears the operation lease a drive leaves
 // behind when it ends.
 //
@@ -2918,9 +2947,10 @@ func (s *Service) handBackDeferredCutoverDrive(ctx context.Context, driverID int
 // for a full staleness window, and for that window nothing can tell the
 // leftover apart from the lease a driver just took: same state, same shape of
 // owner, same recent heartbeat. Any reader that consults the lease to ask
-// whether a drive is in progress has to assume the pessimistic answer. Clearing
-// the lease at the point the drive actually ends makes a fresh lease mean what
-// it says.
+// whether a drive is in progress has to assume the pessimistic answer: the
+// retryable expiry waits for the lease to go stale, and so does the claim that
+// takes a failed_retryable operation's retry. Clearing the lease at the point
+// the drive actually ends makes a fresh lease mean what it says.
 //
 // This runs as the drive returns rather than inside the state write, because
 // the multi-operation drive projects the parent apply's state under this same
@@ -2952,8 +2982,7 @@ func (s *Service) releaseFinishedOperationClaim(ctx context.Context, driverID in
 
 	released, err := s.storage.ApplyOperations().ReleaseFinishedClaim(releaseCtx, opLease)
 	if err != nil {
-		s.logger.Warn("operator: failed to clear the lease on the operation this driver finished; the leftover lease defers this apply's retryable expiry until it goes stale",
-			append(op.LogAttrs(), "driver", driverID, "error", err)...)
+		s.logFailedFinishedClaimRelease(releaseCtx, driverID, op, err)
 		return
 	}
 	if !released {

@@ -191,43 +191,56 @@ func TestHandlePlanAnswersFixedMessageWhenRolloutMembersCannotBePlanned(t *testi
 
 // A plan the engine declines, and a plan SchemaBot refuses with the change to
 // make, keep their text: it tells the author what to change in the schema
-// files or in the deployment, and it carries no storage or engine cause.
+// files or in the deployment, and it carries no storage or engine cause. A
+// refusal of the schema files is 422 schema_refused, since planning the same
+// files again gets the same answer; a deployment that needs an upgrade is
+// still a server fault.
 func TestHandlePlanKeepsTextWrittenForTheReader(t *testing.T) {
 	const refusal = "the schema files drop table orders_seq; remove the drop or list the table under drop_tables"
 	withheld := redactionPlanRequest()
 	withheld.IgnoreTables = []string{"orders_archive"}
 
 	tests := []struct {
-		name    string
-		request PlanRequest
-		client  *mockTernClient
-		want    string
+		name       string
+		request    PlanRequest
+		client     *mockTernClient
+		want       string
+		wantStatus int
+		wantCode   string
 	}{
 		{
-			name:    "engine declines the plan",
-			request: redactionPlanRequest(),
-			client:  &mockTernClient{planErr: fmt.Errorf("plan namespace: %w", &engine.PlanRefusedError{Err: errors.New(refusal)})},
-			want:    "plan failed: " + refusal,
+			name:       "engine declines the plan",
+			request:    redactionPlanRequest(),
+			client:     &mockTernClient{planErr: fmt.Errorf("plan namespace: %w", &engine.PlanRefusedError{Err: errors.New(refusal)})},
+			want:       "plan failed: " + refusal,
+			wantStatus: http.StatusUnprocessableEntity,
+			wantCode:   apitypes.ErrCodeSchemaRefused,
 		},
 		{
 			name:    "engine declines the plan under a wrap that names an address",
 			request: redactionPlanRequest(),
 			client: &mockTernClient{planErr: fmt.Errorf("plan namespace payments via 10.0.0.5:3306: %w",
 				&engine.PlanRefusedError{Err: errors.New(refusal)})},
-			want: "plan failed: " + refusal,
+			want:       "plan failed: " + refusal,
+			wantStatus: http.StatusUnprocessableEntity,
+			wantCode:   apitypes.ErrCodeSchemaRefused,
 		},
 		{
-			name:    "remote data plane declines the plan",
-			request: redactionPlanRequest(),
-			client:  &mockTernClient{isRemote: true, planErr: status.Error(codes.FailedPrecondition, refusal)},
-			want:    "plan failed: " + refusal,
+			name:       "remote data plane declines the plan",
+			request:    redactionPlanRequest(),
+			client:     &mockTernClient{isRemote: true, planErr: status.Error(codes.FailedPrecondition, refusal)},
+			want:       "plan failed: " + refusal,
+			wantStatus: http.StatusUnprocessableEntity,
+			wantCode:   apitypes.ErrCodeSchemaRefused,
 		},
 		{
 			name:    "remote data plane declines the plan under a wrap that names an address",
 			request: redactionPlanRequest(),
 			client: &mockTernClient{isRemote: true, planErr: fmt.Errorf("plan via 10.0.0.5:3306: %w",
 				status.Error(codes.FailedPrecondition, refusal))},
-			want: "plan failed: " + refusal,
+			want:       "plan failed: " + refusal,
+			wantStatus: http.StatusUnprocessableEntity,
+			wantCode:   apitypes.ErrCodeSchemaRefused,
 		},
 		{
 			name:    "deployment plans a drop that ignore_tables withholds",
@@ -239,6 +252,7 @@ func TestHandlePlanKeepsTextWrittenForTheReader(t *testing.T) {
 			want: `plan failed: the plan from deployment "default" proposes dropping "orders_archive", which ignore_tables withholds. ` +
 				`That deployment's planner did not apply the exclusion, so the plan is refused rather than reviewed as a drop. ` +
 				`Upgrade that deployment to a build that supports ignore_tables`,
+			wantStatus: http.StatusInternalServerError,
 		},
 	}
 	for _, tt := range tests {
@@ -247,12 +261,33 @@ func TestHandlePlanKeepsTextWrittenForTheReader(t *testing.T) {
 
 			rec := postJSON(t, svc.handlePlan, "/api/plan", tt.request)
 
-			require.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
+			require.Equal(t, tt.wantStatus, rec.Code, rec.Body.String())
 			var resp apitypes.ErrorResponse
 			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
 			assert.Equal(t, tt.want, resp.Error)
+			assert.Equal(t, tt.wantCode, resp.ErrorCode)
 		})
 	}
+}
+
+// A remote data plane's plan refusal reaches the webhook marked as text written
+// for the reader, so the pull request explains the refusal the same way it
+// does a local engine's. The text is the refusal's own, without the gRPC
+// framing or the wrap that names an address, and the status code still reads
+// through it.
+func TestExecutePlanMarksARemoteRefusalAsAuthored(t *testing.T) {
+	const refusal = "drop_tables entries were written in the last 24h"
+	svc := withheldDropService(&capturingPlanStore{}, &mockTernClient{isRemote: true,
+		planErr: fmt.Errorf("plan via 10.0.0.5:3306: %w", status.Error(codes.FailedPrecondition, refusal))})
+
+	_, err := svc.ExecutePlan(t.Context(), redactionPlanRequest())
+
+	require.Error(t, err)
+	text, quotesRepository, ok := AuthoredTextOf(err)
+	require.True(t, ok, "a remote refusal must be marked as authored: %v", err)
+	assert.Equal(t, refusal, text)
+	assert.True(t, quotesRepository)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
 }
 
 // A pull that fails inside SchemaBot answers 500 with a fixed message that
@@ -406,4 +441,78 @@ func TestPlanFailureMessageForUnselectedDropCheck(t *testing.T) {
 		assert.Equal(t, `plan failed for database "orders" in environment "production": SchemaBot hit an internal error. `+
 			`Plan again in a moment. If it keeps failing, a SchemaBot operator can find the cause in the server log.`, got, name)
 	}
+}
+
+// A drop check that stopped on a schema file that would not parse answers
+// 422 schema_refused with the text that names the file, since planning the
+// same files again stops the same way. A drop check that stopped for any
+// other reason, such as the parser not being available or storage failing,
+// is SchemaBot's own fault: it answers 500 with the fixed message and no
+// error code.
+func TestHandlePlanAnswersADropCheckByItsCause(t *testing.T) {
+	declared := map[string]*ternv1.SchemaFiles{
+		"ns_1": {Files: map[string]string{"payments.sql": "CREATE TABLE `payments` ("}},
+	}
+	checkFailure := func(cause error) error {
+		return fmt.Errorf("plan via 10.0.0.5:3306: %w", &UnselectedTableDropCheckError{
+			Database: "payments", Environment: "staging", Target: "payments-001", Err: cause,
+		})
+	}
+	_, parseCause := tablesDeclaredBy(declared, []string{"ns_1"}, "mysql")
+	require.ErrorAs(t, parseCause, new(*schemaFileParseError))
+	_, parserCause := tablesDeclaredBy(declared, []string{"ns_1"}, "nosuchdb")
+	require.Error(t, parserCause)
+
+	t.Run("schema file does not parse", func(t *testing.T) {
+		svc := withheldDropService(&capturingPlanStore{}, &mockTernClient{planErr: checkFailure(parseCause)})
+
+		rec := postJSON(t, svc.handlePlan, "/api/plan", redactionPlanRequest())
+
+		require.Equal(t, http.StatusUnprocessableEntity, rec.Code, rec.Body.String())
+		resp := decodeErrorResponse(t, rec)
+		assert.Equal(t, apitypes.ErrCodeSchemaRefused, resp.ErrorCode)
+		assert.Contains(t, resp.Error, `check planned drops of database "payments" environment "staging" target "payments-001"`)
+		assert.Contains(t, resp.Error, "ns_1/payments.sql")
+		assert.NotContains(t, resp.Error, "10.0.0.5")
+	})
+
+	storageCause := fmt.Errorf("load schema files: %w", errors.New(sensitivePlanFailure))
+	for name, cause := range map[string]error{"parser unavailable": parserCause, "storage fails": storageCause} {
+		t.Run(name, func(t *testing.T) {
+			svc := withheldDropService(&capturingPlanStore{}, &mockTernClient{planErr: checkFailure(cause)})
+
+			rec := postJSON(t, svc.handlePlan, "/api/plan", redactionPlanRequest())
+
+			require.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
+			resp := decodeErrorResponse(t, rec)
+			assert.Empty(t, resp.ErrorCode)
+			assert.Equal(t, wantPlanFailedMessage, resp.Error)
+		})
+	}
+}
+
+// A rollout member the data plane declines for its schema files does not
+// fail the plan: the primary's plan answers 200, and the member is listed as
+// needing attention with the data plane's own text, without the "rpc error"
+// framing, so the author sees what to change for that member.
+func TestHandlePlanListsARefusedRolloutMemberWithItsRefusal(t *testing.T) {
+	const refusal = "the schema files drop table orders_seq; remove the drop or list the table under drop_tables"
+	client := &mockTernClient{
+		planResp:    reviewedUsersPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)"),
+		planDiffErr: status.Error(codes.FailedPrecondition, refusal),
+	}
+	svc := multiTargetService(t, client, &recordingPlanStore{})
+	request := planDiffReq(t)
+	request.RendersRollout = true
+
+	rec := postJSON(t, svc.handlePlan, "/api/plan", request)
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var resp apitypes.PlanResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.NotNil(t, resp.Rollout)
+	require.Len(t, resp.Rollout.Attention, 1)
+	assert.Equal(t, "eu/testapp-002", resp.Rollout.Attention[0].Member)
+	assert.Equal(t, "unplanned", resp.Rollout.Attention[0].Reason)
+	assert.Equal(t, "refused: "+refusal, resp.Rollout.Attention[0].Detail)
 }

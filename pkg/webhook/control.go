@@ -209,7 +209,8 @@ func runControlCommand[R any](
 			h.postChangeGateRefusal(repo, pr, installationID, actionName, result.Environment, requestedBy, err)
 			return nil
 		}
-		h.postCommandError(repo, pr, installationID, actionName, result.Environment, requestedBy, err.Error())
+		h.postCommandError(repo, pr, installationID, actionName, result.Environment, requestedBy,
+			controlOperationFailureMessage(err, actionName, result.ApplyID, result.Environment))
 		return nil
 	}
 	if resp == nil {

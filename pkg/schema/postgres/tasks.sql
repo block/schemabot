@@ -34,6 +34,7 @@ CREATE TABLE tasks (
   cutover_attempts integer NOT NULL DEFAULT 0,
   is_instant boolean DEFAULT FALSE,
   engine_migration_id varchar(255) DEFAULT NULL,
+  plan_change_ordinal integer NOT NULL DEFAULT 0,
   started_at timestamp DEFAULT NULL,
   completed_at timestamp DEFAULT NULL,
   created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,

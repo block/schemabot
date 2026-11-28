@@ -100,3 +100,46 @@ func TestStopCmdSurfacesABareConflictFromAnOlderServer(t *testing.T) {
 	assert.Contains(t, err.Error(), "stop rejected: schema change is already terminal (current state: stopped)")
 	assert.NotContains(t, out, "Schema change already stopped")
 }
+
+// An operator stops a PostgreSQL schema change through a non-default profile.
+// The engine can't pause it, so the server refuses with a code naming the
+// remedy, and the CLI names the command to run with that same profile: a
+// copied hint reaches the server that refused the stop, not the default one.
+func TestStopCmdNamesTheRemedyWithTheInvokedRoute(t *testing.T) {
+	tests := []struct {
+		name string
+		code string
+		want string
+	}{
+		{
+			name: "a lone index build is ended with cancel",
+			code: apitypes.ErrCodeStopUnsupportedCancel,
+			want: "This schema change can't be paused. To end it: `schemabot cancel " + stopTestApplyID + " -e staging --profile alternate`",
+		},
+		{
+			name: "anything else is followed until it finishes",
+			code: apitypes.ErrCodeStopUnsupportedFinishes,
+			want: "This schema change can't be paused, and it finishes on its own. To follow it: `schemabot progress " + stopTestApplyID + " -e staging --no-watch --profile alternate`",
+		},
+		{
+			name: "an unknown shape names both",
+			code: apitypes.ErrCodeStopUnsupported,
+			want: "This schema change can't be paused. If it is a single index build, end it with `schemabot cancel " + stopTestApplyID + " -e staging --profile alternate`" +
+				"; anything else finishes on its own. To follow it: `schemabot progress " + stopTestApplyID + " -e staging --no-watch --profile alternate`",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recordRoute(t, Globals{Profile: "alternate"})
+			server, stopCalls := stopTestServer(t, http.StatusBadRequest, apitypes.ErrorResponse{
+				Error:     "stop rejected: PostgreSQL can't pause this schema change. To follow it: `schemabot progress " + stopTestApplyID + " -e staging`",
+				ErrorCode: tt.code,
+			})
+
+			_, err := runStopCmd(t, server.URL)
+			require.Error(t, err)
+			assert.Equal(t, 1, *stopCalls)
+			assert.Equal(t, tt.want, err.Error())
+		})
+	}
+}
