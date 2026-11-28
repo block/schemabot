@@ -221,10 +221,11 @@ func referencedTablePrivilege(err error) (referencedTableGrant, bool) {
 
 // sentinelCause returns the error in err's chain that wraps sentinel most
 // directly: the error the planner returned, carrying its detail, with none of
-// the context the engine wrapped around it.
+// the context the engine wrapped around it. The walk follows single wraps
+// and stops above the sentinel, which wraps nothing.
 func sentinelCause(err, sentinel error) error {
 	cause := err
-	for next := errors.Unwrap(cause); next != nil && !errors.Is(next, sentinel) && errors.Is(next, sentinel); next = errors.Unwrap(cause) {
+	for next := errors.Unwrap(cause); next != nil && errors.Unwrap(next) != nil && errors.Is(next, sentinel); next = errors.Unwrap(cause) {
 		cause = next
 	}
 	return cause
