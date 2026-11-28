@@ -188,3 +188,50 @@ func TestPlannedConstraintDropsLeaveOutOnlyTheDropsThatRun(t *testing.T) {
 	}, nil)
 	assert.Equal(t, []string{"regions"}, plan.order)
 }
+
+// A refused drop's reason counts keys, the tables that hold them, and their
+// namespaces separately, so two keys of one table read as one table and the
+// fix names one file or constraint when there is one.
+func TestReferenceDropReasonsFollowDistinctTables(t *testing.T) {
+	fk := func(schema, table, constraint string) schemadiff.IncomingForeignKey {
+		return schemadiff.IncomingForeignKey{Schema: schema, Table: table, Constraint: constraint}
+	}
+	for name, tc := range map[string]struct {
+		got, want string
+	}{
+		"one kept key": {
+			got:  keptReferenceDropReason("public", []schemadiff.IncomingForeignKey{fk("public", "posts", "posts_tag_fkey")}),
+			want: `foreign key "posts.posts_tag_fkey" of a table that stays references it, so PostgreSQL refuses to drop it — remove that constraint or its table's schema file too and plan again, or declare the table in a schema file`,
+		},
+		"two kept keys of one table": {
+			got:  keptReferenceDropReason("public", []schemadiff.IncomingForeignKey{fk("public", "posts", "posts_tag_fkey"), fk("public", "posts", "posts_alt_tag_fkey")}),
+			want: `foreign keys "posts.posts_tag_fkey", "posts.posts_alt_tag_fkey" of a table that stays reference it, so PostgreSQL refuses to drop it — remove those constraints or their table's schema file too and plan again, or declare the table in a schema file`,
+		},
+		"kept keys of two tables": {
+			got:  keptReferenceDropReason("public", []schemadiff.IncomingForeignKey{fk("public", "posts", "posts_tag_fkey"), fk("public", "notes", "notes_tag_fkey")}),
+			want: `foreign keys "posts.posts_tag_fkey", "notes.notes_tag_fkey" of tables that stay reference it, so PostgreSQL refuses to drop it — remove those constraints or their tables' schema files too and plan again, or declare the table in a schema file`,
+		},
+		"two keys of two tables in one other namespace": {
+			got:  otherNamespaceReferenceDropReason("public", []schemadiff.IncomingForeignKey{fk("billing", "orders", "orders_user_fkey"), fk("billing", "refunds", "refunds_user_fkey")}),
+			want: `foreign keys "billing.orders.orders_user_fkey", "billing.refunds.refunds_user_fkey" in another namespace reference it, and drops in different namespaces have no guaranteed order — drop those constraints or their tables first, then plan again, or declare the table in a schema file`,
+		},
+		"two keys of one table in another namespace": {
+			got:  otherNamespaceReferenceDropReason("public", []schemadiff.IncomingForeignKey{fk("billing", "orders", "orders_user_fkey"), fk("billing", "orders", "orders_buyer_fkey")}),
+			want: `foreign keys "billing.orders.orders_user_fkey", "billing.orders.orders_buyer_fkey" in another namespace reference it, and drops in different namespaces have no guaranteed order — drop those constraints or their table first, then plan again, or declare the table in a schema file`,
+		},
+		"keys in two other namespaces": {
+			got:  otherNamespaceReferenceDropReason("public", []schemadiff.IncomingForeignKey{fk("billing", "orders", "orders_user_fkey"), fk("audit", "events", "events_user_fkey")}),
+			want: `foreign keys "billing.orders.orders_user_fkey", "audit.events.events_user_fkey" in other namespaces reference it, and drops in different namespaces have no guaranteed order — drop those constraints or their tables first, then plan again, or declare the table in a schema file`,
+		},
+		"one declaring file": {
+			got:  declaredReferenceDropReason([]string{"orders", "orders"}),
+			want: `the schema file of table "orders" declares a foreign key that references it, so PostgreSQL refuses to drop it — remove the foreign key from that file and plan again, or declare the table in a schema file`,
+		},
+		"two declaring files": {
+			got:  declaredReferenceDropReason([]string{"refunds", "orders"}),
+			want: `the schema files of tables "orders", "refunds" declare a foreign key that references it, so PostgreSQL refuses to drop it — remove the foreign keys from those files and plan again, or declare the table in a schema file`,
+		},
+	} {
+		assert.Equal(t, tc.want, tc.got, name)
+	}
+}
