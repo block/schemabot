@@ -9,7 +9,9 @@ import (
 )
 
 // scratchSchemaPrefix starts the name of every schema pg-sprite builds the
-// declared tables in while it plans. pg-sprite appends a random suffix.
+// declared tables in while it plans. pg-sprite appends a random suffix. It
+// copies pg-sprite's literal; schemadiff.ScratchSchemaPrefix retires the copy
+// once the pinned pg-sprite release exports it.
 const scratchSchemaPrefix = "pgsprite_scratch_"
 
 // databaseCodeRefusal reports a plan that code installed on the target, such
@@ -37,7 +39,7 @@ func databaseCodeRefusal(database string, err error) error {
 		return err
 	}
 	return &engine.PlanRefusedError{Err: engine.OperatorErrorf(err,
-		"code on database %q raised SQLSTATE %s while SchemaBot planned. Planning builds the declared tables in a schema named %s<suffix>, in a transaction it always rolls back, so an event trigger on DDL fires there too. Have the trigger skip schemas whose name starts with %s (at ddl_command_start, check current_schema()), then plan again",
+		"code on database %q raised SQLSTATE %s while SchemaBot planned. Planning builds the declared tables in a schema named %s<suffix>, in a transaction it always rolls back, so an event trigger on DDL fires there too, on its CREATE SCHEMA and on the DDL inside it. Have the trigger allow both for a schema whose name starts with %s (at ddl_command_start, check current_schema(); at ddl_command_end, check each command's schema_name, and the object_identity of a CREATE SCHEMA), then plan again",
 		database, pgErr.Code, scratchSchemaPrefix, scratchSchemaPrefix)}
 }
 

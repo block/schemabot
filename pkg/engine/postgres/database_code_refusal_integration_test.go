@@ -47,6 +47,21 @@ func TestEnginePlanRefusesWhenAnEventTriggerRaisesOnTheScratchSchema(t *testing.
 				END LOOP;
 			END $$;
 			CREATE EVENT TRIGGER refuse_create_index ON ddl_command_end EXECUTE FUNCTION public.refuse_create_index()`,
+		// A guard with no tag filter also fires on the scratch schema's own
+		// CREATE SCHEMA, whose row names the schema as its object, not as
+		// its schema_name.
+		"ddl_command_end on every command": `
+			CREATE FUNCTION public.refuse_create_index() RETURNS event_trigger LANGUAGE plpgsql AS $$
+			DECLARE
+				cmd record;
+			BEGIN
+				FOR cmd IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP
+					CONTINUE WHEN current_setting('test.exempt_scratch', true) = 'on' AND (cmd.schema_name LIKE 'pgsprite\_scratch\_%'
+						OR (cmd.command_tag = 'CREATE SCHEMA' AND cmd.object_identity LIKE 'pgsprite\_scratch\_%'));
+					RAISE EXCEPTION 'CREATE INDEX must use CONCURRENTLY (dba policy on db-7.internal)';
+				END LOOP;
+			END $$;
+			CREATE EVENT TRIGGER refuse_create_index ON ddl_command_end EXECUTE FUNCTION public.refuse_create_index()`,
 	}
 	for event, trigger := range triggers {
 		t.Run(event, func(t *testing.T) {
@@ -72,8 +87,10 @@ CREATE INDEX accounts_email_idx ON accounts (email);`,
 			assert.False(t, quotesRepository)
 			assert.Equal(t, `code on database "plan_event_trigger_test" raised SQLSTATE P0001 while SchemaBot planned. `+
 				`Planning builds the declared tables in a schema named pgsprite_scratch_<suffix>, in a transaction it always rolls back, `+
-				`so an event trigger on DDL fires there too. Have the trigger skip schemas whose name starts with pgsprite_scratch_ `+
-				`(at ddl_command_start, check current_schema()), then plan again`, text)
+				`so an event trigger on DDL fires there too, on its CREATE SCHEMA and on the DDL inside it. `+
+				`Have the trigger allow both for a schema whose name starts with pgsprite_scratch_ `+
+				`(at ddl_command_start, check current_schema(); at ddl_command_end, check each command's schema_name, `+
+				`and the object_identity of a CREATE SCHEMA), then plan again`, text)
 			assert.NotContains(t, text, "db-7.internal", "the trigger's raised text stays in the cause")
 			pgErr, ok := errors.AsType[*pgconn.PgError](err)
 			require.True(t, ok, "the cause keeps the target's error for the server log")
