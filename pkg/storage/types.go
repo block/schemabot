@@ -3486,9 +3486,12 @@ const (
 	WebhookEventFailedPermanent = "failed_permanent"
 
 	// WebhookEventSuperseded is the terminal state for an auto-plan delivery
-	// discarded at claim time because a newer covering delivery exists for the
-	// same pull request (see WebhookEventStore.SupersedeIfCovered). The row's
-	// work was never performed; the covering successor performs it instead.
+	// whose work was never performed: discarded at claim time because a newer
+	// covering delivery exists for the same pull request (see
+	// WebhookEventStore.SupersedeIfCovered), or found during processing to
+	// carry a head the pull request had already moved past (see
+	// WebhookEventStore.MarkSuperseded). The delivery for the newer head plans
+	// it instead.
 	WebhookEventSuperseded = "superseded"
 )
 
@@ -3559,7 +3562,8 @@ var WebhookEventStatesAll = []string{
 // moves a row out of. Only an explicit GitHub Redeliver reopens such a row, so
 // these are the only states retention may delete. A completed or permanently
 // failed row is also what HasEventForHead counts as coverage for its head, so
-// deleting it lets the reconciler treat that head as never planned.
+// DeleteTerminalOlderThan keeps the newest covering row of each pull request.
+// Purging never makes an unplanned head read as planned.
 var WebhookEventStatesTerminal = []string{
 	WebhookEventCompleted,
 	WebhookEventFailed,

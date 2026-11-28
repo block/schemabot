@@ -182,6 +182,10 @@ func (s *recordingWebhookEventStore) MarkCompleted(context.Context, int64, strin
 	return errors.New("MarkCompleted not implemented by recordingWebhookEventStore")
 }
 
+func (s *recordingWebhookEventStore) MarkSuperseded(context.Context, int64, string) error {
+	return errors.New("MarkSuperseded not implemented by recordingWebhookEventStore")
+}
+
 func (s *recordingWebhookEventStore) MarkFailed(context.Context, int64, string, string, *time.Time) error {
 	return errors.New("MarkFailed not implemented by recordingWebhookEventStore")
 }
@@ -365,10 +369,12 @@ type scriptedWebhookEventStore struct {
 	// outcome channel send so tests can exercise the storage-failure paths.
 	markCompletedErr       error
 	markFailedErr          error
+	markSupersededErr      error
 	markFailedPermanentErr error
 	releaseErr             error
 
 	completed       chan scriptedWebhookOutcome
+	superseded      chan scriptedWebhookOutcome
 	failed          chan scriptedWebhookFailure
 	failedUncharged chan scriptedWebhookFailure
 	failedPermanent chan scriptedWebhookPermanentFailure
@@ -398,6 +404,7 @@ func newScriptedWebhookEventStore(queue ...*storage.WebhookEvent) *scriptedWebho
 		recordingWebhookEventStore: *newRecordingWebhookEventStore(),
 		queue:                      queue,
 		completed:                  make(chan scriptedWebhookOutcome, 8),
+		superseded:                 make(chan scriptedWebhookOutcome, 8),
 		failed:                     make(chan scriptedWebhookFailure, 8),
 		failedUncharged:            make(chan scriptedWebhookFailure, 8),
 		failedPermanent:            make(chan scriptedWebhookPermanentFailure, 8),
@@ -466,6 +473,14 @@ func (s *scriptedWebhookEventStore) MarkCompleted(_ context.Context, id int64, l
 		return s.markCompletedErr
 	}
 	s.completed <- scriptedWebhookOutcome{id: id, leaseToken: leaseToken}
+	return nil
+}
+
+func (s *scriptedWebhookEventStore) MarkSuperseded(_ context.Context, id int64, leaseToken string) error {
+	if s.markSupersededErr != nil {
+		return s.markSupersededErr
+	}
+	s.superseded <- scriptedWebhookOutcome{id: id, leaseToken: leaseToken}
 	return nil
 }
 

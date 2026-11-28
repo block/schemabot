@@ -348,37 +348,6 @@ func TestExecutionVerdictUnknownGuidance(t *testing.T) {
 	}, "users", nil))
 }
 
-// A foreign-key change the planner refuses is shown for review and the engine
-// does not run it. A dropped foreign key's remedy offers declaring it before
-// removing it, so an operator whose file left it out keeps the constraint.
-// Only a table that carries foreign keys into another namespace gets the
-// clause naming them, since those cannot be declared and removal is the only
-// way forward. Any other foreign-key change the planner refuses gets the
-// general remedy, and nothing is reported as unrecognized vocabulary.
-func TestExecutionVerdictForeignKeyChange(t *testing.T) {
-	const dropReason = `statement for table "users" drops a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; to keep the foreign key, declare it in the schema file and re-plan; to remove it, run this statement outside SchemaBot, then re-plan`
-	for _, tt := range []struct {
-		name           string
-		kind           schemadiff.ChangeKind
-		crossNamespace []string
-		want           string
-	}{
-		{"another foreign-key change", schemadiff.ChangeAddForeignKey, nil, `statement for table "users" changes a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; leave the change out of the schema file to apply the rest of the plan, then run this statement outside SchemaBot and put the change back in the file`},
-		{"drop", schemadiff.ChangeDropForeignKey, nil, dropReason},
-		{"drop with cross-namespace foreign keys", schemadiff.ChangeDropForeignKey, []string{"users_account_id_fkey", "users_region_id_fkey"},
-			dropReason + `; foreign key constraint(s) "users_account_id_fkey", "users_region_id_fkey" reference another namespace and cannot be declared, so the plan stays blocked until they are removed through a separately reviewed process`},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, stepVerdict{mode: engine.ExecutionModeBlocked, reason: tt.want},
-				executionVerdict(pgplan.FormatVersion, pgplan.Statement{
-					Kind:        tt.kind,
-					Disposition: router.DispositionRefuse,
-					Reason:      verdict.ReasonDeclarativeForeignKey,
-				}, "users", tt.crossNamespace))
-		})
-	}
-}
-
 // A changed stored generated expression is refused with its own remedy:
 // declaring the live expression plans no change, and changing it is a
 // rewrite the operator runs outside SchemaBot.

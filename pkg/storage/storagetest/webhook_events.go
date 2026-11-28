@@ -880,6 +880,24 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		require.True(t, superseded)
 		assert.False(t, coversHead("head-superseded"), "a superseded row must not cover its head")
 		assert.True(t, coversHead("head-successor"))
+
+		// A delivery whose head the PR had moved past by the time it was
+		// processed planned nothing, so it ends superseded and does not cover
+		// its head either, even though no newer delivery discarded it.
+		successor := claimExpecting(t, store, "delivery-successor")
+		require.NoError(t, store.WebhookEvents().MarkCompleted(ctx, successor.ID, successor.LeaseToken))
+		moved := newPullRequestEvent("delivery-head-moved", "synchronize", 7, "head-moved-past", time.Time{})
+		createEvent(t, store, moved)
+		claimed = claimExpecting(t, store, "delivery-head-moved")
+		require.ErrorIs(t, store.WebhookEvents().MarkSuperseded(ctx, claimed.ID, "stale-token"), storage.ErrWebhookEventLeaseLost)
+		require.NoError(t, store.WebhookEvents().MarkSuperseded(ctx, claimed.ID, claimed.LeaseToken))
+		require.NoError(t, store.WebhookEvents().MarkSuperseded(ctx, claimed.ID, claimed.LeaseToken), "repeating the call with the same lease token is a no-op")
+		got, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-head-moved")
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, storage.WebhookEventSuperseded, got.State)
+		assert.NotNil(t, got.CompletedAt)
+		assert.False(t, coversHead("head-moved-past"), "a delivery whose head the PR moved past must not cover that head")
 	})
 
 	// A claimed auto-plan delivery is discarded only when a strictly newer
