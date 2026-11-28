@@ -1,10 +1,6 @@
 package postgres
 
 import (
-	"errors"
-
-	"github.com/jackc/pgx/v5/pgconn"
-
 	"github.com/block/schemabot/pkg/engine"
 )
 
@@ -34,18 +30,11 @@ func databaseCodeRefusal(database string, err error) error {
 	if err == nil {
 		return err
 	}
-	pgErr, ok := errors.AsType[*pgconn.PgError](err)
-	if !ok || !raisedByDatabaseCode(pgErr.Code) {
+	code, ok := raisedByDatabaseCode(err)
+	if !ok {
 		return err
 	}
 	return &engine.PlanRefusedError{Err: engine.OperatorErrorf(err,
 		"code on database %q raised SQLSTATE %s while SchemaBot planned. Planning builds the declared tables in a schema named %s<suffix>, in a transaction it always rolls back, so an event trigger on DDL fires there too, on its CREATE SCHEMA and on the DDL inside it. Have the trigger allow both for a schema whose name starts with %s (at ddl_command_start, check current_schema(); at ddl_command_end, check each command's schema_name, and the object_identity of a CREATE SCHEMA), then plan again",
-		database, pgErr.Code, scratchSchemaPrefix, scratchSchemaPrefix)}
-}
-
-// raisedByDatabaseCode reports a SQLSTATE that PL/pgSQL code raises itself:
-// RAISE EXCEPTION without its own code (P0001) and a failed ASSERT (P0004).
-// PostgreSQL never raises either for a statement it cannot run.
-func raisedByDatabaseCode(code string) bool {
-	return code == "P0001" || code == "P0004"
+		database, code, scratchSchemaPrefix, scratchSchemaPrefix)}
 }
