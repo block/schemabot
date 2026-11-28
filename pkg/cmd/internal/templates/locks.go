@@ -234,6 +234,9 @@ func WriteLockConflict(data LockConflictData) {
 	fmt.Println()
 }
 
+// ApplyPrompt is the question apply asks before it starts a schema change.
+const ApplyPrompt = "\nDo you want to apply these changes? Only 'yes' will be accepted: "
+
 // What each command tells the operator before it takes a lock from another
 // owner, and the question it then asks. A command that was given -y asks
 // nothing and shows none of this.

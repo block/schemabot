@@ -281,7 +281,7 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 
 	// Step 3: Prompt for confirmation (unless auto-approve)
 	if !cmd.AutoApprove {
-		prompt, cancelMsg := "\nDo you want to apply these changes? Only 'yes' will be accepted: ", "\nApply cancelled."
+		prompt, cancelMsg := templates.ApplyPrompt, "\nApply cancelled."
 		if takeover != nil {
 			templates.WriteLockTakeoverWarning(lockHolderData(cfg.Database, cfg.Type, takeover), templates.ApplyTakeoverConsequence)
 			prompt, cancelMsg = templates.ApplyTakeoverPrompt, "\nApply cancelled. The lock was not changed."
