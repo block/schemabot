@@ -282,7 +282,10 @@ func (c *LocalClient) releaseNamespaceArtifacts(ctx context.Context, eng engine.
 		return reclaimed, err
 	}
 	if !reclaimed {
-		c.logger.Info("schema change left no artifacts on the target",
+		// The release looks only for what its engine reclaims, so finding
+		// none says nothing of what else the failure reported left behind,
+		// such as an invalid index a failed build could not drop.
+		c.logger.Info("artifact release found nothing on the target to reclaim",
 			append(apply.LogAttrs(), "namespace", namespace, "outcome", kind.outcome, "tables", artifacts.tables)...)
 	}
 	return reclaimed, nil
