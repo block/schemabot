@@ -1701,7 +1701,7 @@ func (h *Handler) locksForUnlock(ctx context.Context, repo string, pr int, resul
 				continue
 			}
 			if lock.PullRequest != 0 && (lock.Repository != repo || lock.PullRequest != pr) {
-				return nil, unlockRefusal(fmt.Sprintf("lock for %s is held by %s#%d", result.Database, lock.Repository, lock.PullRequest), nil)
+				return nil, unlockRefusal(fmt.Sprintf("lock for %s is held by %s#%d; run `schemabot unlock` on that PR to release it", result.Database, lock.Repository, lock.PullRequest), nil)
 			}
 			matches = append(matches, lock)
 		}
@@ -1734,16 +1734,16 @@ func (h *Handler) inferUnlockDatabase(ctx context.Context, repo string, pr int, 
 	config, _, err := h.resolveUnscopedManagedConfig(ctx, client, repo, pr, "", action.Unlock)
 	if err != nil {
 		// Schema another deployment owns — whether outside allowed_dirs or for
-		// a database not in this deployment's registry — means there is nothing
-		// for this deployment to unlock: same outcome as no config at all.
-		if isSchemaUnownedByDeploymentError(err) {
-			return "", unlockRejection(ghclient.ErrNoConfig)
-		}
-		// Schema whose database this leader never registered was never
-		// locked by it, so there is nothing to unlock here either.
-		var notRegistered *databaseNotRegisteredError
-		if errors.As(err, &notRegistered) {
-			return "", unlockRejection(ghclient.ErrNoConfig)
+		// a database this leader never registered — was never locked by this
+		// deployment, so there is nothing here to unlock. The repository does
+		// have a config, so the refusal says that rather than asking the
+		// author to add a schemabot.yaml for schema they do not own. The
+		// refusal carries no cause: the plan path's own line for these errors
+		// asks for a server config change, which an unlock never needs, and
+		// it would take precedence over this one in the comment.
+		if _, notRegistered := errors.AsType[*databaseNotRegisteredError](err); notRegistered || isSchemaUnownedByDeploymentError(err) {
+			h.logger.Info("force unlock found no schema this deployment manages", "repo", repo, "pr", pr, "error", err)
+			return "", unlockRefusal("this SchemaBot deployment manages no schema in this PR, so it holds no lock here to release", nil)
 		}
 		// A repo with no config, or only malformed ones, is a deterministic
 		// discovery outcome the same delivery always reproduces — the
@@ -1752,16 +1752,20 @@ func (h *Handler) inferUnlockDatabase(ctx context.Context, repo string, pr int, 
 			return "", unlockRejection(err)
 		}
 		if errors.Is(err, ghclient.ErrMultipleConfigs) {
-			message := "multiple SchemaBot configs match this PR; retry with `schemabot unlock -d <database> --force`"
+			message := "multiple SchemaBot configs match this PR"
 			if multiple, ok := errors.AsType[*ghclient.MultipleConfigsError](err); ok {
-				message += ": " + multiple.Error()
+				described := make([]string, 0, len(multiple.Candidates))
+				for _, candidate := range multiple.Candidates {
+					described = append(described, fmt.Sprintf("`%s` (%s)", candidate.Database, candidate.SchemaDir))
+				}
+				message += ": " + strings.Join(described, ", ")
 			}
-			return "", unlockRefusal(message, err)
+			return "", unlockRefusal(message+"; retry with `schemabot unlock -d <database> --force`", err)
 		}
 		return "", err
 	}
 	if config == nil || config.Database == "" {
-		return "", unlockRefusal("no database found in SchemaBot config", nil)
+		return "", unlockRefusal("the SchemaBot config for this PR names no database; retry with `schemabot unlock -d <database> --force`", nil)
 	}
 	return config.Database, nil
 }

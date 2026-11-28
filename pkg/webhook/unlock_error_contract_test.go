@@ -640,7 +640,7 @@ func TestUnlockCommandCoreInferenceRejectionsAreTerminal(t *testing.T) {
 				serveConfigFile(t, mux, "db/orders/schemabot.yaml", "database: orders\ntype: mysql\n")
 				serveConfigFile(t, mux, "db/payments/schemabot.yaml", "database: payments\ntype: mysql\n")
 			},
-			wantComment: "multiple SchemaBot configs match this PR",
+			wantComment: "multiple SchemaBot configs match this PR: `orders` (db/orders), `payments` (db/payments); retry with `schemabot unlock -d",
 		},
 		{
 			// A config outside this deployment's allowed_dirs is another
@@ -660,7 +660,7 @@ func TestUnlockCommandCoreInferenceRejectionsAreTerminal(t *testing.T) {
 				serveUnlockInferencePR(t, mux, "db/other/schemabot.yaml")
 				serveConfigFile(t, mux, "db/other/schemabot.yaml", "database: orders\ntype: mysql\n")
 			},
-			wantComment: "No `schemabot.yaml` configuration file was found in this repository",
+			wantComment: "this SchemaBot deployment manages no schema in this PR, so it holds no lock here to release",
 		},
 	}
 
@@ -681,6 +681,7 @@ func TestUnlockCommandCoreInferenceRejectionsAreTerminal(t *testing.T) {
 			body := requireComment(t, comments, "inference rejection comment")
 			assert.Contains(t, body, "Failed to infer database for force unlock")
 			assert.Contains(t, body, tc.wantComment)
+			assert.NotContains(t, body, "No `schemabot.yaml` configuration file was found", "a repository with a config is never told to add one")
 			assert.NotContains(t, body, "invalid schemabot.yaml config found", "the discovery error's own text, which names repository paths, stays in the server log")
 			assert.NotContains(t, body, "no schemabot.yaml config found")
 		})
@@ -709,7 +710,7 @@ func TestUnlockRejectionShowsOnlyAuthoredText(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, retry, "a lock held by another PR is the command's answer; re-driving reproduces it")
 		body := requireComment(t, comments, "lock held by another PR comment")
-		assert.Contains(t, body, "Failed to look up locks: lock for orders is held by octocat/other-repo#2")
+		assert.Contains(t, body, "Failed to look up locks: lock for orders is held by octocat/other-repo#2; run `schemabot unlock` on that PR to release it")
 		assert.Zero(t, lockStore.releaseCalls)
 	})
 
