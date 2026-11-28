@@ -197,7 +197,8 @@ func TestE2EDurableDispatchPlansOnlyTheNewestHeadOfAPushBurst(t *testing.T) {
 // head is claimed while that late delivery sits behind it in the inbox. The
 // live pull request shows the claimed head is still current, so the delivery
 // is kept and planned; the late delivery's head is no longer the PR's head, so
-// it publishes nothing. The current head ends with its plan and Check Run.
+// it ends superseded and publishes nothing. The current head ends with its
+// plan and Check Run.
 func TestE2EDurableDispatchKeepsTheCurrentHeadWhenAnOlderPushArrivesLast(t *testing.T) {
 	const (
 		dbName       = "webhook_push_cycle"
@@ -215,7 +216,8 @@ func TestE2EDurableDispatchKeepsTheCurrentHeadWhenAnOlderPushArrivesLast(t *test
 	f.requirePlanOf(t, dbName, currentHead)
 
 	before := f.requests.snapshot()
-	assert.Equal(t, storage.WebhookEventCompleted, f.drive(t, "cycle-push-away-arriving-late"))
+	assert.Equal(t, storage.WebhookEventSuperseded, f.drive(t, "cycle-push-away-arriving-late"),
+		"the late delivery finds the pull request has left its head, so it ends superseded")
 	assert.Equal(t, []string{pushBurstPullRequestRead}, slices.Sorted(maps.Keys(f.requestsSince(before))),
 		"the late delivery may read the pull request, and must publish nothing on a head the pull request has left")
 }
@@ -224,8 +226,9 @@ func TestE2EDurableDispatchKeepsTheCurrentHeadWhenAnOlderPushArrivesLast(t *test
 // the push from A to B arrives last. All three deliveries wait in the inbox.
 // Both deliveries that carry A are kept and planned, because the live pull
 // request shows A is still its head; the first publishes A's plan and Check
-// Run. The late delivery's head is no longer the PR's head, so it publishes
-// nothing. The current head is never left without a plan and a Check Run.
+// Run. The late delivery's head is no longer the PR's head, so it ends
+// superseded and publishes nothing. The current head is never left without a
+// plan and a Check Run.
 func TestE2EDurableDispatchKeepsTheCurrentHeadThroughAReplayedPushCycle(t *testing.T) {
 	const (
 		dbName       = "webhook_push_replay"
@@ -257,7 +260,8 @@ func TestE2EDurableDispatchKeepsTheCurrentHeadThroughAReplayedPushCycle(t *testi
 	}
 
 	before := f.requests.snapshot()
-	assert.Equal(t, storage.WebhookEventCompleted, f.drive(t, "replay-push-a-to-b-arriving-late"))
+	assert.Equal(t, storage.WebhookEventSuperseded, f.drive(t, "replay-push-a-to-b-arriving-late"),
+		"the late delivery finds the pull request has left its head, so it ends superseded")
 	assert.Equal(t, []string{pushBurstPullRequestRead}, slices.Sorted(maps.Keys(f.requestsSince(before))),
 		"the late delivery may read the pull request, and must publish nothing on a head the pull request has left")
 }
