@@ -73,22 +73,17 @@ type container struct {
 
 // Ensure starts or reuses a sample owned by this project and engine. Docker keeps
 // its data across restarts; retrying setup never re-seeds an existing database.
-func Ensure(ctx context.Context, project, engine, version string, progress ...func(string)) (Database, error) {
-	report := func(stage string) {
-		for _, notify := range progress {
-			if notify != nil {
-				notify(stage)
-			}
-		}
-	}
+func Ensure(ctx context.Context, project, engine, version string, progress Progress) (Database, error) {
 	switch engine {
 	case "mysql", "postgres":
 		return ensureSQL(ctx, sqlSample{
 			project: project, engine: engine, label: engine,
-			seed: seedSQL(engine), seedStage: "Preparing sample tables",
-		}, report)
+			seed:        seedSQL(engine),
+			createStage: "Creating your sample database",
+			seedStage:   "Preparing sample tables",
+		}, progress)
 	case "vitess":
-		return ensureVitess(ctx, project, version, report)
+		return ensureVitess(ctx, project, version, progress)
 	}
 	return Database{}, fmt.Errorf("sample databases support mysql, postgres, or vitess")
 }
@@ -98,16 +93,19 @@ func Ensure(ctx context.Context, project, engine, version string, progress ...fu
 // from the engine when the container is one component of a larger sample rather
 // than the sample itself.
 type sqlSample struct {
-	project   string
-	engine    string
-	label     string
-	seed      string
-	seedStage string
+	project string
+	engine  string
+	label   string
+	seed    string
+	// createStage and seedStage are the steps shown while the container is
+	// created and while its seed is copied in.
+	createStage string
+	seedStage   string
 }
 
 // ensureSQL provisions one SQL container: the engine's own server, seeded on
 // first creation and reused on every later run.
-func ensureSQL(ctx context.Context, sample sqlSample, report func(string)) (Database, error) {
+func ensureSQL(ctx context.Context, sample sqlSample, progress Progress) (Database, error) {
 	engine := sample.engine
 	name, err := sampleName(sample.project, sample.label)
 	if err != nil {
@@ -119,8 +117,9 @@ func ensureSQL(ctx context.Context, sample sqlSample, report func(string)) (Data
 		image, port, passwordKey = "postgres:17", "5432/tcp", "POSTGRES_PASSWORD"
 		env = []string{"POSTGRES_DB=shop"}
 	}
-	report("Checking Docker")
-	if err = requireLocalDocker(ctx); err != nil {
+	progress.step("Checking Docker")
+	endpoint, err := requireLocalDocker(ctx)
+	if err != nil {
 		return Database{}, err
 	}
 	// Listing distinguishes an absent container from a broken Docker connection.
@@ -129,12 +128,19 @@ func ensureSQL(ctx context.Context, sample sqlSample, report func(string)) (Data
 		return Database{}, err
 	}
 	if strings.TrimSpace(string(listed)) == "" {
-		report("Preparing " + image + " (downloading if needed)")
-		password := make([]byte, 24)
-		if _, err = rand.Read(password); err != nil {
+		present, err := imagePresent(ctx, image)
+		if err != nil {
 			return Database{}, err
 		}
-		if err = ensureImage(ctx, image); err != nil {
+		if !present {
+			progress.step("Downloading " + image)
+			if err = pullImage(ctx, endpoint, image, progress.pull); err != nil {
+				return Database{}, err
+			}
+		}
+		progress.step(sample.createStage)
+		password := make([]byte, 24)
+		if _, err = rand.Read(password); err != nil {
 			return Database{}, err
 		}
 		hostPort, err := reserveHostPort(ctx)
@@ -159,7 +165,7 @@ func ensureSQL(ctx context.Context, sample sqlSample, report func(string)) (Data
 		return Database{}, fmt.Errorf("container %s is not this project's sample; refusing to use it", name)
 	}
 	if c.State.Status == "created" {
-		report(sample.seedStage)
+		progress.step(sample.seedStage)
 		dir, err := os.MkdirTemp("", "schemabot-sample-")
 		if err != nil {
 			return Database{}, err
@@ -178,7 +184,7 @@ func ensureSQL(ctx context.Context, sample sqlSample, report func(string)) (Data
 		}
 	}
 	if !c.State.Running {
-		report("Starting your sample database")
+		progress.step("Starting your sample database")
 		if _, err = run(ctx, nil, "start", name); err != nil {
 			if c.State.Status == "created" {
 				return Database{}, fmt.Errorf("start new sample %s: %w; resolve the Docker error and retry setup", name, err)
@@ -224,7 +230,7 @@ func ensureSQL(ctx context.Context, sample sqlSample, report func(string)) (Data
 	if engine == "postgres" {
 		result.Namespace = "public"
 	}
-	report("Waiting for the database to accept connections")
+	progress.step("Waiting for the database to accept connections")
 	readyCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	ticker := time.NewTicker(250 * time.Millisecond)
@@ -250,38 +256,33 @@ func ensureSQL(ctx context.Context, sample sqlSample, report func(string)) (Data
 // created. A sample publishes its ports on loopback and is reached there, so a
 // remote daemon would produce a container nothing on this machine can connect
 // to.
-func requireLocalDocker(ctx context.Context) error {
+func requireLocalDocker(ctx context.Context) (string, error) {
 	endpoint := os.Getenv("DOCKER_HOST")
 	if endpoint == "" || os.Getenv("DOCKER_CONTEXT") != "" {
 		value, err := run(ctx, nil, "context", "inspect", "--format", "{{.Endpoints.docker.Host}}")
 		if err != nil {
-			return err
+			return "", err
 		}
 		endpoint = strings.TrimSpace(string(value))
 	}
 	if !localDockerEndpoint(endpoint) {
-		return fmt.Errorf("sample setup needs a local Docker context; your current Docker endpoint is remote")
+		return "", fmt.Errorf("sample setup needs a local Docker context; your current Docker endpoint is remote")
 	}
 	if _, err := run(ctx, nil, "info", "--format", "{{.ServerVersion}}"); err != nil {
-		return fmt.Errorf("start Docker, then try sample setup again: %w", err)
+		return "", fmt.Errorf("start Docker, then try sample setup again: %w", err)
 	}
-	return nil
+	return endpoint, nil
 }
 
-// ensureImage pulls an image only when the daemon does not already hold it, so
-// repeated setup on a machine that is offline still works.
-func ensureImage(ctx context.Context, image string) error {
+// imagePresent reports whether the daemon already holds image. An image it
+// holds is never downloaded again, so repeated setup on a machine that is
+// offline still works.
+func imagePresent(ctx context.Context, image string) (bool, error) {
 	images, err := run(ctx, nil, "image", "ls", "--quiet", image)
 	if err != nil {
-		return fmt.Errorf("inspect sample image %s: %w", image, err)
+		return false, fmt.Errorf("inspect sample image %s: %w", image, err)
 	}
-	if strings.TrimSpace(string(images)) != "" {
-		return nil
-	}
-	if _, err := run(ctx, nil, "pull", image); err != nil {
-		return fmt.Errorf("pull sample image %s: %w", image, err)
-	}
-	return nil
+	return strings.TrimSpace(string(images)) != "", nil
 }
 
 // reserveHostPort picks a free loopback port and releases it for Docker to

@@ -3,6 +3,8 @@ package commands
 import (
 	"context"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -64,19 +66,28 @@ func (cmd *InitCmd) prepareSample(ctx context.Context, g *Globals) error {
 	setupCtx, cancel := context.WithTimeout(ctx, setupTimeout)
 	defer cancel()
 	var sample localdemo.Database
-	provision := func(runCtx context.Context, report func(string)) (*initResult, error) {
+	provision := func(runCtx context.Context, progress localdemo.Progress) error {
 		var provisionErr error
-		sample, provisionErr = localdemo.Ensure(runCtx, project, cmd.Type, g.Version, report)
-		return nil, provisionErr
+		sample, provisionErr = localdemo.Ensure(runCtx, project, cmd.Type, g.Version, progress)
+		return provisionErr
 	}
 	if !cmd.NonInteractive && !cmd.JSON && ui.IsTerminal(os.Stdin) && ui.IsTerminal(os.Stdout) {
-		_, err = runInitProgress(setupCtx, "sample database", provision, tea.WithInput(os.Stdin), tea.WithOutput(os.Stdout))
+		_, err = runInitProgress(setupCtx, "sample database", func(runCtx context.Context, step, detail func(string)) (*initResult, error) {
+			return nil, provision(runCtx, localdemo.Progress{
+				Step: step,
+				Pull: func(p localdemo.PullProgress) { detail(formatSamplePull(p)) },
+			})
+		}, tea.WithInput(os.Stdin), tea.WithOutput(os.Stdout))
 	} else {
-		_, err = provision(setupCtx, func(stage string) {
-			if !cmd.JSON {
-				fmt.Println("  " + stage)
+		var progress localdemo.Progress
+		if !cmd.JSON {
+			milestones := &samplePullMilestones{out: os.Stdout}
+			progress = localdemo.Progress{
+				Step: func(stage string) { fmt.Println("  " + stage) },
+				Pull: milestones.observe,
 			}
-		})
+		}
+		err = provision(setupCtx, progress)
 	}
 	if err != nil {
 		return err
@@ -235,4 +246,61 @@ func (m *initStartChoice) View() string {
 	}
 	b.WriteString("  " + muted.Render(controls+" · esc cancel") + "\n")
 	return b.String()
+}
+
+// formatSamplePull renders how far a sample image download has come, for the
+// line under the step downloading it.
+func formatSamplePull(p localdemo.PullProgress) string {
+	switch {
+	case p.Unpacking():
+		return fmt.Sprintf("Unpacking · %d of %d layers", p.Unpacked, p.Layers)
+	case p.Total > 0:
+		return fmt.Sprintf("%s of %s · %d%%", ui.FormatBytesBinary(p.Downloaded), ui.FormatBytesBinary(p.Total), p.Downloaded*100/p.Total)
+	default:
+		return ui.FormatBytesBinary(p.Downloaded) + " downloaded"
+	}
+}
+
+// samplePullUnsizedStep is how many bytes apart download progress is printed
+// when the registry did not report the image's size.
+const samplePullUnsizedStep = 256 << 20
+
+// samplePullMilestones prints a download's progress to output that cannot be
+// redrawn in place: every tenth of the download, or every
+// samplePullUnsizedStep bytes when its size is unknown, then once when
+// unpacking starts. The first report prints at once, so the size shows before
+// any of it has arrived.
+type samplePullMilestones struct {
+	out       io.Writer
+	printed   bool
+	milestone int64
+	unpacking bool
+}
+
+func (m *samplePullMilestones) observe(p localdemo.PullProgress) {
+	if p.Unpacking() {
+		if m.unpacking {
+			return
+		}
+		m.unpacking = true
+		m.print(fmt.Sprintf("Unpacking %d layers", p.Layers))
+		return
+	}
+	milestone := p.Downloaded / samplePullUnsizedStep
+	if p.Total > 0 {
+		milestone = p.Downloaded * 10 / p.Total
+	}
+	if m.printed && milestone <= m.milestone {
+		return
+	}
+	m.printed, m.milestone = true, milestone
+	m.print(formatSamplePull(p))
+}
+
+func (m *samplePullMilestones) print(line string) {
+	// Progress is a courtesy beside the setup, so output that cannot be
+	// written does not stop the download.
+	if _, err := fmt.Fprintln(m.out, "    "+line); err != nil {
+		slog.Debug("print sample download progress", "error", err)
+	}
 }

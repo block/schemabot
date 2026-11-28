@@ -520,7 +520,7 @@ func (r initBrokenTerminal) Read([]byte) (int, error) {
 
 func TestInitTerminalFailureJoinsCleanup(t *testing.T) {
 	started, cleaned := make(chan struct{}), make(chan struct{})
-	_, err := runInitProgress(t.Context(), "connect and verify", func(ctx context.Context, report func(string)) (*initResult, error) {
+	_, err := runInitProgress(t.Context(), "connect and verify", func(ctx context.Context, report, _ func(string)) (*initResult, error) {
 		defer close(cleaned)
 		close(started)
 		<-ctx.Done()
@@ -542,7 +542,7 @@ func TestInitTerminalFailureJoinsCleanup(t *testing.T) {
 // registration, and prints no interrupt notice.
 func TestInitTerminalFailureAfterRegistrationExitsOne(t *testing.T) {
 	started := make(chan struct{})
-	_, err := runInitProgress(t.Context(), "connect and verify", func(ctx context.Context, report func(string)) (*initResult, error) {
+	_, err := runInitProgress(t.Context(), "connect and verify", func(ctx context.Context, report, _ func(string)) (*initResult, error) {
 		close(started)
 		<-ctx.Done()
 		return nil, retainedInitError(ctx, fmt.Errorf("import live schema: %w", ctx.Err()))
@@ -582,7 +582,7 @@ func (initCancelKeyProgram) Send(tea.Msg) {}
 // with the interrupt status.
 func TestInitProgressCancelKeyAfterRegistrationExitsInterrupted(t *testing.T) {
 	running := make(chan struct{})
-	_, err := runInitProgressProgram(t.Context(), func(ctx context.Context, report func(string)) (*initResult, error) {
+	_, err := runInitProgressProgram(t.Context(), func(ctx context.Context, report, _ func(string)) (*initResult, error) {
 		close(running)
 		<-ctx.Done()
 		return nil, retainedInitError(ctx, fmt.Errorf("import live schema: %w", ctx.Err()))
@@ -605,7 +605,7 @@ func (initStartupFailure) Send(tea.Msg)            {}
 
 func TestInitTerminalStartupFailureDoesNotInitialize(t *testing.T) {
 	called := false
-	_, err := runInitProgressProgram(t.Context(), func(ctx context.Context, report func(string)) (*initResult, error) {
+	_, err := runInitProgressProgram(t.Context(), func(ctx context.Context, report, _ func(string)) (*initResult, error) {
 		called = true
 		return nil, nil
 	}, func(tea.Model) initProgressProgram { return initStartupFailure{} })
@@ -618,7 +618,7 @@ func TestInitCancelledBeforeWorkReturnsError(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	called := false
-	result, err := runInitProgress(ctx, "connect and verify", func(context.Context, func(string)) (*initResult, error) {
+	result, err := runInitProgress(ctx, "connect and verify", func(context.Context, func(string), func(string)) (*initResult, error) {
 		called = true
 		return &initResult{}, nil
 	}, tea.WithInput(nil), tea.WithOutput(io.Discard), tea.WithoutRenderer())

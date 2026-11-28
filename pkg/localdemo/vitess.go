@@ -74,9 +74,10 @@ func localscaleImage(version string) string {
 // inside it. The cluster itself is rebuilt from the seed schema whenever the
 // container restarts, so the sample is a demonstration rather than a database
 // to keep work in.
-func ensureVitess(ctx context.Context, project, version string, report func(string)) (Database, error) {
-	report("Checking Docker")
-	if err := requireLocalDocker(ctx); err != nil {
+func ensureVitess(ctx context.Context, project, version string, progress Progress) (Database, error) {
+	progress.step("Checking Docker")
+	endpoint, err := requireLocalDocker(ctx)
+	if err != nil {
 		return Database{}, err
 	}
 	name, err := sampleName(project, "vitess")
@@ -90,6 +91,14 @@ func ensureVitess(ctx context.Context, project, version string, report func(stri
 		return Database{}, err
 	}
 	needsCluster := strings.TrimSpace(string(listed)) == ""
+	needsImage := false
+	if needsCluster {
+		present, err := imagePresent(ctx, image)
+		if err != nil {
+			return Database{}, err
+		}
+		needsImage = !present
+	}
 
 	// The cluster image and the state database are independent: one is
 	// downloaded, the other is a second container that starts and seeds itself.
@@ -97,18 +106,21 @@ func ensureVitess(ctx context.Context, project, version string, report func(stri
 	// nothing on the run where the download dominates setup.
 	var pulled chan error
 	cancelPull := context.CancelFunc(func() {})
-	if needsCluster {
+	pullProgress := &gatedPull{report: progress.pull}
+	if needsImage {
 		var pullCtx context.Context
 		pullCtx, cancelPull = context.WithCancel(ctx)
 		defer cancelPull()
 		pulled = make(chan error, 1)
-		go func() { pulled <- ensureImage(pullCtx, image) }()
+		go func() { pulled <- pullImage(pullCtx, endpoint, image, pullProgress.observe) }()
 	}
 
 	storage, err := ensureSQL(ctx, sqlSample{
 		project: project, engine: "mysql", label: "vitess-storage",
-		seed: "CREATE DATABASE schemabot;\n", seedStage: "Preparing SchemaBot's own database",
-	}, report)
+		seed:        "CREATE DATABASE schemabot;\n",
+		createStage: "Creating SchemaBot's own database",
+		seedStage:   "Preparing SchemaBot's own database",
+	}, progress)
 	if err != nil {
 		return Database{}, errors.Join(
 			fmt.Errorf("prepare the sample's state database: %w", err),
@@ -116,14 +128,18 @@ func ensureVitess(ctx context.Context, project, version string, report func(stri
 		)
 	}
 
-	if needsCluster {
-		// The stage is reported here rather than when the download starts, so
-		// the printed stages follow the state database's in the order setup
-		// waits on them.
-		report("Preparing " + image + " (downloading if needed)")
+	if needsImage {
+		// The step is reported here rather than when the download starts, so
+		// the printed steps follow the state database's in the order setup
+		// waits on them, and the download's progress shows only under its own
+		// step.
+		progress.step("Downloading " + image)
+		pullProgress.show()
 		if err = <-pulled; err != nil {
 			return Database{}, err
 		}
+	}
+	if needsCluster {
 		// The API port and the proxy ports are reserved as one block, so the
 		// proxy ports can never include the API port. The proxy ports are
 		// published at an offset, so two projects can each run a sample without
@@ -156,7 +172,7 @@ func ensureVitess(ctx context.Context, project, version string, report func(stri
 		return Database{}, fmt.Errorf("container %s is not this project's sample; refusing to use it", name)
 	}
 	if c.State.Status == "created" {
-		report("Preparing sample keyspace and tables")
+		progress.step("Preparing sample keyspace and tables")
 		proxyBase, err := sampleProxyBase(c)
 		if err != nil {
 			return Database{}, fmt.Errorf("read the proxy ports of new sample %s: %w", name, err)
@@ -166,7 +182,7 @@ func ensureVitess(ctx context.Context, project, version string, report func(stri
 		}
 	}
 	if !c.State.Running {
-		report("Starting your sample cluster")
+		progress.step("Starting your sample cluster")
 		if _, err = run(ctx, nil, "start", name); err != nil {
 			if c.State.Status == "created" {
 				// A container that never started holds no data. Removing it
@@ -201,7 +217,7 @@ func ensureVitess(ctx context.Context, project, version string, report func(stri
 		Namespace:    sampleVitessDatabase,
 	}
 
-	report("Waiting for the cluster to come up")
+	progress.step("Waiting for the cluster to come up")
 	if err := waitForLocalscale(ctx, name, result.APIURL); err != nil {
 		return Database{}, err
 	}

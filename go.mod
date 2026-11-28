@@ -20,6 +20,8 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/charmbracelet/x/ansi v0.11.6
 	github.com/coreos/go-oidc/v3 v3.18.0
+	github.com/cpuguy83/dockercfg v0.3.2
+	github.com/distribution/reference v0.6.0
 	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/go-mysql-org/go-mysql v1.16.1-0.20260731133054-6f853f178dc3
 	github.com/gofri/go-github-ratelimit/v2 v2.0.2
@@ -31,6 +33,7 @@ require (
 	github.com/jackc/pgx/v5 v5.12.0
 	github.com/mattn/go-runewidth v0.0.23
 	github.com/moby/moby/api v1.56.1
+	github.com/moby/moby/client v0.6.2
 	github.com/pganalyze/pg_query_go/v6 v6.2.5
 	github.com/planetscale/planetscale-go v0.155.0
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2
@@ -128,8 +131,6 @@ require (
 	github.com/containerd/platforms v0.2.1 // indirect
 	github.com/coreos/go-semver v0.3.1 // indirect
 	github.com/coreos/go-systemd/v22 v22.7.0 // indirect
-	github.com/cpuguy83/dockercfg v0.3.2 // indirect
-	github.com/distribution/reference v0.6.0 // indirect
 	github.com/docker/go-connections v0.8.2 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
@@ -192,7 +193,6 @@ require (
 	github.com/mitchellh/go-homedir v1.1.0 // indirect
 	github.com/moby/docker-image-spec v1.3.1 // indirect
 	github.com/moby/go-archive v0.3.3 // indirect
-	github.com/moby/moby/client v0.6.2 // indirect
 	github.com/moby/patternmatcher v0.6.1 // indirect
 	github.com/moby/sys/sequential v0.7.0 // indirect
 	github.com/moby/sys/user v0.4.1 // indirect
