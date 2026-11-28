@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"fmt"
 	"testing"
 
 	pgplan "github.com/block/pg-sprite/pkg/plan"
@@ -66,6 +67,31 @@ func TestDestructiveReasonNeutralizesTheFindingSeparatorInTheTableName(t *testin
 	got := destructiveReason(droppedStatement(schemadiff.DroppedColumn, "note"), "notes; audit", false)
 	assert.Equal(t, `statement drops column "note" from table "notes, audit": its values are deleted, and reverting the schema file does not bring them back`, got)
 	assert.Len(t, ui.LintReasons(got), 1, "the reason renders as one finding")
+}
+
+// A column many objects depend on names the first few and counts the rest,
+// so its reason stays one readable finding.
+func TestDestructiveReasonCountsDependentsPastTheFirstFew(t *testing.T) {
+	dependent := func(i int) string {
+		return fmt.Sprintf("index users_note_%[1]d_idx: CREATE INDEX users_note_%[1]d_idx ON public.users USING btree (note)", i)
+	}
+	const named = `statement drops column "note" from table "users": its values are deleted, and reverting the schema file does not bring them back. ` +
+		`It also drops index users_note_1_idx: CREATE INDEX users_note_1_idx ON public.users USING btree (note). ` +
+		`It also drops index users_note_2_idx: CREATE INDEX users_note_2_idx ON public.users USING btree (note). ` +
+		`It also drops index users_note_3_idx: CREATE INDEX users_note_3_idx ON public.users USING btree (note)`
+	for count, want := range map[int]string{
+		3:  named,
+		4:  named + ", and 1 more object",
+		40: named + ", and 37 more objects",
+	} {
+		dependents := make([]string, 0, count)
+		for i := 1; i <= count; i++ {
+			dependents = append(dependents, dependent(i))
+		}
+		got := destructiveReason(droppedStatement(schemadiff.DroppedColumn, "note", dependents...), "users", false)
+		assert.Equal(t, want, got, "%d dependents", count)
+		assert.Len(t, ui.LintReasons(got), 1, "the reason renders as one finding")
+	}
 }
 
 // An object that goes with a dropped column is quoted whole, so a name that

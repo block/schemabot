@@ -1937,16 +1937,27 @@ func droppedConstraintReason(name, table, definition string) string {
 	}
 }
 
+// maxNamedDependents is how many of a dropped column's dependent objects
+// its reason names one by one before it counts the rest, so a column many
+// objects depend on still renders as one readable finding.
+const maxNamedDependents = 3
+
 // droppedDependents is one sentence per object that goes with a dropped
-// column, each quoting the entry pg-sprite renders for it
-// ([schemadiff.Dependent.String]) whole. The entry is not split into a name
-// and a definition: an object's name can hold the separator between them, so
-// a split could name the wrong object.
+// column, up to maxNamedDependents, each quoting the entry pg-sprite renders
+// for it ([schemadiff.Dependent.String]) whole, and then a count of the rest.
+// The entry is not split into a name and a definition: an object's name can
+// hold the separator between them, so a split could name the wrong object.
 func droppedDependents(dependents []string) string {
 	var b strings.Builder
-	for _, d := range dependents {
+	for _, d := range dependents[:min(len(dependents), maxNamedDependents)] {
 		b.WriteString(". It also drops ")
 		b.WriteString(oneFinding(sanitizeStatementText(d)))
+	}
+	switch rest := len(dependents) - maxNamedDependents; {
+	case rest == 1:
+		b.WriteString(", and 1 more object")
+	case rest > 1:
+		fmt.Fprintf(&b, ", and %d more objects", rest)
 	}
 	return b.String()
 }
