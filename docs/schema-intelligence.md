@@ -109,10 +109,25 @@ the non-reserved namespaces.
 Supply concrete live namespace names when selecting them. `{env}` and `$ENV`
 are schema-directory placeholders, so both are rejected in `--namespace` and
 `POST /api/pull` `namespaces` arguments. A namespace argument that is not one
-concrete, unreserved name, or that repeats, answers `400` with `error_code`
-`invalid_request` and says what to change. When the deployment that serves the
-database cannot be reached, pull answers `503` with `error_code`
-`engine_unavailable`; retry after a short wait.
+concrete, unreserved name, or that repeats, answers `400` and says what to
+change. When the deployment that serves the database cannot be reached, pull
+answers `503` with `error_code` `engine_unavailable`; retry after a short wait.
+
+Every `400` from `POST /api/pull` carries `error_code` `invalid_request`,
+whatever the request got wrong: a missing or conflicting `database`, `app`, or
+`environment`, a route the server does not configure, a namespace no target
+selects, or a lint request the server cannot audit. Match the code rather than
+the message, and correct the request before sending it again. A request with no
+`environment` answers:
+
+```json
+{
+  "error": "environment is required",
+  "error_code": "invalid_request"
+}
+```
+
+Pull a database's schema from the CLI:
 
 ```sh
 schemabot pull -d shop -e production
@@ -541,7 +556,7 @@ naming it and the selectable ones, rather than answered with an empty schema:
 ```json
 {
   "error": "database \"orders\" environment \"production\" has no targets entry selecting namespaces [shop_l]; the selectable namespaces are [shop_0, shop_1]",
-  "error_code": ""
+  "error_code": "invalid_request"
 }
 ```
 
