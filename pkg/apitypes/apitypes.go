@@ -2069,6 +2069,9 @@ type ApplyResponse struct {
 	ApplyID      string `json:"apply_id,omitempty"`
 	ErrorCode    string `json:"error_code,omitempty"`
 	ErrorMessage string `json:"error_message,omitempty"`
+	// FreezeOverride is the override request that let this apply through
+	// the freezes holding its environment. Empty when no freeze held it.
+	FreezeOverride string `json:"freeze_override,omitempty"`
 }
 
 // ControlResponse is the HTTP response for simple control operations
