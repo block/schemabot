@@ -15,7 +15,7 @@ func engineWithSettledApply(t *testing.T, state engine.State, phase, detail stri
 	t.Helper()
 	eng := New()
 	change := nativeApply{namespace: "public", table: "users", sql: concurrentIndexDDL, steps: 1, concurrentIndex: true}
-	eng.claimProgress(cancelTestKey, progressResult(state, phase, time.Now(), change, detail), newTestTracker(t), slog.New(slog.DiscardHandler), buildShape{cancellable: true}, nil, "")
+	claimTracked(t, eng, cancelTestKey, progressResult(state, phase, time.Now(), change, detail), newTestTracker(t), slog.New(slog.DiscardHandler), buildShape{cancellable: true}, nil, "")
 	return eng
 }
 

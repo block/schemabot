@@ -719,7 +719,7 @@ func TestCancelThatSendsNothingDoesNotWithdrawAnOverlappingCancel(t *testing.T) 
 // would let the caller record the build cancelled while it keeps running.
 func TestCancelThatNamesNoApplyFailsWhileABuildRuns(t *testing.T) {
 	eng := New()
-	eng.claimProgress("task-a", progressResult(engine.StateRunning, "running", time.Now(), nativeApply{namespace: "public", table: "t_a", sql: "CREATE INDEX CONCURRENTLY t_a_idx ON public.t_a (a)"}, ""), newTestTracker(t), slog.Default(), buildShape{}, nil, "")
+	claimTracked(t, eng, "task-a", progressResult(engine.StateRunning, "running", time.Now(), nativeApply{namespace: "public", table: "t_a", sql: "CREATE INDEX CONCURRENTLY t_a_idx ON public.t_a (a)"}, ""), newTestTracker(t), slog.Default(), buildShape{}, nil, "")
 
 	for name, req := range map[string]*engine.ControlRequest{
 		"no resume state":   {},

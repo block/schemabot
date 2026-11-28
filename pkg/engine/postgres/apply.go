@@ -268,12 +268,21 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	}
 	started := time.Now()
 	key := progressIdentity(req.ResumeState)
+	if key == "" {
+		// Progress and Cancel cannot find an apply that has no identity, so an
+		// apply accepted without one could never be polled or cancelled.
+		return nil, errMissingApplyIdentity("apply")
+	}
 	// An accepted apply must survive the request that accepted it, so the
 	// drive's context is detached from the caller. It is cancellable so the
 	// engine itself can end the drive — a cancel of last resort, and the
 	// halt on shutdown.
 	applyCtx, cancelApply := context.WithCancel(context.WithoutCancel(ctx))
-	done := e.claimProgress(key, progressResult(engine.StateRunning, "preflight", started, change, ""), tracker, logger, change.buildShape(e.validateMaxDuration), cancelApply, engine.WorkOwnerFromContext(ctx))
+	done, err := e.claimProgress(ctx, key, progressResult(engine.StateRunning, "preflight", started, change, ""), tracker, logger, change.buildShape(e.validateMaxDuration), cancelApply, engine.WorkOwnerFromContext(ctx))
+	if err != nil {
+		cancelApply()
+		return nil, err
+	}
 	conn := targetConn{dsn: req.Credentials.DSN, caCertPath: caPath}
 	e.wg.Go(func() {
 		defer close(done)
@@ -3538,13 +3547,42 @@ func progressResult(state engine.State, phase string, started time.Time, change 
 // in-flight change always answers for itself no matter how many siblings the
 // engine accepts.
 //
+// An apply whose key is still held by a drive that has not exited waits for
+// that drive first, bounded by ctx, so two drives never write to the target
+// under one identity and the older drive's progress never lands in the newer
+// entry. Applies under other keys are not waited on. When ctx ends first,
+// nothing is claimed and the error names the key.
+//
 // The returned channel is the drive's to close once its terminal result is
 // published; Cancel waits on it for the outcome.
-func (e *Engine) claimProgress(key string, result *engine.ProgressResult, tracker *progress.Tracker, logger *slog.Logger, shape buildShape, cancelApply context.CancelFunc, owner string) chan struct{} {
+func (e *Engine) claimProgress(ctx context.Context, key string, result *engine.ProgressResult, tracker *progress.Tracker, logger *slog.Logger, shape buildShape, cancelApply context.CancelFunc, owner string) (chan struct{}, error) {
+	for {
+		done, previous := e.claimIfKeyFree(key, result, tracker, logger, shape, cancelApply, owner)
+		if previous == nil {
+			return done, nil
+		}
+		logger.Info("PostgreSQL apply waiting for the previous drive under the same identity to exit",
+			"task_id", key, "namespace", result.Tables[0].Namespace, "table", result.Tables[0].Table)
+		select {
+		case <-previous:
+		case <-ctx.Done():
+			return nil, fmt.Errorf("wait for the previous PostgreSQL schema change %q to exit: %w", key, ctx.Err())
+		}
+	}
+}
+
+// claimIfKeyFree claims key under one lock acquisition, so the check that no
+// drive holds the key and the claim itself cannot be split by another Apply.
+// When a drive that has not exited holds the key, nothing is claimed and the
+// returned channel, closed when that drive exits, is what the caller waits on.
+func (e *Engine) claimIfKeyFree(key string, result *engine.ProgressResult, tracker *progress.Tracker, logger *slog.Logger, shape buildShape, cancelApply context.CancelFunc, owner string) (claimed chan struct{}, running <-chan struct{}) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.progress == nil {
 		e.progress = make(map[string]*trackedApply)
+	}
+	if existing := e.progress[key]; existing != nil && !applyGoroutineExited(existing) {
+		return nil, existing.done
 	}
 	for id, tracked := range e.progress {
 		if id != key && tracked.result.State.IsTerminal() {
@@ -3557,7 +3595,7 @@ func (e *Engine) claimProgress(key string, result *engine.ProgressResult, tracke
 		cancellableBuild: shape.cancellable, partitionedBuild: shape.partitioned, haltable: shape.haltable, validationBound: shape.validationBound, cancelApply: cancelApply, done: done,
 		owner: owner,
 	}
-	return done
+	return done, nil
 }
 
 // publishProgress stores a background apply's progress unless the engine has

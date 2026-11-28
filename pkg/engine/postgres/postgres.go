@@ -2088,9 +2088,11 @@ func sortedKeys[V any](values map[string]V) []string {
 // goroutine of this process with nothing to provision first, and the tracked
 // progress is claimed under the engine mutex before Apply returns. Because
 // progress is tracked per apply, a second apply on the same target cannot
-// displace a running one's entry, so the only ways an entry disappears are
-// Drain and the retirement of an already-terminal entry — neither of which can
-// erase work still in flight. A pending progress report for a task a driver
+// displace a running one's entry: an apply under another key leaves it alone,
+// and an apply under the same key waits for the running one to exit before it
+// claims anything. So the only ways an entry disappears are Drain and the
+// retirement of an already-terminal entry — neither of which can erase work
+// still in flight. A pending progress report for a task a driver
 // believes is in flight is therefore conclusive rather than a phase to wait out.
 func (e *Engine) RegistersWorkSynchronously() bool {
 	return true
