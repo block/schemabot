@@ -1815,19 +1815,35 @@ func TestClassifyApplyFailureMissingGrant(t *testing.T) {
 // A statement the server refuses because other objects depend on what it
 // drops or retypes, such as a column a publication names, ends the apply at
 // once: the dependency stays until someone removes it, so retrying cannot
-// clear it. The detail leaves out the objects the server's message names.
+// clear it. The detail names the dependents the server lists, on one line
+// and cut when the list runs long, since the owner cannot read the server
+// log.
 func TestClassifyApplyFailureDependentObjects(t *testing.T) {
-	err := fmt.Errorf("drop column: %w", &pgconn.PgError{
-		Code:    "2BP01",
-		Message: `cannot drop column amt of table orders because other objects depend on it`,
-		Detail:  `publication of table orders in publication orders_pub depends on column amt of table orders`,
+	refusal := func(detail string) error {
+		return fmt.Errorf("drop column: %w", &pgconn.PgError{
+			Code:    "2BP01",
+			Message: `cannot drop column amt of table orders because other objects depend on it`,
+			Detail:  detail,
+		})
+	}
+
+	t.Run("names the dependents", func(t *testing.T) {
+		failure := classifyApplyFailure(refusal("publication of table orders in publication orders_pub depends on column amt of table orders\nview order_totals depends on column amt of table orders"), "orders", nil)
+		assert.False(t, failure.retryable, "the dependency stays until someone removes it")
+		assert.Equal(t, `other objects depend on what the statement on "orders" drops or retypes: publication of table orders in publication orders_pub depends on column amt of table orders view order_totals depends on column amt of table orders; remove the dependency, then apply again`, failure.detail)
 	})
 
-	failure := classifyApplyFailure(err, "orders", nil)
+	t.Run("cuts a long list", func(t *testing.T) {
+		failure := classifyApplyFailure(refusal(strings.Repeat("view v depends on column amt of table orders\n", 20)), "orders", nil)
+		assert.Contains(t, failure.detail, "…; remove the dependency, then apply again")
+		assert.Less(t, len([]rune(failure.detail)), maxDependentObjectsDetailLen+120)
+	})
 
-	assert.False(t, failure.retryable, "the dependency stays until someone removes it")
-	assert.Equal(t, `other objects depend on what the statement on "orders" drops or retypes, such as a publication that names the column; the server log names them; remove the dependency, then apply again`, failure.detail)
-	assert.NotContains(t, failure.detail, "orders_pub")
+	t.Run("points at the server log without a list", func(t *testing.T) {
+		failure := classifyApplyFailure(refusal(""), "orders", nil)
+		assert.False(t, failure.retryable)
+		assert.Equal(t, `other objects depend on what the statement on "orders" drops or retypes, such as a publication that names the column; the server log names them; remove the dependency, then apply again`, failure.detail)
+	})
 }
 
 // The server log carries the objects a dependent-objects or privilege

@@ -732,9 +732,10 @@ func missingGrantDetail(err error, table string) (string, bool) {
 // catalogErrorLogAttrs returns the server's DETAIL and HINT for a refusal
 // whose detail names catalog objects rather than row values: the objects
 // that depend on what a statement drops, or the privilege a statement
-// lacks. The operator-facing detail leaves them out and points at the
-// server log, so the log has to carry them. Other SQLSTATEs return nothing,
-// since a constraint violation's DETAIL quotes the rows' values.
+// lacks. The operator-facing detail cuts a long list of dependents and
+// leaves the privilege out, so the log carries them whole. Other SQLSTATEs
+// return nothing, since a constraint violation's DETAIL quotes the rows'
+// values.
 func catalogErrorLogAttrs(err error) []any {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) {
@@ -753,19 +754,35 @@ func catalogErrorLogAttrs(err error) []any {
 // as a column a publication's column list or row filter names.
 const sqlstateDependentObjectsStillExist = "2BP01"
 
+// maxDependentObjectsDetailLen bounds the server's list of dependent objects
+// carried in an apply's failure detail. The server lists every dependent, so
+// the list is cut on a rune boundary rather than trusted to fit a status line.
+const maxDependentObjectsDetailLen = 300
+
 // dependentObjectsDetail names a statement the server refused because other
 // objects depend on what it drops or retypes. The plan refuses the
 // dependents it can read before the apply starts; this covers the ones only
-// the server sees. The detail leaves out the server's message, which names
-// objects the plan did not, and the server log keeps it.
+// the server sees. The server's DETAIL names those objects and nothing else,
+// no row values, so the detail carries it: the owner of a hosted deployment
+// cannot read the server log, and the dependents are what they have to
+// change.
 func dependentObjectsDetail(err error, table string) (string, bool) {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateDependentObjectsStillExist {
 		return "", false
 	}
+	dependents := singleLine(pgErr.Detail)
+	if dependents == "" {
+		return sanitizeReasonText(fmt.Sprintf(
+			"other objects depend on what the statement on %q drops or retypes, such as a publication that names the column; the server log names them; remove the dependency, then apply again",
+			table)), true
+	}
+	if runes := []rune(dependents); len(runes) > maxDependentObjectsDetailLen {
+		dependents = string(runes[:maxDependentObjectsDetailLen-1]) + "…"
+	}
 	return sanitizeReasonText(fmt.Sprintf(
-		"other objects depend on what the statement on %q drops or retypes, such as a publication that names the column; the server log names them; remove the dependency, then apply again",
-		table)), true
+		"other objects depend on what the statement on %q drops or retypes: %s; remove the dependency, then apply again",
+		table, dependents)), true
 }
 
 // sqlstateForeignKeyViolation is the SQLSTATE the server raises when a row
