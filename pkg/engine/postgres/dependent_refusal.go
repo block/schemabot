@@ -21,7 +21,7 @@ import (
 // The way forward never passes through a state the application cannot
 // work in. A policy dropped in one change and recreated in a later one
 // leaves a table with row security on and no policy between the two, so it
-// reads no rows and every write fails; a generated column dropped to let the
+// reads no rows and refuses inserts; a generated column dropped to let the
 // change run cannot be added back without a full copy of the table. When
 // the safe path is one SchemaBot cannot run, the clause says so first.
 func dependentObjectCauses(decisions []planner.Decision) []string {
