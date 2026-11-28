@@ -1238,7 +1238,7 @@ func (r *PlanResponse) RolloutUnsafeChanges() []UnsafeChange {
 	var result []UnsafeChange
 	seen := make(map[string]bool)
 	for _, plan := range r.MemberPlans() {
-		plan.eachUnsafeChange(func(namespace string, c UnsafeChange) {
+		plan.eachUnsafeChange((*TableChangeResponse).UnsafeChange, func(namespace string, c UnsafeChange) {
 			key := strings.Join([]string{namespace, c.Table, c.DDL, c.Reason}, "\x00")
 			if seen[key] {
 				return
@@ -1434,7 +1434,23 @@ func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
 		return nil
 	}
 	var result []UnsafeChange
-	r.eachUnsafeChange(func(_ string, c UnsafeChange) {
+	r.eachUnsafeChange((*TableChangeResponse).UnsafeChange, func(_ string, c UnsafeChange) {
+		result = append(result, c)
+	})
+	return result
+}
+
+// DisclosedUnsafeChanges returns the unsafe changes a plan lists for the
+// operator's consent: UnsafeChanges without the changes the engine refuses.
+// A refused change fails the apply whatever the operator consents to, so it
+// is listed once, as refused, and never also as unsafe. Consent gates use
+// UnsafeChanges, which keeps every unsafe change.
+func (r *PlanResponse) DisclosedUnsafeChanges() []UnsafeChange {
+	if r == nil {
+		return nil
+	}
+	var result []UnsafeChange
+	r.eachUnsafeChange((*TableChangeResponse).DisclosedUnsafeChange, func(_ string, c UnsafeChange) {
 		result = append(result, c)
 	})
 	return result
@@ -1442,15 +1458,16 @@ func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
 
 // eachUnsafeChange calls fn with each unsafe change in the plan and the
 // namespace it is in, in plan order: the namespace-level changes, then the
-// per-shard changes that do not repeat one of them.
-func (r *PlanResponse) eachUnsafeChange(fn func(namespace string, c UnsafeChange)) {
+// per-shard changes that do not repeat one of them. view decides which table
+// changes are unsafe and how each reads.
+func (r *PlanResponse) eachUnsafeChange(view func(*TableChangeResponse) (UnsafeChange, bool), fn func(namespace string, c UnsafeChange)) {
 	if r == nil {
 		return
 	}
 	type statement struct{ namespace, table, ddl string }
 	seen := make(map[statement]struct{})
 	add := func(namespace string, t *TableChangeResponse) {
-		unsafeChange, ok := t.UnsafeChange()
+		unsafeChange, ok := view(t)
 		if !ok {
 			return
 		}
@@ -2051,6 +2068,17 @@ func (t *TableChangeResponse) UnsafeChange() (UnsafeChange, bool) {
 		DDL:        t.DDL,
 		ChangeType: t.ChangeType,
 	}, true
+}
+
+// DisclosedUnsafeChange returns the unsafe-change view of a table change a
+// plan lists for the operator's consent. A change the engine refuses is left
+// out: the apply fails on it whatever the operator consents to, so it is
+// disclosed once, as refused.
+func (t *TableChangeResponse) DisclosedUnsafeChange() (UnsafeChange, bool) {
+	if t.EngineBlocked() {
+		return UnsafeChange{}, false
+	}
+	return t.UnsafeChange()
 }
 
 // LintViolationResponse represents a lint violation in the HTTP response.

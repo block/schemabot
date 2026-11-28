@@ -95,6 +95,39 @@ func planTableDrops(namespace string, models map[string]schemadiff.Model, refuse
 	return plan
 }
 
+// plannedConstraintDrops names, per table, the constraints the namespace's
+// planned changes drop. The table drops run after every other change in the
+// namespace, so a foreign key dropped there no longer references the tables
+// they drop. A blocked step drops nothing, so only a step that runs counts.
+func plannedConstraintDrops(changes []engine.TableChange) (map[string]map[string]bool, error) {
+	dropped := map[string]map[string]bool{}
+	for _, tc := range changes {
+		if tc.ExecutionMode == engine.ExecutionModeBlocked {
+			continue
+		}
+		record, err := reviewedDropFromMetadata(tc.Metadata)
+		if err != nil {
+			return nil, fmt.Errorf("read the planned drop on table %q: %w", tc.Table, err)
+		}
+		if record == nil || record.Kind != schemadiff.DroppedConstraint {
+			continue
+		}
+		if dropped[tc.Table] == nil {
+			dropped[tc.Table] = map[string]bool{}
+		}
+		dropped[tc.Table][record.Name] = true
+	}
+	return dropped, nil
+}
+
+// withoutPlannedDrops leaves out the incoming foreign keys of tables in the
+// namespace that the plan drops before its table drops run.
+func withoutPlannedDrops(namespace string, incoming []schemadiff.IncomingForeignKey, dropped map[string]map[string]bool) []schemadiff.IncomingForeignKey {
+	return slices.DeleteFunc(slices.Clone(incoming), func(fk schemadiff.IncomingForeignKey) bool {
+		return fk.Schema == namespace && dropped[fk.Table][fk.Constraint]
+	})
+}
+
 // inTableHierarchy reports whether the table is partitioned, a partition, an
 // inheritance parent, or an inheritance child.
 func inTableHierarchy(m schemadiff.Model) bool {
@@ -112,22 +145,22 @@ func blockKeptReferences(namespace string, models map[string]schemadiff.Model, b
 			if _, ok := blocked[name]; ok {
 				continue
 			}
-			var kept, otherNamespaces []string
+			var kept, otherNamespaces []schemadiff.IncomingForeignKey
 			for _, fk := range models[name].IncomingForeignKeys {
 				if fk.Schema != namespace {
-					otherNamespaces = append(otherNamespaces, foreignKeyName(namespace, fk))
+					otherNamespaces = append(otherNamespaces, fk)
 					continue
 				}
 				if _, dropped := droppedReferrer(namespace, fk, models, blocked); !dropped {
-					kept = append(kept, foreignKeyName(namespace, fk))
+					kept = append(kept, fk)
 				}
 			}
 			var reasons []string
 			if len(kept) > 0 {
-				reasons = append(reasons, keptReferenceDropReason(kept))
+				reasons = append(reasons, keptReferenceDropReason(namespace, kept))
 			}
 			if len(otherNamespaces) > 0 {
-				reasons = append(reasons, otherNamespaceReferenceDropReason(otherNamespaces))
+				reasons = append(reasons, otherNamespaceReferenceDropReason(namespace, otherNamespaces))
 			}
 			if len(reasons) > 0 {
 				blocked[name] = reasons
@@ -245,14 +278,58 @@ func undeclaredTablePreamble(namespace, table string) string {
 const hierarchyDropReason = "SchemaBot does not drop a partitioned table or a table in an inheritance hierarchy, because the drop reaches tables the plan does not show" +
 	" — declare the table in a schema file, or drop the table tree through a separately reviewed process"
 
-func keptReferenceDropReason(refs []string) string {
-	return fmt.Sprintf("foreign key constraint(s) %s of tables that stay reference it, so PostgreSQL refuses to drop it", strings.Join(quoteAll(refs), ", ")) +
-		" — remove those constraints or their tables' schema files too and plan again, or declare the table in a schema file"
+// keptReferenceDropReason refuses a drop that foreign keys of tables staying
+// in the plan's namespace reference. The words follow how many keys and how
+// many distinct tables hold them, so two keys of one table read as one table.
+func keptReferenceDropReason(namespace string, fks []schemadiff.IncomingForeignKey) string {
+	keys, tables := len(fks), distinctReferrers(fks, func(fk schemadiff.IncomingForeignKey) string { return fk.Table })
+	return fmt.Sprintf("%s %s of %s that %s %s it, so PostgreSQL refuses to drop it",
+		plural(keys, "foreign key", "foreign keys"), strings.Join(quoteAll(foreignKeyNames(namespace, fks)), ", "),
+		plural(tables, "a table", "tables"), plural(tables, "stays", "stay"), plural(keys, "references", "reference")) +
+		" — remove " + plural(keys, "that constraint or its ", "those constraints or their ") +
+		plural(tables, "table's schema file", "tables' schema files") + " too and plan again, or declare the table in a schema file"
 }
 
-func otherNamespaceReferenceDropReason(refs []string) string {
-	return fmt.Sprintf("foreign key constraint(s) %s in other namespaces reference it, and drops in different namespaces have no guaranteed order", strings.Join(quoteAll(refs), ", ")) +
-		" — drop those constraints or their tables first, then plan again, or declare the table in a schema file"
+func declaredReferenceDropReason(tables []string) string {
+	sorted := slices.Clone(tables)
+	slices.Sort(sorted)
+	sorted = slices.Compact(sorted)
+	n := len(sorted)
+	return fmt.Sprintf("the %s of %s %s %s a foreign key that references it, so PostgreSQL refuses to drop it",
+		plural(n, "schema file", "schema files"), plural(n, "table", "tables"), strings.Join(quoteAll(sorted), ", "), plural(n, "declares", "declare")) +
+		" — remove " + plural(n, "the foreign key from that file", "the foreign keys from those files") +
+		" and plan again, or declare the table in a schema file"
+}
+
+// otherNamespaceReferenceDropReason refuses a drop that foreign keys in
+// other namespaces reference. The words follow how many keys, how many
+// distinct tables hold them, and how many distinct namespaces those are in.
+func otherNamespaceReferenceDropReason(namespace string, fks []schemadiff.IncomingForeignKey) string {
+	keys := len(fks)
+	tables := distinctReferrers(fks, func(fk schemadiff.IncomingForeignKey) string { return fk.Schema + "." + fk.Table })
+	namespaces := distinctReferrers(fks, func(fk schemadiff.IncomingForeignKey) string { return fk.Schema })
+	return fmt.Sprintf("%s %s in %s %s it, and drops in different namespaces have no guaranteed order",
+		plural(keys, "foreign key", "foreign keys"), strings.Join(quoteAll(foreignKeyNames(namespace, fks)), ", "),
+		plural(namespaces, "another namespace", "other namespaces"), plural(keys, "references", "reference")) +
+		" — drop " + plural(keys, "that constraint or its ", "those constraints or their ") +
+		plural(tables, "table", "tables") + " first, then plan again, or declare the table in a schema file"
+}
+
+func foreignKeyNames(namespace string, fks []schemadiff.IncomingForeignKey) []string {
+	names := make([]string, 0, len(fks))
+	for _, fk := range fks {
+		names = append(names, foreignKeyName(namespace, fk))
+	}
+	return names
+}
+
+// distinctReferrers counts the distinct values key gives the foreign keys.
+func distinctReferrers(fks []schemadiff.IncomingForeignKey, key func(schemadiff.IncomingForeignKey) string) int {
+	seen := make(map[string]struct{}, len(fks))
+	for _, fk := range fks {
+		seen[key(fk)] = struct{}{}
+	}
+	return len(seen)
 }
 
 const cycleDropReason = "its foreign keys form a cycle with other tables the plan drops, so no drop order satisfies PostgreSQL" +

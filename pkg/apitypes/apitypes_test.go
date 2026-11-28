@@ -30,6 +30,37 @@ func TestPlanResponse_UnsafeChanges(t *testing.T) {
 	assert.Equal(t, "items", changes[1].Table)
 }
 
+// A plan whose engine refuses a destructive statement lists it once, as
+// refused: the operator's consent cannot make it run, so the disclosed unsafe
+// changes leave it out, while the consent gate's set still holds it.
+func TestPlanResponse_DisclosedUnsafeChangesLeavesOutRefusedChanges(t *testing.T) {
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{{
+			Namespace: "app",
+			TableChanges: []*TableChangeResponse{
+				{TableName: "orders", DDL: "ALTER TABLE orders DROP CONSTRAINT orders_region_id_fkey", ChangeType: "alter", IsUnsafe: true, UnsafeReason: "statement removes live structure from table \"orders\"", ExecutionMode: "blocked", ModeReason: "refused"},
+				{TableName: "items", DDL: "ALTER TABLE items DROP COLUMN legacy", ChangeType: "alter", IsUnsafe: true, UnsafeReason: "statement removes live structure from table \"items\""},
+			},
+		}},
+		Shards: []*ShardPlanResponse{{
+			Namespace: "app",
+			Shard:     "-80",
+			Changes: []*TableChangeResponse{
+				{TableName: "events", DDL: "DROP TABLE events", ChangeType: "drop", ExecutionMode: "blocked", ModeReason: "refused"},
+			},
+		}},
+	}
+
+	disclosed := resp.DisclosedUnsafeChanges()
+	require.Len(t, disclosed, 1)
+	assert.Equal(t, "items", disclosed[0].Table)
+	assert.Equal(t, "ALTER TABLE items DROP COLUMN legacy", disclosed[0].DDL)
+
+	gated := resp.UnsafeChanges()
+	require.Len(t, gated, 3)
+	assert.Equal(t, []string{"orders", "items", "events"}, []string{gated[0].Table, gated[1].Table, gated[2].Table})
+}
+
 func TestPlanResponse_UnsafeChangesTreatsTableDropAsUnsafe(t *testing.T) {
 	resp := &PlanResponse{
 		Changes: []*SchemaChangeResponse{{

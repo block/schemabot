@@ -62,7 +62,7 @@ func TestPlannerRefusalReasonCoversEveryReason(t *testing.T) {
 			want, ok := plannerRefusalSentences[reason]
 			require.True(t, ok, "planner reason %q has no refusal sentence", reason)
 			assert.Equal(t, stepVerdict{mode: engine.ExecutionModeBlocked, reason: want},
-				executionVerdict(pgplan.FormatVersion, refusedStatement(reason), "users", nil))
+				executionVerdict(pgplan.FormatVersion, refusedStatement(reason), "users"))
 		})
 	}
 	assert.Len(t, plannerRefusalClauses, len(plannerRefusalSentences), "a clause has no golden sentence")
@@ -72,7 +72,7 @@ func TestPlannerRefusalReasonCoversEveryReason(t *testing.T) {
 // two operations refused for the same reason name it once.
 func TestPlannerRefusalReasonJoinsDistinctReasons(t *testing.T) {
 	got := executionVerdict(pgplan.FormatVersion,
-		refusedStatement(planner.ReasonNotNullWithoutDefault, planner.ReasonNotNullWithoutDefault, planner.ReasonUnsupportedOperation), "users", nil)
+		refusedStatement(planner.ReasonNotNullWithoutDefault, planner.ReasonNotNullWithoutDefault, planner.ReasonUnsupportedOperation), "users")
 	assert.Equal(t, stepVerdict{
 		mode: engine.ExecutionModeBlocked,
 		reason: `statement for table "users" is refused: it adds a NOT NULL column with no default to a table that holds rows, which PostgreSQL refuses because every existing row would hold NULL; give the column a default, or add it without NOT NULL, fill every row, then declare NOT NULL in a later change, which SchemaBot runs online; and ` +
@@ -89,7 +89,7 @@ func TestPlannerRefusalReasonUnknownReason(t *testing.T) {
 		reason:       `statement for table "users" is refused: it cannot be executed safely as written`,
 		unrecognized: &unrecognizedPlannerVocabulary{kind: "refusal_reason", value: "future-reason"},
 	}, executionVerdict(pgplan.FormatVersion,
-		refusedStatement(planner.ReasonNotNullWithoutDefault, planner.Reason("future-reason")), "users", nil))
+		refusedStatement(planner.ReasonNotNullWithoutDefault, planner.Reason("future-reason")), "users"))
 }
 
 // Operations the planner routed to a backend do not count as refused, so a
@@ -102,7 +102,7 @@ func TestPlannerRefusalReasonSkipsOperationsNotRefused(t *testing.T) {
 	assert.Equal(t, stepVerdict{
 		mode:   engine.ExecutionModeBlocked,
 		reason: `statement for table "users" is refused: it cannot be executed safely as written`,
-	}, executionVerdict(pgplan.FormatVersion, st, "users", nil))
+	}, executionVerdict(pgplan.FormatVersion, st, "users"))
 }
 
 // A statement that retypes a column a view reads and adds a NOT NULL column
@@ -118,7 +118,7 @@ func TestPlannerRefusalReasonJoinsDependentObjectsAndOtherReasons(t *testing.T) 
 		mode: engine.ExecutionModeBlocked,
 		reason: `statement for table "users" is refused: it changes or drops a column that view "public"."user_emails" reads; drop or redefine the view outside SchemaBot; and ` +
 			`it adds a NOT NULL column with no default to a table that holds rows, which PostgreSQL refuses because every existing row would hold NULL; give the column a default, or add it without NOT NULL, fill every row, then declare NOT NULL in a later change, which SchemaBot runs online, then plan again`,
-	}, executionVerdict(pgplan.FormatVersion, st, "users", nil))
+	}, executionVerdict(pgplan.FormatVersion, st, "users"))
 }
 
 // A refusal reason this build has no sentence for is reported even beside a
@@ -133,5 +133,5 @@ func TestPlannerRefusalReasonUnknownReasonBesideADependentObject(t *testing.T) {
 		mode:         engine.ExecutionModeBlocked,
 		reason:       `statement for table "users" is refused: it cannot be executed safely as written`,
 		unrecognized: &unrecognizedPlannerVocabulary{kind: "refusal_reason", value: "future-reason"},
-	}, executionVerdict(pgplan.FormatVersion, st, "users", nil))
+	}, executionVerdict(pgplan.FormatVersion, st, "users"))
 }

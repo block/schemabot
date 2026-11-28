@@ -1410,7 +1410,7 @@ func TestEnginePlanUndeclaredTableIsUnsafeDrop(t *testing.T) {
 		{"events", hierarchy},
 		{"ping", cycle},
 		{"pong", cycle},
-		{"tags", `foreign key constraint(s) "events.events_tag_id_fkey" of tables that stay reference it`},
+		{"tags", `foreign key "events.events_tag_id_fkey" of a table that stays references it`},
 		{"users_history", hierarchy},
 	}
 	changes := result.Changes[0].TableChanges
@@ -1604,15 +1604,6 @@ func TestLiveTablesUnderShadowingSearchPath(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"events", "invoices", "orders", "users"}, pulled,
 		"every live table must be enumerated, and only the partition and the extension-owned table left out, despite the shadowing search_path")
-
-	keys, err := foreignKeysFor(t.Context(), pool, "public", pulled)
-	require.NoError(t, err)
-	assert.ElementsMatch(t, []tableForeignKeys{
-		{name: "events", foreignKeys: []string{}, crossNamespaceForeignKeys: []string{}, referencedBy: []string{}},
-		{name: "invoices", foreignKeys: []string{"invoices_account_id_fkey"}, crossNamespaceForeignKeys: []string{"invoices_account_id_fkey"}, referencedBy: []string{}},
-		{name: "orders", foreignKeys: []string{"orders_user_id_fkey"}, crossNamespaceForeignKeys: []string{}, referencedBy: []string{}},
-		{name: "users", foreignKeys: []string{}, crossNamespaceForeignKeys: []string{}, referencedBy: []string{"orders_user_id_fkey"}},
-	}, keys, "every table's foreign keys must be read from the real catalog")
 
 	users, err := schemadiff.Introspect(t.Context(), pool, "public", "users")
 	require.NoError(t, err)
