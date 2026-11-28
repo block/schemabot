@@ -588,14 +588,8 @@ command with `--override` in that comment is the user's to post.
 `change_gate_unavailable` is different: it is a retryable storage problem.
 Retry it with backoff, like any other `503`.
 
-You can copy this into your agent's instructions:
-
-> - If SchemaBot says an environment is frozen, stop. Tell me which freeze
->   holds the change, why, and when it ends.
-> - Do not ask for an override with `--override`, set or lift a freeze, or
->   approve an override request. Give me the exact command instead.
-> - You may run `schemabot freeze list` and `schemabot freeze show` to check
->   on a freeze.
+An agent with the [SchemaBot agent skill](ai-agents.md#install-the-agent-skill)
+already follows these rules.
 
 ## Configure who may freeze and approve
 

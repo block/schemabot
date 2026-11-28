@@ -1134,14 +1134,8 @@ A failed index build can leave an invalid index behind. Leave it in place: the
 next apply removes it once it proves no build still holds it. Dropping it by
 hand can race a build the server is still running.
 
-You can copy this into your agent's instructions:
-
-> - If SchemaBot blocks or refuses a PostgreSQL change, stop. Tell me the
->   reason it gave.
-> - You may rewrite the schema files into the safe steps SchemaBot names and
->   plan again. Show me the new plan.
-> - Never run DDL against the database yourself, drop an invalid index, or
->   cancel a backend. Give me the command instead.
+An agent with the [SchemaBot agent skill](ai-agents.md#install-the-agent-skill)
+already follows these rules.
 
 ## Schema pull
 

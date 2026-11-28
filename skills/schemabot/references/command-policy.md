@@ -70,6 +70,25 @@ A watching `progress` is not read-only: its keys stop or cancel the apply, run i
 
 The CLI also has commands with no PR comment form, which change SchemaBot for every team on the server rather than one change: `freeze`, `unfreeze`, `settings` given a value, `checks backfill`, and the `storage` commands other than `storage plan`. They are for SchemaBot's operators. Hand them over, in every environment. Their read-only forms, such as `freeze list`, `settings` with no value, `checks show`, and `storage plan`, you can run.
 
+## When SchemaBot blocks or refuses a change
+
+Stop. Do not apply again, look for a flag, or try another environment, deployment, or credential to get past it.
+
+- Tell the user the reason SchemaBot gave, in its words. For a freeze, say which freeze holds the change, why, and when it ends.
+- When the reason names a safe form of the change, rewrite the schema files into it, plan again, and show the user the new plan.
+- When no safe form exists, such as a PostgreSQL column type change that rewrites the table, say so. That change needs a separately reviewed process that a person runs.
+- A `401` or `403` means the account lacks access. Say which permission is missing. Never try other credentials or turn off authentication.
+
+You may run `freeze list` and `freeze show` to check on a freeze.
+
+## Never act outside SchemaBot
+
+Every change goes through SchemaBot, so it is planned, reviewed, and recorded. Never change the database another way, in any environment. Give the user the command instead.
+
+- Never run DDL against the database or cluster yourself.
+- On PostgreSQL, never drop an invalid index or cancel a backend. A failed index build can leave an invalid index behind; the next apply removes it once it proves no build still holds it. Dropping it by hand can race a build the server is still running.
+- On Vitess, never act in the PlanetScale console: do not delete a branch, or approve or revert a deploy request.
+
 ## The user can opt out
 
 If the user says they post every SchemaBot command themselves, hand over every command, in every environment, for the rest of the session. Asking which they prefer is always reasonable.

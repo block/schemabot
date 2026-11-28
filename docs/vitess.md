@@ -522,12 +522,5 @@ that cannot be undone: it ends the deploy request for good, and the change
 starts again as a new one. The command policy routes it like any other control
 command, and nothing about this engine loosens that.
 
-You can copy this into your agent's instructions:
-
-> - If SchemaBot blocks or refuses a Vitess change, stop. Tell me the reason it
->   gave.
-> - You may rewrite the schema files and plan again. Show me the new plan.
-> - Follow the SchemaBot command policy for `cancel`, `cutover`, `revert`, and
->   `skip-revert`. In production, give me the command instead of posting it.
-> - Never run DDL against the cluster yourself or act in the PlanetScale
->   console. Give me the command instead.
+An agent with the [SchemaBot agent skill](ai-agents.md#install-the-agent-skill)
+already follows these rules.
