@@ -142,10 +142,13 @@ long as the change takes.** A new column does that when it is `NOT NULL` with no
 `DEFAULT`. So does a `DEFAULT` that might call a volatile function. The defaults
 that converge are a constant, a SQL value function such as `CURRENT_TIMESTAMP`,
 one of `pg_catalog.now()`, `pg_catalog.transaction_timestamp()`, and
-`pg_catalog.statement_timestamp()`, and a cast of any of these. Write `now()`
-with its `pg_catalog.` prefix, because the bare name is looked up through
-`search_path` and could reach a user function of the same name. One error names
-every change in that state, and none of them converge until all are resolved.
+`pg_catalog.statement_timestamp()`, and a cast of any of these. A time value
+converges only on a built-in date, time, timestamp, or text column, and only
+cast to one of those types, because a conversion to any other type may run a
+volatile function. Write `now()` with its `pg_catalog.` prefix, because the bare
+name is looked up through `search_path` and could reach a user function of the
+same name. One error names every change in that state, and none of them
+converge until all are resolved.
 
 An index PostgreSQL cannot use stops the boot as well, and the error says
 whether the build is still running or failed part way. A running build needs

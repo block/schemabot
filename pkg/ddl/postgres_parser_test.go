@@ -888,6 +888,28 @@ func TestPostgresAddColumnManualReason(t *testing.T) {
 			wantReason: "volatility cannot be proven",
 		},
 		{
+			// A cast to a user type may run a VOLATILE cast function, which
+			// PostgreSQL evaluates for every existing row.
+			name:       "pg_catalog now default cast to a user type",
+			createDDL:  "CREATE TABLE applies (id bigint, created_at app.event_time DEFAULT pg_catalog.now()::app.event_time)",
+			columnName: "created_at",
+			wantReason: "volatility cannot be proven",
+		},
+		{
+			// The conversion into the column's user type is implicit, and as
+			// unproven as an explicit cast.
+			name:       "pg_catalog now default on a user-typed column",
+			createDDL:  "CREATE TABLE applies (id bigint, created_at app.event_time DEFAULT pg_catalog.now())",
+			columnName: "created_at",
+			wantReason: "volatility cannot be proven",
+		},
+		{
+			name:       "current_timestamp default on a user-typed column",
+			createDDL:  "CREATE TABLE applies (id bigint, created_at app.event_time DEFAULT CURRENT_TIMESTAMP)",
+			columnName: "created_at",
+			wantReason: "volatility cannot be proven",
+		},
+		{
 			name:       "random default",
 			createDDL:  "CREATE TABLE applies (id bigint, jitter float8 DEFAULT pg_catalog.random())",
 			columnName: "jitter",
@@ -1096,6 +1118,13 @@ func TestPostgresCostScalesWithTableSize(t *testing.T) {
 		{"add column with within group now default", `ALTER TABLE mutes ADD COLUMN created_at timestamptz DEFAULT now() WITHIN GROUP (ORDER BY 1)`, true},
 		{"add column with clock_timestamp default", `ALTER TABLE mutes ADD COLUMN created_at timestamptz DEFAULT clock_timestamp()`, true},
 		{"add column with pg_catalog clock_timestamp default", `ALTER TABLE mutes ADD COLUMN created_at timestamptz DEFAULT pg_catalog.clock_timestamp()`, true},
+		{"add column with now default cast to a user type", `ALTER TABLE mutes ADD COLUMN created_at app.event_time DEFAULT pg_catalog.now()::app.event_time`, true},
+		{"add column with now default cast through a user type", `ALTER TABLE mutes ADD COLUMN created_at timestamptz DEFAULT now()::app.event_time::timestamptz`, true},
+		{"add user-typed column with now default", `ALTER TABLE mutes ADD COLUMN created_at app.event_time DEFAULT now()`, true},
+		{"add array column with now default", `ALTER TABLE mutes ADD COLUMN seen timestamptz[] DEFAULT ARRAY[now()]`, true},
+		{"add enum column with a string default", `ALTER TABLE mutes ADD COLUMN status app.mute_status DEFAULT 'active'`, false},
+		{"add enum column with a cast string default", `ALTER TABLE mutes ADD COLUMN status app.mute_status DEFAULT 'active'::app.mute_status`, false},
+		{"add varchar column with now default cast to text", `ALTER TABLE mutes ADD COLUMN stamp varchar(40) DEFAULT pg_catalog.now()::text`, false},
 		{"add column with random default", `ALTER TABLE mutes ADD COLUMN jitter float8 DEFAULT random()`, true},
 		{"add column with count star default", `ALTER TABLE mutes ADD COLUMN n bigint DEFAULT count(*)`, true},
 		{"add column with cast volatile function default", `ALTER TABLE mutes ADD COLUMN token text DEFAULT gen_random_uuid()::text`, true},

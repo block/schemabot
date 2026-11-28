@@ -276,7 +276,7 @@ func PostgresAddColumnManualReason(createTableDDL, columnName string) (string, e
 			notNull = true
 		case pgproto.ConstrType_CONSTR_DEFAULT:
 			hasDefault = true
-			constantDefault = postgresNonVolatileExpression(constraint.GetRawExpr(), timeCallsMustNamePgCatalog)
+			constantDefault = postgresNonVolatileDefault(constraint.GetRawExpr(), column.GetTypeName(), timeCallsMustNamePgCatalog)
 		case pgproto.ConstrType_CONSTR_GENERATED, pgproto.ConstrType_CONSTR_IDENTITY:
 			return "definition is generated or identity, which rewrites the whole table under an exclusive lock; add it manually", nil
 		case pgproto.ConstrType_CONSTR_UNIQUE:
@@ -322,7 +322,7 @@ func postgresSerialType(typeName *pgproto.TypeName) bool {
 
 // postgresTimeCallNaming says which spellings of a call to one of the
 // built-in STABLE time functions (see postgresStableTimeFunctions) a caller
-// of postgresNonVolatileExpression accepts. The two callers differ because
+// of postgresNonVolatileDefault accepts. The two callers differ because
 // an unqualified call is resolved through search_path when the statement
 // runs, so the parse tree alone cannot rule out a volatile user function of
 // the same name that shadows the built-in one.
@@ -352,24 +352,83 @@ var postgresStableTimeFunctions = map[string]bool{
 	"statement_timestamp":   true,
 }
 
-// postgresNonVolatileExpression reports whether a DEFAULT expression is
-// provably non-volatile from its parse tree: a constant, a cast whose
-// argument is itself provably non-volatile, a SQL value function
-// (CURRENT_TIMESTAMP and friends, which PostgreSQL defines as STABLE), or a
-// plain call to one of postgresStableTimeFunctions spelled as naming allows.
-// Every other function call reports false — the parse tree carries no
-// volatility information, so an arbitrary function cannot be proven safe
-// without catalog access.
-func postgresNonVolatileExpression(expr *pgproto.Node, naming postgresTimeCallNaming) bool {
+// postgresNonVolatileDefault reports whether a column's DEFAULT is provably
+// non-volatile from its parse tree, so ADD COLUMN evaluates it once instead
+// of rewriting the table. A constant, or a cast of one, keeps its existing
+// verdict. A time value (a SQL value function such as CURRENT_TIMESTAMP, or a
+// call to one of postgresStableTimeFunctions spelled as naming allows) also
+// passes, but only while every conversion it goes through is one PostgreSQL
+// defines as non-volatile: each cast it is wrapped in, and the implicit
+// conversion into the column's type, must target a type in
+// postgresTimeConversionTargets. A conversion to any other type, such as a
+// user type whose cast function may be VOLATILE, cannot be proven safe
+// without catalog access, so it reports false.
+func postgresNonVolatileDefault(expr *pgproto.Node, columnType *pgproto.TypeName, naming postgresTimeCallNaming) bool {
+	nonVolatile, constant := postgresNonVolatileExpression(expr, naming)
+	if !nonVolatile {
+		return false
+	}
+	return constant || postgresTimeConversionTarget(columnType)
+}
+
+// postgresNonVolatileExpression reports whether expr is provably
+// non-volatile, and whether it is a constant, possibly cast. A time value
+// passes only through casts to postgresTimeConversionTargets. Every other
+// function call reports false — the parse tree carries no volatility
+// information, so an arbitrary function cannot be proven safe.
+func postgresNonVolatileExpression(expr *pgproto.Node, naming postgresTimeCallNaming) (nonVolatile, constant bool) {
 	switch x := expr.GetNode().(type) {
 	case *pgproto.Node_AConst:
-		return true
+		return true, true
 	case *pgproto.Node_TypeCast:
-		return postgresNonVolatileExpression(x.TypeCast.GetArg(), naming)
+		nonVolatile, constant = postgresNonVolatileExpression(x.TypeCast.GetArg(), naming)
+		if !nonVolatile || constant {
+			return nonVolatile, constant
+		}
+		return postgresTimeConversionTarget(x.TypeCast.GetTypeName()), false
 	case *pgproto.Node_SqlvalueFunction:
-		return true
+		return true, false
 	case *pgproto.Node_FuncCall:
-		return postgresStableTimeCall(x.FuncCall, naming)
+		return postgresStableTimeCall(x.FuncCall, naming), false
+	default:
+		return false, false
+	}
+}
+
+// postgresTimeConversionTargets are the built-in types a timestamp converts
+// to through a conversion PostgreSQL marks STABLE or IMMUTABLE, never
+// VOLATILE. The names are the catalog names the parser reports: `timestamp`,
+// `time`, `varchar`, and `char` come back as pg_catalog.timestamp,
+// pg_catalog.time, pg_catalog.varchar, and pg_catalog.bpchar.
+var postgresTimeConversionTargets = map[string]bool{
+	"timestamp":   true,
+	"timestamptz": true,
+	"date":        true,
+	"time":        true,
+	"timetz":      true,
+	"text":        true,
+	"varchar":     true,
+	"bpchar":      true,
+}
+
+// postgresTimeConversionTarget reports whether typeName is one of
+// postgresTimeConversionTargets, unqualified or qualified with pg_catalog,
+// and not an array. Any other schema qualifier is refused. The unqualified
+// spelling is accepted, unlike an unqualified now(), because it is how schema
+// files declare a timestamptz or date column, and refusing it would refuse
+// them all; a user type can take its place only when search_path lists
+// pg_catalog after that type's schema.
+func postgresTimeConversionTarget(typeName *pgproto.TypeName) bool {
+	if typeName == nil || len(typeName.GetArrayBounds()) > 0 || typeName.GetSetof() || typeName.GetPctType() {
+		return false
+	}
+	parts := typeName.GetNames()
+	switch len(parts) {
+	case 1:
+		return postgresTimeConversionTargets[parts[0].GetString_().GetSval()]
+	case 2:
+		return parts[0].GetString_().GetSval() == "pg_catalog" &&
+			postgresTimeConversionTargets[parts[1].GetString_().GetSval()]
 	default:
 		return false
 	}
@@ -524,7 +583,7 @@ func addColumnScalesWithTableSize(col *pgproto.ColumnDef) bool {
 			return true
 		case pgproto.ConstrType_CONSTR_DEFAULT:
 			hasDefault = true
-			if !postgresNonVolatileExpression(constraint.GetRawExpr(), timeCallsMayResolveThroughSearchPath) {
+			if !postgresNonVolatileDefault(constraint.GetRawExpr(), col.GetTypeName(), timeCallsMayResolveThroughSearchPath) {
 				return true
 			}
 		case pgproto.ConstrType_CONSTR_FOREIGN:
