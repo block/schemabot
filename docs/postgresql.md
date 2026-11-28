@@ -1385,6 +1385,43 @@ needs `CREATE` on the database and a read-write connection. A role granted
 only the apply privileges fails at plan time. A foreign key in a schema file
 also needs `SELECT` on the referenced table.
 
+**Event triggers.** The scratch schema is named `pgsprite_scratch_<suffix>`.
+An event trigger that enforces DDL rules, such as requiring `CONCURRENTLY` on
+`CREATE INDEX`, fires on it too. A trigger that raises an error there refuses
+every plan, and the plan names the SQLSTATE and this prefix. Have the trigger
+allow the scratch schema's own `CREATE SCHEMA` and the DDL inside it, and
+only for the role SchemaBot connects as: any role that can create a schema
+can pick a name with this prefix, so a check on the name alone lets that
+role's DDL past the guard. `session_user` is the login role, which `SET ROLE`
+does not change. A `ddl_command_start` trigger has no object to read yet, so
+it checks the schema the session builds in (`schemabot` stands for the role
+SchemaBot connects as):
+
+```sql
+IF session_user = 'schemabot' AND current_schema() LIKE 'pgsprite\_scratch\_%' THEN
+  RETURN;
+END IF;
+-- your rule
+```
+
+That check cannot see the `CREATE SCHEMA` itself, which runs before the
+session moves into the new schema. A `ddl_command_start` trigger that covers
+`CREATE SCHEMA` has to let it through, for example with
+`WHEN TAG IN (...)` naming only the commands it guards, and leave the check
+of new schemas to a `ddl_command_end` trigger.
+
+A `ddl_command_end` trigger checks each command's schema, and the name of a
+schema the command creates, which it reports as the object rather than as
+`schema_name`:
+
+```sql
+FOR cmd IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP
+  CONTINUE WHEN session_user = 'schemabot' AND (cmd.schema_name LIKE 'pgsprite\_scratch\_%'
+    OR (cmd.command_tag = 'CREATE SCHEMA' AND cmd.object_identity LIKE 'pgsprite\_scratch\_%'));
+  -- your rule
+END LOOP;
+```
+
 ## Table ownership
 
 PostgreSQL gives every table exactly one owner: a role, initially whichever

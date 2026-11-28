@@ -64,3 +64,20 @@ func TestRemotePlanRefusalWithoutProblemsCarriesNoDetail(t *testing.T) {
 	assert.Nil(t, got)
 	assert.Zero(t, omitted)
 }
+
+// A refusal SchemaBot worded itself, over a cause the target raised, reaches a
+// remote caller as SchemaBot's words alone: the cause is the target's text and
+// stays in this server's log.
+func TestRemotePlanRefusalInSchemaBotsWordsLeavesOutTheCause(t *testing.T) {
+	const message = "have the trigger skip the scratch schema, then plan again"
+	server := NewServer(planErrorClient{err: &engine.PlanRefusedError{
+		Err: engine.OperatorErrorf(errors.New("ERROR: CREATE INDEX must use CONCURRENTLY on db-7.internal (SQLSTATE P0001)"), message),
+	}}, slog.Default())
+	client := newSizeLimitedGRPCClient(t, server, nil, nil)
+
+	_, err := client.Plan(t.Context(), &ternv1.PlanRequest{Database: "app"})
+	require.Error(t, err)
+	st := status.Convert(err)
+	assert.Equal(t, codes.FailedPrecondition, st.Code())
+	assert.Equal(t, message, st.Message())
+}

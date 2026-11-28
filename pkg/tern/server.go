@@ -278,7 +278,8 @@ func (s *Server) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.Pla
 // the engine refused is the schema files' or the target's to fix, not a fault
 // of this server, so it is FailedPrecondition, which callers do not alert on,
 // and its message is the refusal's own text: the wraps this server added on
-// the way out can name addresses and are logged here instead. The statements
+// the way out can name addresses and are logged here instead, and so is the
+// cause of a refusal SchemaBot worded itself. The statements
 // the refusal names in the schema files travel as a PlanRefusal detail, so the
 // caller can point at each one. Any other failure is Internal and carries the
 // whole error.
@@ -289,7 +290,8 @@ func (s *Server) planStatusError(ctx context.Context, req *ternv1.PlanRequest, e
 	}
 	s.logger.WarnContext(ctx, "plan refused; the caller is answered with the refusal's text and the statements it names",
 		"database", req.GetDatabase(), "environment", req.GetEnvironment(), "problems", len(refusal.Problems), "error", err)
-	st, detailErr := ternconv.PlanRefusalStatus(refusal.Error(), refusal.Problems)
+	text, _ := refusal.AuthoredText()
+	st, detailErr := ternconv.PlanRefusalStatus(text, refusal.Problems)
 	if detailErr != nil {
 		s.logger.WarnContext(ctx, "plan refusal answered with its text only; the caller cannot point at each statement",
 			"database", req.GetDatabase(), "environment", req.GetEnvironment(), "error", detailErr)
