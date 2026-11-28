@@ -1,7 +1,9 @@
 package localdemo
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/block/mysql"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -225,4 +228,28 @@ func sampleContainerWithProxyPorts(hostStart int) container {
 		}
 	}
 	return c
+}
+
+// When the state database fails, setup stops before it needs the cluster
+// image. A download that already failed reports its own cause alongside the
+// state database's. One still running is cancelled and waited for, so no
+// docker pull outlives setup, and the cancellation is not reported as a cause.
+func TestAbandonPullReportsOnlyARealDownloadFailure(t *testing.T) {
+	failed := make(chan error, 1)
+	failed <- errors.New("pull refused")
+	require.ErrorContains(t, abandonPull(failed, func() {
+		t.Fatal("a download that already finished needs no cancel")
+	}), "pull refused")
+
+	inFlight := make(chan error, 1)
+	cancelled := false
+	require.NoError(t, abandonPull(inFlight, func() {
+		cancelled = true
+		inFlight <- context.Canceled
+	}))
+	assert.True(t, cancelled, "a download still running should be cancelled")
+
+	require.NoError(t, abandonPull(nil, func() {
+		t.Fatal("setup that started no download has nothing to cancel")
+	}))
 }

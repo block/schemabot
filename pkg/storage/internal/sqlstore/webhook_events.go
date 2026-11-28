@@ -229,12 +229,41 @@ func webhookClaimableArgs() []any {
 // that failed less than WebhookEventFailedCoverageCoolOff ago. The cutoff is
 // measured on the database clock, the same clock that stamped completed_at.
 // Every terminal failure write stamps completed_at; updated_at, which every
-// write stamps, stands in if it is ever unset. Bind one placeholder: the
-// synthesized-GUID LIKE pattern.
-func (s *webhookEventStore) failedOrganicRowInCoolOff() string {
+// write stamps, stands in if it is ever unset. columnPrefix qualifies each
+// column (for example "c."), or is empty for an unaliased table. Bind one
+// placeholder: the synthesized-GUID LIKE pattern.
+func (s *webhookEventStore) failedOrganicRowInCoolOff(columnPrefix string) string {
 	cutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
 		LiteralIntervalAmount(uint64(storage.WebhookEventFailedCoverageCoolOff.Microseconds())), IntervalMicrosecond)
-	return `(delivery_id NOT LIKE ? AND COALESCE(completed_at, updated_at) > ` + cutoff + `)`
+	return `(` + columnPrefix + `delivery_id NOT LIKE ? AND COALESCE(` + columnPrefix + `completed_at, ` + columnPrefix + `updated_at) > ` + cutoff + `)`
+}
+
+// webhookCoveringRow matches a row that counts as coverage for its head, the
+// rule HasEventForHead applies to the row for a given head and the purge
+// applies to decide which rows it must keep. Both derive from this one
+// predicate so what the reconciler treats as planned and what retention
+// protects cannot drift apart. alias is the table alias to qualify columns
+// with, or empty for an unaliased table. Bind the arguments with
+// webhookCoveringRowArgs.
+//
+// Coverage means an auto-plannable pull_request row that is not superseded, and
+// that is not a failed row outside its cool-off or a failed synthesized row.
+// See HasEventForHead for why each of those cases does or does not count.
+func (s *webhookEventStore) webhookCoveringRow(alias string) string {
+	columnPrefix := ""
+	if alias != "" {
+		columnPrefix = alias + "."
+	}
+	return `(` + columnPrefix + `event = 'pull_request' AND ` + columnPrefix + `action IN (` + placeholders(len(storage.AutoPlanPullRequestActions)) + `)
+				AND ` + columnPrefix + `state <> ?
+				AND (` + columnPrefix + `state <> ? OR ` + s.failedOrganicRowInCoolOff(columnPrefix) + `))`
+}
+
+// webhookCoveringRowArgs returns the placeholder bindings for
+// webhookCoveringRow, in order.
+func webhookCoveringRowArgs() []any {
+	args := stringArgs(storage.AutoPlanPullRequestActions)
+	return append(args, storage.WebhookEventSuperseded, storage.WebhookEventFailed, storage.SynthesizedWebhookDeliveryIDPrefix+"%")
 }
 
 func (s *webhookEventStore) HasEventForHead(ctx context.Context, provider, repository string, pullRequest int, headSHA string) (bool, error) {
@@ -269,17 +298,13 @@ func (s *webhookEventStore) HasEventForHead(ctx context.Context, provider, repos
 	// when the successor's coverage lapses (e.g. it targeted a different
 	// head and the PR reopened on this one), the reconciler must be free to
 	// synthesize.
-	args := []any{provider, repository, pullRequest, headSHA}
-	args = append(args, stringArgs(storage.AutoPlanPullRequestActions)...)
-	args = append(args, storage.WebhookEventSuperseded, storage.WebhookEventFailed, storage.SynthesizedWebhookDeliveryIDPrefix+"%")
+	args := append([]any{provider, repository, pullRequest, headSHA}, webhookCoveringRowArgs()...)
 	var one int
 	err := s.db.QueryRowContext(ctx, `
 		SELECT 1
 		FROM webhook_events
 		WHERE provider = ? AND repository = ? AND pull_request = ? AND head_sha = ?
-			AND event = 'pull_request' AND action IN (`+placeholders(len(storage.AutoPlanPullRequestActions))+`)
-			AND state <> ?
-			AND (state <> ? OR `+s.failedOrganicRowInCoolOff()+`)
+			AND `+s.webhookCoveringRow("")+`
 		LIMIT 1
 	`, args...).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -567,6 +592,22 @@ func (s *webhookEventStore) MarkCompleted(ctx context.Context, id int64, leaseTo
 	return s.checkWebhookEventLeaseResult(ctx, result, id, leaseToken)
 }
 
+// MarkSuperseded marks a claimed auto-plannable pull_request event superseded
+// after the driver found the pull request's head had moved past it. Like
+// MarkCompleted it keeps the lease token and COALESCE-preserves completed_at,
+// so repeating the call with the same token is a no-op.
+func (s *webhookEventStore) MarkSuperseded(ctx context.Context, id int64, leaseToken string) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE webhook_events
+		SET state = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+		WHERE id = ? AND lease_token = ?
+	`, storage.WebhookEventSuperseded, id, leaseToken)
+	if err != nil {
+		return fmt.Errorf("mark webhook event %d superseded: %w", id, err)
+	}
+	return s.checkWebhookEventLeaseResult(ctx, result, id, leaseToken)
+}
+
 // MarkFailed marks a claimed event failed. A non-nil retryAfter keeps it
 // retryable after that time; nil makes the failure terminal.
 //
@@ -686,21 +727,89 @@ func (s *webhookEventStore) TerminateStuckProcessing(ctx context.Context, reason
 	return rows, nil
 }
 
+// webhookPurgeCandidate matches the rows a purge may delete, for the
+// webhook_events table reached through alias: a terminal row received before
+// the cutoff that the purge is not required to keep. DeleteTerminalOlderThan
+// (page select and delete re-check) and CountTerminalOlderThan all use it, so
+// the count equals what a purge may remove.
+//
+// A row that counts as coverage for its head (webhookCoveringRow, the rule
+// HasEventForHead applies) is kept unless a newer row that covers permanently
+// exists for the same provider, repository, and pull request. Deleting the
+// only covering row of a pull request that is still active would make the
+// reconciler plan its head again, and replay a dead-lettered head's failure.
+// Only a completed or permanently failed row covers permanently. A pending,
+// processing, or retryable row, or a failed row inside its cool-off, covers
+// now but can lose that coverage (it can fail, or be superseded), so it never
+// justifies deleting an older row; it is itself never deleted while it covers.
+// "Newer" means a higher id: ids follow insertion order and a Redeliver reopen
+// keeps a row's id while it resets received_at, so ordering by received_at
+// would let a redelivery of an old head make that old head's row the newest
+// and expose the current head's row. A row with no pull request or repository
+// can never cover a head, so it is not protected. A row that does not count as
+// coverage (failed outside its cool-off, failed synthesized, superseded) is
+// purgeable on age alone. The guard probes idx_provider_repo_pr (MySQL) and
+// idx_webhook_events_provider_repo_pr (PostgreSQL).
+//
+// Bind the arguments with webhookPurgeCandidateArgs.
+func (s *webhookEventStore) webhookPurgeCandidate(alias string, cutoff string) string {
+	return `(` + alias + `.received_at < ` + cutoff + `
+				AND ` + alias + `.state IN (` + placeholders(len(storage.WebhookEventStatesTerminal)) + `)
+				AND (NOT ` + s.webhookCoveringRow(alias) + `
+					OR ` + alias + `.pull_request = 0 OR ` + alias + `.repository = ''
+					OR EXISTS (
+						SELECT 1 FROM webhook_events newer
+						WHERE newer.provider = ` + alias + `.provider
+							AND newer.repository = ` + alias + `.repository
+							AND newer.pull_request = ` + alias + `.pull_request
+							AND newer.id > ` + alias + `.id
+							AND ` + webhookPermanentCoveringRow("newer") + `)))`
+}
+
+// webhookPermanentCoveringRow matches a row whose coverage no later write
+// takes away: an auto-plannable pull_request row in a completed or permanently
+// failed state, in either GUID form. It is webhookCoveringRow restricted to
+// the two states that cover with no time limit. Bind the arguments with
+// webhookPermanentCoveringRowArgs.
+func webhookPermanentCoveringRow(alias string) string {
+	return `(` + alias + `.event = 'pull_request' AND ` + alias + `.action IN (` + placeholders(len(storage.AutoPlanPullRequestActions)) + `)
+				AND ` + alias + `.state IN (?, ?))`
+}
+
+// webhookPermanentCoveringRowArgs returns the placeholder bindings for
+// webhookPermanentCoveringRow, in order.
+func webhookPermanentCoveringRowArgs() []any {
+	args := stringArgs(storage.AutoPlanPullRequestActions)
+	return append(args, storage.WebhookEventCompleted, storage.WebhookEventFailedPermanent)
+}
+
+// webhookPurgeCandidateArgs returns the placeholder bindings for
+// webhookPurgeCandidate, in order.
+func webhookPurgeCandidateArgs() []any {
+	args := stringArgs(storage.WebhookEventStatesTerminal)
+	args = append(args, webhookCoveringRowArgs()...)
+	return append(args, webhookPermanentCoveringRowArgs()...)
+}
+
 // DeleteTerminalOlderThan deletes at most limit terminal rows received more
 // than age ago, oldest first, and returns how many it deleted. It never
 // deletes a pending, processing, or retryable row, however old, because those
-// are work a driver still owns.
+// are work a driver still owns. It also keeps the newest covering row of each
+// pull request; see webhookPurgeCandidate.
 //
 // The cutoff is rendered as database-clock SQL rather than computed from the
 // caller's time.Now(), so the same age cuts at the same instant on every pod.
 // received_at, not completed_at, dates a row: every row has it, and it is what
-// the received_at index serves. The state test is a residual filter on the
-// rows that index returns.
+// the received_at index serves. The state test and the coverage guard are
+// residual filters on the rows that index returns.
 //
 // A batch is two statements because MySQL rejects LIMIT inside an IN subquery
 // and PostgreSQL has no DELETE ... LIMIT: select a page of primary keys, then
-// delete by primary key. The DELETE repeats the state and cutoff predicates,
-// so a row that Redeliver reopened between the two statements is not deleted.
+// delete by primary key. The DELETE repeats the whole candidate predicate, so
+// a row that Redeliver reopened, or that a newer covering row no longer
+// justifies deleting, between the two statements is not deleted. The
+// predicate sits in a derived table because MySQL rejects a DELETE whose
+// subquery reads the table it deletes from.
 func (s *webhookEventStore) DeleteTerminalOlderThan(ctx context.Context, age time.Duration, limit int) (int64, error) {
 	if age.Microseconds() <= 0 {
 		return 0, fmt.Errorf("delete terminal webhook events: age must be positive, got %s", age)
@@ -714,14 +823,13 @@ func (s *webhookEventStore) DeleteTerminalOlderThan(ctx context.Context, age tim
 
 	cutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
 		LiteralIntervalAmount(uint64(age.Microseconds())), IntervalMicrosecond)
-	terminalIn := placeholders(len(storage.WebhookEventStatesTerminal))
 
-	selectArgs := append(stringArgs(storage.WebhookEventStatesTerminal), limit)
+	selectArgs := append(webhookPurgeCandidateArgs(), limit)
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id
-		FROM webhook_events
-		WHERE received_at < `+cutoff+` AND state IN (`+terminalIn+`)
-		ORDER BY received_at, id
+		SELECT c.id
+		FROM webhook_events c
+		WHERE `+s.webhookPurgeCandidate("c", cutoff)+`
+		ORDER BY c.received_at, c.id
 		LIMIT ?
 	`, selectArgs...)
 	if err != nil {
@@ -746,13 +854,19 @@ func (s *webhookEventStore) DeleteTerminalOlderThan(ctx context.Context, age tim
 		s.hooks.afterPurgeSelect()
 	}
 
-	deleteArgs := make([]any, 0, len(ids)+len(storage.WebhookEventStatesTerminal))
+	deleteArgs := make([]any, 0, len(ids)+len(webhookPurgeCandidateArgs()))
 	deleteArgs = append(deleteArgs, ids...)
-	deleteArgs = append(deleteArgs, stringArgs(storage.WebhookEventStatesTerminal)...)
+	deleteArgs = append(deleteArgs, webhookPurgeCandidateArgs()...)
 	result, err := s.db.ExecContext(ctx, `
 		DELETE FROM webhook_events
-		WHERE id IN (`+placeholders(len(ids))+`)
-			AND received_at < `+cutoff+` AND state IN (`+terminalIn+`)
+		WHERE id IN (
+			SELECT purgeable.id FROM (
+				SELECT c.id AS id
+				FROM webhook_events c
+				WHERE c.id IN (`+placeholders(len(ids))+`)
+					AND `+s.webhookPurgeCandidate("c", cutoff)+`
+			) AS purgeable
+		)
 	`, deleteArgs...)
 	if err != nil {
 		return 0, fmt.Errorf("delete %d terminal webhook events older than %s: %w", len(ids), age, err)
@@ -765,8 +879,9 @@ func (s *webhookEventStore) DeleteTerminalOlderThan(ctx context.Context, age tim
 }
 
 // CountTerminalOlderThan counts the rows DeleteTerminalOlderThan may delete for
-// the same age, using the same cutoff and state predicate so a dry run reports
-// what a real purge would remove.
+// the same age, using the same candidate predicate (cutoff, states, and the
+// newest-covering-row guard) so a dry run reports what a real purge would
+// remove.
 func (s *webhookEventStore) CountTerminalOlderThan(ctx context.Context, age time.Duration) (int64, error) {
 	if age.Microseconds() <= 0 {
 		return 0, fmt.Errorf("count terminal webhook events: age must be positive, got %s", age)
@@ -777,9 +892,9 @@ func (s *webhookEventStore) CountTerminalOlderThan(ctx context.Context, age time
 	var count int64
 	err := s.db.QueryRowContext(ctx, `
 		SELECT COUNT(*)
-		FROM webhook_events
-		WHERE received_at < `+cutoff+` AND state IN (`+placeholders(len(storage.WebhookEventStatesTerminal))+`)
-	`, stringArgs(storage.WebhookEventStatesTerminal)...).Scan(&count)
+		FROM webhook_events c
+		WHERE `+s.webhookPurgeCandidate("c", cutoff)+`
+	`, webhookPurgeCandidateArgs()...).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("count terminal webhook events older than %s: %w", age, err)
 	}
