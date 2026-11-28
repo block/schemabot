@@ -1281,6 +1281,29 @@ func (e *unlockRejectionError) Unwrap() error { return e.err }
 
 func unlockRejection(err error) error { return &unlockRejectionError{err: err} }
 
+// unlockRefusalError is a deterministic unlock rejection whose words SchemaBot
+// wrote for the person who ran the command, so a PR comment shows them as they
+// stand. cause, when set, is the error the refusal was built from; it appears
+// in Error for the server log and never in the PR comment.
+type unlockRefusalError struct {
+	message string
+	cause   error
+}
+
+func (e *unlockRefusalError) Error() string {
+	if e.cause == nil {
+		return e.message
+	}
+	return e.message + ": " + e.cause.Error()
+}
+
+func (e *unlockRefusalError) Unwrap() error { return e.cause }
+
+// unlockRefusal is unlockRejection for a refusal SchemaBot words itself.
+func unlockRefusal(message string, cause error) error {
+	return unlockRejection(&unlockRefusalError{message: message, cause: cause})
+}
+
 func isUnlockRejection(err error) bool {
 	var rejection *unlockRejectionError
 	return errors.As(err, &rejection)
@@ -1357,7 +1380,7 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 		if err != nil {
 			h.logger.Error("failed to infer database for force unlock", "repo", repo, "pr", pr, "error", err)
 			if isUnlockRejection(err) {
-				h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, "Failed to infer database for force unlock: "+err.Error())
+				h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, "Failed to infer database for force unlock: "+userFacingError(err))
 				return false, nil
 			}
 			// A GitHub App resolution failure is deterministic per deployment
@@ -1381,7 +1404,7 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 	if err != nil {
 		h.logger.Error("failed to look up unlock targets", "repo", repo, "pr", pr, "database", result.Database, "force", result.Force, "error", err)
 		if isUnlockRejection(err) {
-			h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, "Failed to look up locks: "+err.Error())
+			h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, "Failed to look up locks: "+userFacingError(err))
 			return false, nil
 		}
 		if !result.SuppressRetryComments {
@@ -1664,7 +1687,7 @@ func (h *Handler) lockedDatabaseApplyForComment(ctx context.Context, repo string
 func (h *Handler) locksForUnlock(ctx context.Context, repo string, pr int, result CommandResult) ([]*storage.Lock, error) {
 	if result.Force {
 		if result.Database == "" {
-			return nil, unlockRejection(errors.New("--force requires a database target"))
+			return nil, unlockRefusal("--force requires a database target", nil)
 		}
 
 		locks, err := h.service.Storage().Locks().List(ctx)
@@ -1678,7 +1701,7 @@ func (h *Handler) locksForUnlock(ctx context.Context, repo string, pr int, resul
 				continue
 			}
 			if lock.PullRequest != 0 && (lock.Repository != repo || lock.PullRequest != pr) {
-				return nil, unlockRejection(fmt.Errorf("lock for %s is held by %s#%d", result.Database, lock.Repository, lock.PullRequest))
+				return nil, unlockRefusal(fmt.Sprintf("lock for %s is held by %s#%d; run `schemabot unlock` on that PR to release it", result.Database, lock.Repository, lock.PullRequest), nil)
 			}
 			matches = append(matches, lock)
 		}
@@ -1711,16 +1734,16 @@ func (h *Handler) inferUnlockDatabase(ctx context.Context, repo string, pr int, 
 	config, _, err := h.resolveUnscopedManagedConfig(ctx, client, repo, pr, "", action.Unlock)
 	if err != nil {
 		// Schema another deployment owns — whether outside allowed_dirs or for
-		// a database not in this deployment's registry — means there is nothing
-		// for this deployment to unlock: same outcome as no config at all.
-		if isSchemaUnownedByDeploymentError(err) {
-			return "", unlockRejection(ghclient.ErrNoConfig)
-		}
-		// Schema whose database this leader never registered was never
-		// locked by it, so there is nothing to unlock here either.
-		var notRegistered *databaseNotRegisteredError
-		if errors.As(err, &notRegistered) {
-			return "", unlockRejection(ghclient.ErrNoConfig)
+		// a database this leader never registered — was never locked by this
+		// deployment, so there is nothing here to unlock. The repository does
+		// have a config, so the refusal says that rather than asking the
+		// author to add a schemabot.yaml for schema they do not own. The
+		// refusal carries no cause: the plan path's own line for these errors
+		// asks for a server config change, which an unlock never needs, and
+		// it would take precedence over this one in the comment.
+		if _, notRegistered := errors.AsType[*databaseNotRegisteredError](err); notRegistered || isSchemaUnownedByDeploymentError(err) {
+			h.logger.Info("force unlock found no schema this deployment manages", "repo", repo, "pr", pr, "error", err)
+			return "", unlockRefusal("this SchemaBot deployment manages no schema in this PR, so it holds no lock here to release", nil)
 		}
 		// A repo with no config, or only malformed ones, is a deterministic
 		// discovery outcome the same delivery always reproduces — the
@@ -1729,12 +1752,20 @@ func (h *Handler) inferUnlockDatabase(ctx context.Context, repo string, pr int, 
 			return "", unlockRejection(err)
 		}
 		if errors.Is(err, ghclient.ErrMultipleConfigs) {
-			return "", unlockRejection(fmt.Errorf("multiple SchemaBot configs match this PR; retry with `schemabot unlock -d <database> --force`: %w", err))
+			message := "multiple SchemaBot configs match this PR"
+			if multiple, ok := errors.AsType[*ghclient.MultipleConfigsError](err); ok {
+				described := make([]string, 0, len(multiple.Candidates))
+				for _, candidate := range multiple.Candidates {
+					described = append(described, fmt.Sprintf("`%s` (%s)", candidate.Database, candidate.SchemaDir))
+				}
+				message += ": " + strings.Join(described, ", ")
+			}
+			return "", unlockRefusal(message+"; retry with `schemabot unlock -d <database> --force`", err)
 		}
 		return "", err
 	}
 	if config == nil || config.Database == "" {
-		return "", unlockRejection(errors.New("no database found in SchemaBot config"))
+		return "", unlockRefusal("the SchemaBot config for this PR names no database; retry with `schemabot unlock -d <database> --force`", nil)
 	}
 	return config.Database, nil
 }

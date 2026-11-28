@@ -294,7 +294,7 @@ func TestUnlockCommandCoreTerminalDispositions(t *testing.T) {
 		assert.False(t, retry, "a missing config is a deterministic rejection the same delivery always reproduces")
 		body := requireComment(t, comments, "no-config inference rejection comment")
 		assert.Contains(t, body, "Failed to infer database for force unlock")
-		assert.Contains(t, body, "no schemabot.yaml config found")
+		assert.Contains(t, body, "No `schemabot.yaml` configuration file was found in this repository")
 	})
 
 	t.Run("no locks found is terminal", func(t *testing.T) {
@@ -621,7 +621,7 @@ func TestUnlockCommandCoreInferenceRejectionsAreTerminal(t *testing.T) {
 				})
 				serveConfigFile(t, mux, "schemabot.yaml", "type: mysql\n")
 			},
-			wantComment: "invalid schemabot.yaml config found",
+			wantComment: "A `schemabot.yaml` in this repository is not valid",
 		},
 		{
 			// A PR spanning several configs this deployment manages is
@@ -640,7 +640,7 @@ func TestUnlockCommandCoreInferenceRejectionsAreTerminal(t *testing.T) {
 				serveConfigFile(t, mux, "db/orders/schemabot.yaml", "database: orders\ntype: mysql\n")
 				serveConfigFile(t, mux, "db/payments/schemabot.yaml", "database: payments\ntype: mysql\n")
 			},
-			wantComment: "multiple SchemaBot configs match this PR",
+			wantComment: "multiple SchemaBot configs match this PR: `orders` (db/orders), `payments` (db/payments); retry with `schemabot unlock -d",
 		},
 		{
 			// A config outside this deployment's allowed_dirs is another
@@ -660,7 +660,7 @@ func TestUnlockCommandCoreInferenceRejectionsAreTerminal(t *testing.T) {
 				serveUnlockInferencePR(t, mux, "db/other/schemabot.yaml")
 				serveConfigFile(t, mux, "db/other/schemabot.yaml", "database: orders\ntype: mysql\n")
 			},
-			wantComment: "no schemabot.yaml config found",
+			wantComment: "this SchemaBot deployment manages no schema in this PR, so it holds no lock here to release",
 		},
 	}
 
@@ -681,6 +681,72 @@ func TestUnlockCommandCoreInferenceRejectionsAreTerminal(t *testing.T) {
 			body := requireComment(t, comments, "inference rejection comment")
 			assert.Contains(t, body, "Failed to infer database for force unlock")
 			assert.Contains(t, body, tc.wantComment)
+			assert.NotContains(t, body, "No `schemabot.yaml` configuration file was found", "a repository with a config is never told to add one")
+			assert.NotContains(t, body, "invalid schemabot.yaml config found", "the discovery error's own text, which names repository paths, stays in the server log")
+			assert.NotContains(t, body, "no schemabot.yaml config found")
 		})
 	}
+}
+
+// A force unlock that SchemaBot refuses shows the words SchemaBot wrote for
+// the refusal, and a rejection wrapping an error SchemaBot did not write shows
+// the fixed line instead of that error's text.
+func TestUnlockRejectionShowsOnlyAuthoredText(t *testing.T) {
+	t.Run("a lock another PR holds names the holder", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := recordComments(t, mux)
+		lockStore := &unlockTestLockStore{locks: []*storage.Lock{{
+			DatabaseName: "orders",
+			DatabaseType: storage.DatabaseTypeMySQL,
+			Repository:   "octocat/other-repo",
+			PullRequest:  2,
+		}}}
+		st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
+		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+		retry, err := h.unlockCommandCore(t.Context(), time.Now(), "octocat/hello-world", 1, 12345, "testuser",
+			CommandResult{Action: action.Unlock, Force: true, Database: "orders"})
+
+		require.NoError(t, err)
+		assert.False(t, retry, "a lock held by another PR is the command's answer; re-driving reproduces it")
+		body := requireComment(t, comments, "lock held by another PR comment")
+		assert.Contains(t, body, "Failed to look up locks: lock for orders is held by octocat/other-repo#2; run `schemabot unlock` on that PR to release it")
+		assert.Zero(t, lockStore.releaseCalls)
+	})
+
+	t.Run("a force unlock with no database names the missing target", func(t *testing.T) {
+		st := &unlockTestStorage{locks: &unlockTestLockStore{}, applies: &noActiveAppliesStore{}}
+		h := unlockTestHandler(t, st, nil)
+
+		_, err := h.locksForUnlock(t.Context(), "octocat/hello-world", 1, CommandResult{Action: action.Unlock, Force: true})
+
+		require.Error(t, err)
+		assert.True(t, isUnlockRejection(err))
+		assert.Equal(t, "--force requires a database target", userFacingError(err))
+	})
+
+	t.Run("the cause of a refusal stays out of the comment line", func(t *testing.T) {
+		err := unlockRefusal("multiple SchemaBot configs match this PR", errors.New(rawInfrastructureError))
+
+		assert.Equal(t, "multiple SchemaBot configs match this PR", userFacingError(err))
+		assert.Contains(t, err.Error(), rawInfrastructureError, "the server log keeps the cause")
+	})
+
+	t.Run("a rejection wrapping an error SchemaBot did not write shows the fixed line", func(t *testing.T) {
+		err := unlockRejection(fmt.Errorf("read config: %w", errors.New(rawInfrastructureError)))
+
+		got := userFacingError(err)
+
+		assert.Equal(t, unexpectedFailureMessage, got)
+		requireNoInfrastructureDetail(t, got)
+	})
+
+	t.Run("a rejection wrapping a discovery sentinel shows the sentinel's line without the wrap", func(t *testing.T) {
+		err := unlockRejection(fmt.Errorf("%w at services/orders/schemabot.yaml", ghclient.ErrInvalidConfig))
+
+		got := userFacingError(err)
+
+		assert.Contains(t, got, "A `schemabot.yaml` in this repository is not valid")
+		assert.NotContains(t, got, "services/orders")
+	})
 }

@@ -17,9 +17,15 @@ import (
 	"github.com/block/schemabot/pkg/webhook/action"
 )
 
+// prSchemaRefusalError is a refusal SchemaBot wrote for the person who ran the
+// plan, so a PR comment shows its words as they stand.
+type prSchemaRefusalError struct{ message string }
+
+func (e *prSchemaRefusalError) Error() string { return e.message }
+
 var (
-	errPRSchemaCapHeld = errors.New("SchemaBot planning is paused by the PR database limit")
-	errPRSchemaMoved   = errors.New("the PR or database registrations changed during planning")
+	errPRSchemaCapHeld = &prSchemaRefusalError{message: "SchemaBot planning is paused by the PR database limit"}
+	errPRSchemaMoved   = &prSchemaRefusalError{message: "the PR or database registrations changed during planning"}
 	// errPRSchemaHeadMoved is the errPRSchemaMoved a push causes. An auto-plan
 	// that meets it planned nothing for its head, so its delivery ends
 	// superseded rather than completed; a base, state, or registration change
@@ -300,10 +306,10 @@ func (h *Handler) admitPRSchemaBeforeQueue(parent context.Context, repo string, 
 func (h *Handler) answerPRSchemaPlanRefusal(w http.ResponseWriter, repo string, pr int, installation int64, environment, requestedBy string, err error) {
 	message := "Could not verify the PR database limit. Retry the plan."
 	if isPRSchemaRefusal(err) {
-		message = err.Error()
+		message = userFacingError(err)
 	}
 	if !errors.Is(err, errPRSchemaCapHeld) {
-		h.logger.Warn("plan stopped before dispatch by the PR database limit", "repo", repo, "pr", pr, "error", err)
+		h.logger.Warn("plan stopped before dispatch by the PR database limit", "repo", repo, "pr", pr, "environment", environment, "error", err)
 		if requestedBy != "" {
 			h.postCommandError(repo, pr, installation, action.Plan, environment, requestedBy, message)
 		}
