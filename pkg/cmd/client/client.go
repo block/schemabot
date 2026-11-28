@@ -772,14 +772,14 @@ func ExitWithJSON(code, message string) error {
 type LockInfo struct {
 	// ID identifies the lock row. It is zero from a server that does not
 	// report it.
-	ID           int64     `json:"id"`
+	ID           int64     `json:"id,omitempty"`
 	Database     string    `json:"database"`
 	DatabaseType string    `json:"database_type"`
 	Owner        string    `json:"owner"`
-	Repository   string    `json:"repository"`
-	PullRequest  int       `json:"pull_request"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	Repository   string    `json:"repository,omitempty"`
+	PullRequest  int       `json:"pull_request,omitempty"`
+	CreatedAt    time.Time `json:"created_at,omitzero"`
+	UpdatedAt    time.Time `json:"updated_at,omitzero"`
 }
 
 // GenerateCLIOwner generates an owner identifier for CLI-based locks and the

@@ -569,33 +569,9 @@ carries these rules, and [working with AI agents](ai-agents.md) explains why.
 | Tell the user a change is frozen, by whom, why, and until when | Ask for an override with `--override`, in any environment |
 | Wait and check again, or suggest waiting | Approve an override, on the CLI, the API or a pull request |
 
-Recognize a refusal by its signal, not its wording:
-
-- **CLI:** exit code 1 with the `❄️ <environment> is frozen` line, and nothing started.
-- **API:** `409` with `error_code: "change_gate_refused"`. Read `blockers` for the freezes.
-- **Pull request:** a comment whose heading starts with `❄️` and contains `Blocked by`: `Blocked by a Freeze` for one freeze, `Blocked by Freezes` for several. The plan comment also says the change was not applied.
-
-When a freeze refuses a change, the agent:
-
-1. Stops. It does not retry in a loop, rewrite the change, or try another environment, deployment or credential to get past the freeze.
-2. Tells the user which freeze holds the change, its reason, and when it ends.
-3. Hands over the exact `--override` command if the user says the change can't wait. The override reason is recorded as the user's, so the user writes it and runs it.
-
-A plan comment's `❄️ <environment> is frozen` notice is a warning, not a
-refusal, and the same rules hold: the agent tells the user, and the apply
-command with `--override` in that comment is the user's to post.
-
-`change_gate_unavailable` is different: it is a retryable storage problem.
-Retry it with backoff, like any other `503`.
-
-You can copy this into your agent's instructions:
-
-> - If SchemaBot says an environment is frozen, stop. Tell me which freeze
->   holds the change, why, and when it ends.
-> - Do not ask for an override with `--override`, set or lift a freeze, or
->   approve an override request. Give me the exact command instead.
-> - You may run `schemabot freeze list` and `schemabot freeze show` to check
->   on a freeze.
+An agent with the [SchemaBot agent skill](ai-agents.md#install-the-agent-skill)
+follows these rules. Its [freezes](../skills/schemabot/references/refusals-and-failures.md#freezes) reference has the signals
+of a refusal and what the agent does next.
 
 ## Configure who may freeze and approve
 

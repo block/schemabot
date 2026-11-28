@@ -2688,11 +2688,11 @@ func TestEngineHaltForShutdownEndsAParkedConcurrentBuild(t *testing.T) {
 // TestEngineApplyConcurrentIndexRecoveryFailureIsNotCompletion proves a
 // recovery that clears the abandoned entry but whose build then fails
 // reports the failure, never a completion: the abandoned invalid index is
-// removed, the unique build fails on duplicate rows and leaves its own
-// invalid index under the name, and the apply is refused naming that index —
-// while the catalog still shows it invalid, the state a completion would have
-// misreported as the index the schema declares. The refusal is permanent: a
-// rerun meets the same duplicate rows, so the operator corrects them first.
+// removed, the unique build fails on duplicate rows, and the apply is
+// refused naming the index. The invalid index that failed build left is
+// dropped too, so it does not go on rejecting writes the live schema allows.
+// The refusal is permanent: a rerun meets the same duplicate rows, so the
+// operator corrects them first.
 func TestEngineApplyConcurrentIndexRecoveryFailureIsNotCompletion(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "recovery_failure_test")
 	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text)")
@@ -2713,16 +2713,58 @@ func TestEngineApplyConcurrentIndexRecoveryFailureIsNotCompletion(t *testing.T) 
 	require.Equal(t, engine.StateFailed, progress.State, "progress: %+v", progress)
 	assert.Equal(t, "refused", progress.Metadata["phase"])
 	assert.False(t, progress.Retryable, "a build the table's rows violate fails the same way on every rerun")
-	assert.Equal(t, `recovering abandoned invalid index "public"."orders_ref_key" failed: `+
-		`the table's rows cannot be indexed by index "public"."orders_ref_key", and the failed build left it invalid on the target; `+
-		`correct the rows, then re-run; the rerun removes the invalid index once it proves no build holds it`, progress.ErrorMessage)
+	assert.Equal(t, `index "public"."orders_ref_key" was not built: rows duplicate its key (23505), and its invalid leftover was dropped; `+
+		`correct the rows, then re-run`, progress.ErrorMessage)
 	assert.NotContains(t, progress.ErrorMessage, "ref-collision", "the server's unique-violation text never reaches the operator surface")
+	assertNoInvalidIndexOn(t, db, "orders")
+}
 
-	var valid bool
-	err = db.QueryRowContext(t.Context(),
-		`SELECT i.indisvalid FROM pg_index i WHERE i.indexrelid = to_regclass('public.orders_ref_key')`).Scan(&valid)
+// A unique index the application's rows break while it builds: the build
+// fails validation and PostgreSQL leaves the index invalid but still
+// maintained, so it would reject every insert that repeats a key, a rule the
+// live schema does not declare. The apply is refused naming the SQLSTATE,
+// the engine drops the leftover, and the application can write the
+// duplicate the live schema allows.
+func TestEngineApplyConcurrentUniqueIndexOnDuplicateRowsDropsItsLeftover(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "data_fault_leftover_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.products (id bigint PRIMARY KEY, sku text)")
 	require.NoError(t, err)
-	assert.False(t, valid, "the failed unique build leaves its own invalid index under the name")
+	_, err = db.ExecContext(t.Context(), "INSERT INTO public.products (id, sku) VALUES (1, 'SKU-1'), (2, 'sku-1')")
+	require.NoError(t, err)
+
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "products",
+		"CREATE UNIQUE INDEX CONCURRENTLY products_sku_key ON public.products (lower(sku))"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "products")
+	require.Equal(t, engine.StateFailed, progress.State, "progress: %+v", progress)
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable)
+	assert.Equal(t, `index "public"."products_sku_key" was not built: rows duplicate its key (23505), and its invalid leftover was dropped; `+
+		`correct the rows, then re-run`, progress.ErrorMessage)
+	assertNoInvalidIndexOn(t, db, "products")
+
+	_, err = db.ExecContext(t.Context(), "INSERT INTO public.products (id, sku) VALUES (3, 'Sku-1')")
+	require.NoError(t, err, "a write the live schema allows is not rejected by the failed build's index")
+}
+
+// assertNoInvalidIndexOn checks public.<table> carries no invalid index, under
+// its own name or a quarantine name.
+func assertNoInvalidIndexOn(t *testing.T, db *sql.DB, table string) {
+	t.Helper()
+	var invalid []string
+	rows, err := db.QueryContext(t.Context(), `
+		SELECT c.relname FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+		WHERE i.indrelid = to_regclass('public.' || $1) AND NOT i.indisvalid`, table)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(rows)
+	for rows.Next() {
+		var name string
+		require.NoError(t, rows.Scan(&name))
+		invalid = append(invalid, name)
+	}
+	require.NoError(t, rows.Err())
+	assert.Empty(t, invalid, "the failed build's invalid index is dropped")
 }
 
 // assertIndexValidWithoutDebris checks the named index on public.<table> is
@@ -3113,6 +3155,160 @@ func TestEnginePlanTableChangeBesideDeclaredRowSecurity(t *testing.T) {
 	})
 	require.ErrorAs(t, err, &refused)
 	assert.True(t, strings.HasSuffix(err.Error(), mixed), "a table change the planner refuses still reads as a mixed file: %s", err)
+}
+
+// Turning on row security for a table a foreign key references is a shape
+// the row security path cannot manage yet. The plan is refused with the
+// table and the foreign key named, so the author knows what to change and
+// planning again does not loop on an internal error.
+func TestEnginePlanRowSecurityOnAForeignKeyTable(t *testing.T) {
+	const database = "rls_foreign_key"
+	dsn, db := testutil.StartPostgres(t, database)
+	ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	_, err := db.ExecContext(ctx, `
+  CREATE TABLE public.kinds (id bigint PRIMARY KEY);
+  CREATE TABLE public.cards (id bigint PRIMARY KEY, kind_id bigint CONSTRAINT cards_kind_fk REFERENCES public.kinds (id));
+ `)
+	require.NoError(t, err)
+
+	_, err = New().Plan(ctx, &engine.PlanRequest{
+		Database: database, Credentials: &engine.Credentials{DSN: dsn},
+		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+			"kinds.sql": "CREATE TABLE kinds (id bigint PRIMARY KEY);\n" +
+				"ALTER TABLE kinds ENABLE ROW LEVEL SECURITY;\n" +
+				"CREATE POLICY readers ON kinds FOR SELECT USING (true);\n",
+			"cards.sql": "CREATE TABLE cards (id bigint PRIMARY KEY, kind_id bigint CONSTRAINT cards_kind_fk REFERENCES kinds (id));\n",
+		}}},
+	})
+	var refused *engine.PlanRefusedError
+	require.ErrorAs(t, err, &refused)
+	assert.Equal(t, `SchemaBot does not manage row security on table "kinds" yet, because it is in a foreign key relationship ("cards.cards_kind_fk"); remove the row security statements from its schema file, then plan again`, refused.Error())
+}
+
+// Two files that turn on row security for tables the row security path
+// cannot manage, one in a foreign key relationship and one whose default
+// draws from a shared sequence, are refused together with a partitioned
+// table the target lacks: the refusal names every table, so the author
+// fixes every file before planning again, and the new table's refusal is a
+// plan refusal rather than an error the plan retries.
+func TestEnginePlanRowSecurityListsEveryRefusedTable(t *testing.T) {
+	const database = "rls_every_refusal"
+	dsn, db := testutil.StartPostgres(t, database)
+	ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	_, err := db.ExecContext(ctx, `
+  CREATE TABLE public.kinds (id bigint PRIMARY KEY);
+  CREATE TABLE public.cards (id bigint PRIMARY KEY, kind_id bigint CONSTRAINT cards_kind_fk REFERENCES public.kinds (id));
+  CREATE SEQUENCE public.shared_ids;
+  CREATE TABLE public.words (id bigint PRIMARY KEY DEFAULT nextval('public.shared_ids'));
+ `)
+	require.NoError(t, err)
+
+	_, err = New().Plan(ctx, &engine.PlanRequest{
+		Database: database, Credentials: &engine.Credentials{DSN: dsn},
+		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+			"kinds.sql": "CREATE TABLE kinds (id bigint PRIMARY KEY);\n" +
+				"ALTER TABLE kinds ENABLE ROW LEVEL SECURITY;\n" +
+				"CREATE POLICY readers ON kinds FOR SELECT USING (true);\n",
+			"cards.sql": "CREATE TABLE cards (id bigint PRIMARY KEY, kind_id bigint CONSTRAINT cards_kind_fk REFERENCES kinds (id));\n",
+			"words.sql": "CREATE TABLE words (id bigint PRIMARY KEY DEFAULT nextval('shared_ids'));\n" +
+				"ALTER TABLE words ENABLE ROW LEVEL SECURITY;\n" +
+				"CREATE POLICY readers ON words FOR SELECT USING (true);\n",
+			"labels.sql": "CREATE TABLE labels (id bigint PRIMARY KEY) PARTITION BY RANGE (id);\n" +
+				"ALTER TABLE labels ENABLE ROW LEVEL SECURITY;\n" +
+				"CREATE POLICY readers ON labels FOR SELECT USING (true);\n",
+		}}},
+	})
+	var refused *engine.PlanRefusedError
+	require.ErrorAs(t, err, &refused)
+	assert.Equal(t, `SchemaBot does not manage row security on table "kinds" yet, because it is in a foreign key relationship ("cards.cards_kind_fk"); remove the row security statements from its schema file, then plan again
+SchemaBot does not manage row security on table "labels" yet, because it is a partitioned table; remove the row security statements from its schema file, then plan again
+SchemaBot does not manage row security on table "words" yet, because it has a column whose default draws from a sequence other than the one a serial column declares; remove the row security statements from its schema file, then plan again`, refused.Error())
+}
+
+// A table that already has row security and gains a foreign key later
+// keeps that row security whatever its file says. A policy change on it is
+// refused with the foreign key named, and the refusal asks for statements
+// that match the table's current settings and policies rather than their
+// removal, which would be refused in turn.
+func TestEnginePlanRowSecurityOnAForeignKeyTableThatHasRowSecurity(t *testing.T) {
+	const database = "rls_foreign_key_live"
+	dsn, db := testutil.StartPostgres(t, database)
+	ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	_, err := db.ExecContext(ctx, `
+  CREATE TABLE public.kinds (id bigint PRIMARY KEY);
+  ALTER TABLE public.kinds ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON public.kinds FOR SELECT USING (true);
+  CREATE TABLE public.cards (id bigint PRIMARY KEY, kind_id bigint CONSTRAINT cards_kind_fk REFERENCES public.kinds (id));
+ `)
+	require.NoError(t, err)
+
+	_, err = New().Plan(ctx, &engine.PlanRequest{
+		Database: database, Credentials: &engine.Credentials{DSN: dsn},
+		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+			"kinds.sql": "CREATE TABLE kinds (id bigint PRIMARY KEY);\n" +
+				"ALTER TABLE kinds ENABLE ROW LEVEL SECURITY;\n" +
+				"CREATE POLICY readers ON kinds FOR SELECT USING (id > 0);\n",
+			"cards.sql": "CREATE TABLE cards (id bigint PRIMARY KEY, kind_id bigint CONSTRAINT cards_kind_fk REFERENCES kinds (id));\n",
+		}}},
+	})
+	var refused *engine.PlanRefusedError
+	require.ErrorAs(t, err, &refused)
+	assert.Equal(t, `SchemaBot does not manage row security on table "kinds" yet, because it is in a foreign key relationship ("cards.cards_kind_fk"); make the row security statements in its schema file match the table's current settings and policies, then plan again`, refused.Error())
+}
+
+// A file that turns on row security with no policy, or drops a table's only
+// permissive policy, hides every row from every role subject to row
+// security, and a file whose only permissive policy is for SELECT refuses
+// every write. The plan says so in its unsafe reason; a permissive policy
+// for ALL grants every command, so it carries no such reason.
+func TestEnginePlanRowSecurityWithNoPolicyWarnsDenyAll(t *testing.T) {
+	const database = "rls_deny_all"
+	dsn, db := testutil.StartPostgres(t, database)
+	ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	_, err := db.ExecContext(ctx, `
+  CREATE TABLE public.notes (id bigint PRIMARY KEY);
+  CREATE TABLE public.drafts (id bigint PRIMARY KEY);
+  ALTER TABLE public.drafts ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY owners ON public.drafts USING (true);
+ `)
+	require.NoError(t, err)
+	planFile := func(table, rowSecurity string) engine.TableChange {
+		t.Helper()
+		result, err := New().Plan(ctx, &engine.PlanRequest{
+			Database: database, Credentials: &engine.Credentials{DSN: dsn},
+			SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+				"notes.sql":    "CREATE TABLE notes (id bigint PRIMARY KEY);\n",
+				"drafts.sql":   "CREATE TABLE drafts (id bigint PRIMARY KEY);\nALTER TABLE drafts ENABLE ROW LEVEL SECURITY;\nCREATE POLICY owners ON drafts USING (true);\n",
+				table + ".sql": "CREATE TABLE " + table + " (id bigint PRIMARY KEY);\nALTER TABLE " + table + " ENABLE ROW LEVEL SECURITY;\n" + rowSecurity,
+			}}},
+		})
+		require.NoError(t, err)
+		require.Len(t, result.Changes, 1)
+		require.Len(t, result.Changes[0].TableChanges, 1)
+		return result.Changes[0].TableChanges[0]
+	}
+
+	const denyAll = "row security is on with no policy that grants access, so every role subject to it reads no rows, its inserts are refused, and its updates and deletes change no rows"
+	for name, tc := range map[string]struct{ table, rowSecurity, want string }{
+		"no policy":                       {table: "notes", want: denyAll},
+		"only a restrictive one":          {table: "notes", rowSecurity: "CREATE POLICY narrow ON notes AS RESTRICTIVE FOR SELECT USING (id > 0);\n", want: denyAll},
+		"its only permissive one dropped": {table: "drafts", want: denyAll},
+		"a permissive one for SELECT": {table: "notes", rowSecurity: "CREATE POLICY readers ON notes FOR SELECT USING (true);\n",
+			want: "no permissive policy grants INSERT, UPDATE, or DELETE, so every role subject to row security has its inserts refused, changes no rows with its updates, and changes no rows with its deletes"},
+	} {
+		change := planFile(tc.table, tc.rowSecurity)
+		assert.Equal(t, tc.table, change.Table, name)
+		assert.True(t, change.IsUnsafe, name)
+		assert.Contains(t, change.UnsafeReason, tc.want, name)
+	}
+
+	change := planFile("notes", "CREATE POLICY owners ON notes USING (true);\n")
+	assert.True(t, change.IsUnsafe)
+	assert.NotContains(t, change.UnsafeReason, "grants", "a permissive policy for ALL grants every command")
 }
 
 // Forward structural planning remains available for RLS tables and siblings.

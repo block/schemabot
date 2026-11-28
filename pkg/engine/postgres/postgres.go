@@ -377,6 +377,9 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		// table change that names a new label still fails its own plan,
 		// since the table is planned against the live type.
 		var enumChanges []engine.TableChange
+		// shapeRefusals are the tables whose row security the path cannot
+		// manage. Each is fixed in its own file, so the plan lists them all.
+		var shapeRefusals []error
 		for _, filename := range files {
 			file := parsed[filename]
 			// An enum type is not a table: it stays out of desiredTables,
@@ -404,6 +407,12 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 				}
 				if !matched {
 					rlsChanges, err := planRowSecurityOperation(ctx, pool, namespace, rowSecurity, tableOwner)
+					if errors.As(err, new(*rowSecurityShapeError)) {
+						slog.Info("PostgreSQL plan refuses a table's row security shape; planning the other files to list every such table",
+							"database", req.Database, "namespace", namespace, "file", filename, "table", rowSecurity.Table(), "error", err)
+						shapeRefusals = append(shapeRefusals, err)
+						continue
+					}
 					if err != nil {
 						return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
 					}
@@ -455,6 +464,9 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 				return nil, fmt.Errorf("verify size for table %q in namespace %q: %w", table, namespace, err)
 			}
 			schemaChange.TableChanges = append(schemaChange.TableChanges, changes...)
+		}
+		if len(shapeRefusals) > 0 {
+			return nil, &engine.PlanRefusedError{Err: errors.Join(shapeRefusals...)}
 		}
 		schemaChange.TableChanges = append(enumChanges, schemaChange.TableChanges...)
 		// A table the config withholds that a schema file also declares is a
