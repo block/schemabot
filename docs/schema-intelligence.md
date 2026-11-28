@@ -127,6 +127,11 @@ the message, and correct the request before sending it again. A request with no
 }
 ```
 
+Two pull answers carry no `error_code`, so match their HTTP status instead. A
+`500` means the pull failed inside SchemaBot; retry it, and if it keeps
+failing, the server logs name the cause. A `501` means the database's engine
+does not support pull, so sending the request again cannot succeed.
+
 Pull a database's schema from the CLI:
 
 ```sh

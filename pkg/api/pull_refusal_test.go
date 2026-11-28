@@ -2,6 +2,8 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +15,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
 )
 
 // Every 400 from POST /api/pull carries error_code invalid_request, so a client
@@ -137,6 +140,41 @@ func TestPullSchemaHandlerAnswersEveryRefusalAsInvalidRequest(t *testing.T) {
 			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 			assert.Equal(t, apitypes.ErrCodeInvalidRequest, resp.ErrorCode)
 			assert.Equal(t, tt.wantError, resp.Error)
+		})
+	}
+}
+
+// A pull that fails inside SchemaBot, or that the engine cannot run, is not
+// the caller's to correct, so it never carries invalid_request: a client that
+// stops retrying on that code keeps retrying these.
+func TestPullSchemaHandlerKeepsServerFailuresOutOfInvalidRequest(t *testing.T) {
+	tests := []struct {
+		name       string
+		service    func(t *testing.T) *Service
+		wantStatus int
+	}{
+		{
+			name: "pull fails inside SchemaBot",
+			service: func(t *testing.T) *Service {
+				return newAppScopedPullService(t, map[string]string{"orders": "commerce"}, &mockTernClient{pullSchemaErr: errors.New("backend failure")})
+			},
+			wantStatus: http.StatusInternalServerError,
+		},
+		{
+			name: "engine does not support pull",
+			service: func(t *testing.T) *Service {
+				client := &mockTernClient{pullSchemaErr: fmt.Errorf("engine does not support schema pull: %w", tern.ErrPullSchemaUnsupportedType)}
+				return newTypeVocabularyService(t, &mockStorage{}, client, "orders", "cockroach", "primary")
+			},
+			wantStatus: http.StatusNotImplemented,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := postJSON(t, tt.service(t).handlePullSchema, "/api/pull", apitypes.PullSchemaRequest{Database: "orders", Environment: "production"})
+
+			require.Equal(t, tt.wantStatus, rec.Code, rec.Body.String())
+			assert.Empty(t, decodeErrorResponse(t, rec).ErrorCode, "a server-side pull failure carries no error code")
 		})
 	}
 }
