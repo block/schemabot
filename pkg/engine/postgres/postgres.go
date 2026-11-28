@@ -591,12 +591,13 @@ const tierUnderived preflight.Tier = -1
 // statement whose verdict is a placeholder for planner vocabulary this build
 // does not map, for the caller to log with the plan's identifiers.
 // crossNamespaceForeignKeysForDrops reads the live table's foreign keys into
-// another namespace when the plan drops a foreign key, so the drop's remedy
-// can name them; a plan with no dropped foreign key never reads the catalog.
-// The live table must exist, since only a live constraint can be dropped, so
-// a missing row is an error rather than a table without foreign keys.
+// another namespace when the planner refuses to drop a foreign key, so the
+// refusal can say when the key is one of them; a plan whose foreign-key drops
+// all run never reads the catalog. The live table must exist, since only a
+// live constraint can be dropped, so a missing row is an error rather than a
+// table without foreign keys.
 func crossNamespaceForeignKeysForDrops(ctx context.Context, pool *pgxpool.Pool, namespace string, report pgplan.Report) ([]string, error) {
-	if !slices.ContainsFunc(report.Statements, func(s pgplan.Statement) bool { return s.Kind == schemadiff.ChangeDropForeignKey }) {
+	if !slices.ContainsFunc(report.Statements, refusedForeignKeyDrop) {
 		return nil, nil
 	}
 	keys, err := foreignKeysFor(ctx, pool, namespace, []string{report.Table})
@@ -611,16 +612,20 @@ func crossNamespaceForeignKeysForDrops(ctx context.Context, pool *pgxpool.Pool, 
 
 // tableChanges maps a table's planned statements to the changes the operator
 // reviews. crossNamespaceForeignKeys names the live table's foreign keys into
-// another namespace, which a schema file cannot declare, so a dropped foreign
-// key's remedy names them only when the table has any.
+// another namespace, which a schema file cannot declare, so a refused drop of
+// one of them says so.
 func tableChanges(report pgplan.Report, crossNamespaceForeignKeys []string, parser ddl.StatementParser) ([]engine.TableChange, []preflight.Tier, []unrecognizedPlannerVocabulary, error) {
+	foreignKeys, err := foreignKeyDropFactsFor(report, crossNamespaceForeignKeys)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	// Each statement's verdict is derived once and reused for both the
 	// greenfield decision and the rendering, so a placeholder verdict is
 	// reported once per statement.
 	verdicts := make([]stepVerdict, len(report.Statements))
 	var unrecognized []unrecognizedPlannerVocabulary
 	for i, statement := range report.Statements {
-		verdicts[i] = executionVerdict(report.FormatVersion, statement, report.Table, crossNamespaceForeignKeys)
+		verdicts[i] = executionVerdict(report.FormatVersion, statement, report.Table, foreignKeys)
 		if verdicts[i].unrecognized != nil {
 			unrecognized = append(unrecognized, *verdicts[i].unrecognized)
 		}
@@ -1515,7 +1520,7 @@ func singleLine(s string) string {
 // guidance code the planner added after the mapping was written — still renders a blocked placeholder,
 // and is reported on the verdict so the caller can log it with the
 // identifiers this function does not have.
-func executionVerdict(formatVersion int, statement pgplan.Statement, table string, crossNamespaceForeignKeys []string) stepVerdict {
+func executionVerdict(formatVersion int, statement pgplan.Statement, table string, foreignKeys *foreignKeyDropFacts) stepVerdict {
 	if formatVersion != pgplan.FormatVersion {
 		return stepVerdict{
 			mode:         engine.ExecutionModeBlocked,
@@ -1565,8 +1570,8 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 		if reason, ok := createShapeRefusalReason(statement.Cause, table); ok {
 			return blocked(reason)
 		}
-		if statement.Cause == "" && statement.Reason == verdict.ReasonDeclarativeForeignKey {
-			return blocked(foreignKeyChangeRefusalReason(statement.Kind, table, crossNamespaceForeignKeys))
+		if statement.Cause == "" && refusedForeignKeyDrop(statement) && statement.Drops != nil {
+			return blocked(foreignKeyDropRefusalReason(table, statement.Drops.Name, foreignKeys))
 		}
 		if statement.Kind == schemadiff.ChangeSetGeneratedExpression {
 			return blocked(generatedExpressionRefusalReason(table))
@@ -1797,26 +1802,83 @@ func rewriteRequiredReason(guidance suggest.Guidance, table string) (string, boo
 	return fmt.Sprintf("statement for table %q %s", table, reason), true
 }
 
-// foreignKeyChangeRefusalReason renders the planner's refusal of a
-// foreign-key drop. The plan shows the drop so it can be reviewed, but the
-// engine does not run it, so the operator runs it themselves. A dropped
-// foreign key is usually one the file left out rather than one the operator
-// means to remove, so the remedy offers declaring it first, which plans no
-// change and keeps the constraint. A changed foreign key plans as a drop and
-// an add, so it is refused here too. A foreign key into another namespace
-// cannot be declared, so when the table carries any, the remedy names them
-// and says removal is the only way forward for those.
-func foreignKeyChangeRefusalReason(kind schemadiff.ChangeKind, table string, crossNamespaceForeignKeys []string) string {
-	const unsupported = "which SchemaBot plans but does not apply on PostgreSQL yet"
-	if kind != schemadiff.ChangeDropForeignKey {
-		return fmt.Sprintf("statement for table %q changes a foreign key, %s; leave the change out of the schema file to apply the rest of the plan, then run this statement outside SchemaBot and put the change back in the file", table, unsupported)
+// refusedForeignKeyDrop reports a foreign-key drop the planner refuses. Every
+// other foreign-key drop runs as a destructive, checked DROP CONSTRAINT.
+func refusedForeignKeyDrop(statement pgplan.Statement) bool {
+	return statement.Kind == schemadiff.ChangeDropForeignKey && statement.Reason == verdict.ReasonDeclarativeForeignKey
+}
+
+// foreignKeyDropFacts is what the reason for a refused foreign-key drop reads
+// beyond the statement, so it can name the one cause that applies.
+// crossNamespace names the live table's foreign keys into another namespace.
+// readded names the foreign keys the plan adds, so a key it drops and adds
+// again under the same name is told apart. dropsFirst reports a plan that
+// drops or retypes a column and also adds or validates a foreign key, which
+// runs its drops first.
+//
+// The planner gives all of these causes one refusal reason, so this reads
+// them from the plan's statement kinds and the live catalog. A cause on the
+// planner's refusal would replace this.
+type foreignKeyDropFacts struct {
+	crossNamespace []string
+	readded        []string
+	dropsFirst     bool
+}
+
+// foreignKeyDropFactsFor collects the facts for a report's refused
+// foreign-key drops. It returns nil for a report without one, which is all
+// a reason needs to know.
+func foreignKeyDropFactsFor(report pgplan.Report, crossNamespaceForeignKeys []string) (*foreignKeyDropFacts, error) {
+	if !slices.ContainsFunc(report.Statements, refusedForeignKeyDrop) {
+		return nil, nil
 	}
-	reason := fmt.Sprintf("statement for table %q drops a foreign key, %s; to keep the foreign key, declare it in the schema file and re-plan; to remove it, run this statement outside SchemaBot, then re-plan", table, unsupported)
-	if len(crossNamespaceForeignKeys) > 0 {
-		reason += fmt.Sprintf("; foreign key constraint(s) %s reference another namespace and cannot be declared, so the plan stays blocked until they are removed through a separately reviewed process",
-			strings.Join(quoteAll(crossNamespaceForeignKeys), ", "))
+	facts := &foreignKeyDropFacts{crossNamespace: crossNamespaceForeignKeys}
+	dropsOrRetypesColumn, installsForeignKey := false, false
+	for _, statement := range report.Statements {
+		switch statement.Kind {
+		case schemadiff.ChangeDropColumn, schemadiff.ChangeAlterType:
+			dropsOrRetypesColumn = true
+		case schemadiff.ChangeValidateForeignKey:
+			installsForeignKey = true
+		case schemadiff.ChangeAddForeignKey:
+			installsForeignKey = true
+			ops, err := pgstatement.ParseOps(statement.SQL)
+			if err != nil {
+				return nil, fmt.Errorf("parse planned foreign key for table %q: %w", report.Table, err)
+			}
+			for _, op := range ops {
+				if op.Kind == pgstatement.OpAddConstraint && op.Name != "" {
+					facts.readded = append(facts.readded, op.Name)
+				}
+			}
+		}
 	}
-	return reason
+	facts.dropsFirst = dropsOrRetypesColumn && installsForeignKey
+	return facts, nil
+}
+
+// foreignKeyDropRefusalReason renders the planner's refusal of a
+// foreign-key drop, which the plan shows for review and the engine does not
+// run. A key into another namespace, or any other key a schema file cannot
+// declare, is planned as a drop whatever the file says, so removal outside
+// SchemaBot is the only way forward. A key dropped before the foreign key
+// that replaces it is in place would leave writes checked against no key in
+// between, so the remedy is the change that puts the replacement first.
+func foreignKeyDropRefusalReason(table, key string, facts *foreignKeyDropFacts) string {
+	if facts == nil {
+		facts = &foreignKeyDropFacts{}
+	}
+	const removeOutside = "the plan stays blocked until the key is removed outside SchemaBot through a separately reviewed process"
+	switch {
+	case slices.Contains(facts.crossNamespace, key):
+		return fmt.Sprintf("statement for table %q drops foreign key %q, which references another namespace, so a schema file cannot declare it and SchemaBot does not drop it; %s", table, key, removeOutside)
+	case facts.dropsFirst:
+		return fmt.Sprintf("statement for table %q drops foreign key %q in a plan that also drops or changes the type of a column on the table, and such a plan runs its drops first, so writes would be checked against no foreign key until the plan's new one is in place; SchemaBot does not apply it, so make the column change and the foreign key change in separate pull requests", table, key)
+	case slices.Contains(facts.readded, key):
+		return fmt.Sprintf("statement for table %q drops foreign key %q before the plan adds its changed definition under the same name, so writes in between would be checked against no foreign key; SchemaBot does not apply it, so declare the changed key under a new name and re-plan, and the new key is added and validated before the old one is dropped", table, key)
+	default:
+		return fmt.Sprintf("statement for table %q drops foreign key %q, which a schema file cannot declare, so SchemaBot does not drop it; %s", table, key, removeOutside)
+	}
 }
 
 // copyAndSwapRefusalReason refuses a statement only a full copy of the table
