@@ -749,8 +749,8 @@ func (s *Service) handleDatabaseHistory(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if len(applies) == 0 && startingAfter == "" {
-		if unknown := s.unknownHistoryScope(r.Context(), database, filter.Environment); unknown != "" {
-			s.writeError(w, http.StatusNotFound, unknown)
+		if unknown := s.unknownApplyScope(r.Context(), database, filter.Environment); unknown != "" {
+			s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeNotFound, unknown)
 			return
 		}
 	}
@@ -799,21 +799,21 @@ func (s *Service) handleDatabaseHistory(w http.ResponseWriter, r *http.Request) 
 	s.writeJSON(w, http.StatusOK, resp)
 }
 
-// unknownHistoryScope returns the 404 text for a history request that found
-// no applies because its database or environment does not exist here, and ""
-// when the empty page is the true answer. A database counts as known when this
-// server configures it or any apply names it, so a database removed from the
-// config keeps its history. An environment counts as known when the database
-// configures it; the caller has already found no applies in it. A server that
-// configures no databases cannot tell a typo from a database it has not seen
-// yet, so it answers with the empty page.
+// unknownApplyScope returns the 404 text for a history or logs request that
+// found no applies because its database or environment does not exist here,
+// and "" when "no applies" is the true answer. A database counts as known when
+// this server configures it or any apply names it, so a database removed from
+// the config keeps its history. An environment counts as known when the
+// database configures it; the caller has already found no applies in it. A
+// server that configures no databases cannot tell a typo from a database it
+// has not seen yet, so it returns "".
 //
-// A failed lookup is logged and answered with the empty page, which is still
-// true: no applies are recorded for the request.
-func (s *Service) unknownHistoryScope(ctx context.Context, database, environment string) string {
+// A failed lookup is logged and returns "", since "no applies" is still true
+// for the request.
+func (s *Service) unknownApplyScope(ctx context.Context, database, environment string) string {
 	config := s.config.withDatabaseSnapshot()
 	if len(config.DatabaseConfigs()) == 0 {
-		s.logger.Debug("history found no applies; this server configures no databases to check the name against",
+		s.logger.Debug("found no applies; this server configures no databases to check the name against",
 			"database", database, "environment", environment)
 		return ""
 	}
@@ -821,19 +821,19 @@ func (s *Service) unknownHistoryScope(ctx context.Context, database, environment
 	if _, unconfigured := errors.AsType[*DatabaseNotConfiguredError](err); unconfigured {
 		recorded, err := s.storage.Applies().GetRecent(ctx, storage.RecentAppliesFilter{Database: database, Limit: 1})
 		if err != nil {
-			s.logger.Warn("history could not check whether an unconfigured database has applies; answering with the empty page",
+			s.logger.Warn("could not check whether an unconfigured database has applies; answering with no applies",
 				"database", database, "environment", environment, "error", err)
 			return ""
 		}
 		if len(recorded) > 0 {
-			s.logger.Debug("history found no applies in the environment of a database this server no longer configures",
+			s.logger.Debug("found no applies in the environment of a database this server no longer configures",
 				"database", database, "environment", environment)
 			return ""
 		}
 		return fmt.Sprintf("database %q is not configured on this server and has no recorded applies. Check the name against the databases list", database)
 	}
 	if err != nil {
-		s.logger.Warn("history could not read the database's environments; answering with the empty page",
+		s.logger.Warn("could not read the database's environments; answering with no applies",
 			"database", database, "environment", environment, "error", err)
 		return ""
 	}

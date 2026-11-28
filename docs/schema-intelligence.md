@@ -656,8 +656,8 @@ so it always lists the whole history.
 A first page with no applies tells a mistyped name from an empty history. A
 database that is neither configured on the server nor named by any recorded
 apply returns `404`, and so does an environment the configured database does
-not have; the error names the database and, for an environment, lists the
-ones it has. A database the server no longer configures keeps its recorded
+not have. The error carries `error_code` `not_found`, names the database
+and, for an environment, lists the ones it has. A database the server no longer configures keeps its recorded
 history, and a configured environment with no applies is an empty page. A
 server that configures no databases answers with the empty page, since it
 has no list to check the name against.
@@ -2320,8 +2320,10 @@ Without `apply_id`, `GET /api/logs/{database}?environment=…` reads the newest
 apply for the database in that environment, which is the one created last. When
 two applies were created in the same instant, the same one is read every time.
 A database with no applies in that environment returns an empty `logs` list.
-With `apply_id`, the database in the path must be the apply's database;
-anything else returns `400` naming the apply's database.
+A database or environment that does not exist returns `404`, the same as
+history. With `apply_id`, the database in the path must be the apply's
+database; anything else returns `400` with `error_code` `invalid_request`,
+naming the apply's database.
 
 The database-independent route, `GET /api/logs?apply_id=apply-example-73`,
 returns the same shape. The default window is the latest 50 entries, returned

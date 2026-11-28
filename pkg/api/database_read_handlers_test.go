@@ -126,11 +126,13 @@ func TestDatabaseReadHandlersCanonicalizePathAndQuery(t *testing.T) {
 			},
 		},
 		{
-			name:     "logs for a database without applies",
+			name:     "logs for a database that is neither configured nor recorded",
 			target:   "/api/logs/UnKnOwN?environment=StAgInG",
-			wantCode: http.StatusOK,
+			wantCode: http.StatusNotFound,
 			assertBody: func(t *testing.T, body []byte) {
-				assert.JSONEq(t, `{"logs":[]}`, string(body))
+				var resp apitypes.ErrorResponse
+				require.NoError(t, json.Unmarshal(body, &resp))
+				assert.Equal(t, `database "unknown" is not configured on this server and has no recorded applies. Check the name against the databases list`, resp.Error)
 			},
 		},
 		{

@@ -50,6 +50,14 @@ func (s *databaseApplyStore) GetRecent(_ context.Context, filter storage.RecentA
 	return out, nil
 }
 
+func (s *databaseApplyStore) GetLatestByDatabase(ctx context.Context, database, _, environment string) (*storage.Apply, error) {
+	applies, err := s.GetRecent(ctx, storage.RecentAppliesFilter{Database: database, Environment: environment, Limit: 1})
+	if err != nil || len(applies) == 0 {
+		return nil, err
+	}
+	return applies[0], nil
+}
+
 func (s *databaseApplyStore) GetByApplyIdentifier(_ context.Context, applyIdentifier string) (*storage.Apply, error) {
 	for _, apply := range s.applies {
 		if apply.ApplyIdentifier == applyIdentifier {
@@ -144,6 +152,60 @@ func TestHandleDatabaseHistoryTellsAnUnknownScopeFromAnEmptyOne(t *testing.T) {
 				return
 			}
 			assert.Equal(t, tc.wantErr, errResp.Error)
+			assert.Equal(t, apitypes.ErrCodeNotFound, errResp.ErrorCode)
+		})
+	}
+}
+
+// A logs request without an apply ID reads the newest apply of the database
+// in the environment. When the database or environment does not exist, it
+// answers 404 the way history does, instead of an empty logs list that reads
+// as "no logs yet".
+func TestHandleLogsTellsAnUnknownScopeFromNoApplies(t *testing.T) {
+	cases := []struct {
+		name     string
+		path     string
+		wantCode int
+		wantErr  string
+	}{
+		{
+			name:     "a database neither configured nor recorded",
+			path:     "/api/logs/ordres?environment=staging",
+			wantCode: http.StatusNotFound,
+			wantErr:  `database "ordres" is not configured on this server and has no recorded applies. Check the name against the databases list`,
+		},
+		{
+			name:     "an environment the configured database does not have",
+			path:     "/api/logs/testdb?environment=prodution",
+			wantCode: http.StatusNotFound,
+			wantErr:  `database "testdb" has no environment "prodution". Its environments are staging`,
+		},
+		{
+			name:     "a configured environment with no applies",
+			path:     "/api/logs/testdb?environment=staging",
+			wantCode: http.StatusOK,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mux := newUnknownScopeServer(t, &databaseApplyStore{applies: unknownScopeApplies()})
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, tc.path, nil)
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+
+			require.Equal(t, tc.wantCode, w.Code, w.Body.String())
+			if tc.wantCode == http.StatusOK {
+				var resp struct {
+					Logs []json.RawMessage `json:"logs"`
+				}
+				require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+				assert.Empty(t, resp.Logs)
+				return
+			}
+			var errResp apitypes.ErrorResponse
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &errResp))
+			assert.Equal(t, tc.wantErr, errResp.Error)
+			assert.Equal(t, apitypes.ErrCodeNotFound, errResp.ErrorCode)
 		})
 	}
 }
@@ -173,5 +235,6 @@ func TestHandleLogsRefusesAnApplyOfAnotherDatabase(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
 	var errResp apitypes.ErrorResponse
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &errResp))
-	assert.Equal(t, "apply apply-orders is for database orders, not billing; drop the database from the path or use that apply's database", errResp.Error)
+	assert.Equal(t, "apply apply-orders belongs to database orders, not billing. Ask for its logs without a database, or with database orders", errResp.Error)
+	assert.Equal(t, apitypes.ErrCodeInvalidRequest, errResp.ErrorCode)
 }
