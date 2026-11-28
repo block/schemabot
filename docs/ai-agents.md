@@ -128,8 +128,8 @@ Which account your agent uses decides whose name goes on its work.
   cannot tell whether you or your agent sent the command.
 
 The guidance below is a cautious starting point you can adapt for your team.
-It includes instructions you can give your agent and settings you can enforce
-on the server.
+The agent skill already follows it. It also covers the rules you can add for
+your team and the settings you can enforce on the server.
 
 ## You decide what runs in production
 

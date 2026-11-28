@@ -52,7 +52,7 @@ pg-sprite has already decided which changes are safe to run. Never work around t
 | Refused at apply time | The apply fails and names what to change. Applying the same plan again meets the same refusal | Rewrite the schema files into the steps it names, plan again, and show the user the new plan |
 | No safe form | The reason names no steps, such as a column type change that rewrites the table | Tell the user. That change needs a separately reviewed process a person runs |
 | Retryable failure | The apply names what it waits for, such as an index build still running | Report it and check again. SchemaBot retries it |
-| Changed since review | A table, column, or constraint the plan drops changed after review, so the drop does not run, and SchemaBot posts a new plan | Nobody has reviewed the new plan. Ask the user before `apply-confirm` |
+| Changed since review | A table, column, or constraint the plan drops changed after review, so the drop does not run. An automatic apply posts a new plan in a new comment. A confirmed apply posts nothing | Nobody has reviewed the new plan. After an automatic apply, ask the user before `apply-confirm` on the new comment. After a confirmed apply, run `apply` again under the command policy to show the current plan |
 
 A failed index build can leave an invalid index behind. Leave it: the next apply removes it once it proves no build still holds it.
 
@@ -60,7 +60,7 @@ A failed index build can leave an invalid index behind. Leave it: the next apply
 
 | Outcome | Signal | Next |
 |---|---|---|
-| Rejected on the branch | The apply fails with the statement Vitess refused. Nothing reached the production branch | Applying the same plan again meets the same rejection. Rewrite the schema files and plan again |
+| Rejected on the branch | The apply fails with the statement Vitess refused. Nothing reached the production branch | Applying the same plan again meets the same rejection. Tell the user which statement was refused. Rewrite the schema files only into a form the user agrees to, then plan again |
 | Cancelled | The deploy request is closed for good | Nothing resumes. A new apply starts a new deploy request |
 | Reverted in the console | The apply reports the revert. SchemaBot reads the deploy request's state and does not overwrite it | Tell the user. Plan again if the change is still wanted |
 

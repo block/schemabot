@@ -25,7 +25,7 @@ Read [Agent command policy](references/command-policy.md) before you post or han
 3. **Ask first** before `apply-confirm`, `release`, `unlock`, `rollback`, `rollback-confirm`, `revert`, or `skip-revert`, and before closing a PR.
 4. **Other environments: find out who else uses the database first.** Hand the command over if the database is shared, critical, or you can't tell. Otherwise say what you are about to do, then post it.
 5. **The user can opt out.** If they say they post every command themselves, hand every command over.
-6. **Stop when SchemaBot refuses**, and tell the user its reason. Rewrite the schema files only into a safe form it names, then plan again.
+6. **Stop when SchemaBot refuses**, and tell the user its reason. Rewrite the schema files only into a form SchemaBot names or the user agrees to, then plan again.
 7. **Never act outside SchemaBot.** No DDL of your own against the database, and on Vitess nothing in the PlanetScale console.
 
 ## Start here

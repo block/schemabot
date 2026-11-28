@@ -504,7 +504,7 @@ runs.
 | An agent may | An agent hands it to a person |
 |---|---|
 | Run `plan`, `status`, `progress --no-watch`, and `pull` | `apply`, `cutover`, and `cancel` wherever the command policy says to hand them over, which includes production |
-| Rewrite a blocked change into a form the plan accepts, then plan again | `revert` and `skip-revert` in production, and outside it unless the user says yes when the agent asks |
+| Rewrite a blocked change into a form SchemaBot names or the user agrees to, then plan again | `revert` and `skip-revert` in production, and outside it unless the user says yes when the agent asks |
 | Tell the user why a change was blocked or refused, in SchemaBot's words | Any DDL run against the cluster outside SchemaBot, and anything done in the PlanetScale console |
 | Report a failure SchemaBot will retry, and check on it again | Deleting a branch, or approving a deploy request |
 

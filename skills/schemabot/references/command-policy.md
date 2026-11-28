@@ -76,6 +76,7 @@ Stop. Never get past a refusal by repeating the command, adding a flag, or tryin
 
 - Tell the user the reason SchemaBot gave, in its words. For a freeze, say which freeze holds the change, why, and when it ends.
 - When the reason names a safe form of the change, rewrite the schema files into it, plan again, and show the user the new plan.
+- When the reason names only the statement that was refused, as a Vitess rejection does, propose a rewrite and make it only once the user agrees. Then plan again and show the user the new plan.
 - When no safe form exists, such as a PostgreSQL column type change that rewrites the table, say so. That change needs a separately reviewed process that a person runs.
 - A `403` means the account lacks a permission. Say which one. A `401` means the token is missing, expired, or invalid, so the user needs to log in again or fix their token, not change their access. In either case, never try other credentials or turn off authentication.
 
