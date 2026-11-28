@@ -145,6 +145,33 @@ func TestSettingsJSON(t *testing.T) {
 		}`, out)
 	})
 
+	// An empty value reads as unset whichever command reports it, so a
+	// caller that sets "" and reads it back gets the same answer.
+	t.Run("AnEmptyValueReadsAsUnsetOnEveryPath", func(t *testing.T) {
+		unset := `{
+			"key": "spirit_debug_logs", "value": "false", "set": false, "default": "false",
+			"description": "Enable verbose Spirit debug logs (replication events, etc.)"
+		}`
+		api := &jsonAPI{replies: map[string]jsonReply{
+			"POST /api/settings":                  {body: map[string]string{}},
+			"GET /api/settings":                   {body: map[string]any{"settings": []map[string]string{{"key": "spirit_debug_logs", "value": ""}}}},
+			"GET /api/settings/spirit_debug_logs": {body: map[string]string{"key": "spirit_debug_logs", "value": ""}},
+		}}
+		endpoint := api.start(t)
+
+		out, err := runLockCmd(endpoint, (&SettingsCmd{Args: []string{"spirit_debug_logs", ""}, JSON: true}).Run)
+		require.NoError(t, err)
+		assert.JSONEq(t, unset, out, "set")
+
+		out, err = runLockCmd(endpoint, (&SettingsCmd{Args: []string{"spirit_debug_logs"}, JSON: true}).Run)
+		require.NoError(t, err)
+		assert.JSONEq(t, unset, out, "get")
+
+		out, err = runLockCmd(endpoint, (&SettingsCmd{JSON: true}).Run)
+		require.NoError(t, err)
+		assert.JSONEq(t, `{"settings": [`+unset+`]}`, out, "list")
+	})
+
 	t.Run("SetReportsTheStoredValue", func(t *testing.T) {
 		api := &jsonAPI{replies: map[string]jsonReply{
 			"POST /api/settings": {body: map[string]string{}},

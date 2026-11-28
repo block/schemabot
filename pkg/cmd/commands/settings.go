@@ -33,8 +33,9 @@ type SettingsCmd struct {
 type settingJSON struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
-	// Set is true when the server stores a value for the key. When it is
-	// false, Value is the default the server falls back to.
+	// Set is true when a non-empty value is stored for the key, the same
+	// rule the text views use. When it is false, Value is the setting's
+	// documented default.
 	Set         bool   `json:"set"`
 	Default     string `json:"default,omitempty"`
 	Description string `json:"description,omitempty"`
@@ -45,12 +46,13 @@ type settingsListJSON struct {
 	Settings []settingJSON `json:"settings"`
 }
 
-// newSettingJSON describes key from its stored value, if any. An unknown key
-// carries no default or description.
-func newSettingJSON(key, stored string, set bool) settingJSON {
+// newSettingJSON describes key from its stored value. An empty value reads
+// as unset on every path, list, get and set alike, as it does in the text
+// views. An unknown key carries no default or description.
+func newSettingJSON(key, stored string) settingJSON {
 	info := knownSettings[key]
-	out := settingJSON{Key: key, Value: stored, Set: set, Default: info.Default, Description: info.Description}
-	if !set {
+	out := settingJSON{Key: key, Value: stored, Set: stored != "", Default: info.Default, Description: info.Description}
+	if !out.Set {
 		out.Value = info.Default
 	}
 	return out
@@ -115,8 +117,7 @@ func listSettings(endpoint string, outputJSON bool) error {
 		slices.Sort(keys)
 		doc := settingsListJSON{Settings: make([]settingJSON, 0, len(keys))}
 		for _, key := range keys {
-			value, set := currentValues[key]
-			doc.Settings = append(doc.Settings, newSettingJSON(key, value, set && value != ""))
+			doc.Settings = append(doc.Settings, newSettingJSON(key, currentValues[key]))
 		}
 		return writeJSON(doc)
 	}
@@ -148,7 +149,7 @@ func getSetting(endpoint, key string, outputJSON bool) error {
 	}
 
 	if outputJSON {
-		return writeJSON(newSettingJSON(key, value, value != ""))
+		return writeJSON(newSettingJSON(key, value))
 	}
 
 	if value == "" {
@@ -171,7 +172,7 @@ func setSetting(endpoint, key, value string, outputJSON bool) error {
 	}
 
 	if outputJSON {
-		return writeJSON(newSettingJSON(key, value, true))
+		return writeJSON(newSettingJSON(key, value))
 	}
 
 	fmt.Printf("%s%s set to %s%s\n", templates.ANSIGreen, key, value, templates.ANSIReset)

@@ -166,6 +166,11 @@ func TestAgentSkillCommandPolicy(t *testing.T) {
 				assert.True(t, hasFlag(child, "--no-watch"), "the CLI's %s has no --no-watch; update cliCommandKinds", child.Name)
 				assert.Contains(t, handOverPart, "`"+child.Name+" --no-watch`",
 					"the command policy must tell an agent to run %s with --no-watch", child.Name)
+				// --json takes one snapshot and never opens the watcher, so
+				// the policy may name it as the other safe form.
+				assert.True(t, hasFlag(child, "--json"), "the CLI's %s has no --json; update cliCommandKinds", child.Name)
+				assert.Contains(t, handOverPart, "`"+child.Name+" --json`",
+					"the command policy must name %s --json as a safe snapshot", child.Name)
 				continue
 			}
 			if kind == cliChangesSchemaBot {
@@ -288,9 +293,9 @@ type cliKind string
 
 const (
 	cliReadsOnly cliKind = "reads only"
-	// cliWatchHasControls reads only with --no-watch; watching, its keys
-	// stop or cancel the apply, or run its cutover.
-	cliWatchHasControls cliKind = "reads only with --no-watch"
+	// cliWatchHasControls reads only with --no-watch or --json; watching,
+	// its keys stop or cancel the apply, or run its cutover.
+	cliWatchHasControls cliKind = "reads only with --no-watch or --json"
 	cliWorksLocally     cliKind = "works on the local machine or the worktree"
 	cliRunsAServer      cliKind = "runs a SchemaBot server"
 	cliChangesSchemaBot cliKind = "changes SchemaBot itself"
