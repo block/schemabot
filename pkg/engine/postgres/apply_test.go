@@ -1812,6 +1812,62 @@ func TestClassifyApplyFailureMissingGrant(t *testing.T) {
 	assert.Equal(t, `the engine role lacks a privilege the statement on "orders" needs, such as REFERENCES on the table a foreign key references; the server log names it; grant it, then retry`, failure.detail)
 }
 
+// A statement the server refuses because other objects depend on what it
+// drops, such as a column a publication names, ends the apply at
+// once: the dependency stays until someone removes it, so retrying cannot
+// clear it. The detail names the dependents the server lists, on one line
+// and cut when the list runs long, since the owner cannot read the server
+// log.
+func TestClassifyApplyFailureDependentObjects(t *testing.T) {
+	refusal := func(detail string) error {
+		return fmt.Errorf("drop column: %w", &pgconn.PgError{
+			Code:    "2BP01",
+			Message: `cannot drop column amt of table orders because other objects depend on it`,
+			Detail:  detail,
+		})
+	}
+
+	t.Run("names the dependents", func(t *testing.T) {
+		failure := classifyApplyFailure(refusal("publication of table orders in publication orders_pub depends on column amt of table orders\nview order_totals depends on column amt of table orders"), "orders", nil)
+		assert.False(t, failure.retryable, "the dependency stays until someone removes it")
+		assert.Equal(t, `other objects depend on what the statement on "orders" drops: publication of table orders in publication orders_pub depends on column amt of table orders, view order_totals depends on column amt of table orders; remove the dependency, then apply again`, failure.detail)
+	})
+
+	t.Run("cuts a long list", func(t *testing.T) {
+		failure := classifyApplyFailure(refusal(strings.Repeat("view v depends on column amt of table orders\n", 20)), "orders", nil)
+		assert.Contains(t, failure.detail, "…; remove the dependency, then apply again")
+		assert.Less(t, len([]rune(failure.detail)), maxDependentObjectsDetailLen+120)
+	})
+
+	t.Run("points at the server log without a list", func(t *testing.T) {
+		failure := classifyApplyFailure(refusal(""), "orders", nil)
+		assert.False(t, failure.retryable)
+		assert.Equal(t, `other objects depend on what the statement on "orders" drops, such as a publication that names the column; the server log names them; remove the dependency, then apply again`, failure.detail)
+	})
+}
+
+// The server log carries the objects a dependent-objects or privilege
+// refusal names, which the operator-facing detail leaves out, and never a
+// constraint violation's DETAIL, which quotes row values.
+func TestCatalogErrorLogAttrs(t *testing.T) {
+	dependents := fmt.Errorf("drop column: %w", &pgconn.PgError{
+		Code:   "2BP01",
+		Detail: `publication of table orders in publication orders_pub depends on column amt of table orders`,
+		Hint:   `Use DROP ... CASCADE to drop the dependent objects too.`,
+	})
+	assert.Equal(t, []any{
+		"server_detail", `publication of table orders in publication orders_pub depends on column amt of table orders`,
+		"server_hint", `Use DROP ... CASCADE to drop the dependent objects too.`,
+	}, catalogErrorLogAttrs(dependents))
+
+	grant := &pgconn.PgError{Code: "42501"}
+	assert.Empty(t, catalogErrorLogAttrs(grant), "a refusal with no DETAIL or HINT logs neither")
+
+	duplicate := &pgconn.PgError{Code: "23505", Detail: `Key (email)=(ada@example.com) is duplicated.`}
+	assert.Nil(t, catalogErrorLogAttrs(duplicate))
+	assert.Nil(t, catalogErrorLogAttrs(errors.New("connection reset")))
+}
+
 func TestProgressResultReportsCreateSequenceLength(t *testing.T) {
 	result := progressResult(engine.StateRunning, "running", time.Now(), nativeApply{
 		namespace: "public",
