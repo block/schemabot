@@ -80,6 +80,20 @@ type DeploymentLogError struct {
 	Message    string                    `json:"message"`
 }
 
+// Code and Reason pairs a DeploymentLogError carries. The server sets them and
+// the CLI matches on them to decide whether a source can ever be read, so both
+// sides use these constants rather than their own copies of the strings.
+const (
+	DeploymentLogCodeReadFailed        = "RemoteLogReadFailed"
+	DeploymentLogReasonReadFailed      = "remote_log_read_failed"
+	DeploymentLogCodeUnsupported       = "UnsupportedCapability"
+	DeploymentLogReasonUpgradeRequired = "upgrade_required"
+	DeploymentLogCodeNotFound          = "RemoteLogNotFound"
+	DeploymentLogReasonNotFound        = "remote_log_not_found"
+	DeploymentLogCodeMalformed         = "MalformedRemoteLog"
+	DeploymentLogReasonMalformed       = "malformed_remote_log"
+)
+
 // =============================================================================
 // Error Codes
 // =============================================================================
