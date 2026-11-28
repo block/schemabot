@@ -1229,9 +1229,9 @@ and remove the trigger.
    DROP FUNCTION set_updated_at();
    ```
 
-A table with an explicit column collation is skipped and listed in
-`ignore_tables`. Changing a column's collation rewrites the column, so it
-stays out of the files.
+A column with an explicit collation is pulled with its `COLLATE` clause, and
+a type change keeps that collation. Changing a column's collation is
+refused, because it rewrites the column.
 
 The schema intelligence API's detailed catalog output is not available for
 PostgreSQL. A request for it is rejected rather than answered with the basic
