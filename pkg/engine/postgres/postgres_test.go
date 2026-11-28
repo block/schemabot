@@ -20,6 +20,7 @@ import (
 	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/router"
 	"github.com/block/pg-sprite/pkg/schemadiff"
+	pgstatement "github.com/block/pg-sprite/pkg/statement"
 	"github.com/block/pg-sprite/pkg/suggest"
 	"github.com/block/pg-sprite/pkg/verdict"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -101,6 +102,13 @@ func TestExecutionVerdict(t *testing.T) {
 				Disposition: router.DispositionExecute},
 			wantMode:   engine.ExecutionModeBlocked,
 			wantReason: `statement for table "users": the change needs a full copy of the table, which SchemaBot's PostgreSQL support does not run yet; reach the same schema without rewriting the table, such as a new column filled in batches, or make this change outside SchemaBot`,
+		},
+		{
+			name: "copy and swap for a stored generated column",
+			statement: pgplan.Statement{Route: planner.RouteCopyAndSwap, Backend: router.BackendCopyAndSwap,
+				Disposition: router.DispositionUnavailable, Decisions: []planner.Decision{{Route: planner.RouteCopyAndSwap, Reason: planner.ReasonGeneratedStored}}},
+			wantMode:   engine.ExecutionModeBlocked,
+			wantReason: `statement for table "users" adds a stored generated column, which computes every row while a lock blocks reads and writes, and SchemaBot's PostgreSQL support does not run that yet; add the column outside SchemaBot through a separately reviewed process, then plan again`,
 		},
 		{
 			name: "unavailable without copy-and-swap backend",
@@ -2094,19 +2102,46 @@ func TestExecutionVerdictNamesTheObjectsThatBlockAColumnChange(t *testing.T) {
 			want:     `statement for table "orders" is refused: it changes or drops a column that views "public"."a", "public"."b" read; drop or redefine the views outside SchemaBot, then plan again`,
 		},
 		{
-			name:     "a policy",
-			decision: planner.Decision{Reason: planner.ReasonDependentPolicy, DependentPolicies: []string{`"owner_only" ON "public"."orders"`}},
-			want:     `statement for table "orders" is refused: it changes or drops a column that row security policy "owner_only" ON "public"."orders" reads; drop the policy before the change and recreate it after it, then plan again`,
+			name: "a policy on a dropped column",
+			decision: planner.Decision{Reason: planner.ReasonDependentPolicy, Kind: pgstatement.OpDropColumn, DependentFix: planner.DependentFixRewriteDependents,
+				DependentPolicies: []string{`"owner_only" ON "public"."orders"`}},
+			want: `statement for table "orders" is refused: it drops a column that row security policy "owner_only" ON "public"."orders" reads; change it so it no longer reads the column and apply that first, then plan again`,
 		},
 		{
-			name:     "a trigger",
-			decision: planner.Decision{Reason: planner.ReasonDependentTrigger, DependentTriggers: []string{`"audit" ON "public"."orders"`}},
-			want:     `statement for table "orders" is refused: it changes or drops a column that trigger "audit" ON "public"."orders" names in UPDATE OF or WHEN; drop or redefine the trigger, then plan again`,
+			name: "a policy on a type change that runs in place",
+			decision: planner.Decision{Reason: planner.ReasonDependentPolicy, Kind: pgstatement.OpAlterColumnType, DependentFix: planner.DependentFixRecreateAroundChange,
+				DependentPolicies: []string{`"owner_only" ON "public"."orders"`}},
+			want: `statement for table "orders" is refused: it changes the type of a column that row security policy "owner_only" ON "public"."orders" reads, which SchemaBot cannot run yet; the change does not rewrite the table, so outside SchemaBot, through a separately reviewed process, drop it, change the column, and recreate it in one transaction, which never leaves the table without it, then plan again`,
 		},
 		{
-			name:     "a generated column",
-			decision: planner.Decision{Reason: planner.ReasonDependentGeneratedColumn, DependentGeneratedColumns: []string{`"public"."orders"."total"`}},
-			want:     `statement for table "orders" is refused: it changes or drops a column that generated column "public"."orders"."total" reads; change the generated column first, then plan again`,
+			name: "a policy and a trigger on a type change that rewrites the table",
+			decision: planner.Decision{Reason: planner.ReasonDependentPolicy, Kind: pgstatement.OpAlterColumnType, DependentFix: planner.DependentFixExpandContract,
+				DependentPolicies: []string{`"owner_only" ON "public"."orders"`}, DependentTriggers: []string{`"audit" ON "public"."orders"`}},
+			want: `statement for table "orders" is refused: it changes the type of a column that row security policy "owner_only" ON "public"."orders" and trigger "audit" ON "public"."orders" read, and the change rewrites the table, which SchemaBot cannot run yet; add a column of the new type instead, backfill it, point them at the new column, and drop the old column, each as its own change, then plan again`,
+		},
+		{
+			name: "two triggers on a dropped column",
+			decision: planner.Decision{Reason: planner.ReasonDependentTrigger, Kind: pgstatement.OpDropColumn, DependentFix: planner.DependentFixRewriteDependents,
+				DependentTriggers: []string{`"audit" ON "public"."orders"`, `"stamp" ON "public"."orders"`}},
+			want: `statement for table "orders" is refused: it drops a column that triggers "audit" ON "public"."orders", "stamp" ON "public"."orders" read; change them so they no longer read the column and apply that first, then plan again`,
+		},
+		{
+			name: "a policy with a manual path this build has no sentence for",
+			decision: planner.Decision{Reason: planner.ReasonDependentPolicy, Kind: pgstatement.OpAlterColumnType, DependentFix: planner.DependentFix("a-later-path"),
+				DependentPolicies: []string{`"owner_only" ON "public"."orders"`}},
+			want: `statement for table "orders" is refused: it changes or drops a column that row security policy "owner_only" ON "public"."orders" reads, which SchemaBot cannot run yet; make the change outside SchemaBot through a separately reviewed process, then plan again`,
+		},
+		{
+			name: "a generated column on a type change",
+			decision: planner.Decision{Reason: planner.ReasonDependentGeneratedColumn, Kind: pgstatement.OpAlterColumnType,
+				DependentGeneratedColumns: []string{`"public"."orders"."total"`}},
+			want: `statement for table "orders" is refused: it changes the type of a column that generated column "public"."orders"."total" reads, which SchemaBot cannot run yet: PostgreSQL refuses the change while it stands, and adding a stored generated column back rewrites the table; to keep it, outside SchemaBot, through a separately reviewed process, drop it, change the column, and add it back in one transaction, which blocks reads and writes while the table is rewritten, then plan again`,
+		},
+		{
+			name: "a generated column on a dropped column",
+			decision: planner.Decision{Reason: planner.ReasonDependentGeneratedColumn, Kind: pgstatement.OpDropColumn,
+				DependentGeneratedColumns: []string{`"public"."orders"."total"`}},
+			want: `statement for table "orders" is refused: it drops a column that generated column "public"."orders"."total" reads; if it should go too, remove it from the file and apply that first, or to keep it, make the change outside SchemaBot through a separately reviewed process, then plan again`,
 		},
 		{
 			name:     "a partition key",

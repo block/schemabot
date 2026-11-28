@@ -1561,7 +1561,7 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 	switch statement.Disposition {
 	case router.DispositionUnavailable:
 		if statement.Backend == router.BackendCopyAndSwap {
-			return blocked(copyAndSwapRefusalReason(table))
+			return blocked(copyAndSwapRefusalReason(table, statement.Decisions))
 		}
 		return blocked(fmt.Sprintf("statement for table %q requires an execution path SchemaBot's PostgreSQL support does not provide yet", table))
 	case router.DispositionRewriteRequired:
@@ -1608,7 +1608,7 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 		// statement is blocked in SchemaBot's words rather than reported as
 		// vocabulary that moved.
 		if statement.Backend == router.BackendCopyAndSwap {
-			return blocked(copyAndSwapRefusalReason(table))
+			return blocked(copyAndSwapRefusalReason(table, statement.Decisions))
 		}
 		// Execute on anything but the native route with native steps is a
 		// route or backend this build does not run, or a plan with nothing
@@ -1836,8 +1836,14 @@ func foreignKeyChangeRefusalReason(kind schemadiff.ChangeKind, table string, cro
 
 // copyAndSwapRefusalReason refuses a statement only a full copy of the table
 // can run. Whether the planning library has that route open or not, SchemaBot
-// does not drive it, so both read the same and name the two ways forward.
-func copyAndSwapRefusalReason(table string) string {
+// does not drive it, so both read the same and name the two ways forward. A
+// stored generated column has no batched alternative, since only PostgreSQL
+// writes its values, so it gets its own sentence.
+func copyAndSwapRefusalReason(table string, decisions []planner.Decision) string {
+	if slices.ContainsFunc(decisions, func(d planner.Decision) bool { return d.Reason == planner.ReasonGeneratedStored }) {
+		return fmt.Sprintf("statement for table %q adds a stored generated column, which computes every row while a lock blocks reads and writes, and SchemaBot's PostgreSQL support does not run that yet; "+
+			"add the column outside SchemaBot through a separately reviewed process, then plan again", table)
+	}
 	return fmt.Sprintf("statement for table %q: the change needs a full copy of the table, which SchemaBot's PostgreSQL support does not run yet; "+
 		"reach the same schema without rewriting the table, such as a new column filled in batches, or make this change outside SchemaBot", table)
 }
