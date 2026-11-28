@@ -1,17 +1,22 @@
 package main
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"io"
+	"os"
 	"testing"
 
 	"github.com/alecthomas/kong"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/commands"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 )
 
@@ -189,4 +194,110 @@ func TestUsesLocalRuntime_FreezeCommands(t *testing.T) {
 		require.NoError(t, err, args)
 		assert.True(t, usesLocalRuntime(ctx.Command(), &cli), args)
 	}
+}
+
+// A command asked for JSON output that fails writes its error to stdout as a
+// JSON object, so a script parses the failure instead of meeting text where it
+// expects JSON. The code is the API's when the server gave one, the command's
+// own for an absence it decided, and absent otherwise; the message is cleaned
+// of terminal escapes as errorLine cleans it.
+func TestWriteJSONErrorNamesTheCodeAndCleansTheMessage(t *testing.T) {
+	for name, tc := range map[string]struct {
+		err  error
+		want string
+	}{
+		"absence the command decided": {
+			err:  &commands.NotFoundError{Message: `no schema change found for apply "apply-1" on this server`},
+			want: `{"error":{"code":"not_found","message":"no schema change found for apply \"apply-1\" on this server"}}`,
+		},
+		"server error code": {
+			err:  fmt.Errorf("get logs: %w", &client.APIError{Status: 404, ErrorCode: "not_found", Message: "apply not found"}),
+			want: `{"error":{"code":"not_found","message":"get logs: apply not found"}}`,
+		},
+		"plain error": {
+			err:  errors.New("dial tcp: connection refused\x1b[2J"),
+			want: `{"error":{"message":"dial tcp: connection refused[2J"}}`,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var out bytes.Buffer
+			writeJSONError(&out, tc.err)
+			assert.JSONEq(t, tc.want, out.String())
+		})
+	}
+}
+
+// Only a command run with --json reports its failure as JSON.
+func TestJSONOutputRequestedReadsTheCommandsJSONFlag(t *testing.T) {
+	for name, tc := range map[string]struct {
+		args []string
+		want bool
+	}{
+		"status with --json":    {args: []string{"status", "apply-1", "--json"}, want: true},
+		"status without --json": {args: []string{"status", "apply-1"}, want: false},
+		"logs with --json":      {args: []string{"logs", "apply-1", "--json"}, want: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var cli CLI
+			parser, err := kong.New(&cli, kong.Writers(io.Discard, io.Discard), kong.Vars{"cli_name": "schemabot"})
+			require.NoError(t, err)
+			ctx, err := parser.Parse(tc.args)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, jsonOutputRequested(ctx))
+		})
+	}
+}
+
+// A failure main reports for a --json command, including one from startup
+// before the command runs, such as a bearer token that cannot be resolved, is
+// a single JSON document on stdout. A command that already wrote its response
+// with the failure in it, such as a refused storage apply or a checks backfill
+// that needs attention, returns its error as already reported, and main adds
+// nothing after that response.
+func TestReportFailureWritesOneJSONDocumentForAJSONCommand(t *testing.T) {
+	t.Run("startup failure", func(t *testing.T) {
+		var out bytes.Buffer
+		reportFailure(&out, true, templates.ANSIRed, errors.New("no token configured for profile \"missing\"; run schemabot login"))
+		assert.JSONEq(t, `{"error":{"message":"no token configured for profile \"missing\"; run schemabot login"}}`, out.String())
+	})
+	t.Run("already reported", func(t *testing.T) {
+		var out bytes.Buffer
+		stderr := captureMainStderr(t, func() {
+			reportFailure(&out, true, "", fmt.Errorf("%w: %w", commands.ErrSilent, errors.New("refusing to converge storage schema")))
+		})
+		assert.Empty(t, out.String(), "the command's own response is the whole of stdout")
+		assert.Empty(t, stderr, "a silent error was already shown in full")
+	})
+	t.Run("carried in the response", func(t *testing.T) {
+		var out bytes.Buffer
+		stderr := captureMainStderr(t, func() {
+			reportFailure(&out, true, "", inJSONResponseError{errors.New("refusing to converge storage schema")})
+		})
+		assert.Empty(t, out.String(), "the command's own response is the whole of stdout")
+		assert.Equal(t, "Error: refusing to converge storage schema\n", stderr, "the person at the terminal still reads why")
+	})
+}
+
+// inJSONResponseError stands in for an error a command returns after writing
+// it inside its --json response.
+type inJSONResponseError struct{ err error }
+
+func (e inJSONResponseError) Error() string        { return e.err.Error() }
+func (e inJSONResponseError) Unwrap() []error      { return []error{commands.ErrSilent, e.err} }
+func (e inJSONResponseError) InJSONResponse() bool { return true }
+
+// captureMainStderr returns what fn writes to os.Stderr.
+func captureMainStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	read, write, err := os.Pipe()
+	require.NoError(t, err)
+	original := os.Stderr
+	os.Stderr = write
+	fn()
+	os.Stderr = original
+	require.NoError(t, write.Close())
+	captured, err := io.ReadAll(read)
+	require.NoError(t, err)
+	require.NoError(t, read.Close())
+	return string(captured)
 }

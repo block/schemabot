@@ -639,6 +639,10 @@ scanning:
 	if err := cmd.write(report); err != nil {
 		return err
 	}
+	if cmd.JSON {
+		// The report on stdout lists everything that needs attention.
+		return reportedInJSONResponse(attentionExitError(report))
+	}
 	return attentionExitError(report)
 }
 

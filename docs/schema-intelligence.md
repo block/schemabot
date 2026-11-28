@@ -959,9 +959,10 @@ retrying does not fix. When the server cannot read the apply or its tasks from
 its own storage, or the apply has no deployment recorded, the route answers
 `500` with `error_code` `storage_error` and a fixed message that names the apply
 and leaves the cause in the server logs; clients retry it as a transient failure.
-`schemabot status <apply_id>` prints "No schema change found" only for the
-unknown `apply_id`. It reports every other error answer as an error and exits
-non-zero.
+`schemabot status <apply_id>` reports an unknown `apply_id` as "no schema
+change found" and exits non-zero, as it does for every other error answer.
+With `--json`, it writes the error to stdout as
+`{"error": {"code": "not_found", "message": "…"}}`.
 
 <details>
 <summary>Request and response example</summary>
@@ -2333,6 +2334,11 @@ oldest first. Set `limit` to request a larger window. When `truncated` is true,
 older entries exist; increasing the limit reads further back. There is no
 pagination cursor. Remote deployment logs cap the window at 999 entries per
 source, so increasing the limit cannot always recover the whole lifecycle.
+
+An `apply_id` the server never stored answers `404` with `error_code`
+`not_found` and a message that names the ID. `schemabot logs <apply_id>`
+exits non-zero for it, and with `--json` writes
+`{"error": {"code": "not_found", "message": "…"}}` to stdout.
 
 ### Read one target's log
 

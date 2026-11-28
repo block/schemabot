@@ -1055,7 +1055,7 @@ combined with `--json`.
 
 The first read is not retried: if it fails, the command fails at once. After
 that, following stops with a non-zero exit when the server gives an answer a
-retry cannot change, such as `apply not found` or a refused token. A server it
+retry cannot change, such as an apply ID the server never stored, or a refused token. A server it
 cannot reach is retried with backoff, the same way the watchers retry, and
 following stops with a non-zero exit once polls have kept failing for a few
 minutes in a row. Run the same `logs` command again to keep following: it
@@ -1598,6 +1598,26 @@ $ schemabot databases --json
     }
   ]
 }
+```
+
+A `--json` command that fails exits non-zero and writes the error to stdout
+as JSON, in place of the text error on stderr. That includes a failure to
+resolve the server or its token before the command runs. A command whose
+response already carries the failure, such as a refused `storage apply` or a
+`checks backfill` that needs attention, writes only that response. Flags the
+CLI cannot parse are still reported as text on stderr. `code` is the API's
+error code when there is one, and is left out otherwise:
+
+```console
+$ schemabot status apply-0000000000000000 --json
+{
+  "error": {
+    "code": "not_found",
+    "message": "no schema change found for apply \"apply-0000000000000000\" on this server; check the ID against the applies schemabot status lists"
+  }
+}
+$ echo $?
+1
 ```
 
 `apply -o json` controls its progress stream; it is not a single JSON response

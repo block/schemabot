@@ -112,6 +112,27 @@ func (cf *ControlFlags) RequireApplyID() error {
 // and no additional "Error:" message should be printed.
 var ErrSilent = errors.New("silent error")
 
+// reportedInJSONResponse marks err as already reported by a --json command
+// whose response on stdout carries the failure, so main writes no second JSON
+// document after it. The message and the exit status are still err's.
+func reportedInJSONResponse(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &reportedError{err: err}
+}
+
+// reportedError is an error a command has already written in full. It reads
+// as the error it wraps and matches ErrSilent as well.
+type reportedError struct{ err error }
+
+func (e *reportedError) Error() string   { return e.err.Error() }
+func (e *reportedError) Unwrap() []error { return []error{ErrSilent, e.err} }
+
+// InJSONResponse marks the error as one a --json response on stdout carries,
+// which main still writes on stderr for the person at the terminal.
+func (e *reportedError) InJSONResponse() bool { return true }
+
 // CLIConfig represents the schemabot.yaml configuration file for CLI commands.
 // Database and Type are row-identity keys: LoadCLIConfig folds them with
 // storage.CanonicalKey so the CLI names the same identity the server stores,

@@ -331,9 +331,11 @@ func TestChecksBackfillDryRunFindingsExitNonzero(t *testing.T) {
 
 	require.Error(t, runErr)
 	assert.EqualError(t, runErr, "checks backfill left 1 PR with missing Check Runs and 1 stuck Check Run needing attention")
+	assert.ErrorIs(t, runErr, ErrSilent, "the report on stdout is the whole response, so main adds no JSON error after it")
+	assert.Equal(t, 1, ExitCodeFor(runErr))
 
 	var report checksBackfillReport
-	require.NoError(t, json.Unmarshal([]byte(output), &report), "the full report is still printed before the exit-code error")
+	require.NoError(t, json.Unmarshal([]byte(output), &report), "stdout is the report alone, still printed before the non-zero exit")
 	require.Len(t, report.Actions, 1)
 	assert.Equal(t, 7, report.Actions[0].PR)
 	require.Len(t, report.Stuck, 1)

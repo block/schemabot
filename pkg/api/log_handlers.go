@@ -81,7 +81,8 @@ func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, datab
 			return
 		}
 		if apply == nil {
-			s.writeError(w, http.StatusNotFound, "apply not found")
+			s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeNotFound,
+				fmt.Sprintf("no schema change found for apply %q on this server", applyID))
 			return
 		}
 		if database != "" && storage.CanonicalKey(apply.Database) != database {
