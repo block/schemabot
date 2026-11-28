@@ -123,6 +123,11 @@ type Engine struct {
 	// without a write before a plan proposes dropping it. New sets it to
 	// defaultDropTablesQuietPeriod; it is a field so tests can shorten it.
 	dropTablesQuietPeriod time.Duration
+
+	// interruptedRunnerSettleTimeout bounds how long a stop or cancel waits
+	// for the runner it interrupted to return. New sets it to
+	// interruptedRunnerSettleCeiling; it is a field so tests can shorten it.
+	interruptedRunnerSettleTimeout time.Duration
 }
 
 // runningSchemaChange tracks the state of an in-progress schema change.
@@ -249,8 +254,10 @@ func (x runExit) returned() bool {
 	}
 }
 
-// wait waits for the run to return, or for ctx to end. A run that has already
-// returned wins over a context that has already ended.
+// wait waits for the run to return, or for ctx to end. With no run alive there
+// is nothing to wait for, so a run that has returned wins over a context that
+// has ended, whichever happened first: the context's error is returned only
+// while the run is still alive.
 func (x runExit) wait(ctx context.Context) error {
 	if x.returned() {
 		return nil
@@ -259,6 +266,9 @@ func (x runExit) wait(ctx context.Context) error {
 	case <-x.done:
 		return nil
 	case <-ctx.Done():
+		if x.returned() {
+			return nil
+		}
 		return ctx.Err()
 	}
 }
@@ -326,7 +336,8 @@ func New(cfg Config) *Engine {
 		disablePendingDrops: cfg.DisablePendingDrops,
 		checkpointMaxAge:    checkpointMaxAge,
 
-		dropTablesQuietPeriod: defaultDropTablesQuietPeriod,
+		dropTablesQuietPeriod:          defaultDropTablesQuietPeriod,
+		interruptedRunnerSettleTimeout: interruptedRunnerSettleCeiling,
 	}
 	eng.debugLogs.Store(cfg.DebugLogs)
 

@@ -14,6 +14,7 @@ import (
 type ProgressCmd struct {
 	ControlFlags
 	Watch bool `short:"w" help:"Watch progress until completion" default:"true" negatable:""`
+	JSON  bool `help:"Print one progress snapshot as JSON; never opens the watcher"`
 }
 
 // Run executes the progress command.
@@ -27,18 +28,24 @@ func (cmd *ProgressCmd) Run(g *Globals) error {
 		return err
 	}
 
-	if cmd.Watch {
+	// JSON is for a caller that reads the output, so it takes one snapshot.
+	// The watcher is interactive, and its keys can stop the apply or run its cutover.
+	if cmd.Watch && !cmd.JSON {
 		return watchApplyProgressByApplyIDWithEnvironment(ep, cmd.ApplyID, cmd.Environment, true)
 	}
 
 	var result *apitypes.ProgressResponse
-	err = withLoading("Loading schema change progress...", true, func() error {
+	err = withLoading("Loading schema change progress...", !cmd.JSON, func() error {
 		var loadErr error
 		result, loadErr = client.GetProgress(ep, cmd.ApplyID)
 		return loadErr
 	})
 	if err != nil {
 		return err
+	}
+
+	if cmd.JSON {
+		return writeJSON(result)
 	}
 
 	data := templates.ParseProgressResponse(result)

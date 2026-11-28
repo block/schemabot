@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/block/mysql"
 
@@ -53,6 +54,7 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 	database := rm.database
 	tables := rm.tables
 	checkpointWindow := e.stopCheckpointWindow
+	settleTimeout := e.interruptedRunnerSettleTimeout
 	exit := rm.run.exit()
 	e.mu.Unlock()
 
@@ -65,8 +67,9 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 		// the runner's outcome, not from the provisional state, so a change
 		// that lands is never reported stopped twice over. With no runner
 		// alive the wait returns at once; a runner that will not come down
-		// bounds this stop at its caller's context, and the caller retries.
-		if err := waitForInterruptedRunner(ctx, exit, logger, "stop", database, tables); err != nil {
+		// bounds this stop at its caller's context or the settle ceiling,
+		// whichever ends first, and the caller retries.
+		if err := waitForInterruptedRunner(ctx, exit, settleTimeout, logger, "stop", database, tables); err != nil {
 			return nil, err
 		}
 		if err := settleAfterRunnerExit(e, rm, logger, "stop", database, tables); err != nil {
@@ -121,7 +124,7 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 		"tables", tables,
 	)
 
-	if err := waitForInterruptedRunner(ctx, exit, logger, "stop", database, tables); err != nil {
+	if err := waitForInterruptedRunner(ctx, exit, settleTimeout, logger, "stop", database, tables); err != nil {
 		return nil, err
 	}
 	if err := settleAfterRunnerExit(e, rm, logger, "stop", database, tables); err != nil {
@@ -139,16 +142,30 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 	}, nil
 }
 
+// interruptedRunnerSettleCeiling bounds how long a stop or cancel waits for
+// the runner it interrupted to return when its caller sets no tighter bound.
+// The durable stop and cancel consumers call with no deadline, so without it a
+// runner that will not come down would hold the operator's request forever.
+// A cancelled runner normally returns within seconds: what it waits out is
+// its in-flight copy and checksum statements and, during a cutover, a table
+// lock wait bounded by the cutover lock wait timeout. The ceiling is set to
+// hold several of those. A runner still alive by then is reported as not
+// settled, and the driver that holds the apply sends the request again.
+const interruptedRunnerSettleCeiling = 2 * time.Minute
+
 // waitForInterruptedRunner waits for the runner a stop or cancel has just
-// interrupted to return, bounded by ctx. A runner that will not come down ends
-// the wait at the caller's context with a retryable error, not a permanent one:
-// the schema change stays tracked as stopped or cancelled with its runner still
-// alive, no artifacts are released, and the same operation can be sent again
-// once the runner has returned. Until then the engine starts no other run on
-// the target: Start refuses to resume the change, and Apply drains the tracked
-// change before it installs a new one.
-func waitForInterruptedRunner(ctx context.Context, exit runExit, logger *slog.Logger, operation, database string, tables []string) error {
-	err := exit.wait(ctx)
+// interrupted to return, bounded by ctx and by settleTimeout. A runner that
+// will not come down ends the wait with a retryable engine.NotSettledError,
+// not a permanent one: the schema change stays tracked as stopped or cancelled
+// with its runner still alive, no artifacts are released, and the same
+// operation can be sent again once the runner has returned. Until then the
+// engine starts no other run on the target: Start refuses to resume the
+// change, and Apply drains the tracked change before it installs a new one.
+func waitForInterruptedRunner(ctx context.Context, exit runExit, settleTimeout time.Duration, logger *slog.Logger, operation, database string, tables []string) error {
+	started := time.Now()
+	settle, cancel := context.WithTimeout(ctx, settleTimeout)
+	defer cancel()
+	err := exit.wait(settle)
 	if err == nil {
 		return nil
 	}
@@ -164,12 +181,28 @@ func waitForInterruptedRunner(ctx context.Context, exit runExit, logger *slog.Lo
 		)
 		return nil
 	}
-	logger.Warn(operation+" wait ended before the runner returned; the schema change stays tracked and the "+operation+" can be sent again",
+	waited := time.Since(started)
+	if ctx.Err() == nil {
+		logger.Warn(operation+" wait reached its settle ceiling before the runner returned; the schema change stays tracked and the "+operation+" can be sent again",
+			"operation", operation,
+			"database", database,
+			"tables", tables,
+			"settle_timeout", settleTimeout,
+			"waited", waited,
+		)
+		// The ceiling's own deadline error is left off: the caller's context
+		// has not ended, so the error must not read as it having done so to
+		// anything that tests for context.DeadlineExceeded.
+		return &engine.NotSettledError{Err: fmt.Errorf("%s on database %s tables %v: the runner has not returned within the %s settle ceiling; send the %s again once it has", operation, database, tables, settleTimeout, operation)}
+	}
+	logger.Warn(operation+" wait ended at the caller's context before the runner returned; the schema change stays tracked and the "+operation+" can be sent again",
+		"operation", operation,
 		"database", database,
 		"tables", tables,
+		"waited", waited,
 		"error", err,
 	)
-	return fmt.Errorf("%s on database %s tables %v: the runner has not returned after %w; send the %s again once it has", operation, database, tables, err, operation)
+	return &engine.NotSettledError{Err: fmt.Errorf("%s on database %s tables %v: the runner has not returned after %w; send the %s again once it has", operation, database, tables, err, operation)}
 }
 
 // settleAfterRunnerExit reads the change's state once its runner has returned
@@ -321,6 +354,7 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 	}
 	rm.state = engine.StateCancelled
 	exit := rm.run.exit()
+	settleTimeout := e.interruptedRunnerSettleTimeout
 	e.mu.Unlock()
 
 	logger := e.schemaChangeLogger(rm)
@@ -328,7 +362,7 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 		"database", database,
 		"tables", tables,
 	)
-	if err := waitForInterruptedRunner(ctx, exit, logger, "cancel", database, tables); err != nil {
+	if err := waitForInterruptedRunner(ctx, exit, settleTimeout, logger, "cancel", database, tables); err != nil {
 		return nil, err
 	}
 	if err := settleAfterRunnerExit(e, rm, logger, "cancel", database, tables); err != nil {

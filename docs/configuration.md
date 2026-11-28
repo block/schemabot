@@ -18,6 +18,7 @@
 - [Direct Execution](#direct-execution)
 - [Storage Dialect](#storage-dialect)
 - [Storage Connection Pool](#storage-connection-pool)
+- [Storage Retention](#storage-retention)
 - [Spirit Run Settings](#spirit-run-settings)
 - [Postgres](#postgres)
 - [Target TLS Posture](#target-tls-posture)
@@ -1284,7 +1285,13 @@ GitHub's own primary rate limit is handled the same way, whether or not
 installation's quota is spent, SchemaBot retries the event at the reset time
 GitHub reports, plus up to 30 seconds. For three hours after the event arrived
 that wait does not use up its retry attempts, and after that each refusal uses
-one of the five. A secondary rate limit, or a refusal that carries no readable
+one of the five. If GitHub refuses the event with a reset that had already
+passed on the server's clock before the event became due, the server's clock
+is ahead of GitHub's: SchemaBot logs a warning with the reset time and its own
+time, and waits as long as the reset is overdue, between 10 seconds and 10
+minutes plus up to 30 seconds, before trying again. Keep the
+server's clock synchronized (for example with NTP) so events retry promptly
+after a reset. A secondary rate limit, or a refusal that carries no readable
 reset time, is retried on the usual schedule.
 
 Because each wait lasts until a reset, a PR command such as `apply` that the
@@ -1743,6 +1750,70 @@ rejects the setting at config load.
 server and database from a secret, and a hand-written `schema_dsn` would not
 follow that secret when it changes. SchemaBot rejects the combination at config
 load; use `storage.dsn` with `schema_dsn`.
+
+## Storage Retention
+
+SchemaBot keeps every row it writes unless told otherwise. The
+`storage_retention` block turns on a background pass that deletes old rows from
+SchemaBot's own storage tables. It is off by default, and when enabled it only
+counts and logs what it would delete until `dry_run: false` is set, because a
+deleted row cannot be recovered. The pass covers one table today, the webhook
+inbox (`webhook_events`), and only deletes deliveries that have finished. It
+never deletes a delivery that is still pending, being processed, or waiting to
+retry, however old.
+
+```yaml
+storage_retention:
+  enabled: true         # default: false
+  dry_run: true         # default: true — count and log instead of deleting
+  interval: 1h          # default: 1h — how often the pass runs
+  batch_size: 500       # default: 500, at most 5000 — rows deleted per statement
+  webhook_events: 168h  # default: 168h (7 days) — how long a finished delivery is kept
+```
+
+Every instance runs the pass on its own interval, and an advisory lock lets one
+instance purge at a time. A pass deletes in batches with a short pause between
+them, and stops after a fixed number of batches so a large first backlog drains
+over several passes instead of holding the database in one long run. Each pass
+logs one line naming the table, the rows it deleted (or would delete, in a dry
+run), the batches it took, the window, and whether it was a dry run. A pass that
+fails logs at error level and the next interval tries again.
+
+Read a dry run's log line before turning deletion on: set `enabled: true`, let a
+pass run, and check `rows_would_delete` for the `webhook_events` table.
+
+### Webhook inbox window
+
+The inbox is also how SchemaBot tells whether it has already planned a pull
+request's latest commit. For each pull request the pass keeps the newest
+finished delivery that planned a commit, however old. Retention never makes a
+commit that was not planned read as planned. At worst the webhook reconciler
+plans a pull request once more, for example when the pull request goes back to
+an older commit whose delivery has aged out. The table therefore keeps about
+one row per pull request, plus every delivery newer than the window.
+
+Finished deliveries include failed ones. A delivery that failed for good is
+kept for the window like any other, then deleted, and it stops counting in the
+`schemabot.webhook.inbox_depth` gauge once it is gone.
+
+`webhook_events` has a floor, the longer of two times:
+
+- **The 3 days GitHub keeps a delivery redeliverable.** The inbox row is what
+  stops a redelivered delivery from running its side effects twice, so a
+  shorter window would let a redelivery run as if it were new.
+- **The time the reconciler still looks back over:** its lookback plus its
+  grace period plus the cool-off after which a failed delivery stops counting
+  as planned. With the default reconciler lookback of 48 hours that is a little
+  under 49 hours, so the 3-day limit is the floor by default.
+
+SchemaBot refuses to start when `webhook_events` is below the floor, and the
+error names the values behind it. The reconciler's lookback is set with the
+`WEBHOOK_RECONCILE_LOOKBACK` environment variable, and raising it above about
+71 hours raises the floor. Each instance checks the floor against its own
+environment when it starts, so if you raise `WEBHOOK_RECONCILE_LOOKBACK`, raise
+it on every instance and raise `webhook_events` with it.
+
+`interval` cannot be shorter than one minute.
 
 ## Spirit Run Settings
 

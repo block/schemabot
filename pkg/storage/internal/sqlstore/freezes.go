@@ -180,16 +180,13 @@ func (s *freezeStore) List(ctx context.Context, environment string, recent int) 
 	if err != nil {
 		return nil, fmt.Errorf("list current freezes (environment %q): %w", environment, err)
 	}
-	if where != "" {
-		where = "WHERE " + strings.TrimSuffix(where, "AND ")
-	}
 	recentFreezes, err := listFreezes(ctx, tx, `
 		SELECT `+freezeColumns+`
 		FROM environment_freezes
-		`+where+`
+		WHERE `+where+`(lifted_at IS NOT NULL OR ends_at <= ?)
 		ORDER BY starts_at DESC, id DESC
 		LIMIT ?
-	`, append(slices.Clone(args), recent)...)
+	`, append(slices.Clone(args), now, recent)...)
 	if err != nil {
 		return nil, fmt.Errorf("list recent freezes (environment %q): %w", environment, err)
 	}

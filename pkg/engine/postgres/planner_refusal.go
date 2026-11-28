@@ -45,23 +45,28 @@ var dependentRefusalReasons = []planner.Reason{
 // beside reasons that render, since a sentence naming only the known fixes
 // would tell the operator that following them is enough; the caller renders
 // the generic refusal and reports the reason as planner vocabulary that
-// moved. It reports false when no operation names a cause this function
-// renders.
+// moved. A manual path for the objects in the way that this build has no
+// sentence for is returned as unknown the same way. It reports false when
+// no operation names a cause this function renders.
 //
 // Dependent object names come from the catalog, so the composed reason is
 // collapsed to one line and its blocked-cause separator neutralized, as for
 // every other reason built from a database identifier.
-func operationRefusalReason(decisions []planner.Decision, table string) (reason string, unknown planner.Reason, ok bool) {
-	clauses, unknown := plannerRefusalClauseList(decisions)
-	if unknown != "" {
+func operationRefusalReason(decisions []planner.Decision, table string) (reason string, unknown *unrecognizedPlannerVocabulary, ok bool) {
+	clauses, unknownReason := plannerRefusalClauseList(decisions)
+	if unknownReason != "" {
+		return "", &unrecognizedPlannerVocabulary{kind: "refusal_reason", value: string(unknownReason)}, false
+	}
+	causes, unknown := dependentObjectCauses(decisions)
+	if unknown != nil {
 		return "", unknown, false
 	}
-	causes := append(dependentObjectCauses(decisions), clauses...)
+	causes = append(causes, clauses...)
 	if len(causes) == 0 {
-		return "", "", false
+		return "", nil, false
 	}
 	reason = fmt.Sprintf("statement for table %q is refused: %s, then plan again", table, strings.Join(causes, "; and "))
-	return engine.SanitizeBlockedCause(singleLine(reason)), "", true
+	return engine.SanitizeBlockedCause(singleLine(reason)), nil, true
 }
 
 // plannerRefusalClauseList returns the clause for each distinct reason the

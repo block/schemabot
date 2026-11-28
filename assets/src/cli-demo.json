@@ -953,7 +953,7 @@
         "seconds": 4,
         "command": "schemabot unfreeze freeze-abc --reason \"Holidays are over\"",
         "caption": "The holidays are over: lift the freeze",
-        "output": "✓ freeze-abc lifted.\n"
+        "output": "✓ freeze-abc lifted by alice at 2026-01-20T16:00:00Z: Holidays are over.\n   Scope:  whole environment in production\n"
       }
     ]
   },

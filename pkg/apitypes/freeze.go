@@ -94,8 +94,8 @@ type FreezeListResponse struct {
 	// Scheduled are the freezes that start later, soonest first.
 	Scheduled []Freeze `json:"scheduled"`
 
-	// Recent are the latest freezes of any state, newest start first,
-	// including the ones above.
+	// Recent are the latest freezes that have ended, lifted or past their
+	// end, newest start first. It never repeats a freeze listed above.
 	Recent []Freeze `json:"recent"`
 }
 

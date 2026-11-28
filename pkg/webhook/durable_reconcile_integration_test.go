@@ -129,3 +129,27 @@ func TestE2EDurableDispatchSynthesizedDeliverySkipsCommentWhenPlanCurrent(t *tes
 	case <-time.After(3 * time.Second):
 	}
 }
+
+// TestE2EDurableDispatchRecoveryDeliveryForMovedHeadPlansNothing covers a
+// delivery whose head the PR has already moved past when it is processed, such
+// as a recovery delivery enqueued just before a push. Nothing is planned for the
+// old head, and processing reports the moved head so the driver ends the row
+// superseded rather than completed: a completed row would count as coverage
+// for a head that was never evaluated as the PR's head.
+func TestE2EDurableDispatchRecoveryDeliveryForMovedHeadPlansNothing(t *testing.T) {
+	dbName := "webhook_synth_dispatch_moved"
+	h, result, row := setupSynthesizedDispatchTest(t, dbName, "three-old-head-sha")
+	result.HeadSHAs = []string{"three-new-head-sha"}
+
+	retry, err := h.processDurableWebhookEvent(t.Context(), row)
+	require.ErrorIs(t, err, errAutoPlanHeadMoved)
+	assert.False(t, retry, "a moved head is an outcome, not a failure to retry")
+
+	select {
+	case body := <-result.comments:
+		require.FailNow(t, fmt.Sprintf("expected no plan comment for a head the PR moved past, got: %s", body))
+	case cr := <-result.checkRuns:
+		require.FailNow(t, fmt.Sprintf("expected no check run for a head the PR moved past, got: %s", cr.Name))
+	case <-time.After(3 * time.Second):
+	}
+}

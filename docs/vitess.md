@@ -127,7 +127,14 @@ branch is never touched. Predicting the rest would mean reimplementing Vitess's
 own DDL acceptance rules, and getting that wrong would refuse changes that work.
 
 A deploy request that PlanetScale has configured to require approval fails the
-apply. SchemaBot does not approve deploy requests.
+apply. SchemaBot does not approve deploy requests. When PlanetScale refuses the
+deploy, SchemaBot closes the deploy request it created, so nobody can deploy it
+from PlanetScale after the apply has failed. SchemaBot never closes a deploy
+request it did not create. When it does not close one, the server log names it,
+and so does the apply's failure when the refusal answered the start of a deploy
+that was waiting for it: close it in PlanetScale if the close failed or
+SchemaBot did not create it, or check whether the change landed if PlanetScale
+reports that its deploy may have begun.
 
 ## Example: add a column to a sharded table
 
@@ -497,30 +504,10 @@ runs.
 | An agent may | An agent hands it to a person |
 |---|---|
 | Run `plan`, `status`, `progress --no-watch`, and `pull` | `apply`, `cutover`, and `cancel` wherever the command policy says to hand them over, which includes production |
-| Rewrite a blocked change into a form the plan accepts, then plan again | `revert` and `skip-revert` in production, and outside it unless the user says yes when the agent asks |
+| Rewrite a blocked change into a form SchemaBot names or the user agrees to, then plan again | `revert` and `skip-revert` in production, and outside it unless the user says yes when the agent asks |
 | Tell the user why a change was blocked or refused, in SchemaBot's words | Any DDL run against the cluster outside SchemaBot, and anything done in the PlanetScale console |
 | Report a failure SchemaBot will retry, and check on it again | Deleting a branch, or approving a deploy request |
 
-Recognize each outcome by its signal:
-
-| Outcome | Signal |
-|---|---|
-| Blocked plan | The plan Check Run fails, and the plan comment names the table and the reason. `--allow-unsafe` accepts a destructive change; it does not make a blocked one runnable |
-| Rejected on the branch | The apply fails with the statement Vitess refused. Nothing reached the production branch, and applying the same plan again meets the same rejection |
-| Cancelled | Permanent. There is nothing to resume, and a new apply starts a new deploy request |
-| Reverted in the console | SchemaBot reads the deploy request's state, so the revert is reported, not overwritten |
-
-`cancel` deserves its own line, because it is the one control operation here
-that cannot be undone: it ends the deploy request for good, and the change
-starts again as a new one. The command policy routes it like any other control
-command, and nothing about this engine loosens that.
-
-You can copy this into your agent's instructions:
-
-> - If SchemaBot blocks or refuses a Vitess change, stop. Tell me the reason it
->   gave.
-> - You may rewrite the schema files and plan again. Show me the new plan.
-> - Follow the SchemaBot command policy for `cancel`, `cutover`, `revert`, and
->   `skip-revert`. In production, give me the command instead of posting it.
-> - Never run DDL against the cluster yourself or act in the PlanetScale
->   console. Give me the command instead.
+An agent with the [SchemaBot agent skill](ai-agents.md#install-the-agent-skill)
+follows these rules. Its [Vitess](../skills/schemabot/references/refusals-and-failures.md#vitess) reference has the signal of
+each outcome and what the agent does next.

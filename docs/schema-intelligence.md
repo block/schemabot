@@ -109,10 +109,30 @@ the non-reserved namespaces.
 Supply concrete live namespace names when selecting them. `{env}` and `$ENV`
 are schema-directory placeholders, so both are rejected in `--namespace` and
 `POST /api/pull` `namespaces` arguments. A namespace argument that is not one
-concrete, unreserved name, or that repeats, answers `400` with `error_code`
-`invalid_request` and says what to change. When the deployment that serves the
-database cannot be reached, pull answers `503` with `error_code`
-`engine_unavailable`; retry after a short wait.
+concrete, unreserved name, or that repeats, answers `400` and says what to
+change. When the deployment that serves the database cannot be reached, pull
+answers `503` with `error_code` `engine_unavailable`; retry after a short wait.
+
+Every `400` from `POST /api/pull` carries `error_code` `invalid_request`,
+whatever the request got wrong: a missing or conflicting `database`, `app`, or
+`environment`, a route the server does not configure, a namespace no target
+selects, or a lint request the server cannot audit. Match the code rather than
+the message, and correct the request before sending it again. A request with no
+`environment` answers:
+
+```json
+{
+  "error": "environment is required",
+  "error_code": "invalid_request"
+}
+```
+
+Two pull answers carry no `error_code`, so match their HTTP status instead. A
+`500` means the pull failed inside SchemaBot; retry it, and if it keeps
+failing, the server logs name the cause. A `501` means the database's engine
+does not support pull, so sending the request again cannot succeed.
+
+Pull a database's schema from the CLI:
 
 ```sh
 schemabot pull -d shop -e production
@@ -541,7 +561,7 @@ naming it and the selectable ones, rather than answered with an empty schema:
 ```json
 {
   "error": "database \"orders\" environment \"production\" has no targets entry selecting namespaces [shop_l]; the selectable namespaces are [shop_0, shop_1]",
-  "error_code": ""
+  "error_code": "invalid_request"
 }
 ```
 
@@ -753,6 +773,8 @@ uses the target database dialect and preserves quoted names and values. If
 without choosing another dialect.
 
 While an apply runs, `GET /api/progress/apply/{apply_id}` is the live view.
+`schemabot progress <apply_id> --json` prints one snapshot of the same
+document and never opens the interactive watcher.
 Table entries identify the DDL and task state. Available metrics depend on the
 engine and execution phase: copying can report rows and percent complete;
 `eta_seconds` is an estimate and may be omitted. Do not interpret an absent ETA
@@ -2597,6 +2619,9 @@ Response excerpt (illustrative values):
   ]
 }
 ```
+
+`schemabot locks --json` prints the same document. With no locks held,
+`locks` is an empty list.
 
 </details>
 

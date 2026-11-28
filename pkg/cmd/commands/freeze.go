@@ -88,6 +88,7 @@ func parseFreezeTime(flag, value string) (*time.Time, error) {
 // FreezeListCmd lists freezes.
 type FreezeListCmd struct {
 	Environment string `short:"e" help:"Only list freezes for this environment"`
+	JSON        bool   `help:"Output as JSON"`
 }
 
 // Run executes the freeze list command.
@@ -97,7 +98,7 @@ func (cmd *FreezeListCmd) Run(g *Globals) error {
 		return err
 	}
 	var list *apitypes.FreezeListResponse
-	err = withLoading("Loading freezes...", true, func() error {
+	err = withLoading("Loading freezes...", !cmd.JSON, func() error {
 		var listErr error
 		list, listErr = client.ListFreezes(ep, cmd.Environment)
 		return listErr
@@ -105,13 +106,17 @@ func (cmd *FreezeListCmd) Run(g *Globals) error {
 	if err != nil {
 		return err
 	}
+	if cmd.JSON {
+		return writeJSON(list)
+	}
 	templates.WriteFreezeList(*list)
 	return nil
 }
 
 // FreezeShowCmd shows one freeze.
 type FreezeShowCmd struct {
-	ID string `arg:"" name:"freeze-id" help:"Freeze ID"`
+	ID   string `arg:"" name:"freeze-id" help:"Freeze ID"`
+	JSON bool   `help:"Output as JSON"`
 }
 
 // Run executes the freeze show command.
@@ -121,13 +126,16 @@ func (cmd *FreezeShowCmd) Run(g *Globals) error {
 		return err
 	}
 	var freeze *apitypes.Freeze
-	err = withLoading("Loading freeze...", true, func() error {
+	err = withLoading("Loading freeze...", !cmd.JSON, func() error {
 		var getErr error
 		freeze, getErr = client.GetFreeze(ep, cmd.ID)
 		return getErr
 	})
 	if err != nil {
 		return err
+	}
+	if cmd.JSON {
+		return writeJSON(freeze)
 	}
 	templates.WriteFreezeShow(*freeze)
 	return nil
@@ -159,7 +167,8 @@ func (cmd *FreezeApproveCmd) Run(g *Globals) error {
 
 // FreezeOverrideCmd shows a freeze override request.
 type FreezeOverrideCmd struct {
-	ID string `arg:"" name:"ovr-id" help:"Override request ID"`
+	ID   string `arg:"" name:"ovr-id" help:"Override request ID"`
+	JSON bool   `help:"Output as JSON"`
 }
 
 // Run executes the freeze override command.
@@ -169,13 +178,16 @@ func (cmd *FreezeOverrideCmd) Run(g *Globals) error {
 		return err
 	}
 	var request *apitypes.FreezeOverrideRequest
-	err = withLoading("Loading override request...", true, func() error {
+	err = withLoading("Loading override request...", !cmd.JSON, func() error {
 		var getErr error
 		request, getErr = client.GetFreezeOverride(ep, cmd.ID)
 		return getErr
 	})
 	if err != nil {
 		return err
+	}
+	if cmd.JSON {
+		return writeJSON(request)
 	}
 	templates.WriteFreezeOverride(*request)
 	return nil
