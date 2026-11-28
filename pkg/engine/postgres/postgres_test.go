@@ -2117,13 +2117,13 @@ func TestExecutionVerdictNamesTheObjectsThatBlockAColumnChange(t *testing.T) {
 			name: "a policy and a trigger on a type change that rewrites the table",
 			decision: planner.Decision{Reason: planner.ReasonDependentPolicy, Kind: pgstatement.OpAlterColumnType, DependentFix: planner.DependentFixExpandContract,
 				DependentPolicies: []string{`"owner_only" ON "public"."orders"`}, DependentTriggers: []string{`"audit" ON "public"."orders"`}},
-			want: `statement for table "orders" is refused: it changes the type of a column that row security policy "owner_only" ON "public"."orders" and trigger "audit" ON "public"."orders" read, and the change rewrites the table, which SchemaBot cannot run yet; add a column of the new type instead, backfill it, point them at the new column (the policies in the schema file, the triggers outside SchemaBot), and drop the old column, each as its own change, then plan again`,
+			want: `statement for table "orders" is refused: it changes the type of a column that row security policy "owner_only" ON "public"."orders" and trigger "audit" ON "public"."orders" read, and the change rewrites the table, which SchemaBot cannot run yet; add a column of the new type instead, have the application write to both and backfill it, point them at the new column (the policies in the schema file, the triggers outside SchemaBot) and switch reads to it, and last drop the old column once nothing uses it, each as its own change, then plan again`,
 		},
 		{
 			name: "a trigger on a type change that rewrites the table",
 			decision: planner.Decision{Reason: planner.ReasonDependentTrigger, Kind: pgstatement.OpAlterColumnType, DependentFix: planner.DependentFixExpandContract,
 				DependentTriggers: []string{`"audit" ON "public"."orders"`}},
-			want: `statement for table "orders" is refused: it changes the type of a column that trigger "audit" ON "public"."orders" reads, and the change rewrites the table, which SchemaBot cannot run yet; add a column of the new type instead, backfill it, point it at the new column outside SchemaBot, and drop the old column, each as its own change, then plan again`,
+			want: `statement for table "orders" is refused: it changes the type of a column that trigger "audit" ON "public"."orders" reads, and the change rewrites the table, which SchemaBot cannot run yet; add a column of the new type instead, have the application write to both and backfill it, point it at the new column outside SchemaBot and switch reads to it, and last drop the old column once nothing uses it, each as its own change, then plan again`,
 		},
 		{
 			name: "two triggers on a dropped column",

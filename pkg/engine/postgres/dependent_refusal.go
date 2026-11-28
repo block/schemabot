@@ -64,7 +64,9 @@ func recreatableDependents(d planner.Decision) (named string, n int) {
 // that read the column, from what the change does with them out of the way.
 // Dropping them in one change and recreating them in another would leave a
 // window without them, so a dependent is changed first, recreated in the
-// same transaction as the change, or moved to a new column. SchemaBot
+// same transaction as the change, or moved to a new column that writes
+// keep in step with the old one, so the dependents never read a stale
+// value. SchemaBot
 // manages a table's policies through its schema file but never its
 // triggers, so a trigger is changed outside SchemaBot.
 func recreatableDependentsCause(d planner.Decision, named string, n int) string {
@@ -93,7 +95,7 @@ func recreatableDependentsCause(d planner.Decision, named string, n int) string 
 		default:
 			where = " (the policies in the schema file, the triggers outside SchemaBot)"
 		}
-		return fmt.Sprintf("it changes the type of a column that %s %s, and the change rewrites the table, which SchemaBot cannot run yet; add a column of the new type instead, backfill it, point %s at the new column%s, and drop the old column, each as its own change",
+		return fmt.Sprintf("it changes the type of a column that %s %s, and the change rewrites the table, which SchemaBot cannot run yet; add a column of the new type instead, have the application write to both and backfill it, point %s at the new column%s and switch reads to it, and last drop the old column once nothing uses it, each as its own change",
 			named, reads, them, where)
 	}
 	slog.Warn("planner names a dependent fix with no sentence; rendering the generic one", "dependent_fix", string(d.DependentFix))
