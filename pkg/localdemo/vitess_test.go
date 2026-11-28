@@ -1,6 +1,7 @@
 package localdemo
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/block/mysql"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -228,29 +230,26 @@ func sampleContainerWithProxyPorts(hostStart int) container {
 	return c
 }
 
-// Setup downloads the cluster image while the state database starts, so the
-// wait it reports has to describe what is actually left. A cached image is
-// collected without announcing a wait that never happened; a download still in
-// flight when the state database is ready says so before blocking on it.
-func TestAwaitImageReportsOnlyAWaitThatHappens(t *testing.T) {
-	cached := make(chan error, 1)
-	cached <- nil
-	var reported []string
-	require.NoError(t, awaitImage(cached, "example:latest", func(stage string) {
-		reported = append(reported, stage)
-	}))
-	require.Empty(t, reported, "a cached image should not announce a wait")
+// When the state database fails, setup stops before it needs the cluster
+// image. A download that already failed reports its own cause alongside the
+// state database's. One still running is cancelled and waited for, so no
+// docker pull outlives setup, and the cancellation is not reported as a cause.
+func TestAbandonPullReportsOnlyARealDownloadFailure(t *testing.T) {
+	failed := make(chan error, 1)
+	failed <- errors.New("pull refused")
+	require.ErrorContains(t, abandonPull(failed, func() {
+		t.Fatal("a download that already finished needs no cancel")
+	}), "pull refused")
 
-	// The download finishes only once the wait is reported, so the ordering the
-	// test asserts cannot depend on which goroutine runs first.
-	pending := make(chan error, 1)
-	done := make(chan error, 1)
-	go func() {
-		done <- awaitImage(pending, "example:latest", func(stage string) {
-			reported = append(reported, stage)
-			pending <- errors.New("pull refused")
-		})
-	}()
-	require.ErrorContains(t, <-done, "pull refused")
-	require.Equal(t, []string{"Waiting for example:latest"}, reported)
+	inFlight := make(chan error, 1)
+	cancelled := false
+	require.NoError(t, abandonPull(inFlight, func() {
+		cancelled = true
+		inFlight <- context.Canceled
+	}))
+	assert.True(t, cancelled, "a download still running should be cancelled")
+
+	require.NoError(t, abandonPull(nil, func() {
+		t.Fatal("setup that started no download has nothing to cancel")
+	}))
 }

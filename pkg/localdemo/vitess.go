@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -95,9 +96,10 @@ func ensureVitess(ctx context.Context, project, version string, report func(stri
 	// Download while the state database comes up, so the state database costs
 	// nothing on the run where the download dominates setup.
 	var pulled chan error
+	cancelPull := context.CancelFunc(func() {})
 	if needsCluster {
-		report("Preparing " + image + " (downloading if needed)")
-		pullCtx, cancelPull := context.WithCancel(ctx)
+		var pullCtx context.Context
+		pullCtx, cancelPull = context.WithCancel(ctx)
 		defer cancelPull()
 		pulled = make(chan error, 1)
 		go func() { pulled <- ensureImage(pullCtx, image) }()
@@ -108,11 +110,18 @@ func ensureVitess(ctx context.Context, project, version string, report func(stri
 		seed: "CREATE DATABASE schemabot;\n", seedStage: "Preparing SchemaBot's own database",
 	}, report)
 	if err != nil {
-		return Database{}, fmt.Errorf("prepare the sample's state database: %w", err)
+		return Database{}, errors.Join(
+			fmt.Errorf("prepare the sample's state database: %w", err),
+			abandonPull(pulled, cancelPull),
+		)
 	}
 
 	if needsCluster {
-		if err = awaitImage(pulled, image, report); err != nil {
+		// The stage is reported here rather than when the download starts, so
+		// the printed stages follow the state database's in the order setup
+		// waits on them.
+		report("Preparing " + image + " (downloading if needed)")
+		if err = <-pulled; err != nil {
 			return Database{}, err
 		}
 		// The API port and the proxy ports are reserved as one block, so the
@@ -228,18 +237,24 @@ func sampleProxyBase(c container) (int, error) {
 	return port, nil
 }
 
-// awaitImage collects the cluster image download that setup started alongside
-// the state database. The wait is reported only when the download is still
-// running, so a cached image announces nothing rather than a wait that did not
-// happen.
-func awaitImage(pulled <-chan error, image string, report func(string)) error {
+// abandonPull settles the cluster image download when setup stops before it
+// needs the image. A download that already failed returns its own error, so
+// both causes reach the user at once instead of the second only on the retry.
+// One still running is cancelled and waited for, so no docker pull outlives
+// setup; the error it then returns is the cancellation this function caused,
+// which says nothing about the image, so it is not reported.
+func abandonPull(pulled <-chan error, cancel context.CancelFunc) error {
+	if pulled == nil {
+		return nil
+	}
 	select {
 	case err := <-pulled:
 		return err
 	default:
 	}
-	report("Waiting for " + image)
-	return <-pulled
+	cancel()
+	<-pulled
+	return nil
 }
 
 // sampleProxyPortMap reads what host port each of the container's proxy ports
