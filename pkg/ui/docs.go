@@ -34,6 +34,16 @@ const (
 	// names those limits without printing the values the policy and the
 	// engine own.
 	DirectExecutionDocURL = DocsBaseURL + "direct-execution.md"
+
+	// PrimaryKeyDocURL explains how to choose a primary key for a MySQL table.
+	// Rendered as related guidance under a plan whose lint findings include a
+	// table without a suitable primary key.
+	PrimaryKeyDocURL = DocsBaseURL + "mysql.md#choosing-a-primary-key"
+
+	// RenameDocURL explains how to rename a column or table without breaking
+	// the application that reads it. Rendered as related guidance under a plan
+	// whose lint findings include a rename.
+	RenameDocURL = DocsBaseURL + "pre-merge-workflow.md#renaming-a-column-or-table"
 )
 
 // DocLinks is every documentation link rendered on a user-facing surface. The
@@ -43,6 +53,8 @@ var DocLinks = []string{
 	SchemaConfigDocURL,
 	MySQLThrottleDocURL,
 	DirectExecutionDocURL,
+	PrimaryKeyDocURL,
+	RenameDocURL,
 }
 
 // DocRef is the short form a documentation link is displayed as on a terminal:

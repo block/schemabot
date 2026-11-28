@@ -532,6 +532,13 @@ type DeploymentDriftData struct {
 	// confirms names every copy the apply destroys, wherever it is. Set only
 	// for a clean rollup, the only one whose targets' plans an apply runs.
 	DiscardedCopies []TargetExistingCopy
+	// UnmatchedDropTables are the drop_tables entries that name no live table
+	// on any target, primary included, in the order the config lists them.
+	// PlanCommentData.UnmatchedDropTables describes the primary target alone,
+	// and an entry it lists can still drop a table on another target. Empty
+	// when a target could not be planned or the rollup was not computed,
+	// since what that target holds is unknown.
+	UnmatchedDropTables []string
 }
 
 // TargetExistingCopy is an unfinished copy on one rollout target.
@@ -632,7 +639,9 @@ type DeploymentDriftEntry struct {
 	// Blocked is the number of changes this member will refuse at apply.
 	Blocked int
 	// Detail is a short human explanation for a diverged or errored member;
-	// empty for a member that passed.
+	// empty for a member that passed. It is plain text that can quote names
+	// from the schema files, such as an engine's refusal, so the comment
+	// escapes it rather than writing it as markdown.
 	Detail string
 }
 
@@ -1842,14 +1851,14 @@ func writeUnmatchedDropTables(sb *strings.Builder, entries []string) {
 }
 
 // shownUnmatchedDropTables is the unmatched drop_tables entries the plan
-// reports. A rollout plan reports none: the entries describe the primary
-// target alone, while every other member is planned with the same list and
-// drops a table it still has, so a line saying the entry drops nothing could
-// sit beside that member's DROP and tell the reader to remove the entry the
-// drop depends on.
+// reports. A rollout plan reports the entries no target matched: the plan's
+// own list describes the primary target alone, while every other target is
+// planned with the same list and can drop a table it still has, so a line
+// saying the entry drops nothing could sit beside that target's DROP and tell
+// the reader to remove the entry the drop depends on.
 func (d PlanCommentData) shownUnmatchedDropTables() []string {
 	if d.DeploymentDrift != nil {
-		return nil
+		return d.DeploymentDrift.UnmatchedDropTables
 	}
 	return d.UnmatchedDropTables
 }
@@ -1883,7 +1892,7 @@ func multiEnvHasUnmatchedDropTables(data MultiEnvPlanCommentData) bool {
 // drop_tables entries narrowed to those every environment's plan reports, so
 // no section tells the reader to remove an entry another environment still
 // drops a table for (see presentation.UnmatchedDropTablesInEveryPlan). A
-// rollout plan reports no entries, so beside one nothing is reported.
+// rollout plan takes part with the entries no target of it matched.
 func withUnmatchedDropTablesInEveryPlan(data MultiEnvPlanCommentData) map[string]*PlanCommentData {
 	var lists [][]string
 	for _, env := range data.Environments {
@@ -1904,6 +1913,13 @@ func withUnmatchedDropTablesInEveryPlan(data MultiEnvPlanCommentData) map[string
 		}
 		copied := *plan
 		copied.UnmatchedDropTables = common
+		// A rollout's section reads its own list, so it is narrowed too, on
+		// a copy that leaves the caller's data untouched.
+		if plan.DeploymentDrift != nil {
+			drift := *plan.DeploymentDrift
+			drift.UnmatchedDropTables = common
+			copied.DeploymentDrift = &drift
+		}
 		narrowed[env] = &copied
 	}
 	return narrowed
@@ -3389,12 +3405,14 @@ func countCommentDDLBlocks(data PlanCommentData) int {
 }
 
 // driftDetailSuffix renders a deployment's drift detail as a trailing clause, or
-// an empty string when there is no detail.
+// an empty string when there is no detail. The detail can quote names from the
+// schema files, so it is written as markdownReason writes a reason: on one
+// line, with nothing in it able to start markdown of its own.
 func driftDetailSuffix(detail string) string {
 	if detail == "" {
 		return ""
 	}
-	return " — " + detail
+	return " — " + markdownReason(detail)
 }
 
 // writeBlockedChanges writes the section for statements the engine refuses,

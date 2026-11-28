@@ -2,12 +2,15 @@ package commands
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/alecthomas/kong"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -634,4 +637,127 @@ func TestReleaseCmdReleasesAPausedRollout(t *testing.T) {
 		"Database:    orders\n"+
 		"Environment: staging\n\n"+
 		"Held deployments will resume. Use 'schemabot progress "+controlTestApplyID+" -e staging' to follow them.\n", out)
+}
+
+// controlWatch is one watch a control command entered.
+type controlWatch struct {
+	endpoint            string
+	applyID             string
+	environment         string
+	allowControlActions bool
+}
+
+// controlWatchMarker is the line the stand-in watch prints, so a test can see
+// where in the command's output the watch began.
+const controlWatchMarker = "[watching]\n"
+
+// stubControlWatch stands in for the terminal watch that start and release
+// follow by default. It records every watch entered and prints
+// controlWatchMarker in place of the progress display.
+func stubControlWatch(t *testing.T) *[]controlWatch {
+	t.Helper()
+	var watches []controlWatch
+	previous := watchControlledApply
+	watchControlledApply = func(endpoint, applyID, environment string, allowControlActions bool) error {
+		watches = append(watches, controlWatch{endpoint, applyID, environment, allowControlActions})
+		fmt.Print(controlWatchMarker)
+		return nil
+	}
+	t.Cleanup(func() { watchControlledApply = previous })
+	return &watches
+}
+
+// assertWatchedOnce checks that the command entered exactly one watch, on the
+// schema change and environment the operator named, with control keys on.
+func assertWatchedOnce(t *testing.T, endpoint string, watches []controlWatch) {
+	t.Helper()
+	assert.Equal(t, []controlWatch{{endpoint, controlTestApplyID, "staging", true}}, watches)
+}
+
+// Starting a stopped schema change with --watch, the default, sends one start
+// request, says how many tables resumed and how many were already complete,
+// and then follows the schema change.
+func TestStartCmdWatchesTheSchemaChangeItStarts(t *testing.T) {
+	watches := stubControlWatch(t)
+	server, requests := controlTestServer(t, state.Apply.Stopped, "/api/start",
+		apitypes.StartResponse{Accepted: true, StartedCount: 3, SkippedCount: 1})
+
+	cmd := StartCmd{ControlFlags: controlTestFlags(), Watch: true}
+	out, err := runControlCmd(server.URL, cmd.Run)
+	require.NoError(t, err)
+	assertSentOnce(t, *requests)
+	assert.Equal(t, "▶️  Schema change resumed\n\n"+
+		"Database:    orders\n"+
+		"Environment: staging\n"+
+		"Resumed:     3 table(s)\n"+
+		"Skipped:     1 table(s) (already complete)\n\n"+
+		"Resuming from checkpoint...\n\n"+
+		controlWatchMarker, out)
+	assertWatchedOnce(t, server.URL, *watches)
+}
+
+// A start with --watch on a schema change that is already running sends no
+// start request and follows the schema change that is running.
+func TestStartCmdWatchesASchemaChangeThatIsAlreadyRunning(t *testing.T) {
+	watches := stubControlWatch(t)
+	server, requests := controlTestServer(t, state.Apply.Running, "/api/start", apitypes.StartResponse{Accepted: true})
+
+	cmd := StartCmd{ControlFlags: controlTestFlags(), Watch: true}
+	out, err := runControlCmd(server.URL, cmd.Run)
+	require.NoError(t, err)
+	assert.Empty(t, *requests, "a schema change that is already running must not be sent a start")
+	assert.Equal(t, "Schema change already running\n"+controlWatchMarker, out)
+	assertWatchedOnce(t, server.URL, *watches)
+}
+
+// Releasing a paused rollout with --watch, the default, sends one release
+// request and then follows the deployments it was holding back.
+func TestReleaseCmdWatchesTheRolloutItReleases(t *testing.T) {
+	watches := stubControlWatch(t)
+	server, requests := controlTestServer(t, state.Apply.Paused, "/api/release", apitypes.ReleaseResponse{Accepted: true})
+
+	cmd := ReleaseCmd{ControlFlags: controlTestFlags(), Watch: true}
+	out, err := runControlCmd(server.URL, cmd.Run)
+	require.NoError(t, err)
+	assertSentOnce(t, *requests)
+	assert.Equal(t, "▶️  Paused rollout released\n\n"+
+		"Database:    orders\n"+
+		"Environment: staging\n\n"+
+		"Held deployments will resume. Use 'schemabot progress "+controlTestApplyID+" -e staging' to follow them.\n\n"+
+		controlWatchMarker, out)
+	assertWatchedOnce(t, server.URL, *watches)
+}
+
+// start and release follow the schema change unless the operator passes
+// --no-watch. The default lives in the flag declaration, so this parses the
+// commands the way the CLI does rather than building them by hand.
+func TestStartAndReleaseWatchByDefault(t *testing.T) {
+	for _, tc := range []struct {
+		args      []string
+		wantWatch bool
+	}{
+		{args: []string{"start", controlTestApplyID, "-e", "staging"}, wantWatch: true},
+		{args: []string{"start", controlTestApplyID, "-e", "staging", "--no-watch"}, wantWatch: false},
+		{args: []string{"release", controlTestApplyID, "-e", "staging"}, wantWatch: true},
+		{args: []string{"release", controlTestApplyID, "-e", "staging", "--no-watch"}, wantWatch: false},
+	} {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			var cli struct {
+				Globals
+				Start   StartCmd   `cmd:""`
+				Release ReleaseCmd `cmd:""`
+			}
+			parser, err := kong.New(&cli, kong.Name("schemabot"))
+			require.NoError(t, err)
+
+			_, err = parser.Parse(tc.args)
+			require.NoError(t, err)
+
+			watch := cli.Start.Watch
+			if tc.args[0] == "release" {
+				watch = cli.Release.Watch
+			}
+			assert.Equal(t, tc.wantWatch, watch)
+		})
+	}
 }

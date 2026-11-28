@@ -47,7 +47,7 @@ func (cmd *StartCmd) Run(g *Globals) error {
 	if state.IsRunningApplyState(curState) || state.IsState(curState, state.Apply.CuttingOver) {
 		fmt.Println("Schema change already running")
 		if cmd.Watch {
-			return WatchApplyProgressByApplyID(ep, cmd.ApplyID, true)
+			return watchControlledApply(ep, cmd.ApplyID, cmd.Environment, true)
 		}
 		return nil
 	}
@@ -85,5 +85,5 @@ func (cmd *StartCmd) Run(g *Globals) error {
 	})
 	fmt.Println()
 
-	return WatchApplyProgressByApplyID(ep, cmd.ApplyID, true)
+	return watchControlledApply(ep, cmd.ApplyID, cmd.Environment, true)
 }

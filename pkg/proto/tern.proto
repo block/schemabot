@@ -889,6 +889,10 @@ message PlanDiffResponse {
   // diff could meet, so a caller can tell a clean target from a data plane
   // that never looked or whose lookup failed.
   bool existing_copies_reported = 7;
+  // The drop_tables entries that name no live table on this target, the same
+  // list PlanResponse carries. A data plane that predates the field leaves it
+  // empty, which reads as every entry having matched.
+  repeated string unmatched_drop_tables = 8;
 }
 
 // ApplyRequest requests execution of a previously generated plan.

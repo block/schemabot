@@ -1563,6 +1563,11 @@ func (s *Service) stopApply(ctx context.Context, client tern.Client, apply *stor
 	}, httpStatus, nil
 }
 
+// immediateStopCompletionFailedLogMessage is the apply log entry for an
+// immediate stop the engine accepted but SchemaBot could not mark complete in
+// its own storage.
+const immediateStopCompletionFailedLogMessage = "Immediate stop accepted, but SchemaBot could not record it as complete; the durable stop request remains pending and the apply owner will retry it. If the apply does not reach stopped, check the server logs for this apply"
+
 func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string) {
 	// A multi-operation apply has no single data-plane apply id: each operation
 	// drives against its own deployment with its own remote apply. An apply-scoped
@@ -1644,11 +1649,14 @@ func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Cl
 	}
 	stopCompleted, err := s.completeImmediateStopRequestIfStopped(ctx, apply, caller)
 	if err != nil {
-		s.logger.Warn("immediate stop accepted but durable stop request completion failed; durable stop request remains pending for apply owner retry",
+		s.logger.Error("immediate stop accepted but durable stop request completion failed; durable stop request remains pending for apply owner retry",
 			append(apply.LogAttrs(),
-				"tern_apply_id", ternApplyID, "requested_by", caller, "stopped_count", resp.StoppedCount, "skipped_count", resp.SkippedCount, "error", err)...)
+				"operation", "complete_immediate_stop", "tern_apply_id", ternApplyID, "requested_by", caller, "stopped_count", resp.StoppedCount, "skipped_count", resp.SkippedCount, "error", err)...)
+		// The storage error is logged above with the identifiers that make it
+		// triageable. The apply log is operator-facing, so it carries the outcome
+		// and the next step rather than raw driver text naming hosts or addresses.
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
-			fmt.Sprintf("Immediate stop accepted but durable stop request completion failed; durable stop request remains pending: %v", err))
+			immediateStopCompletionFailedLogMessage)
 		return
 	}
 	if !stopCompleted {

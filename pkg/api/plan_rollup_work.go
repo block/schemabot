@@ -3,6 +3,7 @@ package api
 import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/presentation"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 )
@@ -23,6 +24,21 @@ func (r PlanRollup) MembersWithWork() []routing.ExecutionTarget {
 		out = append(out, routing.ExecutionTarget{Deployment: entry.Deployment, Target: entry.Target})
 	}
 	return out
+}
+
+// UnmatchedDropTables returns the drop_tables entries that name no live table
+// on any rollout member, primary included, in the order the config lists them.
+// Every member is planned with the same list, so an entry one member matched
+// names a table that member still has and plans a drop for, and a line saying
+// the entry drops nothing would tell the reader to remove the entry that drop
+// depends on. A member that errored has no list, so beside it nothing is
+// reported: what its target holds is unknown.
+func (r PlanRollup) UnmatchedDropTables() []string {
+	lists := make([][]string, len(r.Entries))
+	for i, entry := range r.Entries {
+		lists[i] = entry.UnmatchedDropTables
+	}
+	return presentation.UnmatchedDropTablesInEveryPlan(lists)
 }
 
 // MemberCopiesUnreported finds the first rollout member after the primary

@@ -132,7 +132,9 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 				h.logger.Error("failed to enqueue durable PR close cleanup",
 					"repo", payload.Repository.FullName, "pr", payload.PullRequest.Number,
 					"delivery_id", deliveryID, "error", err)
-				metrics.RecordWebhookEvent(ctx, metricApp, "pull_request", payload.Action, payload.Repository.FullName, "durable_enqueue_failed")
+				// Close cleanup is queued before the repository allowlist check,
+				// so the repository may be one this deployment does not manage.
+				metrics.RecordWebhookEvent(ctx, metricApp, "pull_request", payload.Action, h.metricRepo(payload.Repository.FullName), "durable_enqueue_failed")
 				h.writeError(w, http.StatusInternalServerError, "failed to enqueue webhook delivery")
 				return
 			}

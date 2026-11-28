@@ -80,6 +80,20 @@ type DeploymentLogError struct {
 	Message    string                    `json:"message"`
 }
 
+// Code and Reason pairs a DeploymentLogError carries. The server sets them and
+// the CLI matches on them to decide whether a source can ever be read, so both
+// sides use these constants rather than their own copies of the strings.
+const (
+	DeploymentLogCodeReadFailed        = "RemoteLogReadFailed"
+	DeploymentLogReasonReadFailed      = "remote_log_read_failed"
+	DeploymentLogCodeUnsupported       = "UnsupportedCapability"
+	DeploymentLogReasonUpgradeRequired = "upgrade_required"
+	DeploymentLogCodeNotFound          = "RemoteLogNotFound"
+	DeploymentLogReasonNotFound        = "remote_log_not_found"
+	DeploymentLogCodeMalformed         = "MalformedRemoteLog"
+	DeploymentLogReasonMalformed       = "malformed_remote_log"
+)
+
 // =============================================================================
 // Error Codes
 // =============================================================================
@@ -1080,6 +1094,12 @@ type PlanRolloutResponse struct {
 	// member rather than read from a group: each member applies to its own
 	// data. Members listed for attention are not included.
 	TableSizes []*PlanMemberTableSizeResponse `json:"table_sizes,omitempty"`
+	// UnmatchedDropTables lists the drop_tables entries that name no live
+	// table on any member, in the order the config lists them. The top-level
+	// UnmatchedDropTables describes the primary member alone, and an entry it
+	// lists can still drop a table on another member. Empty when a member
+	// could not be planned, since what its target holds is unknown.
+	UnmatchedDropTables []string `json:"unmatched_drop_tables,omitempty"`
 }
 
 // PlanMemberTableSizeResponse is one rollout member's plan-time size estimate
@@ -2069,6 +2089,9 @@ type ApplyResponse struct {
 	ApplyID      string `json:"apply_id,omitempty"`
 	ErrorCode    string `json:"error_code,omitempty"`
 	ErrorMessage string `json:"error_message,omitempty"`
+	// FreezeOverride is the override request that let this apply through
+	// the freezes holding its environment. Empty when no freeze held it.
+	FreezeOverride string `json:"freeze_override,omitempty"`
 }
 
 // ControlResponse is the HTTP response for simple control operations

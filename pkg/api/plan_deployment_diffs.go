@@ -53,6 +53,10 @@ type DeploymentPlanDiff struct {
 	ExistingCopies         []*ternv1.ExistingCopy
 	ExistingCopiesReported bool
 
+	// UnmatchedDropTables are the request's drop_tables entries that name no
+	// live table on this member. The primary's entry carries its plan's list.
+	UnmatchedDropTables []string
+
 	// DirectExecution is the policy this member's diff was judged under. The
 	// member's stored plan records it, so the apply that dispatches this
 	// member runs its statements under the policy its verdicts were computed
@@ -138,6 +142,7 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 			results[i].Changes = primaryPlan.Changes
 			results[i].Shards = primaryPlan.Shards
 			results[i].LintViolations = primaryPlan.LintViolations
+			results[i].UnmatchedDropTables = primaryPlan.UnmatchedDropTables
 			// The primary plan that reported planning errors is not a trustworthy
 			// baseline; record the error so the rollup fails closed rather than
 			// comparing deployments against a broken primary.
@@ -234,6 +239,7 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 			results[i].LintViolations = resp.LintViolations
 			results[i].ExistingCopies = resp.ExistingCopies
 			results[i].ExistingCopiesReported = resp.ExistingCopiesReported
+			results[i].UnmatchedDropTables = resp.UnmatchedDropTables
 			// A diff that succeeded at the RPC layer but reported planning errors
 			// is not a trustworthy comparison input; block on it so the rollup
 			// never mistakes an incomplete diff for agreement.

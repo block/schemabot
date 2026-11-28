@@ -288,6 +288,97 @@ func TestDispatch_LegacySingleAppStillWorks(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rr.Code)
 }
 
+// TestServeHTTP_SingleAppEventsKeepUnmanagedRepoNamesOff covers a single-App
+// deployment, where no apps are configured and so the signing-App ownership
+// check lets every repository through. A delivery from a repository missing
+// from repos: is still counted on schemabot.webhook.events_total under its
+// usual status, but without a repository attribute, because any repository
+// that installs the App can deliver and its name would add a series. A
+// managed repository keeps its name on the series.
+func TestServeHTTP_SingleAppEventsKeepUnmanagedRepoNamesOff(t *testing.T) {
+	const (
+		managedRepo   = "org/allowed-repo"
+		unmanagedRepo = "octocat/hello-world"
+	)
+	planComment := func(repo, body string) []byte {
+		return []byte(`{"action":"created","issue":{"number":7,"pull_request":{"url":"x"}},` +
+			`"comment":{"id":1,"body":"` + body + `","user":{"login":"octocat","type":"User"}},` +
+			`"repository":{"full_name":"` + repo + `"},"installation":{"id":42}}`)
+	}
+	ping := func(repo string) []byte {
+		return []byte(`{"repository":{"full_name":"` + repo + `"}}`)
+	}
+	scenarios := []struct {
+		name           string
+		eventType      string
+		body           []byte
+		wantMessage    string
+		wantStatus     string
+		wantMetricRepo string
+	}{
+		{
+			name:        "plan command from an unmanaged repository",
+			eventType:   "issue_comment",
+			body:        planComment(unmanagedRepo, "schemabot plan"),
+			wantMessage: "repository not registered",
+			wantStatus:  "processed",
+		},
+		{
+			name:        "unsupported event from an unmanaged repository",
+			eventType:   "ping",
+			body:        ping(unmanagedRepo),
+			wantMessage: "event type 'ping' ignored",
+			wantStatus:  "ignored",
+		},
+		{
+			name:           "non-command comment from a managed repository",
+			eventType:      "issue_comment",
+			body:           planComment(managedRepo, "looks good"),
+			wantMessage:    "no SchemaBot command found",
+			wantStatus:     "processed",
+			wantMetricRepo: managedRepo,
+		},
+		{
+			name:           "unsupported event from a managed repository",
+			eventType:      "ping",
+			body:           ping(managedRepo),
+			wantMessage:    "event type 'ping' ignored",
+			wantStatus:     "ignored",
+			wantMetricRepo: managedRepo,
+		},
+	}
+	for _, tc := range scenarios {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := newDispatchMetricsReader(t)
+			secret := []byte("single-app-secret")
+			cfg := &api.ServerConfig{Repos: map[string]api.RepoConfig{managedRepo: {}}}
+			svc := api.New(&emptyStorage{}, cfg, nil, testLogger())
+			h := NewHandler(svc, &fakeClientFactory{}, secret, testLogger())
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", bytes.NewReader(tc.body))
+			req.Header.Set("X-GitHub-Event", tc.eventType)
+			req.Header.Set(headerSignature256, signWebhookBody(secret, tc.body))
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+			require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+			require.Contains(t, rr.Body.String(), tc.wantMessage, "the delivery must take the handler path this case is about")
+
+			points := collectCounterPoints(t, reader, "schemabot.webhook.events_total")
+			require.Len(t, points, 1, "the delivery must record exactly one webhook event")
+			assertStringAttr(t, points[0].Attributes, "status", tc.wantStatus)
+			assertStringAttr(t, points[0].Attributes, "event_type", tc.eventType)
+			repository, hasRepository := points[0].Attributes.Value(attribute.Key("repository"))
+			if tc.wantMetricRepo == "" {
+				assert.False(t, hasRepository,
+					"an unmanaged repository's name must not become an attribute value, got %q", repository.AsString())
+				return
+			}
+			require.True(t, hasRepository, "a managed repository keeps its name on the series")
+			assert.Equal(t, tc.wantMetricRepo, repository.AsString())
+		})
+	}
+}
+
 func TestFactoryForRepo_MultiAppResolution(t *testing.T) {
 	h, _ := newMultiAppTestHandler(t)
 

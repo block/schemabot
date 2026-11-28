@@ -187,6 +187,19 @@ func TestPlanCarriesUnmatchedDropTables(t *testing.T) {
 	}
 }
 
+// A rollout member's diff reports its own unmatched drop_tables entries, so
+// the control plane can tell an entry no member matched from one another
+// member still drops a table for.
+func TestPlanDiffCarriesUnmatchedDropTables(t *testing.T) {
+	client := exemptTablesClient(&fakePlanStore{createErr: assert.AnError}, exemptTablesEngine{
+		unmatched: map[string][]string{"app": {"_orders_olds"}},
+	})
+
+	resp, err := client.PlanDiff(t.Context(), &ternv1.PlanRequest{SchemaFiles: appSchemaFiles(), DropTables: []string{"_users_old", "_orders_olds"}})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"_orders_olds"}, resp.GetUnmatchedDropTables())
+}
+
 // Every MySQL namespace is planned with the whole drop_tables list, so an
 // entry that names a table in one namespace's database plans a drop there and
 // is not reported, even though the other namespaces find no such table. Only

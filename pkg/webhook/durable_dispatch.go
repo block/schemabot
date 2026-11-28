@@ -351,7 +351,11 @@ func (h *Handler) durableWebhookClaimsSnapshot() [][]any {
 func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, store storage.WebhookEventStore, event *storage.WebhookEvent) {
 	claimedAt := time.Now()
 	appName := h.metricAppForRepo(event.Repository)
-	metrics.RecordWebhookEvent(ctx, appName, event.Event, event.Action, event.Repository, "durable_dispatch_started")
+	// A closed pull request is queued before the repository allowlist check,
+	// and a repository can leave the config while its rows wait, so the row's
+	// repository may be one this deployment no longer manages.
+	metricRepo := h.metricRepo(event.Repository)
+	metrics.RecordWebhookEvent(ctx, appName, event.Event, event.Action, metricRepo, "durable_dispatch_started")
 	if event.Attempts == 1 {
 		// Only the first claim measures inbox wait: started_at pins to the
 		// first claim, and a retry claim's wait is the retry window, not
@@ -370,7 +374,7 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 			// receipt — the pre-deferral behavior, never a bogus epoch lag.
 			lagSince = event.ReceivedAt
 		}
-		metrics.RecordWebhookInboxDispatchLag(ctx, appName, event.Event, event.Repository, time.Since(lagSince))
+		metrics.RecordWebhookInboxDispatchLag(ctx, appName, event.Event, metricRepo, time.Since(lagSince))
 	}
 
 	if event.Event == "pull_request" && isAutoPlannablePullRequestAction(event.Action) {
@@ -451,6 +455,7 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 		if retry && !refusedByQuotaReserve {
 			rateLimitResetAt, rateLimited = ghclient.PrimaryRateLimitResetAt(processErr)
 		}
+		resetWaitedOut := rateLimited && primaryRateLimitResetWaitedOut(event, rateLimitResetAt, now)
 		switch {
 		case !retry:
 			failureReason = durableFailureReason(processErr)
@@ -477,7 +482,7 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 			// GitHub refuses every request of the exhausted resource until its
 			// reset, so a retry sooner would be refused the same way. The
 			// delivery waits for the reset and the wait costs no attempt.
-			retryAt = h.primaryRateLimitRetryAt(rateLimitResetAt, now)
+			retryAt = h.primaryRateLimitRetryAt(rateLimitResetAt, now, resetWaitedOut)
 			markErr = store.MarkFailedUncharged(finishCtx, event.ID, event.LeaseToken, processErr.Error(), retryAt)
 			outcome = "rate_limit_deferred"
 		case event.Attempts < maxDurableWebhookAttempts:
@@ -498,7 +503,7 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 				// Past the uncharged window the delivery still waits for the
 				// reset, but the rate limit spends an attempt (see
 				// unchargedRefusalWindow).
-				retryAt = h.primaryRateLimitRetryAt(rateLimitResetAt, now)
+				retryAt = h.primaryRateLimitRetryAt(rateLimitResetAt, now, resetWaitedOut)
 			}
 			markErr = store.MarkFailed(finishCtx, event.ID, event.LeaseToken, processErr.Error(), &retryAt)
 			outcome = "retrying"
@@ -531,7 +536,7 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 		}
 		recordOutcome(outcome)
 		if outcome == "failed_permanent" {
-			metrics.RecordWebhookPermanentFailure(finishCtx, appName, event.Event, event.Action, event.Repository, failureReason)
+			metrics.RecordWebhookPermanentFailure(finishCtx, appName, event.Event, event.Action, metricRepo, failureReason)
 			origin := "organic"
 			if strings.HasPrefix(event.DeliveryID, storage.SynthesizedWebhookDeliveryIDPrefix) {
 				origin = "synthesized"
@@ -552,7 +557,7 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 					deadLetterAttrs...)
 			}
 		} else {
-			metrics.RecordWebhookEvent(finishCtx, appName, event.Event, event.Action, event.Repository, "durable_dispatch_"+outcome)
+			metrics.RecordWebhookEvent(finishCtx, appName, event.Event, event.Action, metricRepo, "durable_dispatch_"+outcome)
 		}
 		if notifyTerminalCommand {
 			h.postDurableCommandTerminalComment(event, processErr)
@@ -562,6 +567,9 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 		}
 		if rateLimited {
 			h.logPrimaryRateLimitRetry(driverID, event, rateLimitResetAt, retryAt, outcome)
+		}
+		if resetWaitedOut {
+			h.logPrimaryRateLimitClockSkew(driverID, event, rateLimitResetAt, now, retryAt, outcome)
 		}
 		// An uncharged refusal gave back the attempt its claim consumed, so
 		// log the count the row now holds, as logQuotaReserveRetry does.
@@ -609,7 +617,7 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 		return
 	}
 	recordOutcome("completed")
-	metrics.RecordWebhookEvent(finishCtx, appName, event.Event, event.Action, event.Repository, "durable_dispatch_completed")
+	metrics.RecordWebhookEvent(finishCtx, appName, event.Event, event.Action, metricRepo, "durable_dispatch_completed")
 	h.logger.Info("durable webhook driver completed delivery",
 		"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 		"action", event.Action, "repo", event.Repository, "pr", event.PullRequest)
@@ -686,7 +694,7 @@ func (h *Handler) supersedeCoveredAutoPlan(ctx context.Context, driverID int, st
 		return false
 	}
 	metrics.RecordWebhookDispatchDuration(ctx, appName, event.Event, event.Repository, "superseded", time.Since(claimedAt))
-	metrics.RecordWebhookEvent(ctx, appName, event.Event, event.Action, event.Repository, "durable_dispatch_superseded")
+	metrics.RecordWebhookEvent(ctx, appName, event.Event, event.Action, h.metricRepo(event.Repository), "durable_dispatch_superseded")
 	h.logger.Info("durable webhook driver superseded stale auto-plan delivery; a newer delivery for the same pull request covers it",
 		"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 		"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
@@ -1151,17 +1159,73 @@ func (h *Handler) logQuotaReserveRetry(driverID int, event *storage.WebhookEvent
 	}
 }
 
+// primaryRateLimitResetWaitedOut reports whether the delivery had already
+// waited out resetAt before this claim: the claim only became due at or after
+// the reset GitHub now reports, and the reset has passed on the claiming pod's
+// clock. A refusal schedules its retry at or after the reset it reported, so a
+// retry that GitHub refuses with the same reset, or an earlier one, means
+// GitHub's clock is behind the claiming pod's. A genuinely new rate limit
+// window reports a later reset, so it is not waited out.
+//
+// The time the claim became due can come from another pod's clock, the one
+// that received the webhook. When that pod runs ahead, a reset can be before
+// the due time and still in the future on the claiming pod, which is not
+// skew on the claiming pod, so the delivery waits for that reset as usual.
+func primaryRateLimitResetWaitedOut(event *storage.WebhookEvent, resetAt, now time.Time) bool {
+	return !resetAt.After(event.ClaimableSince) && !resetAt.After(now)
+}
+
 // primaryRateLimitRetryAt returns when to retry a delivery GitHub's primary
 // rate limit refused until resetAt: the reset as quotaReserveRetryAt bounds
 // it, plus up to primaryRateLimitRetryJitter. The bound on the reset applies
 // before the extra is added, so the longest wait is that much more than
 // ghclient.QuotaResetHorizon.
-func (h *Handler) primaryRateLimitRetryAt(resetAt, now time.Time) time.Time {
+//
+// When the delivery had already waited out resetAt, retrying at the reset
+// would poll GitHub after quotaReserveRetryFloor every time until GitHub's
+// clock reaches it. Instead the retry waits as long as the reset has been
+// overdue by the pod's clock, at least quotaReserveRetryFloor and at most
+// durableWebhookRetryMaxDelay. The overdue time grows with each refusal, so
+// the waits double without any stored count, and a pod clock that runs ahead
+// of GitHub's costs a few claims per window rather than one every few seconds.
+func (h *Handler) primaryRateLimitRetryAt(resetAt, now time.Time, resetWaitedOut bool) time.Time {
 	jitter := durableWebhookRetryJitter
 	if h.durableWebhookRetryJitterOverride != nil {
 		jitter = h.durableWebhookRetryJitterOverride
 	}
-	return quotaReserveRetryAt(resetAt, now).Add(jitter(primaryRateLimitRetryJitter))
+	retryAt := quotaReserveRetryAt(resetAt, now)
+	if resetWaitedOut {
+		retryAt = now.Add(min(max(now.Sub(resetAt), quotaReserveRetryFloor), durableWebhookRetryMaxDelay))
+	}
+	return retryAt.Add(jitter(primaryRateLimitRetryJitter))
+}
+
+// logPrimaryRateLimitClockSkew warns that GitHub's primary rate limit refused
+// a delivery again with a reset the delivery had already waited out, which
+// means the pod's clock is ahead of GitHub's. It names the reset, the time the
+// claim became due (the retry time the previous refusal set, at or after the
+// reset it reported), and the pod's clock, so an operator can see the skew.
+func (h *Handler) logPrimaryRateLimitClockSkew(driverID int, event *storage.WebhookEvent, resetAt, now, retryAt time.Time, outcome string) {
+	attrs := []any{
+		"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+		"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
+		"head_sha", event.HeadSHA, "installation_id", event.TenantID,
+		"reset_time", resetAt.UTC().Format(time.RFC3339),
+		"due_since", event.ClaimableSince.UTC().Format(time.RFC3339),
+		"pod_now", now.UTC().Format(time.RFC3339),
+		"reset_overdue", now.Sub(resetAt).Round(time.Second).String(),
+		"disposition", outcome,
+	}
+	if retryAt.IsZero() {
+		// The refusal spent the delivery's last attempt, so nothing will
+		// claim it again; do not promise a retry.
+		h.logger.Warn("GitHub's primary rate limit refused a durable webhook delivery with a reset it had already waited out, so this pod's clock is ahead of GitHub's; the delivery has no attempts left and will not be retried",
+			attrs...)
+		return
+	}
+	attrs = append(attrs, "retry_at", retryAt.UTC().Format(time.RFC3339))
+	h.logger.Warn("GitHub's primary rate limit refused a durable webhook delivery with a reset it had already waited out, so this pod's clock is ahead of GitHub's; the retry will wait as long as the reset is overdue instead of at the reset",
+		attrs...)
 }
 
 // logPrimaryRateLimitRetry records how a delivery that GitHub's primary rate

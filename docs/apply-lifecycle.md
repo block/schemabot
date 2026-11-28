@@ -271,7 +271,8 @@ retry may succeed.
 
 In a rollout, a member the engine refuses is listed under the rollout's
 members needing attention, with the refusal as its detail, and the response
-is `200` for the members that planned.
+is `200` for the members that planned. The pull request's plan comment names
+the member with the same detail.
 
 ## Refused before an apply exists
 
