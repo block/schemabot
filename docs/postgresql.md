@@ -1283,6 +1283,25 @@ same unsafe-change consent as a destructive change, because it changes who
 can read rows. Applying it opens every row the remaining policies and grants
 allow, so review the access change before you consent.
 
+A plan that changes an existing table's RLS says in its unsafe reason which
+commands it leaves no permissive policy granting, when a policy granted them
+before. PostgreSQL grants rows only
+through a permissive policy, for that command or for `ALL`. With none for
+`SELECT`, every role subject to RLS reads no rows. With none for `INSERT`,
+its inserts are refused. With none for `UPDATE` or `DELETE`, those succeed
+without changing any row. A new table holds no rows yet, so its create
+carries no such reason.
+
+SchemaBot does not manage RLS yet on some tables: one that has a foreign key
+or that a foreign key references, an unlogged table, and a few other
+shapes. The plan is refused with each such table and its
+reason named, every such table in the schema at once, and the keys when a
+foreign key on an existing table is the reason. To plan the table's
+other changes, remove the RLS statements from its file. If the table already
+has RLS, make the file's RLS statements match its current settings and
+policies instead, since a file that stops declaring RLS SchemaBot applied is
+refused.
+
 **How a policy change runs.** A table's policy, setting, and comment changes
 are one operation:
 
