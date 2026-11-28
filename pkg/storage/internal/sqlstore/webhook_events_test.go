@@ -198,6 +198,7 @@ func assertDeleteTerminalOlderThan(t *testing.T, store storage.Storage, db *sql.
 		{"negative age", -time.Hour, 10},
 		{"zero limit", retention, 0},
 		{"negative limit", retention, -1},
+		{"limit above the largest batch", retention, storage.MaxWebhookEventPurgeBatch + 1},
 	} {
 		deleted, err := store.WebhookEvents().DeleteTerminalOlderThan(ctx, tc.age, tc.limit)
 		require.Error(t, err, tc.name)
@@ -267,6 +268,49 @@ func assertDeleteTerminalOlderThan(t *testing.T, store storage.Storage, db *sql.
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), deleted, "the next call takes the rest")
 	assert.False(t, exists("batch-newest"))
+
+	// A Redeliver that reopens a row after the purge selected it keeps the row:
+	// the delete checks state and age again.
+	inbox := store.WebhookEvents().(*webhookEventStore)
+	t.Cleanup(func() { inbox.hooks = webhookEventHooks{} })
+	seed("race-reopened", storage.WebhookEventCompleted, old)
+	seed("race-purged", storage.WebhookEventCompleted, old)
+	inbox.hooks.afterPurgeSelect = func() {
+		inbox.hooks.afterPurgeSelect = nil
+		created, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
+			DeliveryID: "race-reopened", Event: "pull_request", Action: "synchronize",
+			Repository: "block/example", Payload: []byte(`{}`),
+		})
+		require.NoError(t, err)
+		require.True(t, created, "the redelivery reopens the completed row")
+	}
+	deleted, err = store.WebhookEvents().DeleteTerminalOlderThan(ctx, retention, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), deleted, "only the row nobody reopened is deleted")
+	assert.False(t, exists("race-purged"))
+	reopened, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "race-reopened")
+	require.NoError(t, err)
+	require.NotNil(t, reopened, "a row reopened between the select and the delete must survive")
+	assert.Equal(t, storage.WebhookEventPending, reopened.State)
+
+	// A purge that deletes a row between a redelivery's duplicate insert and
+	// its reopen does not lose the redelivery: Create inserts the row again.
+	seed("race-recreated", storage.WebhookEventCompleted, old)
+	inbox.hooks.afterDuplicateInsert = func() {
+		inbox.hooks.afterDuplicateInsert = nil
+		_, err := db.ExecContext(ctx, rebind(`DELETE FROM webhook_events WHERE delivery_id = ?`), "race-recreated")
+		require.NoError(t, err)
+	}
+	created, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
+		DeliveryID: "race-recreated", Event: "pull_request", Action: "synchronize",
+		Repository: "block/example", Payload: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	assert.True(t, created, "the redelivery is accepted, so it must have a row")
+	recreated, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "race-recreated")
+	require.NoError(t, err)
+	require.NotNil(t, recreated, "an accepted redelivery has a row to drive")
+	assert.Equal(t, storage.WebhookEventPending, recreated.State)
 }
 
 // createCoalescingEvent inserts a delivery for the SupersedeIfCovered tests

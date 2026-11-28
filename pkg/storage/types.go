@@ -50,6 +50,13 @@ const ApplyTargetLockWait = 10 * time.Second
 // a terminal state are left for reconciliation/monitoring to surface.
 const MaxWebhookEventAttempts = 5
 
+// MaxWebhookEventPurgeBatch is the most rows one DeleteTerminalOlderThan call
+// may delete. The delete binds one placeholder per row, so a ceiling well under
+// the MySQL and PostgreSQL placeholder limits keeps one configured value from
+// building a statement the server refuses, and it bounds how long one delete
+// holds row locks on a table that stores whole payloads.
+const MaxWebhookEventPurgeBatch = 10000
+
 // Cutover policies control how a multi-member rollout sequences the copy and
 // cutover phases of its members: the deployments of a deployments map, or the
 // targets of a targets list, each ordered the same way. The value is resolved from the
@@ -3550,7 +3557,9 @@ var WebhookEventStatesAll = []string{
 
 // WebhookEventStatesTerminal lists the webhook inbox states no driver or sweep
 // moves a row out of. Only an explicit GitHub Redeliver reopens such a row, so
-// these are the only states retention may delete.
+// these are the only states retention may delete. A completed or permanently
+// failed row is also what HasEventForHead counts as coverage for its head, so
+// deleting it lets the reconciler treat that head as never planned.
 var WebhookEventStatesTerminal = []string{
 	WebhookEventCompleted,
 	WebhookEventFailed,

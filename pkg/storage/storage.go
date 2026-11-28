@@ -774,8 +774,13 @@ type WebhookEventStore interface {
 	// processing, or retryable row, however old. The cutoff is measured on the
 	// database clock, so clock skew between server pods cannot move it. A caller
 	// that wants to drain a backlog calls it repeatedly until it returns fewer
-	// rows than limit. An age or limit that is not positive is an error and
-	// deletes nothing.
+	// rows than limit. A short count can also mean another caller deleted part
+	// of the same page or a redelivery reopened a row in it, so a sweep runs
+	// under WithStorageRetentionElection to run alone and leaves anything still old for its next
+	// pass. An age or limit that is not positive, or a limit above
+	// MaxWebhookEventPurgeBatch, is an error and deletes nothing. Deleting a
+	// completed or permanently failed row also drops the coverage
+	// HasEventForHead reports for its head.
 	DeleteTerminalOlderThan(ctx context.Context, age time.Duration, limit int) (int64, error)
 
 	// CountTerminalOlderThan returns how many rows DeleteTerminalOlderThan

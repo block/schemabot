@@ -24,7 +24,20 @@ type webhookEventStore struct {
 	dialect    Dialect
 	identity   identityInserter
 	classifier ErrorClassifier
+	// hooks lets a test act between two statements that do not run in one
+	// transaction, to pin the guard the second one carries. Both are nil
+	// outside tests.
+	hooks webhookEventHooks
 }
+
+type webhookEventHooks struct {
+	afterDuplicateInsert func()
+	afterPurgeSelect     func()
+}
+
+// maxCreateAttempts bounds how often Create re-inserts a delivery whose row a
+// purge deleted between the duplicate-key insert and the reopen.
+const maxCreateAttempts = 3
 
 func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEvent) (bool, error) {
 	if event.DeliveryID == "" {
@@ -64,25 +77,53 @@ func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEv
 	// Producers of deferred work — a redundant convergence signal that should
 	// lose the race to the primary delivery — use it to schedule dispatch
 	// without holding the delivery outside the inbox.
-	id, err := s.identity.InsertID(ctx, s.db, `
-		INSERT INTO webhook_events (
-			provider, delivery_id, event, action, repository, pull_request, head_sha, tenant_id,
-			payload, state, attempts, retry_after, received_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, provider, event.DeliveryID, event.Event, event.Action, event.Repository, event.PullRequest, event.HeadSHA, event.TenantID,
-		payload, state, event.Attempts, nullTimePtr(event.RetryAfter), receivedAt)
-	if err != nil {
-		if s.classifier.IsDuplicateKey(err) {
-			return s.reopenTerminalWebhookEvent(ctx, provider, event.DeliveryID, payload, receivedAt)
+	//
+	// A duplicate GUID means the row exists, and the reopen decides whether to
+	// run it again. Retention can delete a terminal row between the failed
+	// insert and the reopen, so a reopen that matches nothing checks that the
+	// row is still there and inserts again if it is gone: a delivery that is
+	// acknowledged always has a row (AV-7).
+	for attempt := 1; ; attempt++ {
+		id, err := s.identity.InsertID(ctx, s.db, `
+			INSERT INTO webhook_events (
+				provider, delivery_id, event, action, repository, pull_request, head_sha, tenant_id,
+				payload, state, attempts, retry_after, received_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, provider, event.DeliveryID, event.Event, event.Action, event.Repository, event.PullRequest, event.HeadSHA, event.TenantID,
+			payload, state, event.Attempts, nullTimePtr(event.RetryAfter), receivedAt)
+		if err == nil {
+			event.ID = id
+			event.Provider = provider
+			event.State = state
+			event.Payload = []byte(payload)
+			event.ReceivedAt = receivedAt
+			return true, nil
 		}
-		return false, fmt.Errorf("insert webhook event (provider=%s, delivery_id=%s): %w", provider, event.DeliveryID, err)
+		if !s.classifier.IsDuplicateKey(err) {
+			return false, fmt.Errorf("insert webhook event (provider=%s, delivery_id=%s): %w", provider, event.DeliveryID, err)
+		}
+		if s.hooks.afterDuplicateInsert != nil {
+			s.hooks.afterDuplicateInsert()
+		}
+		reopened, err := s.reopenTerminalWebhookEvent(ctx, provider, event.DeliveryID, payload, receivedAt)
+		if err != nil {
+			return false, err
+		}
+		if reopened {
+			return true, nil
+		}
+		existing, err := s.GetByDeliveryID(ctx, provider, event.DeliveryID)
+		if err != nil {
+			return false, fmt.Errorf("check webhook delivery after its reopen matched no row (provider=%s, delivery_id=%s): %w", provider, event.DeliveryID, err)
+		}
+		if existing != nil {
+			// The row is in flight, so this delivery is a duplicate.
+			return false, nil
+		}
+		if attempt == maxCreateAttempts {
+			return false, fmt.Errorf("create webhook event (provider=%s, delivery_id=%s): its row was deleted between the insert and the reopen %d times", provider, event.DeliveryID, attempt)
+		}
 	}
-	event.ID = id
-	event.Provider = provider
-	event.State = state
-	event.Payload = []byte(payload)
-	event.ReceivedAt = receivedAt
-	return true, nil
 }
 
 // reopenTerminalWebhookEvent handles the duplicate-GUID branch of Create.
@@ -132,9 +173,9 @@ func (s *webhookEventStore) reopenTerminalWebhookEvent(ctx context.Context, prov
 			lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
 			retry_after = NULL, completed_at = NULL, started_at = NULL, updated_at = NOW()
 		WHERE provider = ? AND delivery_id = ?
-			AND (state IN (?, ?, ?, ?) OR (state = ? AND lease_expires_at <= `+s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond)+`))
-	`, storage.WebhookEventPending, payload, receivedAt, provider, deliveryID,
-		storage.WebhookEventFailed, storage.WebhookEventFailedPermanent, storage.WebhookEventCompleted, storage.WebhookEventSuperseded, storage.WebhookEventProcessing)
+			AND (state IN (`+placeholders(len(storage.WebhookEventStatesTerminal))+`) OR (state = ? AND lease_expires_at <= `+s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond)+`))
+	`, append(append([]any{storage.WebhookEventPending, payload, receivedAt, provider, deliveryID},
+		stringArgs(storage.WebhookEventStatesTerminal)...), storage.WebhookEventProcessing)...)
 	if err != nil {
 		return false, fmt.Errorf("reopen webhook delivery for redelivery (provider=%s, delivery_id=%s): %w", provider, deliveryID, err)
 	}
@@ -667,6 +708,9 @@ func (s *webhookEventStore) DeleteTerminalOlderThan(ctx context.Context, age tim
 	if limit <= 0 {
 		return 0, fmt.Errorf("delete terminal webhook events: limit must be positive, got %d", limit)
 	}
+	if limit > storage.MaxWebhookEventPurgeBatch {
+		return 0, fmt.Errorf("delete terminal webhook events: limit %d is above the largest batch, %d", limit, storage.MaxWebhookEventPurgeBatch)
+	}
 
 	cutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
 		LiteralIntervalAmount(uint64(age.Microseconds())), IntervalMicrosecond)
@@ -697,6 +741,9 @@ func (s *webhookEventStore) DeleteTerminalOlderThan(ctx context.Context, age tim
 	}
 	if len(ids) == 0 {
 		return 0, nil
+	}
+	if s.hooks.afterPurgeSelect != nil {
+		s.hooks.afterPurgeSelect()
 	}
 
 	deleteArgs := make([]any, 0, len(ids)+len(storage.WebhookEventStatesTerminal))

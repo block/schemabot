@@ -64,8 +64,11 @@ The apply store supports crash recovery through heartbeat-based leasing:
 `webhook_events` stores the full JSON payload of every accepted delivery, so it
 grows without bound if never pruned. Terminal rows (`completed`, `failed`,
 `failed_permanent`, `superseded`) are kept for forensics and because the
-reconciler counts a head as covered by its row, so they must outlive the
-reconcile lookback. GitHub lets an operator redeliver only deliveries from the
+reconciler counts a head as covered by its `completed` or `failed_permanent`
+row. The reconcile lookback measures how recently a PR was updated, not how old
+its head is, so purging an old head's row on a PR that is still active lets the
+reconciler plan that head again; the sweep has to keep such rows or accept the
+re-plan. GitHub lets an operator redeliver only deliveries from the
 past 3 days, and a redelivery reopens a terminal row anyway, so dedup needs
 nothing longer. `DeleteTerminalOlderThan` deletes such rows in batches, keyed on
 `idx_received_at`; the periodic sweep that calls it is not wired up yet. Until
