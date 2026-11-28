@@ -12,6 +12,7 @@ import (
 	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/schemadiff"
 	"github.com/block/pg-sprite/pkg/statement"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/block/schemabot/pkg/engine"
@@ -157,26 +158,32 @@ func (e *planningPrivilegeError) Unwrap() error { return e.err }
 // privilege the planning role lacks, or nil for any other failure. When
 // pg-sprite checked the privilege itself, its PrivilegeError carries the exact
 // GRANT, and the refusal names it with the catalog check that verifies it.
-// Otherwise the server's insufficient_privilege error names the object, and
-// the refusal keeps that error and says to grant the privilege it names.
+// Otherwise the server's insufficient_privilege message names the object, and
+// the refusal says to grant the privilege it names.
+//
+// The text leads with the remedy and ends with the file, so a renderer that
+// clamps it loses the context before the GRANT. It carries the server's
+// message alone, never the wrapped chain: a connection error's text names the
+// login, host, and address it dialed, which the operator-facing refusal must
+// not show. The full chain goes to the server log.
 func planningPrivilegeRefusal(namespace, filename string, wrapped error) *planningPrivilegeError {
+	var text string
 	if privilege, ok := errors.AsType[*preflight.PrivilegeError](wrapped); ok {
-		remedy := fmt.Sprintf("provision with: %s (verified by: %s)", privilege.Grant, privilege.Check)
+		text = "grant SchemaBot's role the privilege planning needs, then re-plan: " + privilege.Grant
 		if privilege.Hint != "" {
-			remedy += "; " + privilege.Hint
+			text += "; " + privilege.Hint
 		}
-		return &planningPrivilegeError{
-			text: fmt.Sprintf("plan PostgreSQL schema in %q/%q: SchemaBot's role lacks a privilege planning this file needs; %s; then re-plan", namespace, filename, remedy),
-			err:  wrapped,
-		}
+		text += fmt.Sprintf(" (file %q/%q; verified by: %s)", namespace, filename, privilege.Check)
+	} else if denied, ok := errors.AsType[*pgconn.PgError](wrapped); ok && denied.Code == sqlstateInsufficientPrivilege {
+		text = fmt.Sprintf("grant SchemaBot's role the privilege this error names, then re-plan: %s (SQLSTATE %s; file %q/%q)", denied.Message, denied.Code, namespace, filename)
+	} else {
+		return nil
 	}
-	if isInsufficientPrivilege(wrapped) {
-		return &planningPrivilegeError{
-			text: wrapped.Error() + "; SchemaBot's role lacks the privilege this error names, so grant it to that role, then re-plan",
-			err:  wrapped,
-		}
-	}
-	return nil
+	slog.Warn("PostgreSQL plan refused: the planning role lacks a privilege on the target",
+		"namespace", namespace,
+		"file", filename,
+		"error", wrapped)
+	return &planningPrivilegeError{text: text, err: wrapped}
 }
 
 // referencedTableRemedy names the fix for a foreign key the planner cannot

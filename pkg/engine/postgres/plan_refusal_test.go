@@ -3,6 +3,7 @@ package postgres
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/block/pg-sprite/pkg/executor"
@@ -14,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -125,8 +127,9 @@ func TestPlannerRefusalTypesOnlyPlannerDeclines(t *testing.T) {
 // way until someone grants it, so it is a refusal that ends in the grant, not
 // an internal error to retry. When pg-sprite checked the privilege, the
 // refusal names its exact GRANT and the catalog check that verifies it; when
-// only the server refused, it keeps the server's error, which names the
-// object, and says to grant that privilege.
+// only the server refused, it carries the server's message, which names the
+// object, and says to grant that privilege. The remedy leads, so a renderer
+// that clamps the text cuts the file context, not the GRANT.
 func TestPlannerRefusalNamesTheGrantAPlanNeeds(t *testing.T) {
 	t.Run("a privilege pg-sprite checked", func(t *testing.T) {
 		privilege := &preflight.PrivilegeError{
@@ -137,8 +140,8 @@ func TestPlannerRefusalNamesTheGrantAPlanNeeds(t *testing.T) {
 		err := plannerRefusal("billing", "invoices.sql", fmt.Errorf(`plan PostgreSQL table "invoices": %w`, privilege))
 		assert.True(t, engine.IsPlanRefused(err))
 		assert.ErrorIs(t, err, privilege)
-		assert.EqualError(t, err, `plan PostgreSQL schema in "billing"/"invoices.sql": SchemaBot's role lacks a privilege planning this file needs; `+
-			`provision with: GRANT USAGE ON SCHEMA "billing" TO "sb_planner" (verified by: has_schema_privilege(sb_planner, billing, 'USAGE')); then re-plan`)
+		assert.EqualError(t, err, `grant SchemaBot's role the privilege planning needs, then re-plan: GRANT USAGE ON SCHEMA "billing" TO "sb_planner" `+
+			`(file "billing"/"invoices.sql"; verified by: has_schema_privilege(sb_planner, billing, 'USAGE'))`)
 	})
 
 	t.Run("a hint follows the grant", func(t *testing.T) {
@@ -150,8 +153,8 @@ func TestPlannerRefusalNamesTheGrantAPlanNeeds(t *testing.T) {
 		}
 		err := plannerRefusal("billing", "invoices.sql", privilege)
 		assert.True(t, engine.IsPlanRefused(err))
-		assert.EqualError(t, err, `plan PostgreSQL schema in "billing"/"invoices.sql": SchemaBot's role lacks a privilege planning this file needs; `+
-			`provision with: GRANT USAGE ON SCHEMA "billing" TO "sb_planner" (verified by: has_schema_privilege(sb_planner, billing, 'USAGE')); the schema's owner can grant it; then re-plan`)
+		assert.EqualError(t, err, `grant SchemaBot's role the privilege planning needs, then re-plan: GRANT USAGE ON SCHEMA "billing" TO "sb_planner"; the schema's owner can grant it `+
+			`(file "billing"/"invoices.sql"; verified by: has_schema_privilege(sb_planner, billing, 'USAGE'))`)
 	})
 
 	t.Run("a privilege only the server checked", func(t *testing.T) {
@@ -159,8 +162,27 @@ func TestPlannerRefusalNamesTheGrantAPlanNeeds(t *testing.T) {
 		err := plannerRefusal("billing", "invoices.sql", fmt.Errorf("look up table facts billing.invoices: %w", denied))
 		assert.True(t, engine.IsPlanRefused(err))
 		assert.ErrorIs(t, err, denied)
-		assert.EqualError(t, err, `plan PostgreSQL schema in "billing"/"invoices.sql": look up table facts billing.invoices: ERROR: permission denied for schema billing (SQLSTATE 42501); `+
-			`SchemaBot's role lacks the privilege this error names, so grant it to that role, then re-plan`)
+		assert.EqualError(t, err, `grant SchemaBot's role the privilege this error names, then re-plan: permission denied for schema billing (SQLSTATE 42501; file "billing"/"invoices.sql")`)
+	})
+
+	t.Run("a connection refused for a privilege shows the server's message alone", func(t *testing.T) {
+		denied := &pgconn.PgError{Severity: "FATAL", Code: "42501", Message: "permission denied for database app"}
+		err := plannerRefusal("billing", "invoices.sql", fmt.Errorf("failed to connect to `user=sb_planner database=app`: 10.0.0.7:5432 (db.internal.example): %w", denied))
+		assert.True(t, engine.IsPlanRefused(err))
+		assert.ErrorIs(t, err, denied)
+		assert.EqualError(t, err, `grant SchemaBot's role the privilege this error names, then re-plan: permission denied for database app (SQLSTATE 42501; file "billing"/"invoices.sql")`)
+	})
+
+	t.Run("the grant survives the inline clamp at the longest names", func(t *testing.T) {
+		schemaName := strings.Repeat("s", 63)
+		filename := strings.Repeat("f", 251) + ".sql"
+		privilege := &preflight.PrivilegeError{
+			Tier:  preflight.TierConnect,
+			Check: fmt.Sprintf("has_schema_privilege(sb_planner, %s, 'USAGE')", schemaName),
+			Grant: fmt.Sprintf(`GRANT USAGE ON SCHEMA "%s" TO "sb_planner"`, schemaName),
+		}
+		rendered := presentation.InlineError(plannerRefusal(schemaName, filename, privilege).Error())
+		assert.Contains(t, rendered, "then re-plan: "+privilege.Grant, "the remedy leads, so the clamp cuts only the file context")
 	})
 
 	t.Run("another server error is not a refusal", func(t *testing.T) {

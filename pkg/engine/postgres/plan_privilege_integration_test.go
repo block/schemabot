@@ -63,9 +63,7 @@ func TestEnginePlanRefusesWhatThePlanningRoleCannotRead(t *testing.T) {
 			"public":  {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text)"}},
 		})
 		assert.True(t, engine.IsPlanRefused(err), "%v", err)
-		assert.Contains(t, err.Error(), `plan PostgreSQL schema in "billing"/"invoices.sql": `)
-		assert.Contains(t, err.Error(), "permission denied for schema billing (SQLSTATE 42501)")
-		assert.Contains(t, err.Error(), "SchemaBot's role lacks the privilege this error names, so grant it to that role, then re-plan")
+		assert.EqualError(t, err, `grant SchemaBot's role the privilege this error names, then re-plan: permission denied for schema billing (SQLSTATE 42501; file "billing"/"invoices.sql")`)
 	})
 
 	t.Run("a table a foreign key references that the role cannot read", func(t *testing.T) {
@@ -86,8 +84,6 @@ func TestEnginePlanRefusesWhatThePlanningRoleCannotRead(t *testing.T) {
 			"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text)",
 		}}})
 		assert.True(t, engine.IsPlanRefused(err), "%v", err)
-		assert.Contains(t, err.Error(), `plan PostgreSQL schema in "public"/"users.sql": `)
-		assert.Contains(t, err.Error(), "permission denied for database "+database+" (SQLSTATE 42501)")
-		assert.Contains(t, err.Error(), "grant it to that role, then re-plan")
+		assert.EqualError(t, err, `grant SchemaBot's role the privilege this error names, then re-plan: permission denied for database `+database+` (SQLSTATE 42501; file "public"/"users.sql")`)
 	})
 }
