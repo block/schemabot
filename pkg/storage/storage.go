@@ -2330,6 +2330,14 @@ type ApplyLogStore interface {
 	// limit, or a limit above MaxApplyLogPurgeBatch, is an error and deletes
 	// nothing.
 	DeleteForSettledAppliesOlderThan(ctx context.Context, age time.Duration, limit int) (int64, error)
+
+	// CountForSettledAppliesOlderThan returns how many log entries
+	// DeleteForSettledAppliesOlderThan would be free to delete for the same age,
+	// with no limit: entries of applies settled more than age ago, measured on the
+	// database clock, that no driver holds a fresh lease on. It changes nothing,
+	// so a dry run can report what a purge would remove. An age that is not
+	// positive is an error.
+	CountForSettledAppliesOlderThan(ctx context.Context, age time.Duration) (int64, error)
 }
 
 // ControlRequestStore manages durable user control requests.

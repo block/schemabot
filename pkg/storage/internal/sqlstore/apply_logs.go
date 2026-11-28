@@ -222,11 +222,25 @@ func undrivenSettledApply(d Dialect) string {
 	return fmt.Sprintf("(a.lease_owner = '' OR a.updated_at < %s) AND %s", staleCutoff, undrivenApplyGateCorrelatedOn(d, "a.id"))
 }
 
+// settledApplyLogEligibility renders the test, on the apply aliased a, that
+// decides whether the log entries of an apply may be deleted: the apply is
+// settled, it completed more than age ago on the database clock, and no driver
+// holds a fresh lease on it. It returns the test and the settled states it
+// binds, in placeholder order. Deleting and counting both build their
+// statements from it, so a dry run reports what a real pass could delete.
+func settledApplyLogEligibility(d Dialect, age time.Duration) (string, []any) {
+	cutoff := d.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(age.Microseconds())), IntervalMicrosecond)
+	settled := settledApplyStates()
+	eligible := `a.state IN (` + placeholders(len(settled)) + `) AND a.completed_at < ` + cutoff + `
+		AND ` + undrivenSettledApply(d)
+	return eligible, stringArgs(settled)
+}
+
 // settledApplyLogPageQuery renders the statement that selects one page of apply
-// log ids belonging to settled applies older than the cutoff. It takes the
-// state placeholders and the database-clock cutoff expression, and the
-// undriven-apply test on the alias a, and binds the settled states, then the
-// page limit.
+// log ids belonging to applies that pass the eligibility test from
+// settledApplyLogEligibility, which supplies the settled states it binds. The
+// page limit is bound after them.
 //
 // The order is the parent apply's completed_at and nothing else, so both
 // databases read the page through the applies completed_at index and probe
@@ -236,13 +250,12 @@ func undrivenSettledApply(d Dialect) string {
 // including the logs of stopped and recent applies. Adding the apply id or the
 // log id after completed_at is no better: the index does not provide that order,
 // so MySQL would read and sort every matching log before it could apply the limit.
-func settledApplyLogPageQuery(settledIn, cutoff, undriven string) string {
+func settledApplyLogPageQuery(eligible string) string {
 	return `
 		SELECT l.id
 		FROM apply_logs l
 		JOIN applies a ON a.id = l.apply_id
-		WHERE a.state IN (` + settledIn + `) AND a.completed_at < ` + cutoff + `
-			AND ` + undriven + `
+		WHERE ` + eligible + `
 		ORDER BY a.completed_at
 		LIMIT ?
 	`
@@ -280,14 +293,10 @@ func (s *applyLogStore) DeleteForSettledAppliesOlderThan(ctx context.Context, ag
 		return 0, fmt.Errorf("delete apply logs of settled applies: limit %d is above the largest batch, %d", limit, storage.MaxApplyLogPurgeBatch)
 	}
 
-	cutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
-		LiteralIntervalAmount(uint64(age.Microseconds())), IntervalMicrosecond)
-	settled := settledApplyStates()
-	settledIn := placeholders(len(settled))
-	undriven := undrivenSettledApply(s.dialect)
+	eligible, eligibleArgs := settledApplyLogEligibility(s.dialect, age)
 
-	selectArgs := append(stringArgs(settled), limit)
-	rows, err := s.db.QueryContext(ctx, settledApplyLogPageQuery(settledIn, cutoff, undriven), selectArgs...)
+	selectArgs := append(slices.Clone(eligibleArgs), limit)
+	rows, err := s.db.QueryContext(ctx, settledApplyLogPageQuery(eligible), selectArgs...)
 	if err != nil {
 		return 0, fmt.Errorf("select apply logs of applies settled more than %s ago: %w", age, err)
 	}
@@ -310,17 +319,16 @@ func (s *applyLogStore) DeleteForSettledAppliesOlderThan(ctx context.Context, ag
 		s.afterPurgeSelect()
 	}
 
-	deleteArgs := make([]any, 0, len(ids)+len(settled))
+	deleteArgs := make([]any, 0, len(ids)+len(eligibleArgs))
 	deleteArgs = append(deleteArgs, ids...)
-	deleteArgs = append(deleteArgs, stringArgs(settled)...)
+	deleteArgs = append(deleteArgs, eligibleArgs...)
 	result, err := s.db.ExecContext(ctx, `
 		DELETE FROM apply_logs
 		WHERE id IN (`+placeholders(len(ids))+`)
 			AND EXISTS (
 				SELECT 1 FROM applies a
 				WHERE a.id = apply_logs.apply_id
-					AND a.state IN (`+settledIn+`) AND a.completed_at < `+cutoff+`
-					AND `+undriven+`
+					AND `+eligible+`
 			)
 	`, deleteArgs...)
 	if err != nil {
@@ -331,6 +339,31 @@ func (s *applyLogStore) DeleteForSettledAppliesOlderThan(ctx context.Context, ag
 		return 0, fmt.Errorf("read deleted apply logs rows affected: %w", err)
 	}
 	return deleted, nil
+}
+
+// CountForSettledAppliesOlderThan counts the log entries
+// DeleteForSettledAppliesOlderThan may delete for the same age, using the same
+// eligibility test, so a dry run reports what a real pass could remove. Like
+// the delete it starts from the applies that settled before the cutoff and
+// probes apply_logs by apply_id, so it never reads the entries of stopped or
+// recent applies.
+func (s *applyLogStore) CountForSettledAppliesOlderThan(ctx context.Context, age time.Duration) (int64, error) {
+	if age.Microseconds() <= 0 {
+		return 0, fmt.Errorf("count apply logs of settled applies: age must be positive, got %s", age)
+	}
+
+	eligible, eligibleArgs := settledApplyLogEligibility(s.dialect, age)
+	var count int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM apply_logs l
+		JOIN applies a ON a.id = l.apply_id
+		WHERE `+eligible+`
+	`, eligibleArgs...).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count apply logs of applies settled more than %s ago: %w", age, err)
+	}
+	return count, nil
 }
 
 // scanApplyLogs scans multiple apply log rows.
