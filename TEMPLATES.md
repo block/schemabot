@@ -518,6 +518,10 @@ schemabot apply -e staging
 
 *Started at 2026-03-15 14:30:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
+🔐 **`octocat` cannot run `schemabot apply` for `testapp`.** Only these teams and this user can. Ask one of them to run it:
+- Operators: `acme/testapp-operators`
+- Admins: `acme/db-admins`, `jdoe`
+
 ```sql
 CREATE TABLE `users` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
@@ -559,10 +563,6 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 schemabot apply -e staging
 ```
-
-🔐 Only these teams and this user can run `schemabot apply` for `testapp`. Ask one of them to run it:
-- Operators: `acme/testapp-operators`
-- Admins: `acme/db-admins`, `jdoe`
 
 </details>
 

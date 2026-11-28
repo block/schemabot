@@ -731,6 +731,18 @@ of a table with no schema file. Enum labels are checked separately; see
 The pinned pg-sprite version defines which shapes run, so upgrading pg-sprite
 can admit more without a SchemaBot change.
 
+pg-sprite refuses some changes outright, because PostgreSQL would fail them or
+they would break the table. The plan comment names the fix:
+
+| Change | Fix |
+|---|---|
+| Adds a `NOT NULL` column with no default to a table that holds rows | Give the column a default. Or add it nullable, fill every row, and declare `NOT NULL` in a later change, which SchemaBot runs online. |
+| Drops the index, key, or column the table's replica identity uses | Point `REPLICA IDENTITY` at another index outside SchemaBot. |
+| Drops with `CASCADE` | Drop each dependent object as its own change, and remove `CASCADE`. |
+| Retypes or drops a column that a view, policy, trigger, or generated column reads | Change or drop the objects the comment names first. |
+| Retypes or drops a column in a partition key | PostgreSQL never allows it. Create a new partitioned table with the new key and move the rows into it. |
+| Uses an operation with no safe path, such as an `EXCLUDE` constraint | Make the change outside SchemaBot. |
+
 When a plan is blocked:
 
 - The plan comment names each blocked table and the reason. A refused shape
