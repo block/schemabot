@@ -84,6 +84,7 @@ func assertDeleteForSettledAppliesOlderThan(t *testing.T, store storage.Storage,
 		{"negative age", -time.Hour, 10},
 		{"zero limit", retention, 0},
 		{"negative limit", retention, -1},
+		{"limit above the largest batch", retention, storage.MaxApplyLogPurgeBatch + 1},
 	} {
 		deleted, err := store.ApplyLogs().DeleteForSettledAppliesOlderThan(ctx, tc.age, tc.limit)
 		require.Error(t, err, tc.name)
@@ -96,9 +97,8 @@ func assertDeleteForSettledAppliesOlderThan(t *testing.T, store storage.Storage,
 	assert.Equal(t, 0, logCountOf(invalid))
 
 	const logsPerApply = 2
-	oldSettled := []string{
-		state.Apply.Completed, state.Apply.Failed, state.Apply.Cancelled, state.Apply.Reverted,
-	}
+	// Every settled state, so a state added to the list is purged here too.
+	oldSettled := state.SettledApplyStates
 	oldKept := []string{
 		state.Apply.Stopped, state.Apply.Running, state.Apply.FailedRetryable,
 	}
@@ -148,4 +148,40 @@ func assertDeleteForSettledAppliesOlderThan(t *testing.T, store storage.Storage,
 	for _, applyState := range oldKept {
 		assert.Equal(t, logsPerApply, logCountOf(oldKeptApplies[applyState]), "batching leaves the logs of an old %s apply alone", applyState)
 	}
+
+	// An apply settled long ago keeps its logs while a driver still holds a
+	// fresh lease on it: on a sibling operation, as under a rollout where one
+	// deployment's failure settled the apply, or on the apply itself.
+	liveSibling := seed("logs_live_sibling", state.Apply.Failed, &old, logsPerApply)
+	_, err = db.ExecContext(ctx, rebind(`
+		INSERT INTO apply_operations (apply_id, deployment, operation_key, state, lease_owner, lease_token)
+		VALUES (?, 'staging-b', 'op-live', ?, 'driver-b', 'op-token')`), liveSibling.ID, state.ApplyOperation.Running)
+	require.NoError(t, err)
+	liveParent := seed("logs_live_parent", state.Apply.Failed, &old, logsPerApply)
+	_, err = db.ExecContext(ctx, rebind(`UPDATE applies SET lease_owner = 'driver-a', lease_token = 'apply-token', updated_at = `+
+		dialect.CurrentTimestamp(TimestampPrecisionDefault)+` WHERE id = ?`), liveParent.ID)
+	require.NoError(t, err)
+	deleted, err = store.ApplyLogs().DeleteForSettledAppliesOlderThan(ctx, retention, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), deleted, "an apply a driver still leases keeps its logs")
+	assert.Equal(t, logsPerApply, logCountOf(liveSibling), "a live sibling operation's logs must survive")
+	assert.Equal(t, logsPerApply, logCountOf(liveParent), "a freshly leased apply's logs must survive")
+
+	// An apply claimed after the purge selected its entries keeps them: the
+	// delete checks the lease again.
+	claimedMidPurge := seed("logs_claimed_mid_purge", state.Apply.Completed, &old, logsPerApply)
+	purgedMidPurge := seed("logs_purged_mid_purge", state.Apply.Completed, &old, logsPerApply)
+	logStore := store.ApplyLogs().(*applyLogStore)
+	t.Cleanup(func() { logStore.afterPurgeSelect = nil })
+	logStore.afterPurgeSelect = func() {
+		logStore.afterPurgeSelect = nil
+		_, err := db.ExecContext(ctx, rebind(`UPDATE applies SET lease_owner = 'driver-c', lease_token = 'claim-token', updated_at = `+
+			dialect.CurrentTimestamp(TimestampPrecisionDefault)+` WHERE id = ?`), claimedMidPurge.ID)
+		require.NoError(t, err)
+	}
+	deleted, err = store.ApplyLogs().DeleteForSettledAppliesOlderThan(ctx, retention, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(logsPerApply), deleted, "only the apply nobody claimed loses its logs")
+	assert.Equal(t, 0, logCountOf(purgedMidPurge))
+	assert.Equal(t, logsPerApply, logCountOf(claimedMidPurge), "an apply claimed between the select and the delete keeps its logs")
 }
