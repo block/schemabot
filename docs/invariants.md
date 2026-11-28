@@ -2462,6 +2462,16 @@ The start request records the override that admitted it in `startControlRequestM
 (`pkg/api/control_handlers.go`). `StoppedByFreeze` (`pkg/api/freeze_stopped_by.go`) names the freeze
 for the progress response and the pull request comments.
 
+### AZ-13: A webhook delivery is acted on only when its signature verifies
+
+Every webhook delivery is verified against a secret configured for the App or repository webhook
+that sent it, before any handler runs. A delivery with no secret to verify against is refused,
+never accepted unsigned: nothing else can prove it came from the code host. Skipping verification
+takes an explicit opt-in on the handler, for tests and local harnesses, and the server never sets
+it. *Enforced:* `authenticateWebhook` (`pkg/webhook/handler.go`), with the opt-in
+`WithInsecureSkipSignatureVerification` and the server's startup refusal of an empty secret in
+`pkg/serve/serve.go`; `TestUnsignedDeliveryWithoutSecret` (`pkg/webhook/unsigned_delivery_test.go`).
+
 ## Structural enforcement
 
 The strongest invariants are enforced by structure, so regressions fail CI instead of review:

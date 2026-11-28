@@ -36,9 +36,10 @@ func TestWebhookIssueCommentIgnoresCommandOnListenOnlyRepository(t *testing.T) {
 		Repos: map[string]api.RepoConfig{"octocat/hello-world": {ListenOnly: true}},
 	}, nil, testLogger())
 	h := &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
-		logger:    testLogger(),
+		insecureSkipSignatureVerification: true,
+		service:                           service,
+		ghClients:                         ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:                            testLogger(),
 	}
 	drainWebhookWorkOnCleanup(t, h)
 
@@ -80,9 +81,10 @@ func listenOnlyCheckTestHandler(t *testing.T, headSHA string) (*Handler, chan st
 		Repos:               map[string]api.RepoConfig{"octocat/hello-world": {ListenOnly: true}},
 	}, nil, testLogger())
 	h := &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClientWithSlug(client, testLogger(), "schemabot")}),
-		logger:    testLogger(),
+		insecureSkipSignatureVerification: true,
+		service:                           service,
+		ghClients:                         ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClientWithSlug(client, testLogger(), "schemabot")}),
+		logger:                            testLogger(),
 	}
 	return h, lookups, writes
 }

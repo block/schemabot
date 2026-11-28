@@ -152,9 +152,10 @@ func TestWebhookEnvironmentFiltering(t *testing.T) {
 		}, nil, testLogger())
 
 		h := &Handler{
-			service:   service,
-			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
-			logger:    testLogger(),
+			insecureSkipSignatureVerification: true,
+			service:                           service,
+			ghClients:                         ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:                            testLogger(),
 		}
 
 		// Plan targeting production should be ignored by this instance because
@@ -191,9 +192,10 @@ func TestWebhookEnvironmentFiltering(t *testing.T) {
 		}, nil, testLogger())
 
 		h := &Handler{
-			service:   service,
-			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
-			logger:    testLogger(),
+			insecureSkipSignatureVerification: true,
+			service:                           service,
+			ghClients:                         ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:                            testLogger(),
 		}
 
 		// Plan for staging should proceed past the environment filter. It will fail
@@ -232,9 +234,10 @@ func TestWebhookEnvironmentFiltering(t *testing.T) {
 		}, nil, testLogger())
 
 		h := &Handler{
-			service:   service,
-			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
-			logger:    testLogger(),
+			insecureSkipSignatureVerification: true,
+			service:                           service,
+			ghClients:                         ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:                            testLogger(),
 		}
 
 		// Plan for production with no allowed_environments config should proceed
@@ -260,8 +263,9 @@ func TestTenantScopedWorkCommandRouting(t *testing.T) {
 		}, nil, testLogger())
 
 		h := &Handler{
-			service: service,
-			logger:  testLogger(),
+			insecureSkipSignatureVerification: true,
+			service:                           service,
+			logger:                            testLogger(),
 		}
 
 		req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -283,8 +287,9 @@ func TestTenantScopedWorkCommandRouting(t *testing.T) {
 		}, nil, testLogger())
 
 		h := &Handler{
-			service: service,
-			logger:  testLogger(),
+			insecureSkipSignatureVerification: true,
+			service:                           service,
+			logger:                            testLogger(),
 		}
 
 		req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -319,9 +324,10 @@ func TestTenantScopedWorkCommandRouting(t *testing.T) {
 		}, nil, testLogger())
 
 		h := &Handler{
-			service:   service,
-			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
-			logger:    testLogger(),
+			insecureSkipSignatureVerification: true,
+			service:                           service,
+			ghClients:                         ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:                            testLogger(),
 		}
 
 		req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -353,9 +359,10 @@ func TestTenantScopedWorkCommandRouting(t *testing.T) {
 		}, nil, testLogger())
 
 		h := &Handler{
-			service:   service,
-			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
-			logger:    testLogger(),
+			insecureSkipSignatureVerification: true,
+			service:                           service,
+			ghClients:                         ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:                            testLogger(),
 		}
 
 		req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -398,9 +405,10 @@ func TestTenantScopedWorkCommandRouting(t *testing.T) {
 			}, nil, testLogger())
 
 			h := &Handler{
-				service:   service,
-				ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
-				logger:    testLogger(),
+				insecureSkipSignatureVerification: true,
+				service:                           service,
+				ghClients:                         ghclient.NewSingleClientSet(defaultAppName, factory),
+				logger:                            testLogger(),
 			}
 
 			req := buildWebhookRequest(t, webhookPayloadOpts{comment: tc.comment, isPR: true}, nil)
@@ -426,8 +434,9 @@ func TestTenantScopedWorkCommandRouting(t *testing.T) {
 		}, nil, testLogger())
 
 		h := &Handler{
-			service: service,
-			logger:  testLogger(),
+			insecureSkipSignatureVerification: true,
+			service:                           service,
+			logger:                            testLogger(),
 		}
 
 		req := buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot rollback -e staging", isPR: true}, nil)
@@ -450,8 +459,9 @@ func TestRespondToUnscoped(t *testing.T) {
 		}, nil, testLogger())
 
 		h := &Handler{
-			service: service,
-			logger:  testLogger(),
+			insecureSkipSignatureVerification: true,
+			service:                           service,
+			logger:                            testLogger(),
 		}
 
 		req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -473,8 +483,9 @@ func TestRespondToUnscoped(t *testing.T) {
 		}, nil, testLogger())
 
 		h := &Handler{
-			service: service,
-			logger:  testLogger(),
+			insecureSkipSignatureVerification: true,
+			service:                           service,
+			logger:                            testLogger(),
 		}
 
 		req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -496,8 +507,9 @@ func TestRespondToUnscoped(t *testing.T) {
 		}, nil, testLogger())
 
 		h := &Handler{
-			service: service,
-			logger:  testLogger(),
+			insecureSkipSignatureVerification: true,
+			service:                           service,
+			logger:                            testLogger(),
 		}
 
 		req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -519,8 +531,9 @@ func TestRespondToUnscoped(t *testing.T) {
 		}, nil, testLogger())
 
 		h := &Handler{
-			service: service,
-			logger:  testLogger(),
+			insecureSkipSignatureVerification: true,
+			service:                           service,
+			logger:                            testLogger(),
 		}
 
 		req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -543,8 +556,9 @@ func TestRespondToUnscoped(t *testing.T) {
 		}, nil, testLogger())
 
 		h := &Handler{
-			service: service,
-			logger:  testLogger(),
+			insecureSkipSignatureVerification: true,
+			service:                           service,
+			logger:                            testLogger(),
 		}
 
 		req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -567,8 +581,9 @@ func TestRespondToUnscoped(t *testing.T) {
 		}, nil, testLogger())
 
 		h := &Handler{
-			service: service,
-			logger:  testLogger(),
+			insecureSkipSignatureVerification: true,
+			service:                           service,
+			logger:                            testLogger(),
 		}
 
 		req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -591,8 +606,9 @@ func TestRespondToUnscoped(t *testing.T) {
 		}, nil, testLogger())
 
 		h := &Handler{
-			service: service,
-			logger:  testLogger(),
+			insecureSkipSignatureVerification: true,
+			service:                           service,
+			logger:                            testLogger(),
 		}
 
 		req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -628,9 +644,10 @@ func TestRespondToUnscoped(t *testing.T) {
 		}, nil, testLogger())
 
 		h := &Handler{
-			service:   service,
-			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
-			logger:    testLogger(),
+			insecureSkipSignatureVerification: true,
+			service:                           service,
+			ghClients:                         ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:                            testLogger(),
 		}
 
 		req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -666,9 +683,10 @@ func TestRespondToUnscoped(t *testing.T) {
 		}, nil, testLogger())
 
 		h := &Handler{
-			service:   service,
-			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
-			logger:    testLogger(),
+			insecureSkipSignatureVerification: true,
+			service:                           service,
+			ghClients:                         ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:                            testLogger(),
 		}
 
 		req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -704,9 +722,10 @@ func TestRespondToUnscoped(t *testing.T) {
 		}, nil, testLogger())
 
 		h := &Handler{
-			service:   service,
-			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
-			logger:    testLogger(),
+			insecureSkipSignatureVerification: true,
+			service:                           service,
+			ghClients:                         ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:                            testLogger(),
 		}
 
 		req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -741,9 +760,10 @@ func TestRespondToUnscoped(t *testing.T) {
 		}, nil, testLogger())
 
 		h := &Handler{
-			service:   service,
-			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
-			logger:    testLogger(),
+			insecureSkipSignatureVerification: true,
+			service:                           service,
+			ghClients:                         ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:                            testLogger(),
 		}
 
 		req := buildWebhookRequest(t, webhookPayloadOpts{

@@ -148,10 +148,6 @@ type Handler struct {
 	// configured. Set by WithInsecureSkipSignatureVerification.
 	insecureSkipSignatureVerification bool
 
-	// unsignedDeliveryWarnOnce limits the "signature verification skipped"
-	// warning to one log line per Handler rather than one per delivery.
-	unsignedDeliveryWarnOnce sync.Once
-
 	durableWebhookDispatch      bool
 	durableWebhookDriverCount   int
 	durableWebhookPollInterval  time.Duration
@@ -281,8 +277,7 @@ func WithPreviousRepoWebhookSecret(secret []byte) HandlerOption {
 // accept unsigned deliveries when no webhook secret is configured. It is for
 // tests and local harnesses only; a deployment that receives deliveries from
 // GitHub must configure a webhook secret instead. Without a secret and without
-// this option, the handler still accepts unsigned deliveries today and logs a
-// warning, and a future release will refuse them.
+// this option, the handler refuses every delivery.
 func WithInsecureSkipSignatureVerification() HandlerOption {
 	return func(h *Handler) {
 		h.insecureSkipSignatureVerification = true
@@ -1416,18 +1411,12 @@ func (h *Handler) authenticateWebhook(r *http.Request, body []byte) (appName str
 	// Legacy single-App mode.
 	secret := h.webhookSecretsByApp[defaultAppName]
 	if len(secret) == 0 {
-		// No secret configured — preserve historical behaviour and skip
-		// signature verification entirely. The explicit opt-in skips silently;
-		// without it the handler warns once, since an embedder that built the
-		// handler with an unset secret is accepting forged deliveries.
+		// Without a secret nothing can prove a delivery came from GitHub, so
+		// the delivery is refused (AZ-13), the same answer multi-App mode gives
+		// an App with no secret. Only an explicit opt-in, for tests and local
+		// harnesses, accepts deliveries unsigned.
 		if !h.insecureSkipSignatureVerification {
-			h.unsignedDeliveryWarnOnce.Do(func() {
-				h.logger.Warn("webhook signature verification is skipped because no webhook secret is configured; "+
-					"set the webhook secret or pass WithInsecureSkipSignatureVerification to the webhook handler, "+
-					"as a future release will refuse unsigned deliveries",
-					"delivery_id", r.Header.Get(headerDeliveryID),
-					"event", r.Header.Get("X-GitHub-Event"))
-			})
+			return defaultAppName, 0, "missing_webhook_secret", false
 		}
 		return defaultAppName, 0, "", true
 	}
