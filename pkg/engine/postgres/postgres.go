@@ -1586,20 +1586,21 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 		if statement.Kind == schemadiff.ChangeSetGeneratedExpression {
 			return blocked(generatedExpressionRefusalReason(table))
 		}
-		reason, unknownReason, ok := operationRefusalReason(statement.Decisions, table)
+		reason, unknown, ok := operationRefusalReason(statement.Decisions, table)
 		if ok {
 			return blocked(reason)
 		}
 		refused := blocked(fmt.Sprintf("statement for table %q is refused: it cannot be executed safely as written", table))
 		// An absent cause is a refusal from outside the create path and an
 		// absent refused decision leaves nothing to name, so the generic
-		// sentence is the right one; only a cause or a refusal reason the
-		// mapping has no sentence for is vocabulary that moved.
+		// sentence is the right one; only a cause, a refusal reason, or a
+		// dependent fix the mapping has no sentence for is vocabulary that
+		// moved.
 		switch {
 		case statement.Cause != "":
 			refused.unrecognized = &unrecognizedPlannerVocabulary{kind: "create_shape_cause", value: string(statement.Cause)}
-		case unknownReason != "":
-			refused.unrecognized = &unrecognizedPlannerVocabulary{kind: "refusal_reason", value: string(unknownReason)}
+		case unknown != nil:
+			refused.unrecognized = unknown
 		}
 		return refused
 	case router.DispositionExecute:
