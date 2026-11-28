@@ -2917,6 +2917,66 @@ func TestLocalClient_ProcessPendingStartControlRequestStartsDeferredDeploy(t *te
 	assert.Nil(t, startReq)
 }
 
+// An operator starts a deferred deploy and the engine refuses it permanently,
+// retiring the change so nothing can deploy it later. The apply fails with the
+// refusal, as it does when the automatic start is refused, rather than staying
+// waiting for the next poll to read the retired change as a cancel nobody
+// asked for, and the start request fails with the same refusal.
+func TestLocalClient_ProcessPendingStartControlRequestFailsApplyOnPermanentRefusal(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              123,
+		ApplyIdentifier: "apply-refused-start",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.WaitingForDeploy,
+	}
+	task := &storage.Task{
+		ID:             456,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-refused-start",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.WaitingForDeploy,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:starter",
+	}}}
+	eng := &retiredThenRefusedEngine{&fakeControlEngine{progressResult: &engine.ProgressResult{State: engine.StateWaitingForDeploy}}}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            &mockApplyLogStore{},
+			controlRequests: controlRequests,
+		},
+		spiritEngine: eng,
+		logger:       slog.Default(),
+	}
+
+	handled, err := client.processPendingStartControlRequest(t.Context(), apply, apply.GetOptions().Map(), false)
+
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, 1, eng.startCount)
+	assert.Equal(t, 1, eng.progressCalls, "the drive reads progress once to confirm nothing started")
+	assert.Equal(t, state.Apply.Failed, apply.State)
+	assert.Equal(t, "deploy could not start: deploy request #9 needs approval; turn off approvals, then run a new plan and apply.", apply.ErrorMessage)
+	assert.Equal(t, state.Task.Failed, task.State)
+	startReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.Nil(t, startReq, "the start request is no longer pending")
+}
+
 func TestLocalClient_StartQueuesOwnerRequest(t *testing.T) {
 	apply := &storage.Apply{
 		ID:              123,
