@@ -66,9 +66,29 @@ The rules above apply to lifecycle commands in the terminal too: a `stop` or `cu
 
 A terminal `unlock --force` is the same decision as the `unlock --force` comment in the never-post list: never run it. The CLI asks the person to confirm before it takes another owner's lock, in `apply --force` as well, and `-y` or `--auto-approve` skips that question. Never add either flag to answer for them.
 
-A watching `progress` is not read-only: its keys stop or cancel the apply, run its cutover, or close the revert window. To follow an apply, use `status` or `progress --no-watch`, which print once and exit.
+A watching `progress` is not read-only: its keys stop or cancel the apply, run its cutover, or close the revert window. To follow an apply, use `status`, `progress --no-watch`, or `progress --json`, which print once and exit.
 
 The CLI also has commands with no PR comment form, which change SchemaBot for every team on the server rather than one change: `freeze`, `unfreeze`, `settings` given a value, `checks backfill`, and the `storage` commands other than `storage plan`. They are for SchemaBot's operators. Hand them over, in every environment. Their read-only forms, such as `freeze list`, `settings` with no value, `checks show`, and `storage plan`, you can run.
+
+## When SchemaBot blocks or refuses a change
+
+Stop. Never get past a refusal by repeating the command, adding a flag, or trying another environment, deployment, or credential. Do take the recovery the refusal itself names, such as posting the command again after reviewing a newer plan, under the rest of this policy. A temporary failure, such as a `503` while SchemaBot checks for freezes, is not a refusal: retry it with backoff. [Refusals, blocks, and failures](refusals-and-failures.md) tells them apart.
+
+- Tell the user the reason SchemaBot gave, in its words. For a freeze, say which freeze holds the change, why, and when it ends.
+- When the reason names a safe form of the change, rewrite the schema files into it, plan again, and show the user the new plan.
+- When the reason names only the statement that was refused, as a Vitess rejection does, propose a rewrite and make it only once the user agrees. Then plan again and show the user the new plan.
+- When no safe form exists, such as a PostgreSQL column type change that rewrites the table, say so. That change needs a separately reviewed process that a person runs.
+- A `403` means the account lacks a permission. Say which one. A `401` means the token is missing, expired, or invalid, so the user needs to log in again or fix their token, not change their access. In either case, never try other credentials or turn off authentication.
+
+You may run `freeze list` and `freeze show` to check on a freeze.
+
+## Never act outside SchemaBot
+
+Every change goes through SchemaBot, so it is planned, reviewed, and recorded. Never change the database another way, in any environment. Give the user the command instead.
+
+- Never run DDL against the database or cluster yourself.
+- On PostgreSQL, never drop an invalid index, cancel a backend, or run the `GRANT` a refusal names. A failed index build can leave an invalid index behind; the next apply removes it once it proves no build still holds it. Dropping it by hand can race a build the server is still running.
+- On Vitess, never act in the PlanetScale console: do not delete a branch, or approve or revert a deploy request.
 
 ## The user can opt out
 

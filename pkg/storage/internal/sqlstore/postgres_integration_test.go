@@ -100,6 +100,17 @@ func TestPostgresStorageParity(t *testing.T) {
 			return NewPostgres(h.db)
 		}, postgresLockWaiter(h.db))
 	})
+	t.Run("ApplyCreateQueuedBehindReleaseSeesLockIntentChanged", func(t *testing.T) {
+		testApplyCreateQueuedBehindReleaseSeesLockIntentChanged(t, func(t *testing.T, classifier ErrorClassifier) *Storage {
+			t.Helper()
+			clearPostgresTables(t, h.db)
+			dialect := PostgresDialect{}
+			return NewWithDependencies(Dependencies{
+				DB: h.db, Binder: dialect, Dialect: dialect, Identity: dialect,
+				Locker: namedlock.Postgres{}, Classifier: classifier,
+			})
+		}, NewPostgresErrorClassifier(), postgresLockWaiter(h.db), 1)
+	})
 	t.Run("StoppedApplyStartRacingItsTakeover", func(t *testing.T) {
 		testStoppedApplyStartRacingItsTakeover(t, func(t *testing.T) *Storage {
 			t.Helper()
@@ -1296,6 +1307,72 @@ func TestPostgresPurgeKeepsNewestCoveringRow(t *testing.T) {
 	clearPostgresTables(t, db)
 
 	assertPurgeKeepsNewestCoveringRow(t, NewPostgres(db), db, PostgresDialect{}, PostgresDialect{}.Rebind)
+}
+
+// A redelivery reopens an old finished row while a purge's DELETE is waiting
+// for that row's lock, and commits first. PostgreSQL then re-reads only the
+// reopened row itself against the DELETE's conditions, not the rows its
+// subquery chose them from, so the DELETE must test the row's own state and
+// age to keep an acknowledged delivery from being deleted (AV-7).
+func TestPostgresPurgeKeepsARowReopenedWhileTheDeleteWaits(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_webhook_purge_reopen")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+	clearPostgresTables(t, db)
+	store := NewPostgres(db)
+	ctx := t.Context()
+
+	const deliveryID = "reopened-during-delete"
+	_, err = store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
+		DeliveryID: deliveryID, Event: "push", Repository: "block/example", Payload: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, `UPDATE webhook_events SET state = $1, received_at = now() - interval '40 days' WHERE delivery_id = $2`,
+		storage.WebhookEventCompleted, deliveryID)
+	require.NoError(t, err)
+
+	reopen, err := db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopen.Rollback() })
+	_, err = reopen.ExecContext(ctx, `UPDATE webhook_events SET state = $1, received_at = now() WHERE delivery_id = $2`,
+		storage.WebhookEventPending, deliveryID)
+	require.NoError(t, err)
+
+	type purgeResult struct {
+		deleted int64
+		err     error
+	}
+	purged := make(chan purgeResult, 1)
+	go func() {
+		deleted, err := store.WebhookEvents().DeleteTerminalOlderThan(ctx, 30*24*time.Hour, 100)
+		purged <- purgeResult{deleted, err}
+	}()
+	require.Eventually(t, func() bool {
+		var waiting int
+		if err := db.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM pg_stat_activity
+			WHERE wait_event_type = 'Lock' AND query LIKE '%DELETE FROM webhook_events%'`).Scan(&waiting); err != nil {
+			return false
+		}
+		return waiting > 0
+	}, 15*time.Second, 25*time.Millisecond, "the purge's DELETE waits on the reopened row's lock")
+	require.NoError(t, reopen.Commit())
+
+	var result purgeResult
+	select {
+	case result = <-purged:
+	case <-time.After(15 * time.Second):
+		require.FailNow(t, "the purge did not return after the reopen committed")
+	}
+	require.NoError(t, result.err)
+	assert.Equal(t, int64(0), result.deleted, "the reopened row is no longer old or finished")
+	event, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, deliveryID)
+	require.NoError(t, err)
+	require.NotNil(t, event, "a row reopened while the delete waited must survive")
+	assert.Equal(t, storage.WebhookEventPending, event.State)
 }
 
 func applyPostgresTestSchema(t *testing.T, db *sql.DB) {

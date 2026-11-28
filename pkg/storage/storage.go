@@ -516,7 +516,9 @@ type FreezeListing struct {
 	// Current holds the freezes in effect or scheduled at Now, oldest start
 	// first.
 	Current []*EnvironmentFreeze
-	// Recent holds the most recent freezes of any state, newest start first.
+	// Recent holds the most recent freezes that have ended, lifted or past
+	// their end at Now, newest start first. It never repeats one in Current,
+	// so a limit on it is spent only on ended freezes.
 	Recent []*EnvironmentFreeze
 }
 

@@ -186,59 +186,11 @@ func leaveDeployRequestOfUnknownDeployOutcome(logger *slog.Logger, org, database
 // that ended by then abandons it rather than sending it.
 func (e *Engine) retireDeployRequestOfFailedApply(ctx context.Context, logger *slog.Logger, client psclient.PSClient, org, database string, number uint64, ownedBranch string, cause error) {
 	attrs := []any{"organization", org, "planetscale_database", database, "deploy_request", number, "branch", ownedBranch, "apply_error", cause}
-	closeCtx, cancel := context.WithTimeout(ctx, deployRequestCloseTimeout)
-	defer cancel()
-
-	dr, err := e.getDeployRequest(closeCtx, client, org, database, number)
-	if ctx.Err() != nil {
-		logger.Warn("drive ended while reading the deploy request; stopping the cleanup of a failed apply's deploy request and leaving the deploy request and branch to the driver that takes over the apply",
-			append(attrs, "error", ctx.Err())...)
+	if err := e.closeUndeployedDeployRequestOfFailedApply(ctx, logger, client, org, database, number, attrs); err != nil {
+		// The close logged why the deploy request was left in place, and the
+		// branch stays with it: deleting the branch is only safe once the
+		// deploy request is closed and never deployed.
 		return
-	}
-	if err != nil {
-		logger.Error("failed to read the deploy request of a failed apply; close it manually if it never deployed, and delete its branch to reclaim branch quota",
-			append(attrs, "error", err)...)
-		return
-	}
-	if !deployRequestNeverDeployed(dr) {
-		logger.Error("the deploy request of a failed apply reports a deploy may have begun; the apply is being failed over a deploy that may now be running, so the deploy request and its branch are left in place; "+reconcileDeployOfFailedApply,
-			append(attrs, "deployment_state", dr.DeploymentState, "deployed_at", formatDeployedAt(dr.DeployedAt))...)
-		return
-	}
-	if dr.State == deployRequestClosed {
-		logger.Info("the deploy request of a failed apply was already closed before it deployed", attrs...)
-	} else {
-		closed, closeErr := client.CloseDeployRequest(closeCtx, &ps.CloseDeployRequestRequest{
-			Organization: org,
-			Database:     database,
-			Number:       number,
-		})
-		if ctx.Err() != nil {
-			endedAttrs := append(slices.Clone(attrs), "error", ctx.Err())
-			if closeErr != nil {
-				endedAttrs = append(endedAttrs, "close_error", closeErr)
-			}
-			logger.Warn("drive ended while closing the deploy request of a failed apply; the close may already have landed; leaving the branch to the driver that takes over the apply",
-				endedAttrs...)
-			return
-		}
-		if closeErr != nil {
-			logger.Error("failed to close the undeployed deploy request of a failed apply; close it manually, and delete its branch to reclaim branch quota",
-				append(attrs, "deployment_state", dr.DeploymentState, "error", closeErr)...)
-			return
-		}
-		if closed == nil {
-			logger.Error("closing the undeployed deploy request of a failed apply returned no deploy request; check it is closed, and delete its branch to reclaim branch quota",
-				attrs...)
-			return
-		}
-		if !deployRequestNeverDeployed(closed) {
-			logger.Error("closing the deploy request of a failed apply reported a deploy began after the cleanup read it; the apply is being failed over a deploy that may now be running, so its branch is left in place; "+reconcileDeployOfFailedApply,
-				append(attrs, "deployment_state", closed.DeploymentState, "deployed_at", formatDeployedAt(closed.DeployedAt))...)
-			return
-		}
-		logger.Info("closed the undeployed deploy request of a failed apply",
-			append(attrs, "deployment_state", dr.DeploymentState)...)
 	}
 	if ownedBranch == "" {
 		logger.Info("the failed apply ran on an operator-supplied branch; keeping it for the operator", attrs...)
@@ -257,6 +209,96 @@ func (e *Engine) retireDeployRequestOfFailedApply(ctx context.Context, logger *s
 	default:
 		logger.Info("deleted the branch of a failed apply after closing its undeployed deploy request", attrs...)
 	}
+}
+
+// closeUndeployedDeployRequestOfFailedApply closes a deploy request this
+// engine created for an apply that is failing, when the deploy request
+// provably never deployed, so it cannot be deployed from the PlanetScale UI
+// after SchemaBot reported the apply failed. The deploy request is re-read
+// first and closed only when it reads as never deployed, and the close
+// response must read that way too.
+//
+// It returns nil once the deploy request is closed and never deployed,
+// whether this call closed it or it was already closed. Otherwise the deploy
+// request was left in place: the reason is logged on logger with attrs, the
+// caller's triage identifiers, and returned. When it was left in place because
+// PlanetScale reports its deploy may have begun, the error is a
+// *deployMayHaveBegunError. ctx is the drive's context; see
+// retireDeployRequestOfFailedApply for why nothing further is issued once it
+// ends.
+func (e *Engine) closeUndeployedDeployRequestOfFailedApply(ctx context.Context, logger *slog.Logger, client psclient.PSClient, org, database string, number uint64, attrs []any) error {
+	closeCtx, cancel := context.WithTimeout(ctx, deployRequestCloseTimeout)
+	defer cancel()
+
+	dr, err := e.getDeployRequest(closeCtx, client, org, database, number)
+	if ctx.Err() != nil {
+		logger.Warn("drive ended while reading the deploy request; stopping the cleanup of a failed apply's deploy request and leaving the deploy request and branch to the driver that takes over the apply",
+			append(slices.Clone(attrs), "error", ctx.Err())...)
+		return fmt.Errorf("drive ended while reading deploy request #%d: %w", number, ctx.Err())
+	}
+	if err != nil {
+		logger.Error("failed to read the deploy request of a failed apply; close it manually if it never deployed, and delete its branch to reclaim branch quota",
+			append(slices.Clone(attrs), "error", err)...)
+		return fmt.Errorf("read deploy request #%d before closing it: %w", number, err)
+	}
+	if dr == nil {
+		logger.Error("reading the deploy request of a failed apply returned no deploy request; close it manually if it never deployed, and delete its branch to reclaim branch quota",
+			attrs...)
+		return fmt.Errorf("read deploy request #%d before closing it returned no deploy request", number)
+	}
+	if !deployRequestNeverDeployed(dr) {
+		logger.Error("the deploy request of a failed apply reports a deploy may have begun; the apply is being failed over a deploy that may now be running, so the deploy request and its branch are left in place; "+reconcileDeployOfFailedApply,
+			append(slices.Clone(attrs), "deployment_state", dr.DeploymentState, "deployed_at", formatDeployedAt(dr.DeployedAt))...)
+		return &deployMayHaveBegunError{msg: fmt.Sprintf("deploy request #%d reports a deploy may have begun (deployment state %q), so it was not closed", number, dr.DeploymentState)}
+	}
+	if dr.State == deployRequestClosed {
+		logger.Info("the deploy request of a failed apply was already closed before it deployed", attrs...)
+		return nil
+	}
+	closed, closeErr := client.CloseDeployRequest(closeCtx, &ps.CloseDeployRequestRequest{
+		Organization: org,
+		Database:     database,
+		Number:       number,
+	})
+	if ctx.Err() != nil {
+		endedAttrs := append(slices.Clone(attrs), "error", ctx.Err())
+		if closeErr != nil {
+			endedAttrs = append(endedAttrs, "close_error", closeErr)
+		}
+		logger.Warn("drive ended while closing the deploy request of a failed apply; the close may already have landed; leaving the branch to the driver that takes over the apply",
+			endedAttrs...)
+		return fmt.Errorf("drive ended while closing deploy request #%d: %w", number, ctx.Err())
+	}
+	if closeErr != nil {
+		logger.Error("failed to close the undeployed deploy request of a failed apply; close it manually, and delete its branch to reclaim branch quota",
+			append(slices.Clone(attrs), "deployment_state", dr.DeploymentState, "error", closeErr)...)
+		return fmt.Errorf("close deploy request #%d: %w", number, closeErr)
+	}
+	if closed == nil {
+		logger.Error("closing the undeployed deploy request of a failed apply returned no deploy request; check it is closed, and delete its branch to reclaim branch quota",
+			attrs...)
+		return fmt.Errorf("close deploy request #%d returned no deploy request", number)
+	}
+	if !deployRequestNeverDeployed(closed) {
+		logger.Error("closing the deploy request of a failed apply reported a deploy began after the cleanup read it; the apply is being failed over a deploy that may now be running, so its branch is left in place; "+reconcileDeployOfFailedApply,
+			append(slices.Clone(attrs), "deployment_state", closed.DeploymentState, "deployed_at", formatDeployedAt(closed.DeployedAt))...)
+		return &deployMayHaveBegunError{msg: fmt.Sprintf("closing deploy request #%d reported a deploy began (deployment state %q)", number, closed.DeploymentState)}
+	}
+	logger.Info("closed the undeployed deploy request of a failed apply",
+		append(slices.Clone(attrs), "deployment_state", dr.DeploymentState)...)
+	return nil
+}
+
+// deployMayHaveBegunError reports that the deploy request of a failed apply
+// was left open because PlanetScale reports its deploy may have begun. Closing
+// it would be the wrong advice to an operator, so callers word this case on
+// its own.
+type deployMayHaveBegunError struct {
+	msg string
+}
+
+func (e *deployMayHaveBegunError) Error() string {
+	return e.msg
 }
 
 var _ engine.CancelledResumeStateReclaimer = (*Engine)(nil)

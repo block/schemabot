@@ -773,6 +773,8 @@ uses the target database dialect and preserves quoted names and values. If
 without choosing another dialect.
 
 While an apply runs, `GET /api/progress/apply/{apply_id}` is the live view.
+`schemabot progress <apply_id> --json` prints one snapshot of the same
+document and never opens the interactive watcher.
 Table entries identify the DDL and task state. Available metrics depend on the
 engine and execution phase: copying can report rows and percent complete;
 `eta_seconds` is an estimate and may be omitted. Do not interpret an absent ETA
@@ -2617,6 +2619,9 @@ Response excerpt (illustrative values):
   ]
 }
 ```
+
+`schemabot locks --json` prints the same document. With no locks held,
+`locks` is an empty list.
 
 </details>
 
