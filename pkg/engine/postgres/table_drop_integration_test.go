@@ -299,3 +299,51 @@ func TestEngineApplyDropsATableWhoseLastReferenceThePlanDrops(t *testing.T) {
 		})
 	}
 }
+
+// An operator deletes the schema file of a table while a kept table's file
+// still declares a foreign key that references it: the key unchanged,
+// replaced under its name, or new. The kept table references the table once
+// the plan's other steps run, so PostgreSQL would refuse its drop, and the
+// plan blocks the drop and names the file to change instead.
+func TestEnginePlanBlocksATableDropADeclaredForeignKeyReferences(t *testing.T) {
+	for _, tt := range []struct{ name, live, orders string }{
+		{
+			name:   "the key is unchanged",
+			live:   "CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint REFERENCES public.users (id))",
+			orders: "CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint REFERENCES users (id))",
+		},
+		{
+			name:   "the key is replaced under its name",
+			live:   "CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint REFERENCES public.users (id))",
+			orders: "CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint REFERENCES users (id) ON DELETE CASCADE)",
+		},
+		{
+			name:   "the key is new",
+			live:   "CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint)",
+			orders: "CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint REFERENCES users (id))",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dsn, db := testutil.StartPostgres(t, "table_drop_declared_reference")
+			_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY); "+tt.live)
+			require.NoError(t, err)
+
+			result, err := New().Plan(t.Context(), &engine.PlanRequest{
+				Database:    "app",
+				SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{"orders.sql": tt.orders}}},
+				Credentials: &engine.Credentials{DSN: dsn},
+			})
+			require.NoError(t, err)
+			require.Len(t, result.Changes, 1)
+			var usersDrop *engine.TableChange
+			for i, change := range result.Changes[0].TableChanges {
+				if change.Table == "users" {
+					usersDrop = &result.Changes[0].TableChanges[i]
+				}
+			}
+			require.NotNil(t, usersDrop, "the undeclared table is planned as a drop")
+			assert.Equal(t, engine.ExecutionModeBlocked, usersDrop.ExecutionMode)
+			assert.Contains(t, usersDrop.ModeReason, `the schema file(s) of table(s) "orders" declare a foreign key that references it, so PostgreSQL refuses to drop it`)
+		})
+	}
+}

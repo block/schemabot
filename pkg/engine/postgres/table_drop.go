@@ -283,6 +283,13 @@ func keptReferenceDropReason(refs []string) string {
 		" — remove those constraints or their tables' schema files too and plan again, or declare the table in a schema file"
 }
 
+func declaredReferenceDropReason(tables []string) string {
+	sorted := slices.Clone(tables)
+	slices.Sort(sorted)
+	return fmt.Sprintf("the schema file(s) of table(s) %s declare a foreign key that references it, so PostgreSQL refuses to drop it", strings.Join(quoteAll(slices.Compact(sorted)), ", ")) +
+		" — remove those foreign keys from the files and plan again, or declare the table in a schema file"
+}
+
 func otherNamespaceReferenceDropReason(refs []string) string {
 	return fmt.Sprintf("foreign key constraint(s) %s in other namespaces reference it, and drops in different namespaces have no guaranteed order", strings.Join(quoteAll(refs), ", ")) +
 		" — drop those constraints or their tables first, then plan again, or declare the table in a schema file"

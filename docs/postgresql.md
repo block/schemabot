@@ -910,6 +910,7 @@ plan Check Run fails:
 |---|---|
 | Partitioned, a partition's parent, or in an inheritance hierarchy | The drop reaches tables or rows the plan does not show |
 | Referenced by a foreign key of a table that stays | PostgreSQL refuses the drop without `CASCADE` |
+| Referenced by a foreign key a schema file declares, whether the key is live, changed in the same plan, or new | The key references the table once the plan's other steps run |
 | Referenced by a foreign key in another namespace | Drops in different namespaces have no guaranteed order |
 | Read by a view, a function, a policy, or another object that stays, including another table's default that draws from its sequence | PostgreSQL refuses the drop without `CASCADE` |
 | Owned by a role the engine role cannot act as | Only a table's owner can drop it. The reason gives the grant to run |

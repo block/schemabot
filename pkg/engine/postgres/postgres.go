@@ -365,6 +365,11 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		schemaChange := engine.SchemaChange{Namespace: namespace}
 		files := sortedKeys(ns.Files)
 		desiredTables := make(map[string]bool, len(files))
+		// declaredReferrers names, per table, the declared tables whose
+		// schema file has a foreign key referencing it. Such a table stays
+		// referenced after the plan, whatever the live keys look like, so
+		// the plan never drops it.
+		declaredReferrers := map[string][]string{}
 		// rowSecurityTables are the tables whose file declares row security,
 		// so the rollback baseline declares their live row security too, even
 		// when the live table has none.
@@ -417,6 +422,9 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 				if !ok {
 					return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: the parse admitted no planner input", namespace, filename)
 				}
+				for _, referenced := range desired.ReferencedTables() {
+					declaredReferrers[referenced] = append(declaredReferrers[referenced], desired.Table())
+				}
 				if err := removedRowSecurity.check(ctx, desired.Table()); err != nil {
 					return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
 				}
@@ -463,7 +471,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		if err != nil {
 			return nil, fmt.Errorf("read the constraint drops planned in namespace %q: %w", namespace, err)
 		}
-		drops, exempt, withheld, err := undeclaredTableDrops(ctx, pool, req.Database, namespace, desiredTables, droppedConstraints, ignored, parser)
+		drops, exempt, withheld, err := undeclaredTableDrops(ctx, pool, req.Database, namespace, desiredTables, declaredReferrers, droppedConstraints, ignored, parser)
 		if err != nil {
 			return nil, fmt.Errorf("compare live tables against schema files in namespace %q: %w", namespace, err)
 		}
@@ -1220,7 +1228,7 @@ func concurrentIndexDropStatement(sql string) (bool, error) {
 // schema files. The naming convention is the per-table exemption;
 // ignore_namespaces is the per-namespace one. Each exempt table is logged
 // and returned on the plan so the PR comment discloses what the plan skipped.
-func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, namespace string, declared map[string]bool, droppedConstraints map[string]map[string]bool, ignored engine.IgnoredTables, parser ddl.StatementParser) ([]engine.TableChange, []string, []string, error) {
+func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, namespace string, declared map[string]bool, declaredReferrers map[string][]string, droppedConstraints map[string]map[string]bool, ignored engine.IgnoredTables, parser ddl.StatementParser) ([]engine.TableChange, []string, []string, error) {
 	// ListManagedTables omits partitions, which follow their parent, and
 	// extension-owned tables, which belong to their extension: no file can
 	// declare either, and the server refuses to drop an extension's table.
@@ -1270,6 +1278,12 @@ func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, nam
 		models[name] = m
 		if refused[name], err = tableDropRefusals(ctx, pool, namespace, name); err != nil {
 			return nil, nil, nil, err
+		}
+		// A foreign key a schema file declares references the table after
+		// the plan, whether the key is live, replaced in the plan, or new, so
+		// PostgreSQL would refuse the drop once the plan's other changes ran.
+		if referrers := declaredReferrers[name]; len(referrers) > 0 {
+			refused[name] = append(refused[name], declaredReferenceDropReason(referrers))
 		}
 	}
 	plan := planTableDrops(namespace, models, refused)
