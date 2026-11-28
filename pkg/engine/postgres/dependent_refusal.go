@@ -85,8 +85,16 @@ func recreatableDependentsCause(d planner.Decision, named string, n int) string 
 		return fmt.Sprintf("it changes the type of a column that %s %s, which SchemaBot cannot run yet; the change does not rewrite the table, so outside SchemaBot, through a separately reviewed process, drop %s, change the column, and recreate %s in one transaction, which never leaves the table without %s",
 			named, reads, them, them, them)
 	case planner.DependentFixExpandContract:
-		return fmt.Sprintf("it changes the type of a column that %s %s, and the change rewrites the table, which SchemaBot cannot run yet; add a column of the new type instead, backfill it, point %s at the new column, and drop the old column, each as its own change",
-			named, reads, them)
+		where := ""
+		switch {
+		case len(d.DependentTriggers) == 0:
+		case len(d.DependentPolicies) == 0:
+			where = " outside SchemaBot"
+		default:
+			where = " (the policies in the schema file, the triggers outside SchemaBot)"
+		}
+		return fmt.Sprintf("it changes the type of a column that %s %s, and the change rewrites the table, which SchemaBot cannot run yet; add a column of the new type instead, backfill it, point %s at the new column%s, and drop the old column, each as its own change",
+			named, reads, them, where)
 	}
 	slog.Warn("planner names a dependent fix with no sentence; rendering the generic one", "dependent_fix", string(d.DependentFix))
 	return fmt.Sprintf("it changes or drops a column that %s %s, which SchemaBot cannot run yet; make the change outside SchemaBot through a separately reviewed process",
