@@ -1813,7 +1813,7 @@ func TestClassifyApplyFailureMissingGrant(t *testing.T) {
 }
 
 // A statement the server refuses because other objects depend on what it
-// drops or retypes, such as a column a publication names, ends the apply at
+// drops, such as a column a publication names, ends the apply at
 // once: the dependency stays until someone removes it, so retrying cannot
 // clear it. The detail names the dependents the server lists, on one line
 // and cut when the list runs long, since the owner cannot read the server
@@ -1830,7 +1830,7 @@ func TestClassifyApplyFailureDependentObjects(t *testing.T) {
 	t.Run("names the dependents", func(t *testing.T) {
 		failure := classifyApplyFailure(refusal("publication of table orders in publication orders_pub depends on column amt of table orders\nview order_totals depends on column amt of table orders"), "orders", nil)
 		assert.False(t, failure.retryable, "the dependency stays until someone removes it")
-		assert.Equal(t, `other objects depend on what the statement on "orders" drops or retypes: publication of table orders in publication orders_pub depends on column amt of table orders view order_totals depends on column amt of table orders; remove the dependency, then apply again`, failure.detail)
+		assert.Equal(t, `other objects depend on what the statement on "orders" drops: publication of table orders in publication orders_pub depends on column amt of table orders, view order_totals depends on column amt of table orders; remove the dependency, then apply again`, failure.detail)
 	})
 
 	t.Run("cuts a long list", func(t *testing.T) {
@@ -1842,7 +1842,7 @@ func TestClassifyApplyFailureDependentObjects(t *testing.T) {
 	t.Run("points at the server log without a list", func(t *testing.T) {
 		failure := classifyApplyFailure(refusal(""), "orders", nil)
 		assert.False(t, failure.retryable)
-		assert.Equal(t, `other objects depend on what the statement on "orders" drops or retypes, such as a publication that names the column; the server log names them; remove the dependency, then apply again`, failure.detail)
+		assert.Equal(t, `other objects depend on what the statement on "orders" drops, such as a publication that names the column; the server log names them; remove the dependency, then apply again`, failure.detail)
 	})
 }
 
@@ -1860,8 +1860,8 @@ func TestCatalogErrorLogAttrs(t *testing.T) {
 		"server_hint", `Use DROP ... CASCADE to drop the dependent objects too.`,
 	}, catalogErrorLogAttrs(dependents))
 
-	grant := &pgconn.PgError{Code: "42501", Detail: "", Hint: ""}
-	assert.Equal(t, []any{"server_detail", "", "server_hint", ""}, catalogErrorLogAttrs(grant))
+	grant := &pgconn.PgError{Code: "42501"}
+	assert.Empty(t, catalogErrorLogAttrs(grant), "a refusal with no DETAIL or HINT logs neither")
 
 	duplicate := &pgconn.PgError{Code: "23505", Detail: `Key (email)=(ada@example.com) is duplicated.`}
 	assert.Nil(t, catalogErrorLogAttrs(duplicate))

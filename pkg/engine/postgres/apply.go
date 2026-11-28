@@ -701,9 +701,9 @@ func classifyApplyFailure(err error, table string, validates *schemadiff.Constra
 	if detail, ok := duplicateKeyDetail(err, table); ok {
 		return applyFailure{detail: detail}
 	}
-	// An object that depends on what the statement drops or retypes keeps
-	// depending on it until someone changes that object, so a retry meets
-	// the same refusal.
+	// An object that depends on what the statement drops keeps depending on
+	// it until someone changes that object, so a retry meets the same
+	// refusal.
 	if detail, ok := dependentObjectsDetail(err, table); ok {
 		return applyFailure{detail: detail}
 	}
@@ -743,15 +743,24 @@ func catalogErrorLogAttrs(err error) []any {
 	}
 	switch pgErr.Code {
 	case sqlstateDependentObjectsStillExist, sqlstateInsufficientPrivilege:
-		return []any{"server_detail", pgErr.Detail, "server_hint", pgErr.Hint}
+		var attrs []any
+		if pgErr.Detail != "" {
+			attrs = append(attrs, "server_detail", pgErr.Detail)
+		}
+		if pgErr.Hint != "" {
+			attrs = append(attrs, "server_hint", pgErr.Hint)
+		}
+		return attrs
 	default:
 		return nil
 	}
 }
 
 // sqlstateDependentObjectsStillExist is the SQLSTATE the server raises when
-// a statement would drop or retype something other objects depend on, such
-// as a column a publication's column list or row filter names.
+// a statement would drop something other objects depend on, such as a
+// column a publication's column list or row filter names. A retype that a
+// dependent blocks raises a different, generic SQLSTATE, so it is not
+// classified here and keeps the retryable default.
 const sqlstateDependentObjectsStillExist = "2BP01"
 
 // maxDependentObjectsDetailLen bounds the server's list of dependent objects
@@ -760,7 +769,7 @@ const sqlstateDependentObjectsStillExist = "2BP01"
 const maxDependentObjectsDetailLen = 300
 
 // dependentObjectsDetail names a statement the server refused because other
-// objects depend on what it drops or retypes. The plan refuses the
+// objects depend on what it drops. The plan refuses the
 // dependents it can read before the apply starts; this covers the ones only
 // the server sees. The server's DETAIL names those objects and nothing else,
 // no row values, so the detail carries it: the owner of a hosted deployment
@@ -771,17 +780,19 @@ func dependentObjectsDetail(err error, table string) (string, bool) {
 	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateDependentObjectsStillExist {
 		return "", false
 	}
-	dependents := singleLine(pgErr.Detail)
+	// The server puts each dependent on its own line; joining them with a
+	// comma keeps two of them from reading as one sentence.
+	dependents := singleLine(strings.Join(strings.FieldsFunc(pgErr.Detail, func(r rune) bool { return r == '\n' }), ", "))
 	if dependents == "" {
 		return sanitizeReasonText(fmt.Sprintf(
-			"other objects depend on what the statement on %q drops or retypes, such as a publication that names the column; the server log names them; remove the dependency, then apply again",
+			"other objects depend on what the statement on %q drops, such as a publication that names the column; the server log names them; remove the dependency, then apply again",
 			table)), true
 	}
 	if runes := []rune(dependents); len(runes) > maxDependentObjectsDetailLen {
 		dependents = string(runes[:maxDependentObjectsDetailLen-1]) + "…"
 	}
 	return sanitizeReasonText(fmt.Sprintf(
-		"other objects depend on what the statement on %q drops or retypes: %s; remove the dependency, then apply again",
+		"other objects depend on what the statement on %q drops: %s; remove the dependency, then apply again",
 		table, dependents)), true
 }
 
