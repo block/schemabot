@@ -127,7 +127,13 @@ branch is never touched. Predicting the rest would mean reimplementing Vitess's
 own DDL acceptance rules, and getting that wrong would refuse changes that work.
 
 A deploy request that PlanetScale has configured to require approval fails the
-apply. SchemaBot does not approve deploy requests.
+apply. SchemaBot does not approve deploy requests. When PlanetScale refuses the
+deploy, SchemaBot closes the deploy request it created, so nobody can deploy it
+from PlanetScale after the apply has failed. If the close fails, the server log
+names the deploy request that is still open, and so does the apply's failure
+when the refusal answered the start of a deploy that was waiting for it, so you
+can close it in PlanetScale. SchemaBot never closes a deploy request it did not
+create.
 
 ## Example: add a column to a sharded table
 

@@ -1533,12 +1533,12 @@ func (s settledTaskSet) contains(task *storage.Task) bool {
 // automatic deploy start with a permanent error. Engine.Start promises that a
 // permanent refusal started nothing, but failing an apply whose deploy is in
 // fact running would leave that deploy with nothing tracking it, so the drive
-// reads progress once more and fails the apply only while the engine still
-// reports the change waiting for its deploy. When the read fails or the engine
-// reports any other state, the apply is left as it is and the next progress
-// tick acts on what the engine reports then. The engine's message names the
-// operator's next step, so the failure message carries it unchanged. Returns
-// true when the apply was settled and this owner must exit the drive.
+// reads progress once more and fails the apply only while the engine reports
+// nothing running (startRefusalLeftNothingRunning). When the read fails or the
+// engine reports any other state, the apply is left as it is and the next
+// progress tick acts on what the engine reports then. The engine's message
+// names the operator's next step, so the failure message carries it unchanged.
+// Returns true when the apply was settled and this owner must exit the drive.
 func (c *LocalClient) failPermanentDeployRefusal(ctx context.Context, logger *slog.Logger, eng engine.Engine, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, ps *atomicPollState, startErr error) bool {
 	result, err := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
 		Database:    apply.Database,
@@ -1550,8 +1550,8 @@ func (c *LocalClient) failPermanentDeployRefusal(ctx context.Context, logger *sl
 			append(apply.MutableLogAttrs(), "start_error", startErr, "error", err)...)
 		return false
 	}
-	if result.State != engine.StateWaitingForDeploy {
-		logger.Warn("auto-deploy was refused with a permanent error, but the engine no longer reports the change waiting for its deploy; the apply is not failed and the drive follows the engine's state at the next progress tick",
+	if !startRefusalLeftNothingRunning(result.State) {
+		logger.Warn("auto-deploy was refused with a permanent error, but the engine reports the change neither waiting for its deploy nor retired; the apply is not failed and the drive follows the engine's state at the next progress tick",
 			append(apply.MutableLogAttrs(), "start_error", startErr, "engine_state", result.State)...)
 		return false
 	}
@@ -1559,6 +1559,24 @@ func (c *LocalClient) failPermanentDeployRefusal(ctx context.Context, logger *sl
 		append(apply.MutableLogAttrs(), "error", startErr)...)
 	ps.terminalErr = c.failApplyAndNotify(ctx, apply, tasks, fmt.Sprintf("deploy could not start: %v", startErr))
 	return true
+}
+
+// startRefusalLeftNothingRunning reports whether the engine state read after a
+// permanent Start refusal shows no work for the apply to track, so failing the
+// apply with the refusal leaves nothing running unwatched.
+func startRefusalLeftNothingRunning(s engine.State) bool {
+	switch s {
+	case engine.StateWaitingForDeploy:
+		// The refused change is still waiting for a deploy that never began.
+		return true
+	case engine.StateCancelled:
+		// The engine retired the change it refused to start, so it can no
+		// longer be started outside SchemaBot. The refusal, not a cancel, is
+		// why the apply ends, so it is failed with the refusal's message.
+		return true
+	default:
+		return false
+	}
 }
 
 // autoTriggerCutover fires the engine cutover for a drive that is not

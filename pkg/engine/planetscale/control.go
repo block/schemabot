@@ -320,6 +320,10 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 	// starting from stored state cannot widen the decision.
 	dr, deployErr := e.deployDeployRequest(ctx, client, credOrg(req.Credentials), req.Database, meta.DeployRequestID, meta.IsInstant, nil)
 	if deployErr != nil {
+		var permanent *engine.PermanentError
+		if errors.As(deployErr, &permanent) {
+			return nil, e.closeRefusedDeployRequest(ctx, client, credOrg(req.Credentials), req.Database, meta, deployErr)
+		}
 		return nil, deployErr
 	}
 	return &engine.ControlResult{
@@ -327,6 +331,72 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 		Message:     fmt.Sprintf("Deploy initiated for deploy request #%d", dr.Number),
 		ResumeState: req.ResumeState,
 	}, nil
+}
+
+// closeRefusedDeployRequest closes the deploy request whose deploy PlanetScale
+// refused permanently, so it cannot be deployed from PlanetScale once the
+// refusal fails the apply. A permanent refusal means the deploy never started,
+// and the close itself re-reads the deploy request and closes it only if it
+// still reads as never deployed.
+//
+// Only a deploy request this engine created is closed. One adopted from the
+// branch was opened by someone else, so it is left open for them.
+//
+// It returns refusal unchanged when the deploy request is closed or was left
+// open on purpose. When the close fails, the returned error is still permanent
+// and keeps refusal on its chain, and its message adds which deploy request is
+// still open, so the operator knows what to close by hand. The close failure's
+// own text stays in the log and off the message.
+func (e *Engine) closeRefusedDeployRequest(ctx context.Context, client psclient.PSClient, org, database string, meta *psMetadata, refusal error) error {
+	attrs := []any{
+		"organization", org,
+		"planetscale_database", database,
+		"deploy_request", meta.DeployRequestID,
+		"deploy_request_url", meta.DeployRequestURL,
+		"branch", meta.BranchName,
+		"refusal", refusal,
+	}
+	if meta.DeployRequestAdopted {
+		e.logger.Warn("PlanetScale refused the deploy permanently; leaving the deploy request open, since SchemaBot adopted it from the branch rather than creating it; close it in PlanetScale if it should not deploy",
+			attrs...)
+		return refusal
+	}
+	e.logger.Info("PlanetScale refused the deploy permanently; closing the deploy request SchemaBot created so it cannot be deployed after the apply fails",
+		attrs...)
+	if closeErr := e.closeUndeployedDeployRequestOfFailedApply(ctx, e.logger, client, org, database, meta.DeployRequestID, attrs); closeErr != nil {
+		return &engine.PermanentError{Err: &refusedDeployRequestLeftOpenError{
+			refusal:      refusal,
+			number:       meta.DeployRequestID,
+			url:          meta.DeployRequestURL,
+			database:     database,
+			closeFailure: closeErr,
+		}}
+	}
+	return refusal
+}
+
+// refusedDeployRequestLeftOpenError is a permanent deploy refusal whose deploy
+// request SchemaBot could not close. Its message is the refusal's, followed by
+// the deploy request that is still open; why the close failed stays on the
+// chain for errors.Is and the logs, but out of the text an operator reads.
+type refusedDeployRequestLeftOpenError struct {
+	refusal      error
+	number       uint64
+	url          string
+	database     string
+	closeFailure error
+}
+
+func (e *refusedDeployRequestLeftOpenError) Error() string {
+	name := fmt.Sprintf("deploy request #%d on database %s", e.number, e.database)
+	if e.url != "" {
+		name = fmt.Sprintf("%s (%s)", name, e.url)
+	}
+	return fmt.Sprintf("%s. SchemaBot could not close %s, so it is still open; close it in PlanetScale so it cannot be deployed", e.refusal.Error(), name)
+}
+
+func (e *refusedDeployRequestLeftOpenError) Unwrap() []error {
+	return []error{e.refusal, e.closeFailure}
 }
 
 // Cutover triggers the final schema swap via ApplyDeployRequest.
