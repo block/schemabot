@@ -177,9 +177,12 @@ func driveRateLimitedClaimAt(t *testing.T, podNow time.Time, event storage.Webho
 		require.NotNil(t, failure.retryAfter)
 		claim.retryAt = failure.retryAfter.Add(-shift)
 	case len(store.failed) == 1:
-		claim.disposition = "charged"
 		failure := <-store.failed
-		require.NotNil(t, failure.retryAfter)
+		if failure.retryAfter == nil {
+			claim.disposition = "terminal"
+			return claim
+		}
+		claim.disposition = "charged"
 		claim.retryAt = failure.retryAfter.Add(-shift)
 	default:
 		require.Fail(t, "the claim recorded no completion or retryable failure")
@@ -255,6 +258,22 @@ func TestDurableWebhookDriverBacksOffPrimaryRateLimitResetAlreadyWaitedOut(t *te
 		resetLogged := loggedTime("reset_time")
 		assert.WithinDuration(t, resetLogged.Add(overdue), loggedTime("pod_now"), time.Second)
 		assert.WithinDuration(t, resetLogged.Add(overdue), loggedTime("due_since"), time.Second)
+	})
+
+	t.Run("the same reset on the last attempt says the delivery will not be retried", func(t *testing.T) {
+		last := retried
+		last.ReceivedAt = secondClaimAt.Add(-unchargedRefusalWindow - time.Minute)
+		last.Attempts = maxDurableWebhookAttempts - 1 // the claim increments to the cap
+		second := driveRateLimitedClaimAt(t, secondClaimAt, last, &reset)
+
+		require.Equal(t, "terminal", second.disposition)
+		line := clockSkewLogLine(t, second.logs)
+		require.NotNil(t, line, "the repeated reset logs the skew: %s", second.logs)
+		assert.Equal(t, "failed", line["disposition"])
+		assert.NotContains(t, line, "retry_at")
+		msg, _ := line["msg"].(string)
+		assert.Contains(t, msg, "will not be retried")
+		assert.NotContains(t, msg, "the retry will wait")
 	})
 
 	t.Run("a later reset is a new window and waits for it", func(t *testing.T) {

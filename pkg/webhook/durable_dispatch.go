@@ -1164,9 +1164,14 @@ func (h *Handler) logPrimaryRateLimitClockSkew(driverID int, event *storage.Webh
 		"reset_overdue", now.Sub(resetAt),
 		"disposition", outcome,
 	}
-	if !retryAt.IsZero() {
-		attrs = append(attrs, "retry_at", retryAt.UTC().Format(time.RFC3339))
+	if retryAt.IsZero() {
+		// The refusal spent the delivery's last attempt, so nothing will
+		// claim it again; do not promise a retry.
+		h.logger.Warn("GitHub's primary rate limit refused a durable webhook delivery with a reset it had already waited out, so this pod's clock is ahead of GitHub's; the delivery has no attempts left and will not be retried",
+			attrs...)
+		return
 	}
+	attrs = append(attrs, "retry_at", retryAt.UTC().Format(time.RFC3339))
 	h.logger.Warn("GitHub's primary rate limit refused a durable webhook delivery with a reset it had already waited out, so this pod's clock is ahead of GitHub's; the retry will wait as long as the reset is overdue instead of at the reset",
 		attrs...)
 }
