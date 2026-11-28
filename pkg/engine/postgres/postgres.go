@@ -385,7 +385,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			if enumType, ok := file.EnumType(); ok {
 				changes, err := planEnumType(ctx, pool, req.Database, namespace, enumType, parser)
 				if err != nil {
-					return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
+					return nil, plannerRefusal(namespace, filename, err)
 				}
 				enumChanges = append(enumChanges, changes...)
 				continue
@@ -400,12 +400,12 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 				// operation of its own.
 				tableReport, matched, err := planRowSecurityTableDefinition(ctx, pool, namespace, rowSecurity)
 				if err != nil {
-					return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
+					return nil, plannerRefusal(namespace, filename, err)
 				}
 				if !matched {
 					rlsChanges, err := planRowSecurityOperation(ctx, pool, namespace, rowSecurity, tableOwner)
 					if err != nil {
-						return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
+						return nil, plannerRefusal(namespace, filename, err)
 					}
 					desiredTables[file.Table()] = true
 					schemaChange.TableChanges = append(schemaChange.TableChanges, rlsChanges...)
@@ -418,11 +418,11 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 					return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: the parse admitted no planner input", namespace, filename)
 				}
 				if err := removedRowSecurity.check(ctx, desired.Table()); err != nil {
-					return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
+					return nil, plannerRefusal(namespace, filename, err)
 				}
 				report, table, err = planPostgresDefinition(ctx, pool, namespace, desired)
 				if err != nil {
-					return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
+					return nil, plannerRefusal(namespace, filename, err)
 				}
 			}
 			desiredTables[table] = true

@@ -9,8 +9,10 @@ import (
 	"github.com/block/pg-sprite/pkg/diffplan"
 	"github.com/block/pg-sprite/pkg/executor"
 	"github.com/block/pg-sprite/pkg/plan"
+	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/schemadiff"
 	"github.com/block/pg-sprite/pkg/statement"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/block/schemabot/pkg/engine"
@@ -96,7 +98,8 @@ func desiredFileRefusal(namespace, filename string, err error) error {
 	return refusal
 }
 
-// plannerRefusal reports a planner's decline of the declared schema as a plan
+// plannerRefusal wraps a failure to plan one schema file with the file it
+// came from, and reports a planner's decline of the declared schema as a plan
 // refusal. A planner reads the target as well as the files, so its errors mix
 // declines with failures of the connection or the role, and only the declines
 // are refusals. pg-sprite names each decline with a sentinel: a shape the
@@ -105,14 +108,16 @@ func desiredFileRefusal(namespace, filename string, err error) error {
 // never settles), a change no ALTER can converge, a foreign key to a table the
 // target lacks, policies that read each other back, and the parser's own
 // refusals when a planner reaches them. Each is fixed by editing the schema
-// files. Any other failure, such as a lost connection or a missing privilege,
-// is returned as it came. A file the parser does not admit never reaches a
-// planner: parseDesiredFiles refuses it first.
+// files. A privilege the planning role lacks is a refusal too, fixed by a
+// grant on the target: see planningPrivilegeRefusal. Any other failure, such
+// as a lost connection, is returned as it came. A file the parser does not
+// admit never reaches a planner: parseDesiredFiles refuses it first.
 //
 // pg-sprite keeps the closed set of these refusals in its migrate package,
 // which also carries its schema change runner, so the sentinels are named here
 // until a lighter pg-sprite package exports a predicate over that set.
-func plannerRefusal(err error) error {
+func plannerRefusal(namespace, filename string, err error) error {
+	wrapped := fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
 	switch {
 	case errors.Is(err, statement.ErrMultipleCreateTables),
 		errors.Is(err, statement.ErrDisallowedStatement),
@@ -127,25 +132,115 @@ func plannerRefusal(err error) error {
 		errors.Is(err, schemadiff.ErrReferencedTableNotFound),
 		errors.Is(err, executor.ErrPolicyRecursion),
 		errors.As(err, new(*removedRowSecurityError)):
-		return &engine.PlanRefusedError{Err: err}
+		return &engine.PlanRefusedError{Err: wrapped}
 	}
-	return err
+	if refusal := planningPrivilegeRefusal(namespace, filename, wrapped); refusal != nil {
+		return &engine.PlanRefusedError{Err: refusal}
+	}
+	return wrapped
 }
 
-// referencedTableRemedy names the fix for a foreign key the planner cannot
-// bind. The planner copies each referenced table's shape from the live
-// database, so the referenced table must already exist on the target: a
-// schema file that creates it in the same plan does not help. The planning
-// role must also hold SELECT and REFERENCES on it. It returns an empty
-// string for every other failure.
-func referencedTableRemedy(err error) string {
+// planningPrivilegeError is a schema file the planning role cannot plan for
+// want of a privilege on the target. Planning again fails the same way until
+// the grant is made, so it is a refusal about the target rather than the
+// files, and its text ends in the grant to make.
+type planningPrivilegeError struct {
+	text string
+	err  error
+}
+
+func (e *planningPrivilegeError) Error() string { return e.text }
+func (e *planningPrivilegeError) Unwrap() error { return e.err }
+
+// planningPrivilegeRefusal returns the refusal for a plan that failed on a
+// privilege the planning role lacks, or nil for any other failure. When
+// pg-sprite checked the privilege itself, its PrivilegeError carries the exact
+// GRANT, and the refusal names it with the catalog check that verifies it.
+// Otherwise the server's insufficient_privilege message names the object, and
+// the refusal says to grant the privilege it names.
+//
+// The text leads with the remedy and ends with the file, so a renderer that
+// clamps it loses the context before the GRANT. It carries the server's
+// message alone, never the wrapped chain: a connection error's text names the
+// login, host, and address it dialed, which the operator-facing refusal must
+// not show. The full chain goes to the server log.
+func planningPrivilegeRefusal(namespace, filename string, wrapped error) *planningPrivilegeError {
+	var text string
+	if ref, ok := referencedTablePrivilege(wrapped); ok {
+		text = fmt.Sprintf("grant SchemaBot's role %s on the table a foreign key references, then re-plan: %s (", ref.privilege, ref.message)
+		if ref.sqlstate != "" {
+			text += "SQLSTATE " + ref.sqlstate + "; "
+		}
+		text += fmt.Sprintf("file %q/%q)", namespace, filename)
+	} else if privilege, ok := errors.AsType[*preflight.PrivilegeError](wrapped); ok {
+		text = "grant SchemaBot's role the privilege planning needs, then re-plan: " + privilege.Grant
+		if privilege.Hint != "" {
+			text += "; " + privilege.Hint
+		}
+		text += fmt.Sprintf(" (file %q/%q; verified by: %s)", namespace, filename, privilege.Check)
+	} else if denied, ok := errors.AsType[*pgconn.PgError](wrapped); ok && denied.Code == sqlstateInsufficientPrivilege {
+		text = fmt.Sprintf("grant SchemaBot's role the privilege this error names, then re-plan: %s (SQLSTATE %s; file %q/%q)", denied.Message, denied.Code, namespace, filename)
+	} else {
+		return nil
+	}
+	slog.Warn("PostgreSQL plan refused: the planning role lacks a privilege on the target",
+		"namespace", namespace,
+		"file", filename,
+		"error", wrapped)
+	return &planningPrivilegeError{text: text, err: wrapped}
+}
+
+// referencedTableGrant is a privilege the planning role lacks on a table a
+// foreign key references, with the message that names the table.
+type referencedTableGrant struct {
+	// privilege is SELECT or REFERENCES.
+	privilege string
+	// message is the server's when the server refused the read, and
+	// pg-sprite's own error otherwise, without the context the engine
+	// wrapped around it.
+	message string
+	// sqlstate is the server's code, empty when pg-sprite checked the
+	// privilege itself.
+	sqlstate string
+}
+
+// referencedTablePrivilege returns the grant a foreign key's referenced table
+// needs, and false for any other failure.
+func referencedTablePrivilege(err error) (referencedTableGrant, bool) {
 	switch {
-	case errors.Is(err, schemadiff.ErrReferencedTableNotFound):
-		return "; a foreign key can reference only a table that already exists on the target, so apply the referenced table first, then add the foreign key to the file in a later change"
 	case errors.Is(err, schemadiff.ErrReferencedTableNotReadable):
-		return "; grant the planning role SELECT on the referenced table, then re-plan"
+		if denied, ok := errors.AsType[*pgconn.PgError](err); ok {
+			return referencedTableGrant{privilege: "SELECT", message: denied.Message, sqlstate: denied.Code}, true
+		}
+		return referencedTableGrant{privilege: "SELECT", message: sentinelCause(err, schemadiff.ErrReferencedTableNotReadable).Error()}, true
 	case errors.Is(err, schemadiff.ErrReferencedTableNotReferenceable):
-		return "; grant the planning role REFERENCES on the referenced table, then re-plan"
+		return referencedTableGrant{privilege: "REFERENCES", message: sentinelCause(err, schemadiff.ErrReferencedTableNotReferenceable).Error()}, true
+	}
+	return referencedTableGrant{}, false
+}
+
+// sentinelCause returns the error in err's chain that wraps sentinel most
+// directly: the error the planner returned, carrying its detail, with none of
+// the context the engine wrapped around it. The walk follows single wraps
+// and stops above the sentinel, which wraps nothing.
+func sentinelCause(err, sentinel error) error {
+	cause := err
+	for next := errors.Unwrap(cause); next != nil && errors.Unwrap(next) != nil && errors.Is(next, sentinel); next = errors.Unwrap(cause) {
+		cause = next
+	}
+	return cause
+}
+
+// referencedTableRemedy names the fix for a foreign key that references a
+// table the target does not have. The planner copies each referenced table's
+// shape from the live database, so the referenced table must already exist on
+// the target: a schema file that creates it in the same plan does not help. It
+// returns an empty string for every other failure; a referenced table the
+// planning role cannot read or reference is a planning privilege refusal,
+// which leads with the grant (see planningPrivilegeRefusal).
+func referencedTableRemedy(err error) string {
+	if errors.Is(err, schemadiff.ErrReferencedTableNotFound) {
+		return "; a foreign key can reference only a table that already exists on the target, so apply the referenced table first, then add the foreign key to the file in a later change"
 	}
 	return ""
 }

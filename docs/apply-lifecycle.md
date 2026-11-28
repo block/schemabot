@@ -265,7 +265,8 @@ apply starts every operation with a full budget.
 `POST /api/plan` answers `422 schema_refused` when the engine cannot plan the
 schema files as written, or a schema file does not parse. The `error` names
 the remedy: usually a change to the files, sometimes a condition to wait for,
-such as a table to drop going quiet. Follow it, then plan again; repeating the
+such as a table to drop going quiet, or a grant SchemaBot's role lacks on the
+target, such as `USAGE` on a schema. Follow it, then plan again; repeating the
 request before then gets the same answer. A `5xx` is a server fault, and a
 retry may succeed.
 

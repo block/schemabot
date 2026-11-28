@@ -3,15 +3,19 @@ package postgres
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/block/pg-sprite/pkg/executor"
+	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/schemadiff"
 	"github.com/block/pg-sprite/pkg/statement"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -80,8 +84,9 @@ func planRequestWithFiles(files map[string]string) *engine.PlanRequest {
 
 // pg-sprite names each way its planner declines a declared schema. Those
 // declines are plan refusals, whatever context the engine wraps them in, and
-// the wrapped text is unchanged. A failure that is not a decline, such as a
-// lost connection or a missing privilege, stays an ordinary error.
+// the text is the planner's, behind the file it came from. A failure that is
+// neither a decline nor a missing privilege, such as a lost connection, stays
+// an ordinary error.
 func TestPlannerRefusalTypesOnlyPlannerDeclines(t *testing.T) {
 	declines := []error{
 		statement.ErrMultipleCreateTables,
@@ -99,28 +104,108 @@ func TestPlannerRefusalTypesOnlyPlannerDeclines(t *testing.T) {
 	}
 	for _, decline := range declines {
 		t.Run(decline.Error(), func(t *testing.T) {
-			wrapped := fmt.Errorf(`plan PostgreSQL schema in "public"/"users.sql": plan PostgreSQL table "users": %w`, decline)
-			err := plannerRefusal(wrapped)
+			cause := fmt.Errorf(`plan PostgreSQL table "users": %w`, decline)
+			err := plannerRefusal("public", "users.sql", cause)
 			assert.True(t, engine.IsPlanRefused(err))
 			assert.ErrorIs(t, err, decline)
-			assert.EqualError(t, err, wrapped.Error())
-		})
-	}
-
-	for _, missing := range []error{schemadiff.ErrReferencedTableNotReadable, schemadiff.ErrReferencedTableNotReferenceable} {
-		t.Run("a missing privilege is not a refusal: "+missing.Error(), func(t *testing.T) {
-			wrapped := fmt.Errorf("plan PostgreSQL table %q: %w", "users", missing)
-			err := plannerRefusal(wrapped)
-			assert.False(t, engine.IsPlanRefused(err))
-			assert.Equal(t, wrapped, err)
+			assert.EqualError(t, err, `plan PostgreSQL schema in "public"/"users.sql": `+cause.Error())
 		})
 	}
 
 	t.Run("a lost connection is not a refusal", func(t *testing.T) {
 		lost := errors.New("write tcp 127.0.0.1:5432: connection reset by peer")
-		err := plannerRefusal(lost)
+		err := plannerRefusal("public", "users.sql", lost)
 		assert.False(t, engine.IsPlanRefused(err))
-		assert.Equal(t, lost, err)
+		assert.ErrorIs(t, err, lost)
+		assert.EqualError(t, err, `plan PostgreSQL schema in "public"/"users.sql": `+lost.Error())
+	})
+}
+
+// A privilege the planning role lacks fails every plan of the file the same
+// way until someone grants it, so it is a refusal that ends in the grant, not
+// an internal error to retry. When pg-sprite checked the privilege, the
+// refusal names its exact GRANT and the catalog check that verifies it; when
+// only the server refused, it carries the server's message, which names the
+// object, and says to grant that privilege. The remedy leads, so a renderer
+// that clamps the text cuts the file context, not the GRANT.
+func TestPlannerRefusalNamesTheGrantAPlanNeeds(t *testing.T) {
+	t.Run("a privilege pg-sprite checked", func(t *testing.T) {
+		privilege := &preflight.PrivilegeError{
+			Tier:  preflight.TierConnect,
+			Check: "has_schema_privilege(sb_planner, billing, 'USAGE')",
+			Grant: `GRANT USAGE ON SCHEMA "billing" TO "sb_planner"`,
+		}
+		err := plannerRefusal("billing", "invoices.sql", fmt.Errorf(`plan PostgreSQL table "invoices": %w`, privilege))
+		assert.True(t, engine.IsPlanRefused(err))
+		assert.ErrorIs(t, err, privilege)
+		assert.EqualError(t, err, `grant SchemaBot's role the privilege planning needs, then re-plan: GRANT USAGE ON SCHEMA "billing" TO "sb_planner" `+
+			`(file "billing"/"invoices.sql"; verified by: has_schema_privilege(sb_planner, billing, 'USAGE'))`)
+	})
+
+	t.Run("a hint follows the grant", func(t *testing.T) {
+		privilege := &preflight.PrivilegeError{
+			Tier:  preflight.TierConnect,
+			Check: "has_schema_privilege(sb_planner, billing, 'USAGE')",
+			Grant: `GRANT USAGE ON SCHEMA "billing" TO "sb_planner"`,
+			Hint:  "the schema's owner can grant it",
+		}
+		err := plannerRefusal("billing", "invoices.sql", privilege)
+		assert.True(t, engine.IsPlanRefused(err))
+		assert.EqualError(t, err, `grant SchemaBot's role the privilege planning needs, then re-plan: GRANT USAGE ON SCHEMA "billing" TO "sb_planner"; the schema's owner can grant it `+
+			`(file "billing"/"invoices.sql"; verified by: has_schema_privilege(sb_planner, billing, 'USAGE'))`)
+	})
+
+	t.Run("a privilege only the server checked", func(t *testing.T) {
+		denied := &pgconn.PgError{Severity: "ERROR", Code: "42501", Message: "permission denied for schema billing"}
+		err := plannerRefusal("billing", "invoices.sql", fmt.Errorf("look up table facts billing.invoices: %w", denied))
+		assert.True(t, engine.IsPlanRefused(err))
+		assert.ErrorIs(t, err, denied)
+		assert.EqualError(t, err, `grant SchemaBot's role the privilege this error names, then re-plan: permission denied for schema billing (SQLSTATE 42501; file "billing"/"invoices.sql")`)
+	})
+
+	t.Run("a referenced table the role cannot read", func(t *testing.T) {
+		denied := &pgconn.PgError{Severity: "ERROR", Code: "42501", Message: "permission denied for table customers"}
+		cause := fmt.Errorf(`plan PostgreSQL table "orders": %w`, fmt.Errorf("%w: public.customers: %w", schemadiff.ErrReferencedTableNotReadable, denied))
+		err := plannerRefusal("public", "orders.sql", cause)
+		assert.True(t, engine.IsPlanRefused(err))
+		assert.ErrorIs(t, err, schemadiff.ErrReferencedTableNotReadable)
+		assert.EqualError(t, err, `grant SchemaBot's role SELECT on the table a foreign key references, then re-plan: permission denied for table customers (SQLSTATE 42501; file "public"/"orders.sql")`)
+	})
+
+	t.Run("a referenced table the role cannot reference", func(t *testing.T) {
+		cause := fmt.Errorf(`plan PostgreSQL table "orders": %w`, fmt.Errorf("%w: public.customers(id)", schemadiff.ErrReferencedTableNotReferenceable))
+		err := plannerRefusal("public", "orders.sql", cause)
+		assert.True(t, engine.IsPlanRefused(err))
+		assert.ErrorIs(t, err, schemadiff.ErrReferencedTableNotReferenceable)
+		assert.EqualError(t, err, `grant SchemaBot's role REFERENCES on the table a foreign key references, then re-plan: `+
+			`planning role lacks REFERENCES on a table a foreign key references: public.customers(id) (file "public"/"orders.sql")`)
+	})
+
+	t.Run("a connection refused for a privilege shows the server's message alone", func(t *testing.T) {
+		denied := &pgconn.PgError{Severity: "FATAL", Code: "42501", Message: "permission denied for database app"}
+		err := plannerRefusal("billing", "invoices.sql", fmt.Errorf("failed to connect to `user=sb_planner database=app`: 10.0.0.7:5432 (db.internal.example): %w", denied))
+		assert.True(t, engine.IsPlanRefused(err))
+		assert.ErrorIs(t, err, denied)
+		assert.EqualError(t, err, `grant SchemaBot's role the privilege this error names, then re-plan: permission denied for database app (SQLSTATE 42501; file "billing"/"invoices.sql")`)
+	})
+
+	t.Run("the grant survives the inline clamp at the longest names", func(t *testing.T) {
+		schemaName := strings.Repeat("s", 63)
+		filename := strings.Repeat("f", 251) + ".sql"
+		privilege := &preflight.PrivilegeError{
+			Tier:  preflight.TierConnect,
+			Check: fmt.Sprintf("has_schema_privilege(sb_planner, %s, 'USAGE')", schemaName),
+			Grant: fmt.Sprintf(`GRANT USAGE ON SCHEMA "%s" TO "sb_planner"`, schemaName),
+		}
+		rendered := presentation.InlineError(plannerRefusal(schemaName, filename, privilege).Error())
+		assert.Contains(t, rendered, "then re-plan: "+privilege.Grant, "the remedy leads, so the clamp cuts only the file context")
+	})
+
+	t.Run("another server error is not a refusal", func(t *testing.T) {
+		gone := &pgconn.PgError{Severity: "FATAL", Code: "57P01", Message: "terminating connection due to administrator command"}
+		err := plannerRefusal("billing", "invoices.sql", gone)
+		assert.False(t, engine.IsPlanRefused(err))
+		assert.ErrorIs(t, err, gone)
 	})
 }
 
