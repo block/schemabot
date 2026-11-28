@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -213,4 +214,87 @@ func TestPartitionedIndexBuildPastItsBoundWithNoPartitionFinishedFails(t *testin
 	assert.False(t, terminal.Retryable, "a retry would spend the same bound on the same partition")
 	assert.Contains(t, terminal.ErrorMessage, "the partitioned index build ran past postgres.concurrent_index_max_duration (1h0m0s) before it finished any partition")
 	assert.Contains(t, terminal.ErrorMessage, "raise postgres.concurrent_index_max_duration and re-run")
+}
+
+// A leaf partition's build that fails on its rows leaves an invalid index on
+// that partition, which the engine drops through pg-sprite's proven drop,
+// named by the leaf's own build statement. RC-4: only a data fault whose
+// leftover pg-sprite proved the build's own, on a named partition, is
+// dropped. A drop that fails keeps the data-fault refusal, names the
+// partition and where the leftover still checks writes, and never claims it
+// was removed.
+func TestBuildPartitionedIndexDropsTheLeftoverAPartitionDataFaultLeft(t *testing.T) {
+	const leafDDL = "CREATE INDEX CONCURRENTLY users_email_idx_p123 ON public.users_2026 USING btree (email)"
+	duplicate := &pgconn.PgError{Code: "23505"}
+	leaf := func(build error, cleanup error, table string) *executor.InvalidIndexError {
+		return &executor.InvalidIndexError{Schema: "public", Index: "users_email_idx_p123", Table: table,
+			Build: build, Cleanup: cleanup}
+	}
+	for name, tc := range map[string]struct {
+		verdict *executor.InvalidIndexError
+		drop    dropScript
+		drops   int
+		// detail is the data-fault refusal's detail; empty when the
+		// failure is not refused as a data fault.
+		detail string
+	}{
+		"dropped": {
+			verdict: leaf(duplicate, executor.ErrBuildLeftInvalidIndex, "users_2026"), drop: droppedOneIndex, drops: 1,
+			detail: `index "public"."users_email_idx_p123" ("users_2026") was not built: rows duplicate its key (23505), and its invalid leftover was dropped; correct the rows, then re-run`,
+		},
+		"drop failed after quarantining the leftover": {
+			verdict: leaf(duplicate, executor.ErrBuildLeftInvalidIndex, "users_2026"), drops: 1,
+			drop: dropFailed(&executor.InvalidIndexError{Schema: "public", Index: "pgsprite_abandoned_42", Table: "users_2026",
+				Cleanup: executor.ErrInvalidIndexBuilderUnobservable}),
+			detail: `index "public"."users_email_idx_p123" ("users_2026") was not built: rows duplicate its key (23505), and its invalid leftover still rejects writes that duplicate its key; ` +
+				`an operator must drop it, named "public"."pgsprite_abandoned_42" (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run`,
+		},
+		"drop failed without saying where the leftover is": {
+			verdict: leaf(duplicate, executor.ErrBuildLeftInvalidIndex, "users_2026"), drops: 1,
+			drop: dropFailed(errors.New("lock not granted")),
+			detail: `index "public"."users_email_idx_p123" ("users_2026") was not built: rows duplicate its key (23505), and its invalid leftover still rejects writes that duplicate its key; ` +
+				`an operator must drop it, under this name or a pgsprite_abandoned_<oid> name (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run`,
+		},
+		"not a data fault": {
+			verdict: leaf(&pgconn.PgError{Code: "40P01"}, executor.ErrBuildLeftInvalidIndex, "users_2026"),
+		},
+		"leftover not proven the build's own": {
+			verdict: leaf(duplicate, executor.ErrAbandonmentUnproven, "users_2026"),
+			detail: `index "public"."users_email_idx_p123" was not built: rows duplicate its key (23505), and an invalid index not proven its own holds the name; ` +
+				`correct the rows, then re-run; the rerun removes the invalid index once it proves no build holds it`,
+		},
+		"no partition named": {
+			verdict: leaf(duplicate, executor.ErrBuildLeftInvalidIndex, ""),
+			detail: `index "public"."users_email_idx_p123" was not built: rows duplicate its key (23505), and its invalid leftover still rejects writes that duplicate its key; ` +
+				`correct the rows, then re-run; the rerun removes the invalid index once it proves no build holds it`,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			drop := tc.drop
+			if drop == nil {
+				drop = dropFailed(errors.New("no drop is expected"))
+			}
+			calls := scriptConcurrentIndex(t, func() error { return errors.New("no build is expected") },
+				func() error { return errors.New("no rebuild is expected") }, drop)
+			scriptPartitionedIndex(t, func(context.Context) error { return tc.verdict })
+
+			err := buildPartitionedIndex(t.Context(), dbconn.Config{}, nil, preflight.PreflightedTable{},
+				partitionedIndexChange(time.Hour), newTestTracker(t), slog.New(slog.DiscardHandler))
+
+			require.Error(t, err)
+			require.Len(t, calls.drop, tc.drops)
+			if tc.drops > 0 {
+				assert.Equal(t, leafDDL, calls.drop[0].sql)
+				assert.Equal(t, executor.ConcurrentBudget{CallerOwned: true}, calls.drop[0].budget)
+			}
+			r := classifyRefusal(err, "users")
+			if tc.detail == "" {
+				assert.Nil(t, r, "a failure that is not a data fault is not refused as one")
+				return
+			}
+			require.NotNil(t, r)
+			assert.Equal(t, "data-fault", r.reason)
+			assert.Equal(t, tc.detail, r.detail)
+		})
+	}
 }

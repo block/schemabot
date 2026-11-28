@@ -2648,12 +2648,10 @@ func TestEngineApplyConcurrentIndexRecoveryFailureIsNotCompletion(t *testing.T) 
 	assertNoInvalidIndexOn(t, db, "orders")
 }
 
-// A unique index the application's rows break while it builds: the build
-// fails validation and PostgreSQL leaves the index invalid but still
-// maintained, so it would reject every insert that repeats a key, a rule the
-// live schema does not declare. The apply is refused naming the SQLSTATE,
-// the engine drops the leftover, and the application can write the
-// duplicate the live schema allows.
+// A unique index the table's existing rows break: the build fails and
+// PostgreSQL leaves an invalid index behind. The apply is refused naming the
+// SQLSTATE, the engine drops the leftover so no rerun or later build meets
+// it, and the application can write the duplicate the live schema allows.
 func TestEngineApplyConcurrentUniqueIndexOnDuplicateRowsDropsItsLeftover(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "data_fault_leftover_test")
 	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.products (id bigint PRIMARY KEY, sku text)")
