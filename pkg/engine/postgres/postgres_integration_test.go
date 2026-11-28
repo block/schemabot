@@ -1422,7 +1422,7 @@ func TestEnginePlanUndeclaredTableIsUnsafeDrop(t *testing.T) {
 		assert.Equal(t, ddl.StatementDropTable, change.Operation)
 		assert.Equal(t, "DROP TABLE public."+want.table, change.DDL)
 		assert.True(t, change.IsUnsafe, "a drop removes live data and must carry the unsafe flag")
-		assert.Equal(t, `DROP TABLE removes all data from table "`+want.table+`"`, change.UnsafeReason)
+		assert.Equal(t, `statement drops table "`+want.table+`": every row in it is deleted, and reverting the schema file creates the table again empty`, change.UnsafeReason)
 		if want.blockedBecause == "" {
 			assert.Empty(t, change.ExecutionMode, "%s: %s", want.table, change.ModeReason)
 			assert.Contains(t, change.Metadata[reviewedTableDropMetadataKey], "table "+want.table+"\n",
