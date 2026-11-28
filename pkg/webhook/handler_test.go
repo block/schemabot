@@ -671,6 +671,42 @@ func TestCheckRunRerequestIgnoresStaleHeadSHA(t *testing.T) {
 	assert.Contains(t, rr.Body.String(), "stale head SHA")
 }
 
+// Re-run on a SchemaBot check of a closed PR is acknowledged without a plan:
+// a closed PR is read-only history, and close cleanup already removed its
+// stored check state.
+func TestCheckRunRerequestIgnoresClosedPR(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"state": "closed",
+			"head":  map[string]any{"sha": "abc123", "ref": "feature-branch"},
+			"base":  map[string]any{"sha": "def456", "ref": "main", "repo": map[string]any{"default_branch": "main"}},
+			"user":  map[string]any{"login": "testuser"},
+		}))
+	})
+	var fileListCalls atomic.Int64
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		fileListCalls.Add(1)
+		require.NoError(t, json.NewEncoder(w).Encode([]map[string]any{}))
+	})
+	h := &Handler{
+		service:   api.New(&emptyStorage{}, &api.ServerConfig{AllowedEnvironments: []string{"staging"}}, nil, testLogger()),
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:    testLogger(),
+	}
+
+	req := buildCheckRunWebhookRequest(t, checkRunWebhookPayloadOpts{
+		checkName: "SchemaBot (staging)",
+		headSHA:   "abc123",
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.JSONEq(t, `{"message":"check_run rerequest ignored for closed PR"}`, rr.Body.String())
+	assert.Zero(t, fileListCalls.Load(), "a closed PR is not planned again")
+}
+
 // newTestHandler creates a Handler wired to a fake GitHub API server.
 // Returns the handler and a channel that receives posted comment bodies.
 func newTestHandler(t *testing.T) (*Handler, chan string, chan string) {

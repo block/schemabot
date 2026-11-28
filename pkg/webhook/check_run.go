@@ -270,6 +270,29 @@ func (h *Handler) handleCheckRunRerequest(ctx context.Context, metricApp string,
 	}
 	defer cancel()
 
+	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
+	if err != nil {
+		h.logger.Error("failed to read pull request for check_run rerequest",
+			"repo", repo,
+			"pr", pr,
+			"head_sha", payload.CheckRun.HeadSHA,
+			"check_run_id", payload.CheckRun.ID,
+			"check_name", payload.CheckRun.Name,
+			"error", err)
+		h.writeError(w, http.StatusInternalServerError, "failed to read pull request")
+		return
+	}
+	if prInfo.IsClosed() {
+		// A closed PR is read-only history; see replanRerunRequest.
+		h.logger.Info("check_run rerequest ignored because the PR is closed; a closed PR is not planned again",
+			"repo", repo,
+			"pr", pr,
+			"head_sha", payload.CheckRun.HeadSHA,
+			"check_run_id", payload.CheckRun.ID,
+			"check_name", payload.CheckRun.Name)
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_run rerequest ignored for closed PR"})
+		return
+	}
 	if !h.verifyHeadSHAStillCurrentForPR(ctx, client, repo, pr, payload.CheckRun.HeadSHA, "check_run_rerequest") {
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_run rerequest ignored for stale head SHA"})
 		return

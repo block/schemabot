@@ -368,6 +368,39 @@ func TestDurableCheckRunDriverCompletesStaleHead(t *testing.T) {
 	require.Equal(t, int64(0), fileListCalls.Load(), "a stale rerequest must stop before config discovery")
 }
 
+// A durable rerequest on a closed PR completes without running discovery: a
+// closed PR is read-only history, and planning it again would recreate the
+// stored check state close cleanup removed.
+func TestDurableCheckRunDriverCompletesClosedPR(t *testing.T) {
+	store := newScriptedWebhookEventStore(durableCheckRunRerequestEvent(t))
+	ghClient, mux := setupGitHubServer(t)
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"state": "closed",
+			"head":  map[string]any{"sha": "head-sha", "ref": "feature-branch"},
+			"base":  map[string]any{"sha": "def456", "ref": "main", "repo": map[string]any{"default_branch": "main"}},
+			"user":  map[string]any{"login": "testuser"},
+		}))
+	})
+	var fileListCalls atomic.Int64
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/7/files", func(w http.ResponseWriter, _ *http.Request) {
+		fileListCalls.Add(1)
+		require.NoError(t, json.NewEncoder(w).Encode([]map[string]any{}))
+	})
+	factory := &fakeClientFactory{client: ghclient.NewInstallationClient(ghClient, testLogger())}
+	h := newDurableDriverHandler(t, store, nil, factory)
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	select {
+	case <-store.completed:
+	default:
+		require.FailNow(t, "expected a closed-PR rerequest to be marked completed")
+	}
+	require.Empty(t, store.failed)
+	require.Equal(t, int64(0), fileListCalls.Load(), "a closed PR is not planned again")
+}
+
 // A GitHub failure verifying the current head is uncertainty, not staleness, so
 // the delivery stays retryable rather than silently completing and dropping the
 // re-plan.

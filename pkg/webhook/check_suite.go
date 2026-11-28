@@ -18,11 +18,18 @@
 // missing from the inbox. Recovery rows use the same deterministic GUID as
 // the reconciler's missing-head synthesis, so the two recovery producers
 // dedupe against each other naturally.
+//
+// check_suite.rerequested is a different signal: an operator pressed Re-run
+// all checks on the commit. It carries operator intent, so it is queued for
+// a driver at once and re-plans every open PR still at the suite head, the
+// same way check_run.rerequested re-plans one PR when its single check is
+// re-run.
 package webhook
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -34,10 +41,13 @@ import (
 )
 
 // checkSuiteRecoveryAction is the only check_suite action the recovery path
-// consumes. GitHub sends "requested" on every push; "rerequested" (a human
-// clicked Re-run on the suite) already re-plans through check_run.rerequested,
-// and "completed" carries no work.
+// consumes. GitHub sends "requested" on every push.
 const checkSuiteRecoveryAction = "requested"
+
+// checkSuiteRerunAction is the check_suite action GitHub sends when someone
+// presses Re-run all checks. Without this path the button does nothing.
+// "completed" carries no work.
+const checkSuiteRerunAction = "rerequested"
 
 // defaultCheckSuiteRecoveryGrace is how long a check_suite delivery waits in
 // the inbox before it becomes claimable. The organic pull_request delivery
@@ -83,6 +93,10 @@ func (h *Handler) handleCheckSuite(ctx context.Context, metricApp string, w http
 	repo := payload.Repository.FullName
 	headSHA := payload.CheckSuite.HeadSHA
 
+	if payload.Action == checkSuiteRerunAction {
+		h.handleCheckSuiteRerequest(ctx, metricApp, w, payload, body, deliveryID)
+		return
+	}
 	if payload.Action != checkSuiteRecoveryAction {
 		h.logger.Debug("check_suite delivery ignored because action carries no recovery work",
 			"action", payload.Action, "repo", repo, "delivery_id", deliveryID)
@@ -197,8 +211,11 @@ func (h *Handler) processDurableCheckSuite(ctx context.Context, event *storage.W
 	if err := decodeDurablePayload(event, &payload); err != nil {
 		return false, err
 	}
+	if payload.Action == checkSuiteRerunAction {
+		return h.processDurableCheckSuiteRerequest(ctx, event, payload)
+	}
 	// Re-validate the action fail-closed: rows can arrive via replay or a
-	// future producer, and a non-requested action carries no recovery work.
+	// future producer, and any other action carries no recovery work.
 	if payload.Action != checkSuiteRecoveryAction {
 		h.logger.Info("durable check_suite delivery ignored because action needs no work",
 			"delivery_id", event.DeliveryID, "action", payload.Action, "repo", event.Repository)
@@ -389,4 +406,197 @@ func (h *Handler) resolveCheckSuitePRs(ctx context.Context, client *ghclient.Ins
 		"repo", repo, "head_sha", headSHA, "max_pages", h.webhookReconcileMaxPages,
 		"page_size", webhookReconcilePageSize)
 	return prs, true, false, nil
+}
+
+// handleCheckSuiteRerequest queues an operator's Re-run all checks. Unlike
+// recovery it is not held back by a grace period and not gated on the
+// recovery kill switch: it is a direct request, and nothing else will answer
+// it. Enqueue failure is a deliberate 500, as for check_run.rerequested:
+// GitHub never retries the delivery, so a red delivery in GitHub's webhook
+// UI beats losing the re-run silently.
+func (h *Handler) handleCheckSuiteRerequest(ctx context.Context, metricApp string, w http.ResponseWriter, payload checkSuitePayload, body []byte, deliveryID string) {
+	repo := payload.Repository.FullName
+	headSHA := payload.CheckSuite.HeadSHA
+	if repo == "" || headSHA == "" {
+		h.writeError(w, http.StatusBadRequest, "check_suite payload missing repository or head SHA")
+		return
+	}
+	if h.service != nil && !h.service.Config().IsRepoAllowed(repo) {
+		h.logger.Warn("webhook from unregistered repository",
+			"event", "check_suite", "action", payload.Action, "repo", repo,
+			"delivery_id", deliveryID)
+		metrics.RecordUnregisteredRepositoryWebhook(ctx, metricApp, "check_suite", payload.Action)
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "repository not registered"})
+		return
+	}
+	// GitHub names the open PRs at a same-repository head in the payload, so
+	// an empty list there means the commit has no open PR to plan. A fork
+	// head (empty head_branch) cannot name its PRs and is resolved later.
+	if payload.CheckSuite.HeadBranch != "" && len(payload.CheckSuite.PullRequests) == 0 {
+		h.logger.Info("check_suite re-run ignored because no open PR is at the suite head",
+			"repo", repo, "head_sha", headSHA, "branch", payload.CheckSuite.HeadBranch,
+			"delivery_id", deliveryID)
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_suite re-run ignored without an open PR"})
+		return
+	}
+	installationID := h.effectiveInstallationID(ctx, payload.Installation.ID)
+	if installationID == 0 {
+		h.writeError(w, http.StatusBadRequest, "missing installation ID in webhook payload")
+		return
+	}
+
+	if !h.durableWebhookDispatch {
+		retry, err := h.rerunCheckSuite(context.Background(), repo, headSHA, installationID, payload, deliveryID)
+		if err != nil {
+			h.logger.Error("check_suite re-run failed",
+				"repo", repo, "head_sha", headSHA, "delivery_id", deliveryID,
+				"retryable", retry, "error", err)
+			h.writeError(w, http.StatusInternalServerError, "failed to re-run checks")
+			return
+		}
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_suite re-run processed"})
+		return
+	}
+
+	event := &storage.WebhookEvent{
+		Provider:   storage.WebhookProviderGitHub,
+		DeliveryID: deliveryID,
+		Event:      "check_suite",
+		Action:     payload.Action,
+		Repository: repo,
+		HeadSHA:    headSHA,
+		TenantID:   strconv.FormatInt(installationID, 10),
+		Payload:    body,
+	}
+	inserted, err := h.enqueueDurableWebhookEvent(ctx, event)
+	if err != nil {
+		h.logger.Error("failed to enqueue durable check_suite re-run",
+			"repo", repo, "head_sha", headSHA, "delivery_id", deliveryID, "error", err)
+		metrics.RecordWebhookEvent(ctx, metricApp, "check_suite", payload.Action, repo, "durable_enqueue_failed")
+		h.writeError(w, http.StatusInternalServerError, "failed to enqueue webhook delivery")
+		return
+	}
+	if !inserted {
+		h.logger.Info("durable check_suite re-run already queued",
+			"repo", repo, "head_sha", headSHA, "delivery_id", deliveryID)
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_suite re-run already queued"})
+		return
+	}
+	h.logger.Info("durable check_suite re-run queued",
+		"repo", repo, "head_sha", headSHA, "delivery_id", deliveryID)
+	h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_suite re-run queued"})
+}
+
+// processDurableCheckSuiteRerequest drives a claimed Re-run all checks
+// delivery under the driver lease.
+func (h *Handler) processDurableCheckSuiteRerequest(ctx context.Context, event *storage.WebhookEvent, payload checkSuitePayload) (retry bool, err error) {
+	repo := storage.CanonicalKey(event.Repository)
+	headSHA := event.HeadSHA
+	if repo == "" || headSHA == "" {
+		return false, fmt.Errorf("durable check_suite re-run %s missing repo or head SHA", event.DeliveryID)
+	}
+	// The allowlist can change between enqueue and claim.
+	if h.service != nil && !h.service.Config().IsRepoAllowed(repo) {
+		h.logger.Warn("durable check_suite re-run from unregistered repository",
+			"delivery_id", event.DeliveryID, "repo", repo, "head_sha", headSHA)
+		metrics.RecordUnregisteredRepositoryWebhook(ctx, h.metricAppForRepo(repo), "check_suite", payload.Action)
+		return false, nil
+	}
+	installationID, err := durableInstallationID(event)
+	if err != nil {
+		return false, err
+	}
+	return h.rerunCheckSuite(ctx, repo, headSHA, installationID, payload, event.DeliveryID)
+}
+
+// rerunCheckSuite plans every PR the suite head belongs to again, through the
+// same per-PR path as a single check's Re-run, so a closed PR or a PR whose
+// head moved is skipped there. A failure on any PR keeps the whole delivery
+// retryable; planning a PR again at the same head is safe, so a retry that
+// re-plans a PR which already succeeded costs only the repeated work.
+func (h *Handler) rerunCheckSuite(ctx context.Context, repo, headSHA string, installationID int64, payload checkSuitePayload, deliveryID string) (retry bool, err error) {
+	runCtx := ctx
+	lookupCtx, cancel, client, err := h.autoPlanBootstrap(ctx, repo, installationID)
+	if err != nil {
+		metrics.RecordWebhookEvent(runCtx, h.metricAppForRepo(repo), "check_suite", payload.Action, repo, "auto_plan_bootstrap_failed")
+		return true, fmt.Errorf("bootstrap check_suite re-run %s for %s@%s: %w", deliveryID, repo, headSHA, err)
+	}
+	prs, err := h.checkSuiteRerunPRs(lookupCtx, client, repo, headSHA, payload)
+	cancel()
+	if err != nil {
+		return true, err
+	}
+	if len(prs) == 0 {
+		h.logger.Info("check_suite re-run found no open PR at the suite head; nothing is planned",
+			"delivery_id", deliveryID, "repo", repo, "head_sha", headSHA)
+		return false, nil
+	}
+	return h.replanCheckSuitePRs(runCtx, client, repo, headSHA, installationID, deliveryID, prs)
+}
+
+// replanCheckSuitePRs re-plans each PR a Re-run all checks names. The PRs are
+// independent, so each gets its own auto-plan deadline, and one PR's failure
+// does not stop the rest from being planned. The delivery is retried when any
+// failure is retryable, and dead-lettered only when every failure is
+// permanent.
+func (h *Handler) replanCheckSuitePRs(runCtx context.Context, client *ghclient.InstallationClient, repo, headSHA string, installationID int64, deliveryID string, prs []int) (retry bool, err error) {
+	var errs []error
+	for _, pr := range prs {
+		if runCtx.Err() != nil {
+			h.logger.Warn("check_suite re-run stopped before planning every PR because its run was cancelled; the delivery will be retried",
+				"delivery_id", deliveryID, "repo", repo, "head_sha", headSHA, "next_pr", pr)
+			errs = append(errs, fmt.Errorf("check_suite re-run %s for %s@%s cancelled before PR #%d: %w", deliveryID, repo, headSHA, pr, runCtx.Err()))
+			retry = true
+			break
+		}
+		prCtx, prCancel := autoPlanContext(runCtx)
+		prRetry, prErr := h.replanRerunRequest(prCtx, runCtx, client, rerunRequest{
+			kind:           checkSuiteRerun,
+			deliveryID:     deliveryID,
+			repo:           repo,
+			pr:             pr,
+			headSHA:        headSHA,
+			installationID: installationID,
+		})
+		prCancel()
+		if prErr != nil {
+			h.logger.Warn("check_suite re-run could not plan a PR; the remaining PRs are still planned",
+				"delivery_id", deliveryID, "repo", repo, "pr", pr, "head_sha", headSHA, "retryable", prRetry, "error", prErr)
+			errs = append(errs, prErr)
+			retry = retry || prRetry
+		}
+	}
+	return retry, errors.Join(errs...)
+}
+
+// checkSuiteRerunPRs lists the PR numbers a Re-run all checks names. A
+// same-repository suite names them in the payload. A fork head cannot, so
+// its PRs are found by walking the open PRs for the suite head, as recovery
+// does.
+func (h *Handler) checkSuiteRerunPRs(ctx context.Context, client *ghclient.InstallationClient, repo, headSHA string, payload checkSuitePayload) ([]int, error) {
+	if len(payload.CheckSuite.PullRequests) > 0 {
+		prs := make([]int, 0, len(payload.CheckSuite.PullRequests))
+		for _, candidate := range payload.CheckSuite.PullRequests {
+			if candidate.Number <= 0 {
+				h.logger.Warn("check_suite re-run skipped a payload PR entry without a number",
+					"repo", repo, "head_sha", headSHA)
+				continue
+			}
+			prs = append(prs, candidate.Number)
+		}
+		return prs, nil
+	}
+	candidates, truncated, _, err := h.resolveCheckSuitePRs(ctx, client, repo, headSHA, payload)
+	if err != nil {
+		return nil, err
+	}
+	if truncated {
+		h.logger.Warn("check_suite re-run plans only the open PRs found before the page budget ran out",
+			"repo", repo, "head_sha", headSHA, "found", len(candidates))
+	}
+	prs := make([]int, 0, len(candidates))
+	for _, candidate := range candidates {
+		prs = append(prs, candidate.number)
+	}
+	return prs, nil
 }

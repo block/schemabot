@@ -1362,14 +1362,10 @@ func (h *Handler) processDurableCheckRunCompleted(ctx context.Context, event *st
 }
 
 // processDurableCheckRunRerequest re-runs auto-plan for a claimed check_run
-// rerequest. Config discovery and plan dispatch run under the delivery lease,
-// while per-database plan execution still runs in detached goroutines whose
-// durability is owned by the applies/tasks layer. Like the synchronous request
-// path it stops before discovery when the rerequested head is no longer the
-// PR's current head: planning a stale head would list the current PR's files
-// against a stale config snapshot, and a newer push already enqueued its own
-// delivery. A GitHub failure verifying the head keeps the delivery retryable
-// rather than completing it, so a transient outage cannot drop the re-plan.
+// rerequest, which GitHub sends when someone presses Re-run on a single
+// SchemaBot check. Config discovery and plan dispatch run under the delivery
+// lease, while per-database plan execution still runs in detached goroutines
+// whose durability is owned by the applies/tasks layer.
 func (h *Handler) processDurableCheckRunRerequest(ctx context.Context, event *storage.WebhookEvent, payload checkRunPayload) (retry bool, err error) {
 	repo := storage.CanonicalKey(payload.Repository.FullName)
 	pr, ok := checkRunPullRequestNumber(payload)
@@ -1405,9 +1401,9 @@ func (h *Handler) processDurableCheckRunRerequest(ctx context.Context, event *st
 	}
 
 	// Keep the driver's run context: autoPlanBootstrap rebinds ctx to a
-	// timeout-bounded work context, and the post-run cancellation check below
-	// must distinguish "shutdown or lease loss" (runCtx) from "the work outran
-	// its own timeout after already succeeding" (ctx).
+	// timeout-bounded work context, and the post-run cancellation check in
+	// replanRerunRequest must distinguish "shutdown or lease loss" (runCtx)
+	// from "the work outran its own timeout after already succeeding" (ctx).
 	runCtx := ctx
 	ctx, cancel, client, err := h.autoPlanBootstrap(ctx, repo, installationID)
 	if err != nil {
@@ -1416,45 +1412,96 @@ func (h *Handler) processDurableCheckRunRerequest(ctx context.Context, event *st
 	}
 	defer cancel()
 
-	// Verify the rerequested head is still the PR's current head before
-	// discovery. A GitHub failure here is uncertainty, not staleness: keep the
-	// delivery retryable so a transient outage cannot silently complete (and
-	// drop) the re-plan. A confirmed newer head means a later push already
-	// enqueued its own delivery, so complete this one without planning a stale
-	// snapshot.
-	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
+	return h.replanRerunRequest(ctx, runCtx, client, rerunRequest{
+		kind:           checkRunRerun,
+		deliveryID:     event.DeliveryID,
+		repo:           repo,
+		pr:             pr,
+		headSHA:        payload.CheckRun.HeadSHA,
+		installationID: installationID,
+	})
+}
+
+// rerunKind names which of GitHub's two Re-run buttons a request came from.
+type rerunKind struct {
+	// label names the request in logs and errors.
+	label string
+	// source is the auto-plan source and action the re-plan records.
+	source string
+	// operation is the status-check operation a stale head is counted under.
+	operation string
+}
+
+var (
+	// checkRunRerun is Re-run on a single SchemaBot check.
+	checkRunRerun = rerunKind{label: "check_run rerequest", source: "check_run.rerequested", operation: "check_run_rerequest"}
+	// checkSuiteRerun is Re-run all checks on the commit's check suite.
+	checkSuiteRerun = rerunKind{label: "check_suite rerequest", source: "check_suite.rerequested", operation: "check_suite_rerequest"}
+)
+
+// rerunRequest is one PR an operator's Re-run asks SchemaBot to plan again.
+type rerunRequest struct {
+	kind           rerunKind
+	deliveryID     string
+	repo           string
+	pr             int
+	headSHA        string
+	installationID int64
+}
+
+// replanRerunRequest plans the PR again at the head the Re-run named, after
+// reading the live PR. It stops without planning in two cases:
+//
+//   - The PR is closed. A closed PR, merged or not, is read-only history:
+//     applies are refused on it and close cleanup removes its stored check
+//     state, so a re-plan would recreate deleted rows and post a plan nobody
+//     can act on.
+//   - The PR's head moved. Planning the old head would list the current
+//     PR's files against an old config snapshot, and the newer push already
+//     enqueued its own delivery.
+//
+// A GitHub failure reading the PR is uncertainty, not either case, so it
+// stays retryable and a transient outage cannot drop the re-plan.
+func (h *Handler) replanRerunRequest(ctx, runCtx context.Context, client *ghclient.InstallationClient, req rerunRequest) (retry bool, err error) {
+	prInfo, err := client.FetchPullRequest(ctx, req.repo, req.pr)
 	if err != nil {
 		metrics.RecordStatusCheckOperation(runCtx, metrics.StatusCheckOperation{
-			Operation:  "check_run_rerequest",
-			Repository: repo,
+			Operation:  req.kind.operation,
+			Repository: req.repo,
 			Status:     "error",
 		})
-		return true, fmt.Errorf("verify current head for durable check_run rerequest %s (%s#%d): %w", event.DeliveryID, repo, pr, err)
+		return true, fmt.Errorf("verify current head for durable %s %s (%s#%d): %w", req.kind.label, req.deliveryID, req.repo, req.pr, err)
 	}
-	if prInfo.HeadSHA != payload.CheckRun.HeadSHA {
+	if prInfo.IsClosed() {
+		h.logger.Info("durable re-run ignored because the PR is closed; a closed PR is not planned again",
+			"kind", req.kind.label, "delivery_id", req.deliveryID, "repo", req.repo, "pr", req.pr,
+			"head_sha", req.headSHA)
+		return false, nil
+	}
+	if prInfo.HeadSHA != req.headSHA {
 		metrics.RecordStatusCheckOperation(runCtx, metrics.StatusCheckOperation{
-			Operation:  "check_run_rerequest",
-			Repository: repo,
+			Operation:  req.kind.operation,
+			Repository: req.repo,
 			Status:     "stale",
 		})
-		h.logger.Info("durable check_run rerequest ignored because head SHA is no longer current for PR",
-			"delivery_id", event.DeliveryID, "repo", repo, "pr", pr,
-			"stale_head_sha", payload.CheckRun.HeadSHA, "current_head_sha", prInfo.HeadSHA)
+		h.logger.Info("durable re-run ignored because head SHA is no longer current for PR",
+			"kind", req.kind.label, "delivery_id", req.deliveryID, "repo", req.repo, "pr", req.pr,
+			"stale_head_sha", req.headSHA, "current_head_sha", prInfo.HeadSHA)
 		return false, nil
 	}
 
-	message, planErr := h.runAutoPlanForPR(ctx, client, repo, pr, payload.CheckRun.HeadSHA, installationID, "check_run.rerequested", "check_run.rerequested", "", event.DeliveryID)
+	message, planErr := h.runAutoPlanForPR(ctx, client, req.repo, req.pr, req.headSHA, req.installationID, req.kind.source, req.kind.source, "", req.deliveryID)
 	if planErr != nil {
-		return !autoPlanFailureIsPermanent(planErr), fmt.Errorf("auto-plan for durable check_run rerequest %s (%s#%d): %w", event.DeliveryID, repo, pr, planErr)
+		return !autoPlanFailureIsPermanent(planErr), fmt.Errorf("auto-plan for durable %s %s (%s#%d): %w", req.kind.label, req.deliveryID, req.repo, req.pr, planErr)
 	}
 	if ctxErr := runCtx.Err(); ctxErr != nil {
 		// The run was cancelled (shutdown or lease loss) — the dispatch may be
 		// partial, so keep the delivery retryable instead of completing it.
-		return true, fmt.Errorf("durable check_run rerequest %s run cancelled during auto-plan dispatch: %w", event.DeliveryID, ctxErr)
+		return true, fmt.Errorf("durable %s %s run cancelled during auto-plan dispatch: %w", req.kind.label, req.deliveryID, ctxErr)
 	}
-	h.logger.Info("durable check_run rerequest auto-plan dispatched",
-		"action", payload.Action, "repo", repo, "pr", pr, "head_sha", payload.CheckRun.HeadSHA,
-		"delivery_id", event.DeliveryID, "outcome", message)
+	h.logger.Info("durable re-run auto-plan dispatched",
+		"kind", req.kind.label, "repo", req.repo, "pr", req.pr, "head_sha", req.headSHA,
+		"delivery_id", req.deliveryID, "outcome", message)
 	return false, nil
 }
 
