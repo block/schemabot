@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"log/slog"
 	"testing"
 
@@ -200,6 +201,47 @@ func TestPlanRollout_RefusedTargetNeedsAttentionWithTheRefusal(t *testing.T) {
 	assert.Equal(t, "eu/testapp-002", rollout.Attention[0].Member)
 	assert.Equal(t, apitypes.PlanMemberUnplanned, rollout.Attention[0].Reason)
 	assert.Equal(t, "refused: "+refusal, rollout.Attention[0].Detail)
+}
+
+// A remote member's refusal reaches the rollup wrapped in the context its
+// caller added, which can name the address the member was dialed at. The
+// attention detail carries the refusal's own text, which says what to change,
+// and none of the wrap. A member that failed for any other reason, such as an
+// internal error on its data plane, keeps the fixed detail.
+func TestPlanRollout_RemoteMemberRefusalDetailLeavesTheWrapOut(t *testing.T) {
+	const refusal = `drop_tables entry "orders_old" is also declared by a schema file in namespace "orders". Remove the entry or the schema file`
+	tests := []struct {
+		name       string
+		err        error
+		wantDetail string
+	}{
+		{
+			name:       "refused",
+			err:        fmt.Errorf("plan member eu: dial tcp 10.0.0.5:9090: %w", grpcstatus.Error(grpccodes.FailedPrecondition, refusal)),
+			wantDetail: "refused: " + refusal,
+		},
+		{
+			name:       "internal",
+			err:        fmt.Errorf("plan member eu: dial tcp 10.0.0.5:9090: %w", grpcstatus.Error(grpccodes.Internal, "storage unavailable")),
+			wantDetail: unplannedMemberDetail,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := multiTargetService(t, &mockTernClient{planDiffErr: tt.err}, &recordingPlanStore{})
+
+			rollout, err := svc.planRollout(t.Context(), planDiffReq(t), reviewedUsersPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)"),
+				&apitypes.PlanResponse{Deployment: "eu", Target: "testapp-001"})
+			require.NoError(t, err)
+			require.NotNil(t, rollout)
+			require.Len(t, rollout.Attention, 1)
+			assert.Equal(t, "eu/testapp-002", rollout.Attention[0].Member)
+			assert.Equal(t, apitypes.PlanMemberUnplanned, rollout.Attention[0].Reason)
+			assert.Equal(t, tt.wantDetail, rollout.Attention[0].Detail)
+			assert.NotContains(t, rollout.Attention[0].Detail, "10.0.0.5")
+			assert.NotContains(t, rollout.Attention[0].Detail, "rpc error")
+		})
+	}
 }
 
 // Deployments that mirror the primary run its plan, so one whose live schema

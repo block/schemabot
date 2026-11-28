@@ -231,8 +231,15 @@ func TestFreezeListCmdPrintsEachGroup(t *testing.T) {
 	lifted.LiftedAt, lifted.LiftedBy, lifted.LiftReason = &liftedAt, "erin", "SEV resolved"
 	scheduled := freezeFixture()
 	scheduled.ID, scheduled.Kind, scheduled.InEffect, scheduled.EndsAt = "freeze-next", "planned", false, &freezeEnd
+	// A planned freeze cancelled before its window opened never held
+	// anything; it keeps its planned window and says it was cancelled.
+	cancelled := freezeFixture()
+	cancelled.ID, cancelled.Kind, cancelled.InEffect = "freeze-cancelled", "planned", false
+	cancelled.StartsAt = freezeStart.Add(48 * time.Hour)
+	cancelledEnd, cancelledAt := freezeStart.Add(72*time.Hour), freezeStart.Add(2*time.Hour)
+	cancelled.EndsAt, cancelled.LiftedAt, cancelled.LiftedBy = &cancelledEnd, &cancelledAt, "erin"
 	api := &freezeAPI{status: http.StatusOK, reply: apitypes.FreezeListResponse{
-		InEffect: []apitypes.Freeze{active}, Scheduled: []apitypes.Freeze{scheduled}, Recent: []apitypes.Freeze{active, lifted},
+		InEffect: []apitypes.Freeze{active}, Scheduled: []apitypes.Freeze{scheduled}, Recent: []apitypes.Freeze{cancelled, lifted},
 	}}
 	endpoint := api.start(t)
 
@@ -242,12 +249,16 @@ func TestFreezeListCmdPrintsEachGroup(t *testing.T) {
 	assert.Equal(t, "environment=production", api.query)
 	assert.Contains(t, out, "In effect (1)\n  1. freeze-abc  production (on demand, in effect)\n")
 	assert.Contains(t, out, "Scheduled (1)\n  1. freeze-next  production (planned)\n")
-	assert.Contains(t, out, "Window:   2026-11-21T10:00:00Z until 2026-11-22T10:00:00Z\n")
-	assert.Contains(t, out, "Recent (2)\n")
+	assert.Contains(t, out, "Window:    2026-11-21T10:00:00Z until 2026-11-22T10:00:00Z\n")
+	assert.Contains(t, out, "Recently ended (2)\n  1. freeze-cancelled  production (planned, cancelled)\n")
+	assert.Contains(t, out, "Window:    2026-11-23T10:00:00Z until 2026-11-24T10:00:00Z, cancelled at 2026-11-21T12:00:00Z before it started\n")
 	assert.Contains(t, out, "  2. freeze-old  production (on demand, lifted)\n")
-	assert.Contains(t, out, "Lifted:   by erin at 2026-11-21T11:00:00Z: SEV resolved\n")
-	assert.Contains(t, out, "Reason:   SEV-1234 payments latency\n")
-	assert.Contains(t, out, "By:       dana\n")
+	assert.Contains(t, out, "Window:    2026-11-21T10:00:00Z until lifted at 2026-11-21T11:00:00Z\n")
+	assert.Contains(t, out, "Lifted:    by erin at 2026-11-21T11:00:00Z: SEV resolved\n")
+	assert.Contains(t, out, "Cancelled: by erin at 2026-11-21T12:00:00Z")
+	assert.Equal(t, 1, strings.Count(out, "Lifted:"), "only the lifted freeze has a Lifted row")
+	assert.Contains(t, out, "Reason:    SEV-1234 payments latency\n")
+	assert.Contains(t, out, "By:        dana\n")
 }
 
 func TestFreezeListCmdSaysWhenThereAreNone(t *testing.T) {
@@ -272,9 +283,9 @@ func TestFreezeShowCmdPrintsDetail(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "/api/freezes/freeze-abc", api.path)
 	assert.Contains(t, out, "Freeze freeze-abc  production (on demand, in effect)\n")
-	assert.Contains(t, out, "Running:  continue (applies already running in scope)\n")
-	assert.Contains(t, out, "Source:   manual\n")
-	assert.Contains(t, out, "External: INC-42\n")
+	assert.Contains(t, out, "Running:   continue (applies already running in scope)\n")
+	assert.Contains(t, out, "Source:    manual\n")
+	assert.Contains(t, out, "External:  INC-42\n")
 }
 
 func TestFreezeApproveCmdPrintsTheApproval(t *testing.T) {
@@ -305,16 +316,38 @@ func TestFreezeOverrideCmdShowsTheRequest(t *testing.T) {
 	assert.Contains(t, out, "Blockers:     freeze freeze-abc\n")
 }
 
+// unfreeze confirms the lift with what the freeze now records: who lifted
+// it, when, why, and what it covered.
 func TestUnfreezeCmdLiftsTheFreeze(t *testing.T) {
-	api := &freezeAPI{status: http.StatusOK, reply: freezeFixture()}
+	lifted := freezeFixture()
+	liftedAt := freezeStart.Add(time.Hour)
+	lifted.InEffect, lifted.LiftedAt, lifted.LiftedBy, lifted.LiftReason = false, &liftedAt, "erin", "SEV resolved"
+	api := &freezeAPI{status: http.StatusOK, reply: lifted}
 	endpoint := api.start(t)
 
 	out, err := runFreezeCmd(endpoint, (&UnfreezeCmd{ID: "freeze-abc", Reason: "SEV resolved"}).Run)
 
 	require.NoError(t, err)
-	assert.Equal(t, "✓ freeze-abc lifted.\n", out)
+	assert.Equal(t, "✓ freeze-abc lifted by erin at 2026-11-21T11:00:00Z: SEV resolved.\n   Scope:  whole environment in production\n", out)
 	assert.Equal(t, "/api/freezes/freeze-abc/lift", api.path)
 	assert.Equal(t, "SEV resolved", api.body["reason"])
+}
+
+// Unfreezing a planned freeze before its window opens cancels it; the
+// confirmation says so rather than calling it lifted.
+func TestUnfreezeCmdSaysAFreezeCancelledBeforeItStarted(t *testing.T) {
+	planned := freezeFixture()
+	planned.Kind, planned.InEffect, planned.StartsAt = "planned", false, freezeStart.Add(48*time.Hour)
+	cancelledAt := freezeStart.Add(time.Hour)
+	planned.LiftedAt, planned.LiftedBy, planned.LiftReason = &cancelledAt, "erin", "launch moved"
+	api := &freezeAPI{status: http.StatusOK, reply: planned}
+	endpoint := api.start(t)
+
+	out, err := runFreezeCmd(endpoint, (&UnfreezeCmd{ID: "freeze-abc", Reason: "launch moved"}).Run)
+
+	require.NoError(t, err)
+	assert.Equal(t, "✓ freeze-abc cancelled before it started, by erin at 2026-11-21T11:00:00Z: launch moved.\n"+
+		"   Scope:  whole environment in production\n", out)
 }
 
 // Whoever set a freeze chooses its reason, so control runes in it never reach

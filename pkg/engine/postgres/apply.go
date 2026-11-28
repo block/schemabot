@@ -89,7 +89,9 @@ const (
 	// outcome degrades to a cancellation. Nothing after the build
 	// charges the gap: pg-sprite runs its post-failure catalog verdict on
 	// a detached context of its own, the cleanup of an operator-cancelled
-	// build runs detached under cancelledIndexCleanupBound, and the terminal
+	// build runs detached under cancelledIndexCleanupBound, the drop of the
+	// leftover a build refused on the table's rows runs detached under
+	// dataFaultIndexCleanupBound, and the terminal
 	// publish reads the tracker the same way. The bound is sized to cover
 	// setup even when every one of its steps runs to the server-side limit
 	// the pool sets for it — the connect timeout for the dial, the
@@ -108,6 +110,13 @@ const (
 	// entry stays for the invalid-index recovery guidance and the apply
 	// still settles cancelled.
 	cancelledIndexCleanupBound = 30 * time.Second
+
+	// dataFaultIndexCleanupBound is the whole budget for removing the
+	// invalid index a build left behind when it failed on the table's rows.
+	// The cleanup runs detached from the apply, whose bound the failed build
+	// may have spent, and covers the same session dial, catalog reads, and
+	// proven drop as an operator cancel's cleanup.
+	dataFaultIndexCleanupBound = 30 * time.Second
 )
 
 type nativeApply struct {
@@ -595,7 +604,8 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		// An invalid index a retry recovers or an operator clears — a build's
 		// own leftover, abandoned debris, another backend's build to wait
 		// out, or a builder this role cannot observe — is operational: once
-		// it is gone a retry can succeed. Checked before the refusal and
+		// it is gone a retry can succeed, unless code in the database refused
+		// the build (invalidIndexRetryable). Checked before the refusal and
 		// budget arms because the verdict wraps the build failure that
 		// produced it (a budget-cancelled build leaves its own invalid
 		// index), and that inner cause must not be read as the outcome — the
@@ -611,7 +621,7 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 			"index_schema", invalidErr.Schema, "index", invalidErr.Index, "error", err)
 		result := progressResult(engine.StateFailed, "failed", started, change,
 			invalidIndexDetail(invalidErr))
-		result.Retryable = true
+		result.Retryable = invalidIndexRetryable(invalidErr)
 		publish(result)
 		return
 	}
@@ -710,7 +720,79 @@ func classifyApplyFailure(err error, table string, validates *schemadiff.Constra
 	if detail, ok := missingGrantDetail(err, table); ok {
 		return applyFailure{detail: detail, retryable: true}
 	}
-	return applyFailure{detail: "PostgreSQL schema change failed; see server logs", retryable: true}
+	// A trigger or function in the database that raises on the statement,
+	// such as an event trigger a DBA installed to guard DDL, raises again on
+	// every retry until someone changes it.
+	if detail, ok := raisedByDatabaseCodeDetail(err, table); ok {
+		return applyFailure{detail: detail}
+	}
+	return applyFailure{detail: unclassifiedFailureDetail(err), retryable: true}
+}
+
+// sqlstateRaiseException and sqlstateAssertFailure are the SQLSTATEs of a
+// RAISE EXCEPTION and a failed ASSERT that sets no code of its own, which
+// for a schema change means code in the database, such as an event trigger
+// or a function a trigger calls, refused the statement.
+const (
+	sqlstateRaiseException = "P0001"
+	sqlstateAssertFailure  = "P0004"
+)
+
+// raisedByDatabaseCodeDetail names a statement that a trigger or function in
+// the database refused. The server's message is the one its author wrote for
+// whoever meets the refusal, but it is untrusted text, so the detail names
+// the SQLSTATE and points at the server log, where the message is.
+func raisedByDatabaseCodeDetail(err error, table string) (string, bool) {
+	code, ok := raisedByDatabaseCode(err)
+	if !ok {
+		return "", false
+	}
+	return sanitizeReasonText(fmt.Sprintf(
+		"a trigger or function in the database refused the statement on %q (SQLSTATE %s); its message is in the server log; change or disable it, then apply again",
+		table, code)), true
+}
+
+// raisedByDatabaseCode returns the SQLSTATE of a failure that a trigger or
+// function in the database raised, and whether err is one.
+func raisedByDatabaseCode(err error) (string, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return "", false
+	}
+	switch pgErr.Code {
+	case sqlstateRaiseException, sqlstateAssertFailure:
+		return pgErr.Code, true
+	default:
+		return "", false
+	}
+}
+
+// invalidIndexRetryable reports whether a retry can clear an operational
+// invalid-index verdict. A build that code in the database refused, such as
+// a function an index expression calls raising on a row, leaves its own
+// invalid index like any failed build, and the retry would remove that
+// leftover only to meet the same refusal, so the apply ends at once and the
+// detail names the SQLSTATE.
+//
+// pg-sprite owns this decision for the rows' own faults (CodeDataFault) and
+// does not yet classify a P0001/P0004 raise. A pg-sprite outcome code for a
+// build that database code refused, ranked above the cleanup state as
+// CodeDataFault is, retires this predicate and the raised-build wording below.
+func invalidIndexRetryable(invalidErr *executor.InvalidIndexError) bool {
+	_, raised := raisedByDatabaseCode(invalidErr.Build)
+	return invalidErr.Code() != executor.CodeInvalidIndexOwnLeftover || !raised
+}
+
+// unclassifiedFailureDetail is the detail of a failure no classifier above
+// recognizes. It names the server's SQLSTATE when there is one, which is the
+// handle an operator searches the server log and the PostgreSQL error codes
+// for, and never the server's message, which can quote row values.
+func unclassifiedFailureDetail(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code != "" {
+		return sanitizeReasonText(fmt.Sprintf("PostgreSQL schema change failed (SQLSTATE %s); see server logs", pgErr.Code))
+	}
+	return "PostgreSQL schema change failed; see server logs"
 }
 
 // missingGrantDetail names a statement the server refused because the engine
@@ -883,8 +965,8 @@ func duplicateKeyDetail(err error, table string) (string, bool) {
 // The two halves leave unsanitized so classifyRefusal can compose a
 // sequence-step clause between them and sanitize the whole; the operational
 // path composes them through invalidIndexDetail.
-func invalidIndexAdvice(invalidErr *executor.InvalidIndexError, stepClause string) (cause, remedy string) {
-	w := invalidIndexWordingFor(invalidErr)
+func invalidIndexAdvice(invalidErr *executor.InvalidIndexError, cleanup *dataFaultIndexCleanupError, stepClause string) (cause, remedy string) {
+	w := invalidIndexWordingFor(invalidErr, cleanup)
 	names := invalidIndexNames(invalidErr, w.namesTable, w.namesRoom(stepClause))
 	return w.causeBefore + names + w.causeAfter, w.lead + w.remedyRest
 }
@@ -925,9 +1007,20 @@ const (
 	invalidIndexRetryRemovesRemedy = " and rebuilds the index; drop it yourself only if the retries are exhausted"
 )
 
-func invalidIndexWordingFor(invalidErr *executor.InvalidIndexError) invalidIndexWording {
+func invalidIndexWordingFor(invalidErr *executor.InvalidIndexError, cleanup *dataFaultIndexCleanupError) invalidIndexWording {
 	switch invalidErr.Code() {
 	case executor.CodeInvalidIndexOwnLeftover:
+		// A build code in the database refused fails the same way on every
+		// retry, so the operator's step is that code, and the next apply
+		// removes the leftover once the code lets the build through.
+		if code, raised := raisedByDatabaseCode(invalidErr.Build); raised {
+			return invalidIndexWording{
+				causeBefore: "this build left its own invalid index ",
+				causeAfter:  fmt.Sprintf(" on the target after a trigger or function in the database refused it (SQLSTATE %s)", code),
+				lead:        "change the database code that refused it",
+				remedyRest:  ", or disable it, then apply again; its message is in the server log, and the next apply removes the leftover and rebuilds the index",
+			}
+		}
 		// A leftover the bound's statement timeout produced says so: the
 		// retry rebuilds under the same bound, so the operator's step is to
 		// raise it, and the budget the verdict carries is that bound.
@@ -987,22 +1080,7 @@ func invalidIndexWordingFor(invalidErr *executor.InvalidIndexError) invalidIndex
 			remedyRest:  ", since it is a partitioned table's index, an index partition, or a constraint's index, or rename the index in the schema file and re-plan",
 		}
 	case executor.CodeDataFault:
-		// The build failed on the table's rows: duplicate values under a
-		// unique index, or a value an index expression cannot take. A rerun
-		// meets the same rows, so the rows come first. The rerun's recovery
-		// then removes the invalid index only once pg-sprite proves no build
-		// holds it, so the operator is never sent to drop it by name. The
-		// server's error is not rendered: it quotes the offending values.
-		causeAfter := ", and the failed build left it invalid on the target"
-		if !errors.Is(invalidErr.Cleanup, executor.ErrBuildLeftInvalidIndex) {
-			causeAfter = ", and an invalid index this build could not prove its own holds the name"
-		}
-		return invalidIndexWording{
-			causeBefore: "the table's rows cannot be indexed by index ",
-			causeAfter:  causeAfter,
-			lead:        "correct the rows",
-			remedyRest:  ", then re-run; the rerun removes the invalid index once it proves no build holds it",
-		}
+		return dataFaultIndexWording(invalidErr, cleanup)
 	default:
 		// CodeInvalidIndexUnproven and any future verdict fail safe with
 		// investigation steps: the index under the name may be healthy.
@@ -1013,6 +1091,111 @@ func invalidIndexWordingFor(invalidErr *executor.InvalidIndexError) invalidIndex
 			remedyRest:  ", then retry",
 		}
 	}
+}
+
+// dataFaultIndexWording words a build the server refused on the table's
+// rows: duplicate values under a unique index, or a value an index
+// expression cannot take. A rerun meets the same rows, so the rows come
+// first. The server's error is not rendered, since it quotes the offending
+// values; its SQLSTATE is. What the cause says of the build's invalid
+// leftover follows what the engine did with it, because the leftover still
+// checks every write: a unique one rejects writes the live schema allows
+// until it is gone.
+func dataFaultIndexWording(invalidErr *executor.InvalidIndexError, cleanup *dataFaultIndexCleanupError) invalidIndexWording {
+	w := invalidIndexWording{
+		causeBefore: "index ",
+		causeAfter:  " was not built: " + dataFaultRows(invalidErr.Build),
+		lead:        "correct the rows",
+		remedyRest:  ", then re-run",
+	}
+	const rerunRemoves = ", then re-run; the rerun removes the invalid index once it proves no build holds it"
+	const operatorDrops = "an operator must drop it"
+	switch {
+	case cleanup != nil && cleanup.cleaned && len(cleanup.skipped) > 0 && len(cleanup.dropped) > 0:
+		// The sweep dropped some entries and stepped over others, and its
+		// report does not say which one was this build's, so the cause
+		// claims neither and names what is left.
+		w.causeAfter += ", and invalid indexes the server refuses to drop concurrently stay quarantined"
+		w.lead = "an operator must drop them"
+		w.remedyRest = fmt.Sprintf(", named %s (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run",
+			quarantinedNames(cleanup.skipped))
+	case cleanup != nil && cleanup.cleaned && len(cleanup.skipped) > 0:
+		// pg-sprite quarantines this build's leftover only once it proves it
+		// droppable, and then drops it, so a sweep that dropped nothing found
+		// the leftover already gone; what it stepped over is older debris, and
+		// the cause names only that.
+		w.causeAfter += ", and older invalid indexes stay quarantined"
+		w.lead = "an operator must drop them"
+		w.remedyRest = fmt.Sprintf(", named %s, since the server refuses to drop them concurrently (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run",
+			quarantinedNames(cleanup.skipped))
+	case cleanup != nil && cleanup.cleaned && len(cleanup.dropped) > 0:
+		w.causeAfter += ", and its invalid leftover was dropped"
+	case cleanup != nil && cleanup.cleaned:
+		w.causeAfter += ", and its invalid leftover was already gone"
+	case cleanup != nil && cleanup.existing != nil && errors.Is(cleanup.existing.Cleanup, executor.ErrInvalidIndexBuildInFlight):
+		// Another build holds the index the drop found: another drive's
+		// recovery removed this build's leftover and started its own build
+		// under the name. That index is not this build's to drop, so the
+		// operator is told to leave it.
+		w.causeAfter += ", and another build now holds the name"
+		w.remedyRest = fmt.Sprintf(", then re-run once that build ends; leave its index, %q.%q, alone", cleanup.existing.Schema, cleanup.existing.Index)
+	case cleanup != nil && cleanup.existing != nil:
+		// The drop failed after it found the leftover, possibly after it
+		// quarantined it under a new name, which the rerun's build does not
+		// meet; the operator is pointed at the name it holds now.
+		w.causeAfter += ", and its invalid leftover " + leftoverStillChecks(invalidErr.Build)
+		w.lead = operatorDrops
+		w.remedyRest = fmt.Sprintf(", named %q.%q (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run",
+			cleanup.existing.Schema, cleanup.existing.Index)
+	case cleanup != nil:
+		// The drop failed without saying where the leftover is: it may
+		// still hold the name, or the drop may have quarantined it first.
+		w.causeAfter += ", and its invalid leftover " + leftoverStillChecks(invalidErr.Build)
+		w.lead = operatorDrops
+		w.remedyRest = ", under this name or a pgsprite_abandoned_<oid> name (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run"
+	case errors.Is(invalidErr.Cleanup, executor.ErrBuildLeftInvalidIndex):
+		w.causeAfter += ", and its invalid leftover " + leftoverStillChecks(invalidErr.Build)
+		w.remedyRest = rerunRemoves
+	default:
+		w.causeAfter += ", and an invalid index not proven its own holds the name"
+		w.remedyRest = rerunRemoves
+	}
+	return w
+}
+
+// quarantinedNames lists the names quarantined entries carry on the table,
+// which is where an operator finds them.
+func quarantinedNames(skipped []executor.QuarantinedIndex) string {
+	names := make([]string, 0, len(skipped))
+	for _, entry := range skipped {
+		names = append(names, fmt.Sprintf("%q.%q", entry.Schema, entry.Index))
+	}
+	return strings.Join(names, ", ")
+}
+
+// dataFaultRows says how the rows broke the index, by the SQLSTATE the
+// server reported.
+func dataFaultRows(build error) string {
+	var pgErr *pgconn.PgError
+	switch {
+	case !errors.As(build, &pgErr):
+		return "the rows violate it"
+	case pgErr.Code == sqlstateUniqueViolation:
+		return "rows duplicate its key (" + sqlstateUniqueViolation + ")"
+	default:
+		return fmt.Sprintf("the rows violate it (%s)", pgErr.Code)
+	}
+}
+
+// leftoverStillChecks says what an invalid index left on the target does
+// to the application's writes: PostgreSQL maintains it on every write, and a
+// unique one rejects a write that duplicates its key.
+func leftoverStillChecks(build error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(build, &pgErr) && pgErr.Code == sqlstateUniqueViolation {
+		return "still rejects writes that duplicate its key"
+	}
+	return "is still checked on every write"
 }
 
 // invalidIndexNames renders the identifiers an invalid-index cause carries —
@@ -1048,7 +1231,7 @@ func invalidIndexNames(invalidErr *executor.InvalidIndexError, withTable bool, r
 // invalidIndexDetail composes the advice for the operational (retryable)
 // publish path, where no sequence-step clause intervenes.
 func invalidIndexDetail(invalidErr *executor.InvalidIndexError) string {
-	cause, remedy := invalidIndexAdvice(invalidErr, "")
+	cause, remedy := invalidIndexAdvice(invalidErr, nil, "")
 	return sanitizeReasonText(cause + clauseSeparator + remedy)
 }
 
@@ -1213,7 +1396,7 @@ func refusalForCause(err error, table string) *refusal {
 	if errors.As(err, &invalidErr) {
 		r, _ := refusalForOutcome(invalidErr.Code(), table)
 		if r != nil {
-			r.cause, r.remedy = invalidIndexAdvice(invalidErr, sequenceStepClause(err))
+			r.cause, r.remedy = invalidIndexAdvice(invalidErr, dataFaultIndexCleanupOf(err, invalidErr), sequenceStepClause(err))
 		}
 		return r
 	}
@@ -2519,6 +2702,7 @@ func buildIndexConcurrently(ctx context.Context, pool *pgxpool.Pool, change nati
 	if cleanupErr := cleanupCancelledConcurrentIndex(ctx, pool, change, err, logger); cleanupErr != nil {
 		return cleanupErr
 	}
+	err = cleanupDataFaultIndex(ctx, pool, change, err, logger)
 	var invalidErr *executor.InvalidIndexError
 	if !errors.As(err, &invalidErr) || !abandonedBeforeBuild(invalidErr) {
 		return fmt.Errorf("build PostgreSQL index concurrently on table %q: %w", change.table,
@@ -2552,6 +2736,7 @@ func buildIndexConcurrently(ctx context.Context, pool *pgxpool.Pool, change nati
 		if cleanupErr := cleanupCancelledConcurrentIndex(ctx, pool, change, err, logger); cleanupErr != nil {
 			return cleanupErr
 		}
+		err = cleanupDataFaultIndex(ctx, pool, change, err, logger)
 		return fmt.Errorf("rebuild PostgreSQL index concurrently on table %q: %w", change.table,
 			&indexRecoveryError{verdict: invalidErr, err: err})
 	}
@@ -2609,6 +2794,104 @@ func cleanupCancelledConcurrentIndex(ctx context.Context, pool *pgxpool.Pool, ch
 			"index_schema", invalidErr.Schema, "index", invalidErr.Index, "duration", report.Duration)
 	}
 	return outcome
+}
+
+// cleanupDataFaultIndex removes the invalid index a build left when it failed
+// on the table's rows. PostgreSQL keeps maintaining that index on every
+// write, so a unique one goes on rejecting writes that duplicate its key, a
+// rule the live schema does not declare, and a rerun cannot succeed until
+// the rows are corrected anyway. The drop is pg-sprite's proven one: under
+// the table's lock it re-verifies the entry by identity as an abandoned
+// invalid index before it drops it concurrently, so it never removes another
+// actor's index. It runs detached from the apply, whose bound the failed
+// build may have spent, under its own bound. The returned error is buildErr
+// with what the cleanup did recorded beside its verdict; buildErr comes back
+// unchanged when it is not a data fault that left this build's own index.
+func cleanupDataFaultIndex(ctx context.Context, pool *pgxpool.Pool, change nativeApply, buildErr error, logger *slog.Logger) error {
+	var invalidErr *executor.InvalidIndexError
+	if !errors.As(buildErr, &invalidErr) || !dataFaultLeftOwnIndex(change, invalidErr) {
+		return buildErr
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dataFaultIndexCleanupBound)
+	defer cancel()
+	report, cleanupErr := concurrentIndex.drop(cleanupCtx, pool, change.sql,
+		executor.ConcurrentBudget{CallerOwned: true})
+	if cleanupErr != nil {
+		// A drop that fails after it quarantined the entry reports the
+		// entry under its quarantine name; that is where it still checks
+		// writes. A failure typed without an index leaves where it is
+		// uncertain.
+		outcome := &dataFaultIndexCleanupError{err: buildErr, verdict: invalidErr}
+		var cleanupVerdict *executor.InvalidIndexError
+		if errors.As(cleanupErr, &cleanupVerdict) {
+			outcome.existing = cleanupVerdict
+			logger.Error("PostgreSQL could not remove the invalid index a concurrent build left after failing on the table's rows; it still checks every write",
+				"namespace", change.namespace, "table", change.table,
+				"index_schema", cleanupVerdict.Schema, "index", cleanupVerdict.Index,
+				"build_index", invalidErr.Index, "error", cleanupErr)
+			return outcome
+		}
+		logger.Error("PostgreSQL could not remove the invalid index a concurrent build left after failing on the table's rows; it still checks every write under its name or a pgsprite_abandoned_<oid> name",
+			"namespace", change.namespace, "table", change.table,
+			"index_schema", invalidErr.Schema, "index", invalidErr.Index, "error", cleanupErr)
+		return outcome
+	}
+	switch {
+	case len(report.Skipped) > 0:
+		logger.Warn("PostgreSQL left quarantined invalid indexes on the table after a concurrent build failed on the table's rows; the server refuses to drop them concurrently and they still check every write",
+			"namespace", change.namespace, "table", change.table,
+			"index_schema", invalidErr.Schema, "index", invalidErr.Index,
+			"quarantined", quarantinedNames(report.Skipped),
+			"dropped", len(report.Dropped), "skipped", len(report.Skipped), "duration", report.Duration)
+	case len(report.Dropped) > 0:
+		logger.Info("PostgreSQL removed the invalid index a concurrent build left after failing on the table's rows",
+			"namespace", change.namespace, "table", change.table,
+			"index_schema", invalidErr.Schema, "index", invalidErr.Index,
+			"dropped", len(report.Dropped), "duration", report.Duration)
+	default:
+		logger.Info("PostgreSQL found the invalid index a concurrent build left after failing on the table's rows already gone",
+			"namespace", change.namespace, "table", change.table,
+			"index_schema", invalidErr.Schema, "index", invalidErr.Index, "duration", report.Duration)
+	}
+	return &dataFaultIndexCleanupError{err: buildErr, verdict: invalidErr, cleaned: true, dropped: report.Dropped, skipped: report.Skipped}
+}
+
+// dataFaultLeftOwnIndex reports whether a build failed on the table's rows
+// and pg-sprite proved the invalid index under the name is the one this
+// build left on the target table.
+func dataFaultLeftOwnIndex(change nativeApply, invalidErr *executor.InvalidIndexError) bool {
+	return invalidErr.Code() == executor.CodeDataFault &&
+		errors.Is(invalidErr.Cleanup, executor.ErrBuildLeftInvalidIndex) &&
+		invalidErr.Table == change.table
+}
+
+// dataFaultIndexCleanupError records what the engine did with the invalid
+// index a build left when it failed on the table's rows, beside the build's
+// own error, which stays the outcome and stays reachable to errors.As. When
+// the cleanup ran to completion, dropped and skipped are the executor's own
+// account of it, and the detail claims no more than they prove; a cleanup
+// that failed leaves cleaned false and the leftover named as still in place,
+// under existing when the failure said where it is.
+type dataFaultIndexCleanupError struct {
+	err      error
+	verdict  *executor.InvalidIndexError
+	existing *executor.InvalidIndexError
+	cleaned  bool
+	dropped  []executor.DroppedIndex
+	skipped  []executor.QuarantinedIndex
+}
+
+func (e *dataFaultIndexCleanupError) Error() string { return e.err.Error() }
+func (e *dataFaultIndexCleanupError) Unwrap() error { return e.err }
+
+// dataFaultIndexCleanupOf returns the cleanup recorded for verdict in err's
+// chain, or nil when the engine ran none for it.
+func dataFaultIndexCleanupOf(err error, verdict *executor.InvalidIndexError) *dataFaultIndexCleanupError {
+	var cleanup *dataFaultIndexCleanupError
+	if !errors.As(err, &cleanup) || cleanup.verdict != verdict {
+		return nil
+	}
+	return cleanup
 }
 
 func cancelledBuildLeftOwnIndex(change nativeApply, err error, invalidErr *executor.InvalidIndexError) bool {
@@ -2673,12 +2956,8 @@ func cleanedIndexDetail(name string, dropped []executor.DroppedIndex, skipped []
 	case len(dropped) > 0:
 		return fmt.Sprintf("Concurrent index build cancelled; invalid index %s was removed", name)
 	case len(skipped) > 0:
-		quarantined := make([]string, 0, len(skipped))
-		for _, entry := range skipped {
-			quarantined = append(quarantined, fmt.Sprintf("%q.%q", entry.Schema, entry.Index))
-		}
 		return fmt.Sprintf("Concurrent index build cancelled; invalid index %s remains quarantined as %s because the server refuses to drop it concurrently; an operator must remove it, see the PostgreSQL invalid-index recovery guidance",
-			name, strings.Join(quarantined, ", "))
+			name, quarantinedNames(skipped))
 	default:
 		return fmt.Sprintf("Concurrent index build cancelled; invalid index %s was already gone when the cleanup ran", name)
 	}
@@ -2868,13 +3147,18 @@ func nameConcurrentIndexBound(err error, bound, elapsed time.Duration) error {
 // invalid index a failed recovery was clearing, so a failure typed without
 // the index — a lock budget lost to a build still holding the table, a pool
 // too small for the recovery's extra session — still names the entry the
-// retry acts on. A failure that is itself an invalid-index verdict never
-// reaches here: that arm is decided first and already names the index. The
-// prefix is kept short so the remedy's lead survives the narrowest operator
-// surface, which truncates the detail from the tail.
+// retry acts on. A failure that carries an invalid-index verdict of its own,
+// such as the rebuild failing on the table's rows, is left unprefixed: its
+// detail already names the index, and the prefix would push the remedy's
+// lead past the narrowest operator surface, which truncates the detail from
+// the tail.
 func recoveryContextDetail(err error, detail string) string {
 	var recoveryErr *indexRecoveryError
 	if !errors.As(err, &recoveryErr) {
+		return detail
+	}
+	var ownVerdict *executor.InvalidIndexError
+	if errors.As(recoveryErr.err, &ownVerdict) {
 		return detail
 	}
 	return sanitizeReasonText(fmt.Sprintf("recovering abandoned invalid index %q.%q failed: %s",

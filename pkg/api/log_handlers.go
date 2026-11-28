@@ -508,15 +508,15 @@ func deploymentLogEntry(applyID string, log *ternv1.ApplyLog) (*apitypes.LogEntr
 // log reads needs an upgrade, and one that finds nothing to read for the
 // requested scope will answer the same way every time.
 func deploymentLogError(fetch *deploymentLogFetch, scope logScope, err error) *apitypes.DeploymentLogError {
-	result := &apitypes.DeploymentLogError{ExternalID: fetch.externalID, Target: fetch.target, Operations: fetch.operations, Code: "RemoteLogReadFailed", Reason: "remote_log_read_failed", Message: "Data-plane logs could not be read; check server logs and retry."}
+	result := &apitypes.DeploymentLogError{ExternalID: fetch.externalID, Target: fetch.target, Operations: fetch.operations, Code: apitypes.DeploymentLogCodeReadFailed, Reason: apitypes.DeploymentLogReasonReadFailed, Message: "Data-plane logs could not be read; check server logs and retry."}
 	switch status.Code(err) {
 	case codes.Unimplemented:
-		result.Code = "UnsupportedCapability"
-		result.Reason = "upgrade_required"
+		result.Code = apitypes.DeploymentLogCodeUnsupported
+		result.Reason = apitypes.DeploymentLogReasonUpgradeRequired
 		result.Message = "The selected data plane does not support log reads; upgrade it and retry."
 	case codes.NotFound:
-		result.Code = "RemoteLogNotFound"
-		result.Reason = "remote_log_not_found"
+		result.Code = apitypes.DeploymentLogCodeNotFound
+		result.Reason = apitypes.DeploymentLogReasonNotFound
 		result.Message = remoteLogNotFoundMessage(scope)
 	}
 	return result
@@ -545,20 +545,20 @@ const (
 // deploymentLogTargetUnsupportedError reports a source whose data plane did
 // not narrow a target-scoped read, because it predates target reads.
 func deploymentLogTargetUnsupportedError(fetch *deploymentLogFetch) *apitypes.DeploymentLogError {
-	return &apitypes.DeploymentLogError{ExternalID: fetch.externalID, Target: fetch.target, Operations: fetch.operations, Code: "UnsupportedCapability", Reason: "upgrade_required", Message: "The selected data plane does not support reading one target's logs; upgrade it or omit --target."}
+	return &apitypes.DeploymentLogError{ExternalID: fetch.externalID, Target: fetch.target, Operations: fetch.operations, Code: apitypes.DeploymentLogCodeUnsupported, Reason: apitypes.DeploymentLogReasonUpgradeRequired, Message: "The selected data plane does not support reading one target's logs; upgrade it or omit --target."}
 }
 
 // deploymentLogShardUnsupportedError reports a source whose data plane did
 // not narrow a shard-scoped read, because it predates shard reads.
 func deploymentLogShardUnsupportedError(fetch *deploymentLogFetch) *apitypes.DeploymentLogError {
-	return &apitypes.DeploymentLogError{ExternalID: fetch.externalID, Target: fetch.target, Operations: fetch.operations, Code: "UnsupportedCapability", Reason: "upgrade_required", Message: "The selected data plane does not support reading one shard's logs; upgrade it or omit --shard."}
+	return &apitypes.DeploymentLogError{ExternalID: fetch.externalID, Target: fetch.target, Operations: fetch.operations, Code: apitypes.DeploymentLogCodeUnsupported, Reason: apitypes.DeploymentLogReasonUpgradeRequired, Message: "The selected data plane does not support reading one shard's logs; upgrade it or omit --shard."}
 }
 
 // deploymentLogRecordError reports a source whose log records could not be
 // decoded. Unlike a transport failure, retrying cannot help — the data plane
 // returned records the control plane does not understand.
 func deploymentLogRecordError(fetch *deploymentLogFetch) *apitypes.DeploymentLogError {
-	return &apitypes.DeploymentLogError{ExternalID: fetch.externalID, Target: fetch.target, Operations: fetch.operations, Code: "MalformedRemoteLog", Reason: "malformed_remote_log", Message: "The data plane returned log records SchemaBot could not decode; check server logs."}
+	return &apitypes.DeploymentLogError{ExternalID: fetch.externalID, Target: fetch.target, Operations: fetch.operations, Code: apitypes.DeploymentLogCodeMalformed, Reason: apitypes.DeploymentLogReasonMalformed, Message: "The data plane returned log records SchemaBot could not decode; check server logs."}
 }
 
 // recordDeploymentLogFailure logs a data-plane read that failed. The caller

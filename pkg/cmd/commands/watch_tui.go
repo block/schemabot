@@ -375,10 +375,9 @@ func WatchApplyProgressTUI(endpoint, database, environment string, allowControlA
 	return runWatchModel(model)
 }
 
-// WatchApplyProgressByApplyID watches progress using an apply ID instead of database/environment.
-func WatchApplyProgressByApplyID(endpoint, applyID string, allowControlActions bool) error {
-	return watchApplyProgressByApplyIDWithEnvironment(endpoint, applyID, "", allowControlActions)
-}
+// watchControlledApply is the watch that start and release follow by default.
+// It needs a terminal, so it is a variable that tests can stand in for.
+var watchControlledApply = watchApplyProgressByApplyIDWithEnvironment
 
 // watchApplyProgressByApplyIDWithEnvironment watches progress and keeps the
 // known environment available for control operations before the first progress payload.
