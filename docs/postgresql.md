@@ -1414,7 +1414,17 @@ also needs `SELECT` on the referenced table.
 An event trigger that enforces DDL rules, such as requiring `CONCURRENTLY` on
 `CREATE INDEX`, fires on it too. A trigger that raises an error there refuses
 every plan, and the plan names the SQLSTATE and this prefix. Have the trigger
-skip scratch schemas:
+skip scratch schemas. A `ddl_command_start` trigger has no object to read
+yet, so it checks the schema the session builds in:
+
+```sql
+IF current_schema() LIKE 'pgsprite\_scratch\_%' THEN
+  RETURN;
+END IF;
+-- your rule
+```
+
+A `ddl_command_end` trigger checks each command's schema:
 
 ```sql
 FOR cmd IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP

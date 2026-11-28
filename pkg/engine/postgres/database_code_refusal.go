@@ -37,7 +37,7 @@ func databaseCodeRefusal(database string, err error) error {
 		return err
 	}
 	return &engine.PlanRefusedError{Err: engine.OperatorErrorf(err,
-		"code on database %q raised SQLSTATE %s while SchemaBot planned. Planning builds the declared tables in a schema named %s<suffix>, in a transaction it always rolls back, so an event trigger on DDL fires there too. Have the trigger skip schemas whose name starts with %s, then plan again",
+		"code on database %q raised SQLSTATE %s while SchemaBot planned. Planning builds the declared tables in a schema named %s<suffix>, in a transaction it always rolls back, so an event trigger on DDL fires there too. Have the trigger skip schemas whose name starts with %s (at ddl_command_start, check current_schema()), then plan again",
 		database, pgErr.Code, scratchSchemaPrefix, scratchSchemaPrefix)}
 }
 

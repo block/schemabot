@@ -19,7 +19,8 @@ func TestDatabaseCodeRefusal(t *testing.T) {
 	raised := &pgconn.PgError{Code: "P0001", Message: "CREATE INDEX must use CONCURRENTLY on db-7.internal"}
 	const want = `code on database "app" raised SQLSTATE P0001 while SchemaBot planned. ` +
 		`Planning builds the declared tables in a schema named pgsprite_scratch_<suffix>, in a transaction it always rolls back, ` +
-		`so an event trigger on DDL fires there too. Have the trigger skip schemas whose name starts with pgsprite_scratch_, then plan again`
+		`so an event trigger on DDL fires there too. Have the trigger skip schemas whose name starts with pgsprite_scratch_ ` +
+		`(at ddl_command_start, check current_schema()), then plan again`
 
 	for name, err := range map[string]error{
 		"raised":                    fmt.Errorf("execute desired statement on scratch schema: %w", raised),
