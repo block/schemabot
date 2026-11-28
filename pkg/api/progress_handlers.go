@@ -830,7 +830,7 @@ func (s *Service) unknownApplyScope(ctx context.Context, database, environment s
 				"database", database, "environment", environment)
 			return ""
 		}
-		return fmt.Sprintf("database %q is not configured on this server and has no recorded applies. Check the name against the databases list", database)
+		return fmt.Sprintf("database %q is not configured on this server and has no recorded applies. Run schemabot databases to list the configured ones", database)
 	}
 	if err != nil {
 		s.logger.Warn("could not read the database's environments; answering with no applies",

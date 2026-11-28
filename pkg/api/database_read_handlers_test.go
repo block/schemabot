@@ -86,7 +86,7 @@ func TestDatabaseReadHandlersCanonicalizePathAndQuery(t *testing.T) {
 			assertBody: func(t *testing.T, body []byte) {
 				var resp apitypes.ErrorResponse
 				require.NoError(t, json.Unmarshal(body, &resp))
-				assert.Equal(t, `database "unknown" is not configured on this server and has no recorded applies. Check the name against the databases list`, resp.Error)
+				assert.Equal(t, `database "unknown" is not configured on this server and has no recorded applies. Run schemabot databases to list the configured ones`, resp.Error)
 			},
 		},
 		{
@@ -132,7 +132,7 @@ func TestDatabaseReadHandlersCanonicalizePathAndQuery(t *testing.T) {
 			assertBody: func(t *testing.T, body []byte) {
 				var resp apitypes.ErrorResponse
 				require.NoError(t, json.Unmarshal(body, &resp))
-				assert.Equal(t, `database "unknown" is not configured on this server and has no recorded applies. Check the name against the databases list`, resp.Error)
+				assert.Equal(t, `database "unknown" is not configured on this server and has no recorded applies. Run schemabot databases to list the configured ones`, resp.Error)
 			},
 		},
 		{

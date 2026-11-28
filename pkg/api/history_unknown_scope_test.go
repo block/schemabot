@@ -87,8 +87,13 @@ func unknownScopeApplies() []*storage.Apply {
 
 func newUnknownScopeServer(t *testing.T, applies *databaseApplyStore) *http.ServeMux {
 	t.Helper()
+	return newUnknownScopeServerWithConfig(t, applies, testServerConfig())
+}
+
+func newUnknownScopeServerWithConfig(t *testing.T, applies *databaseApplyStore, config *ServerConfig) *http.ServeMux {
+	t.Helper()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	svc := New(&mockStorageWithApplyStores{applies: applies, applyLogs: &windowedApplyLogStore{}}, testServerConfig(), nil, logger)
+	svc := New(&mockStorageWithApplyStores{applies: applies, applyLogs: &windowedApplyLogStore{}}, config, nil, logger)
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)
 	return mux
@@ -112,14 +117,14 @@ func TestHandleDatabaseHistoryTellsAnUnknownScopeFromAnEmptyOne(t *testing.T) {
 			database: "ordres",
 			query:    url.Values{"environment": {"staging"}},
 			wantCode: http.StatusNotFound,
-			wantErr:  `database "ordres" is not configured on this server and has no recorded applies. Check the name against the databases list`,
+			wantErr:  `database "ordres" is not configured on this server and has no recorded applies. Run schemabot databases to list the configured ones`,
 		},
 		{
 			name:     "a database neither configured nor recorded, any environment",
 			database: "ordres",
 			query:    url.Values{},
 			wantCode: http.StatusNotFound,
-			wantErr:  `database "ordres" is not configured on this server and has no recorded applies. Check the name against the databases list`,
+			wantErr:  `database "ordres" is not configured on this server and has no recorded applies. Run schemabot databases to list the configured ones`,
 		},
 		{
 			name:     "an environment the configured database does not have",
@@ -172,7 +177,7 @@ func TestHandleLogsTellsAnUnknownScopeFromNoApplies(t *testing.T) {
 			name:     "a database neither configured nor recorded",
 			path:     "/api/logs/ordres?environment=staging",
 			wantCode: http.StatusNotFound,
-			wantErr:  `database "ordres" is not configured on this server and has no recorded applies. Check the name against the databases list`,
+			wantErr:  `database "ordres" is not configured on this server and has no recorded applies. Run schemabot databases to list the configured ones`,
 		},
 		{
 			name:     "an environment the configured database does not have",
@@ -220,6 +225,28 @@ func TestHandleDatabaseHistoryAnswersTheEmptyPageWhenTheLookupFails(t *testing.T
 	code, resp, errResp := getHistoryPage(t, mux, "ordres", url.Values{"environment": {"staging"}})
 	require.Equal(t, http.StatusOK, code, errResp.Error)
 	assert.Empty(t, resp.Applies)
+}
+
+// A server that configures no databases has no list to check a name against,
+// so it cannot tell a mistyped database from one it has not run an apply for
+// yet. History and logs reads of a database with no applies answer the empty
+// page, and `schemabot status -d` exits cleanly.
+func TestUnknownScopeAnswersTheEmptyPageOnAServerWithNoDatabases(t *testing.T) {
+	mux := newUnknownScopeServerWithConfig(t, &databaseApplyStore{applies: unknownScopeApplies()}, &ServerConfig{})
+
+	code, resp, errResp := getHistoryPage(t, mux, "ordres", url.Values{"environment": {"staging"}})
+	require.Equal(t, http.StatusOK, code, errResp.Error)
+	assert.Empty(t, resp.Applies)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs/ordres?environment=staging", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var logs struct {
+		Logs []json.RawMessage `json:"logs"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &logs))
+	assert.Empty(t, logs.Logs)
 }
 
 // A logs request that names a database in the path and an apply of another
