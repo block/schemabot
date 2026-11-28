@@ -764,6 +764,11 @@ func raisedByDatabaseCode(err error) (string, bool) {
 // invalid index like any failed build, and the retry would remove that
 // leftover only to meet the same refusal, so the apply ends at once and the
 // detail names the SQLSTATE.
+//
+// pg-sprite owns this decision for the rows' own faults (CodeDataFault) and
+// does not yet classify a P0001/P0004 raise. A pg-sprite outcome code for a
+// build that database code refused, ranked above the cleanup state as
+// CodeDataFault is, retires this predicate and the raised-build wording below.
 func invalidIndexRetryable(invalidErr *executor.InvalidIndexError) bool {
 	_, raised := raisedByDatabaseCode(invalidErr.Build)
 	return invalidErr.Code() != executor.CodeInvalidIndexOwnLeftover || !raised
@@ -996,9 +1001,6 @@ const (
 func invalidIndexWordingFor(invalidErr *executor.InvalidIndexError) invalidIndexWording {
 	switch invalidErr.Code() {
 	case executor.CodeInvalidIndexOwnLeftover:
-		// A leftover the bound's statement timeout produced says so: the
-		// retry rebuilds under the same bound, so the operator's step is to
-		// raise it, and the budget the verdict carries is that bound.
 		// A build code in the database refused fails the same way on every
 		// retry, so the operator's step is that code, and the next apply
 		// removes the leftover once the code lets the build through.
@@ -1010,6 +1012,9 @@ func invalidIndexWordingFor(invalidErr *executor.InvalidIndexError) invalidIndex
 				remedyRest:  ", or disable it, then apply again; its message is in the server log, and the next apply removes the leftover and rebuilds the index",
 			}
 		}
+		// A leftover the bound's statement timeout produced says so: the
+		// retry rebuilds under the same bound, so the operator's step is to
+		// raise it, and the budget the verdict carries is that bound.
 		var budgetErr *executor.BudgetError
 		if errors.As(invalidErr.Build, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
 			return invalidIndexWording{
