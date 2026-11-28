@@ -2405,6 +2405,77 @@ func TestEngineApplyPartitionedParentConcurrentIndexRefusal(t *testing.T) {
 	assert.Contains(t, progress.ErrorMessage, "cannot build parent-level indexes concurrently")
 }
 
+// An event trigger a DBA installed to guard DDL refuses the statement. The
+// trigger raises again on every retry, so the apply fails at once rather
+// than spending its retries, and the failure names the SQLSTATE and the
+// server log where the trigger's message is, without rendering the message.
+func TestEngineApplyRefusedByAnEventTriggerFailsAtOnce(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "event_trigger_refusal_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.accounts (id bigint PRIMARY KEY)")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), `
+		CREATE FUNCTION public.block_alter() RETURNS event_trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			RAISE EXCEPTION 'ALTER TABLE is blocked by the DBA policy';
+		END $$`)
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(),
+		"CREATE EVENT TRIGGER block_alter ON ddl_command_start WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION public.block_alter()")
+	require.NoError(t, err)
+
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "accounts", "ALTER TABLE public.accounts ADD COLUMN email text"))
+	require.NoError(t, err)
+	failed := awaitPostgresProgress(t, eng, "accounts")
+	require.Equal(t, engine.StateFailed, failed.State, "progress: %+v", failed)
+	assert.False(t, failed.Retryable, "the trigger refuses the statement the same way on every retry")
+	assert.Equal(t, `a trigger or function in the database refused the statement on "accounts" (SQLSTATE P0001); `+
+		`its message is in the server log; change or disable it, then apply again`, failed.ErrorMessage)
+	assert.NotContains(t, failed.ErrorMessage, "DBA policy")
+}
+
+// A concurrent index build over a function that raises on one of the table's
+// rows fails the apply at once, since every retry meets the same row: the
+// failure names the index and the SQLSTATE and leaves out the function's
+// message, which can quote row values. Once the row is fixed, the next apply
+// removes the invalid index the failed build left and builds it valid.
+func TestEngineApplyConcurrentIndexRefusedByDatabaseCodeFailsAtOnce(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "index_database_code_refusal_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text);
+		INSERT INTO public.orders VALUES (1, 'ok'), (2, 'secret-ref');
+		CREATE FUNCTION public.checked_ref(value text) RETURNS text
+			LANGUAGE plpgsql IMMUTABLE AS $$
+		BEGIN
+			IF value = 'secret-ref' THEN
+				RAISE EXCEPTION 'ref % is not allowed', value;
+			END IF;
+			RETURN value;
+		END $$`)
+	require.NoError(t, err)
+	const build = "CREATE INDEX CONCURRENTLY orders_checked_ref_idx ON public.orders (public.checked_ref(ref))"
+
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders", build))
+	require.NoError(t, err)
+	failed := awaitPostgresProgress(t, eng, "orders")
+	require.Equal(t, engine.StateFailed, failed.State, "progress: %+v", failed)
+	assert.False(t, failed.Retryable, "the function raises on the same row on every retry")
+	assert.Contains(t, failed.ErrorMessage, "orders_checked_ref_idx")
+	assert.Contains(t, failed.ErrorMessage, "a trigger or function in the database refused it (SQLSTATE P0001)")
+	assert.NotContains(t, failed.ErrorMessage, "secret-ref")
+	assertIndexInvalid(t, db, "orders_checked_ref_idx")
+
+	_, err = db.ExecContext(t.Context(), "UPDATE public.orders SET ref = 'fixed' WHERE id = 2")
+	require.NoError(t, err)
+	retry := New()
+	_, err = retry.Apply(t.Context(), applyRequest(dsn, "orders", build))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, retry, "orders")
+	assert.Equal(t, engine.StateCompleted, progress.State, "progress: %+v", progress)
+	assertIndexValidWithoutDebris(t, db, "orders", "orders_checked_ref_idx")
+}
+
 // TestEngineApplyConcurrentIndexRecoversAbandonedInvalid proves an abandoned
 // invalid index already occupying the target name — on the target table,
 // with no backend building it — is recovered inside the apply, not handed to

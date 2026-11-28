@@ -486,6 +486,7 @@ applying the same plan again meets the same refusal.
 | The duration bound ended the build | Retryable. The failure names `postgres.concurrent_index_max_duration` | Raise the setting before the retry, or it meets the same bound |
 | The duration bound ended the build, and it left nothing behind | Refused. The failure names the setting | Raise the setting, then apply again |
 | The build failed on the table's rows, such as duplicates under a unique index | Refused. The failure names the index and the SQLSTATE, such as `23505` for a duplicate key, and says what became of the invalid index the build left: dropped, already gone, held by another build, or still in place under a name the failure gives, because PostgreSQL refused to drop it | Fix the rows, then apply again. When the failure names an invalid index that is left, drop it first, since it still checks every write. On a partitioned table, the partition's invalid index stays until you drop it or the rerun builds it |
+| A trigger or function in the database raised during the build (SQLSTATE `P0001` or `P0004`) | Failed. The failure names the SQLSTATE | Change or disable that code, then apply again. The next apply removes the invalid index and builds again |
 | Another backend still holds the index or the table | Retryable. The failure names the index and the backend | Nothing. SchemaBot retries once that build ends |
 | An invalid index has the name but cannot be cleared by this change: it is on another table, backs a constraint, or belongs to a partitioned table | Refused. The failure names the index | Remove the index yourself, then apply again |
 | The target connection pool cannot hold the sessions the build needs | Refused | Raise the pool size in the target DSN |
@@ -1531,7 +1532,22 @@ another.
 table's set, commits or fails as one transaction. Recovery plans again against
 the live database before doing more work. An index build is the exception: it
 runs outside a transaction, and the next drive recovers any invalid index it
-leaves. See [Index builds](#index-builds).
+leaves, unless database code refused the build. See [Index builds](#index-builds).
+
+**Failures a retry cannot clear end the apply at once.** SchemaBot retries
+a failure that can clear on its own, such as lock contention or a dropped
+connection. These fail the apply on the first attempt instead:
+
+- Rows that break a constraint the statement adds or validates.
+- Objects that depend on what the statement drops.
+- A trigger or function in the database that raises on the statement, such
+  as an event trigger that guards DDL (SQLSTATE `P0001` or `P0004`). The
+  failure names the SQLSTATE. The trigger's message is in the server log.
+  Change or disable the trigger, then apply again.
+
+A failure SchemaBot does not classify names the server's SQLSTATE, when the
+server sent one, so you can find it in the server log. Refusals, duration
+bounds, and invalid indexes are described in their own words instead.
 
 **Rollback:**
 

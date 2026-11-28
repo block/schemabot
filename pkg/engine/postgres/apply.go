@@ -604,7 +604,8 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		// An invalid index a retry recovers or an operator clears — a build's
 		// own leftover, abandoned debris, another backend's build to wait
 		// out, or a builder this role cannot observe — is operational: once
-		// it is gone a retry can succeed. Checked before the refusal and
+		// it is gone a retry can succeed, unless code in the database refused
+		// the build (invalidIndexRetryable). Checked before the refusal and
 		// budget arms because the verdict wraps the build failure that
 		// produced it (a budget-cancelled build leaves its own invalid
 		// index), and that inner cause must not be read as the outcome — the
@@ -620,7 +621,7 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 			"index_schema", invalidErr.Schema, "index", invalidErr.Index, "error", err)
 		result := progressResult(engine.StateFailed, "failed", started, change,
 			invalidIndexDetail(invalidErr))
-		result.Retryable = true
+		result.Retryable = invalidIndexRetryable(invalidErr)
 		publish(result)
 		return
 	}
@@ -719,7 +720,79 @@ func classifyApplyFailure(err error, table string, validates *schemadiff.Constra
 	if detail, ok := missingGrantDetail(err, table); ok {
 		return applyFailure{detail: detail, retryable: true}
 	}
-	return applyFailure{detail: "PostgreSQL schema change failed; see server logs", retryable: true}
+	// A trigger or function in the database that raises on the statement,
+	// such as an event trigger a DBA installed to guard DDL, raises again on
+	// every retry until someone changes it.
+	if detail, ok := raisedByDatabaseCodeDetail(err, table); ok {
+		return applyFailure{detail: detail}
+	}
+	return applyFailure{detail: unclassifiedFailureDetail(err), retryable: true}
+}
+
+// sqlstateRaiseException and sqlstateAssertFailure are the SQLSTATEs of a
+// RAISE EXCEPTION and a failed ASSERT that sets no code of its own, which
+// for a schema change means code in the database, such as an event trigger
+// or a function a trigger calls, refused the statement.
+const (
+	sqlstateRaiseException = "P0001"
+	sqlstateAssertFailure  = "P0004"
+)
+
+// raisedByDatabaseCodeDetail names a statement that a trigger or function in
+// the database refused. The server's message is the one its author wrote for
+// whoever meets the refusal, but it is untrusted text, so the detail names
+// the SQLSTATE and points at the server log, where the message is.
+func raisedByDatabaseCodeDetail(err error, table string) (string, bool) {
+	code, ok := raisedByDatabaseCode(err)
+	if !ok {
+		return "", false
+	}
+	return sanitizeReasonText(fmt.Sprintf(
+		"a trigger or function in the database refused the statement on %q (SQLSTATE %s); its message is in the server log; change or disable it, then apply again",
+		table, code)), true
+}
+
+// raisedByDatabaseCode returns the SQLSTATE of a failure that a trigger or
+// function in the database raised, and whether err is one.
+func raisedByDatabaseCode(err error) (string, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return "", false
+	}
+	switch pgErr.Code {
+	case sqlstateRaiseException, sqlstateAssertFailure:
+		return pgErr.Code, true
+	default:
+		return "", false
+	}
+}
+
+// invalidIndexRetryable reports whether a retry can clear an operational
+// invalid-index verdict. A build that code in the database refused, such as
+// a function an index expression calls raising on a row, leaves its own
+// invalid index like any failed build, and the retry would remove that
+// leftover only to meet the same refusal, so the apply ends at once and the
+// detail names the SQLSTATE.
+//
+// pg-sprite owns this decision for the rows' own faults (CodeDataFault) and
+// does not yet classify a P0001/P0004 raise. A pg-sprite outcome code for a
+// build that database code refused, ranked above the cleanup state as
+// CodeDataFault is, retires this predicate and the raised-build wording below.
+func invalidIndexRetryable(invalidErr *executor.InvalidIndexError) bool {
+	_, raised := raisedByDatabaseCode(invalidErr.Build)
+	return invalidErr.Code() != executor.CodeInvalidIndexOwnLeftover || !raised
+}
+
+// unclassifiedFailureDetail is the detail of a failure no classifier above
+// recognizes. It names the server's SQLSTATE when there is one, which is the
+// handle an operator searches the server log and the PostgreSQL error codes
+// for, and never the server's message, which can quote row values.
+func unclassifiedFailureDetail(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code != "" {
+		return sanitizeReasonText(fmt.Sprintf("PostgreSQL schema change failed (SQLSTATE %s); see server logs", pgErr.Code))
+	}
+	return "PostgreSQL schema change failed; see server logs"
 }
 
 // missingGrantDetail names a statement the server refused because the engine
@@ -937,6 +1010,17 @@ const (
 func invalidIndexWordingFor(invalidErr *executor.InvalidIndexError, cleanup *dataFaultIndexCleanupError) invalidIndexWording {
 	switch invalidErr.Code() {
 	case executor.CodeInvalidIndexOwnLeftover:
+		// A build code in the database refused fails the same way on every
+		// retry, so the operator's step is that code, and the next apply
+		// removes the leftover once the code lets the build through.
+		if code, raised := raisedByDatabaseCode(invalidErr.Build); raised {
+			return invalidIndexWording{
+				causeBefore: "this build left its own invalid index ",
+				causeAfter:  fmt.Sprintf(" on the target after a trigger or function in the database refused it (SQLSTATE %s)", code),
+				lead:        "change the database code that refused it",
+				remedyRest:  ", or disable it, then apply again; its message is in the server log, and the next apply removes the leftover and rebuilds the index",
+			}
+		}
 		// A leftover the bound's statement timeout produced says so: the
 		// retry rebuilds under the same bound, so the operator's step is to
 		// raise it, and the budget the verdict carries is that bound.
