@@ -31,13 +31,16 @@ var requestBodyReaders = []string{
 // body any other way, whether json.NewDecoder(r.Body), io.ReadAll(r.Body),
 // or form parsing, fails this test.
 //
-// A request is any variable declared as an *http.Request in a function: a
-// parameter of the function or of a closure inside it, a var of that type,
-// or one assigned from another request, including through WithContext or
-// Clone. Matching is by name within a function, so a different variable that
-// shares a request's name is also checked, which is the safe direction. Two
-// uses of the body are not reads: comparing it with nil, and wrapping it in
-// place with http.MaxBytesReader.
+// Each top-level declaration is checked, so a handler func literal held in a
+// package-level var is covered as well as a function. A request is a
+// parameter declared as an *http.Request, of the function or of any func
+// literal inside the declaration, a var of that type, or a variable assigned
+// or declared from another request, including through any chain of
+// WithContext and Clone calls. A body read straight off such a copy, as in
+// r.Clone(ctx).Body, counts too. Matching is by name within a declaration,
+// so a different variable that shares a request's name is also checked,
+// which is the safe direction. Two uses of the body are not reads: comparing
+// it with nil, and wrapping it in place with http.MaxBytesReader.
 func TestEveryRequestBodyIsDecodedStrictly(t *testing.T) {
 	fset := token.NewFileSet()
 	foundDecoder := false
@@ -45,15 +48,22 @@ func TestEveryRequestBodyIsDecodedStrictly(t *testing.T) {
 	for _, file := range parseAPISourceFiles(t, fset) {
 		httpName := importedName(file, "net/http")
 		for _, decl := range file.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Body == nil {
-				continue
+			// A package-level var can hold a handler func literal, so every
+			// declaration is a scope, not only functions.
+			var scope ast.Node = decl
+			var params []*ast.FieldList
+			if fn, ok := decl.(*ast.FuncDecl); ok {
+				if fn.Body == nil {
+					continue
+				}
+				if fn.Recv == nil && fn.Name.Name == strictBodyDecoder {
+					foundDecoder = true
+					continue
+				}
+				scope = fn.Body
+				params = []*ast.FieldList{fn.Recv, fn.Type.Params}
 			}
-			if fn.Recv == nil && fn.Name.Name == strictBodyDecoder {
-				foundDecoder = true
-				continue
-			}
-			for _, pos := range requestBodyReads(fn, httpName) {
+			for _, pos := range requestBodyReads(scope, params, httpName) {
 				lenient = append(lenient, fset.Position(pos).String())
 			}
 		}
@@ -99,21 +109,22 @@ func importedName(file *ast.File, path string) string {
 	return ""
 }
 
-// requestBodyReads returns where fn reads a request body.
-func requestBodyReads(fn *ast.FuncDecl, httpName string) []token.Pos {
-	requests := requestVariables(fn, httpName)
+// requestBodyReads returns where scope, with the given parameter lists,
+// reads a request body.
+func requestBodyReads(scope ast.Node, params []*ast.FieldList, httpName string) []token.Pos {
+	requests := requestVariables(scope, params, httpName)
 	if len(requests) == 0 {
 		return nil
 	}
-	allowed := bodyUsesThatAreNotReads(fn.Body, requests, httpName)
+	allowed := bodyUsesThatAreNotReads(scope, requests, httpName)
 
 	var reads []token.Pos
-	ast.Inspect(fn.Body, func(n ast.Node) bool {
+	ast.Inspect(scope, func(n ast.Node) bool {
 		sel, ok := n.(*ast.SelectorExpr)
 		if !ok || allowed[sel] || !slices.Contains(requestBodyReaders, sel.Sel.Name) {
 			return true
 		}
-		if ident, ok := sel.X.(*ast.Ident); ok && requests[ident.Name] {
+		if derivesFromRequest(sel.X, requests) {
 			reads = append(reads, sel.Pos())
 		}
 		return true
@@ -121,8 +132,8 @@ func requestBodyReads(fn *ast.FuncDecl, httpName string) []token.Pos {
 	return reads
 }
 
-// requestVariables names the variables in fn that hold an *http.Request.
-func requestVariables(fn *ast.FuncDecl, httpName string) map[string]bool {
+// requestVariables names the variables in scope that hold an *http.Request.
+func requestVariables(scope ast.Node, params []*ast.FieldList, httpName string) map[string]bool {
 	requests := map[string]bool{}
 	addFields := func(fields *ast.FieldList) {
 		if fields == nil {
@@ -136,12 +147,13 @@ func requestVariables(fn *ast.FuncDecl, httpName string) map[string]bool {
 			}
 		}
 	}
-	addFields(fn.Recv)
-	addFields(fn.Type.Params)
+	for _, fields := range params {
+		addFields(fields)
+	}
 
 	for {
 		before := len(requests)
-		ast.Inspect(fn.Body, func(n ast.Node) bool {
+		ast.Inspect(scope, func(n ast.Node) bool {
 			switch node := n.(type) {
 			case *ast.FuncLit:
 				addFields(node.Type.Params)
@@ -149,6 +161,13 @@ func requestVariables(fn *ast.FuncDecl, httpName string) map[string]bool {
 				if isHTTPRequestType(node.Type, httpName) {
 					for _, name := range node.Names {
 						requests[name.Name] = true
+					}
+				}
+				if len(node.Names) == len(node.Values) {
+					for i, value := range node.Values {
+						if derivesFromRequest(value, requests) {
+							requests[node.Names[i].Name] = true
+						}
 					}
 				}
 			case *ast.AssignStmt:
@@ -171,14 +190,22 @@ func requestVariables(fn *ast.FuncDecl, httpName string) map[string]bool {
 }
 
 // derivesFromRequest reports whether expr is a request variable, or a copy
-// of one made with WithContext or Clone.
+// of one made with any chain of WithContext and Clone calls, such as
+// r.WithContext(ctx).Clone(ctx), since both keep the request body.
 func derivesFromRequest(expr ast.Expr, requests map[string]bool) bool {
-	if call, ok := expr.(*ast.CallExpr); ok {
+	for {
+		call, ok := expr.(*ast.CallExpr)
+		if !ok {
+			break
+		}
 		sel, ok := call.Fun.(*ast.SelectorExpr)
 		if !ok || (sel.Sel.Name != "WithContext" && sel.Sel.Name != "Clone") {
 			return false
 		}
 		expr = sel.X
+	}
+	if paren, ok := expr.(*ast.ParenExpr); ok {
+		return derivesFromRequest(paren.X, requests)
 	}
 	ident, ok := expr.(*ast.Ident)
 	return ok && requests[ident.Name]
@@ -203,9 +230,9 @@ func isHTTPRequestType(expr ast.Expr, httpName string) bool {
 // bodyUsesThatAreNotReads returns the request.Body selectors in body that
 // only compare the body with nil or wrap it in place with
 // http.MaxBytesReader.
-func bodyUsesThatAreNotReads(body *ast.BlockStmt, requests map[string]bool, httpName string) map[*ast.SelectorExpr]bool {
+func bodyUsesThatAreNotReads(scope ast.Node, requests map[string]bool, httpName string) map[*ast.SelectorExpr]bool {
 	allowed := map[*ast.SelectorExpr]bool{}
-	ast.Inspect(body, func(n ast.Node) bool {
+	ast.Inspect(scope, func(n ast.Node) bool {
 		switch node := n.(type) {
 		case *ast.BinaryExpr:
 			if node.Op != token.EQL && node.Op != token.NEQ {
@@ -243,7 +270,7 @@ func requestBody(expr ast.Expr, requests map[string]bool) *ast.SelectorExpr {
 	if !ok || sel.Sel.Name != "Body" {
 		return nil
 	}
-	if ident, ok := sel.X.(*ast.Ident); ok && requests[ident.Name] {
+	if derivesFromRequest(sel.X, requests) {
 		return sel
 	}
 	return nil
