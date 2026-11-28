@@ -447,7 +447,7 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 		if retry && !refusedByQuotaReserve {
 			rateLimitResetAt, rateLimited = ghclient.PrimaryRateLimitResetAt(processErr)
 		}
-		resetWaitedOut := rateLimited && primaryRateLimitResetWaitedOut(event, rateLimitResetAt)
+		resetWaitedOut := rateLimited && primaryRateLimitResetWaitedOut(event, rateLimitResetAt, now)
 		switch {
 		case !retry:
 			failureReason = durableFailureReason(processErr)
@@ -1113,14 +1113,19 @@ func (h *Handler) logQuotaReserveRetry(driverID int, event *storage.WebhookEvent
 }
 
 // primaryRateLimitResetWaitedOut reports whether the delivery had already
-// waited out resetAt before this claim: by the pod's clock, the claim only
-// became due at or after the reset GitHub now reports. A refusal schedules its
-// retry at or after the reset it reported, so a retry that GitHub refuses with
-// the same reset, or an earlier one, means GitHub's clock is behind the pod's.
-// A genuinely new rate limit window reports a later reset, so it is not
-// waited out.
-func primaryRateLimitResetWaitedOut(event *storage.WebhookEvent, resetAt time.Time) bool {
-	return !resetAt.After(event.ClaimableSince)
+// waited out resetAt before this claim: the claim only became due at or after
+// the reset GitHub now reports, and the reset has passed on the claiming pod's
+// clock. A refusal schedules its retry at or after the reset it reported, so a
+// retry that GitHub refuses with the same reset, or an earlier one, means
+// GitHub's clock is behind the claiming pod's. A genuinely new rate limit
+// window reports a later reset, so it is not waited out.
+//
+// The time the claim became due can come from another pod's clock, the one
+// that received the webhook. When that pod runs ahead, a reset can be before
+// the due time and still in the future on the claiming pod, which is not
+// skew on the claiming pod, so the delivery waits for that reset as usual.
+func primaryRateLimitResetWaitedOut(event *storage.WebhookEvent, resetAt, now time.Time) bool {
+	return !resetAt.After(event.ClaimableSince) && !resetAt.After(now)
 }
 
 // primaryRateLimitRetryAt returns when to retry a delivery GitHub's primary
@@ -1161,7 +1166,7 @@ func (h *Handler) logPrimaryRateLimitClockSkew(driverID int, event *storage.Webh
 		"reset_time", resetAt.UTC().Format(time.RFC3339),
 		"due_since", event.ClaimableSince.UTC().Format(time.RFC3339),
 		"pod_now", now.UTC().Format(time.RFC3339),
-		"reset_overdue", now.Sub(resetAt),
+		"reset_overdue", now.Sub(resetAt).Round(time.Second).String(),
 		"disposition", outcome,
 	}
 	if retryAt.IsZero() {

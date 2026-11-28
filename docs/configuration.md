@@ -1284,10 +1284,11 @@ GitHub's own primary rate limit is handled the same way, whether or not
 installation's quota is spent, SchemaBot retries the event at the reset time
 GitHub reports, plus up to 30 seconds. For three hours after the event arrived
 that wait does not use up its retry attempts, and after that each refusal uses
-one of the five. If GitHub refuses the retry with a reset the event has
-already waited for, the server's clock is ahead of GitHub's: SchemaBot logs a
-warning with the reset time and its own time, and waits as long as the reset
-is overdue, between 10 seconds and 10 minutes, before trying again. Keep the
+one of the five. If GitHub refuses the event with a reset that had already
+passed on the server's clock before the event became due, the server's clock
+is ahead of GitHub's: SchemaBot logs a warning with the reset time and its own
+time, and waits as long as the reset is overdue, between 10 seconds and 10
+minutes plus up to 30 seconds, before trying again. Keep the
 server's clock synchronized (for example with NTP) so events retry promptly
 after a reset. A secondary rate limit, or a refusal that carries no readable
 reset time, is retried on the usual schedule.

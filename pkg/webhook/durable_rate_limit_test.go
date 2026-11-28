@@ -320,6 +320,89 @@ func TestDurableWebhookDriverBoundsClaimsUnderClockSkew(t *testing.T) {
 	assert.False(t, podNow.Add(-skew).Before(githubReset), "the delivery ran once GitHub's clock reached the reset")
 }
 
+// The overdue wait has a floor, a ceiling, and applies whether or not the
+// refusal spends an attempt. Each case drives one claim refused with a reset
+// the delivery had already waited out, on the claiming pod's clock.
+func TestDurableWebhookDriverBoundsPrimaryRateLimitOverdueWait(t *testing.T) {
+	reset := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
+	dueJustBefore := func(claimAt time.Time) *time.Time {
+		retryAfter := claimAt.Add(-time.Second)
+		return &retryAfter
+	}
+
+	t.Run("a reset overdue by three hours waits the ten minute ceiling", func(t *testing.T) {
+		event := *durablePullRequestEvent(t)
+		event.ReceivedAt = reset.Add(time.Minute)
+		claimAt := reset.Add(3 * time.Hour)
+		event.RetryAfter = dueJustBefore(claimAt)
+
+		claim := driveRateLimitedClaimAt(t, claimAt, event, &reset)
+
+		require.Equal(t, "uncharged", claim.disposition)
+		assert.WithinDuration(t, claimAt.Add(durableWebhookRetryMaxDelay+rateLimitJitter), claim.retryAt, time.Second)
+	})
+
+	t.Run("a reset overdue by two seconds waits the ten second floor", func(t *testing.T) {
+		event := *durablePullRequestEvent(t)
+		event.ReceivedAt = reset.Add(-time.Minute)
+		claimAt := reset.Add(2 * time.Second)
+		event.RetryAfter = dueJustBefore(claimAt)
+
+		claim := driveRateLimitedClaimAt(t, claimAt, event, &reset)
+
+		require.Equal(t, "uncharged", claim.disposition)
+		assert.WithinDuration(t, claimAt.Add(quotaReserveRetryFloor+rateLimitJitter), claim.retryAt, time.Second)
+	})
+
+	t.Run("past the uncharged window the refusal spends an attempt and still waits as long as the reset is overdue", func(t *testing.T) {
+		event := *durablePullRequestEvent(t)
+		claimAt := reset.Add(2 * time.Minute)
+		event.ReceivedAt = claimAt.Add(-unchargedRefusalWindow - time.Hour)
+		retryAfter := reset.Add(30 * time.Second)
+		event.RetryAfter = &retryAfter
+		event.Attempts = 1
+
+		claim := driveRateLimitedClaimAt(t, claimAt, event, &reset)
+
+		require.Equal(t, "charged", claim.disposition)
+		assert.WithinDuration(t, claimAt.Add(2*time.Minute+rateLimitJitter), claim.retryAt, time.Second)
+	})
+
+	t.Run("the first refusal of a delivery received after the reset already waits as long as it is overdue", func(t *testing.T) {
+		event := *durablePullRequestEvent(t)
+		event.ReceivedAt = reset.Add(85 * time.Second)
+		claimAt := event.ReceivedAt
+
+		claim := driveRateLimitedClaimAt(t, claimAt, event, &reset)
+
+		require.Equal(t, "uncharged", claim.disposition)
+		assert.WithinDuration(t, claimAt.Add(85*time.Second+rateLimitJitter), claim.retryAt, time.Second)
+		line := clockSkewLogLine(t, claim.logs)
+		require.NotNil(t, line, "the skew is logged on the first refusal: %s", claim.logs)
+		assert.Equal(t, "1m25s", line["reset_overdue"], "the overdue time reads as a duration")
+	})
+}
+
+// One pod receives the webhook with its clock an hour ahead, so the delivery
+// is due at 13:00 by that clock. Another pod with the right clock claims it at
+// 12:00 and GitHub refuses it until 12:30. The reset is before the due time
+// but still half an hour away on the claiming pod, so this is not skew there:
+// the delivery waits for 12:30 rather than polling after the floor, and no
+// clock skew is logged against the claiming pod.
+func TestDurableWebhookDriverWaitsForResetStillAheadOfClaimingClock(t *testing.T) {
+	claimAt := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
+	reset := claimAt.Add(30 * time.Minute)
+	event := *durablePullRequestEvent(t)
+	event.ReceivedAt = claimAt.Add(time.Hour)
+
+	claim := driveRateLimitedClaimAt(t, claimAt, event, &reset)
+
+	require.Equal(t, "uncharged", claim.disposition)
+	assert.WithinDuration(t, reset.Add(rateLimitJitter), claim.retryAt, time.Second,
+		"a reset still in the future is waited for, not polled every %s", quotaReserveRetryFloor)
+	assert.Nil(t, clockSkewLogLine(t, claim.logs), "the claiming pod's clock is not ahead of GitHub's")
+}
+
 // A delivery that GitHub keeps refusing cannot be rescheduled forever. Within
 // three hours of its receipt the refusals cost no attempt. After that each one
 // spends an attempt but still waits for the reset, so the delivery goes
