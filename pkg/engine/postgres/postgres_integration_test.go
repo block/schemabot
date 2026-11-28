@@ -2434,6 +2434,35 @@ func TestEngineApplyRefusedByAnEventTriggerFailsAtOnce(t *testing.T) {
 	assert.NotContains(t, failed.ErrorMessage, "DBA policy")
 }
 
+// A table whose dropped columns have used up PostgreSQL's 1,600 column
+// numbers refuses a column add, even though it has one live column. The
+// table stays at the limit on every retry, so the apply fails at once and
+// says to rebuild the table, rather than spending its retries.
+func TestEngineApplyColumnAddOnATableAtTheColumnLimitFailsAtOnce(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "column_limit_test")
+	setupCtx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	_, err := db.ExecContext(setupCtx, `
+		CREATE TABLE public.events (id bigint PRIMARY KEY);
+		DO $$
+		BEGIN
+			FOR i IN 1..1599 LOOP
+				EXECUTE format('ALTER TABLE public.events ADD COLUMN c%s int', i);
+				EXECUTE format('ALTER TABLE public.events DROP COLUMN c%s', i);
+			END LOOP;
+		END $$`)
+	require.NoError(t, err)
+
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "events", "ALTER TABLE public.events ADD COLUMN kind text"))
+	require.NoError(t, err)
+	failed := awaitPostgresProgress(t, eng, "events")
+	require.Equal(t, engine.StateFailed, failed.State, "progress: %+v", failed)
+	assert.False(t, failed.Retryable, "the table stays at the limit until someone rebuilds it")
+	assert.Equal(t, `"events", or one of its partitions or child tables, has reached PostgreSQL's limit of 1,600 columns, which counts dropped columns until the table is rebuilt (SQLSTATE 54011); `+
+		`copy whichever table is full into a new one to reclaim them (VACUUM FULL does not), then apply again`, failed.ErrorMessage)
+}
+
 // A concurrent index build over a function that raises on one of the table's
 // rows fails the apply at once, since every retry meets the same row: the
 // failure names the index and the SQLSTATE and leaves out the function's
