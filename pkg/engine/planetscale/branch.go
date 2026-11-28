@@ -714,7 +714,7 @@ func (e *Engine) createBranch(ctx context.Context, client psclient.PSClient, org
 	})
 	if err != nil {
 		// Idempotent: if branch exists, return it
-		if strings.Contains(err.Error(), "Name has already been taken") {
+		if isBranchNameTakenError(err) {
 			e.logger.Info("branch already exists, reusing", "branch", branchName)
 			return client.GetBranch(ctx, &ps.GetDatabaseBranchRequest{
 				Organization: org,

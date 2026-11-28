@@ -849,6 +849,33 @@ func isApprovalRequiredError(err error) bool {
 	}
 }
 
+// isBranchNameTakenError reports whether a failed branch create is PlanetScale
+// answering that a branch with that name already exists. Only an error answer
+// from the PlanetScale API counts, so its message is the API's own text. A
+// transport failure, an answer whose body is not an API error, or a permission
+// or not found answer never counts, even when its text contains the phrase.
+// The caller reuses the branch on a match, and reads it first, so a wrong match
+// fails on that read rather than reusing a branch that does not exist.
+//
+// The planetscale-go client gives this refusal no error code of its own, and it
+// drops the HTTP status. An answer it maps to an unprocessable request (its
+// retry code) or an invalid request counts, and so does one whose API code it
+// does not map, such as a conflict, which it leaves without a code. The message
+// text is the only signal; this should become a typed check once the client
+// exposes the API's error code.
+func isBranchNameTakenError(err error) bool {
+	psErr, ok := errors.AsType[*ps.Error](err)
+	if !ok {
+		return false
+	}
+	switch psErr.Code {
+	case ps.ErrRetry, ps.ErrInvalid, "":
+		return strings.Contains(psErr.Error(), "Name has already been taken")
+	default:
+		return false
+	}
+}
+
 // approvalRequiredError is PlanetScale's refusal to deploy a deploy request
 // that needs approval. Its message is SchemaBot's own and tells the operator
 // what to change; the API's answer stays on the chain for errors.Is and the
