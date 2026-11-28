@@ -2606,6 +2606,60 @@ func TestResumeApplyReplanFailurePausesForRetry(t *testing.T) {
 	assert.Equal(t, state.Task.FailedRetryable, tasks[0].State)
 }
 
+// replanRefusingEngine fails every re-plan with planErr and reports the
+// deferred cutover signal as signalExists.
+type replanRefusingEngine struct {
+	engine.Engine
+	planErr      error
+	signalExists bool
+}
+
+func (e *replanRefusingEngine) Name() string { return "replan-refusing" }
+
+func (e *replanRefusingEngine) Plan(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) {
+	return nil, e.planErr
+}
+
+func (e *replanRefusingEngine) DeferredCutoverSignalExists(context.Context, *engine.DeferredCutoverSignalRequest) (bool, error) {
+	return e.signalExists, nil
+}
+
+// A running apply whose re-plan the engine refuses permanently fails at once,
+// with the refusal on the apply. Every retry would be refused the same way, so
+// pausing it would only spend the recovery budget before the same failure.
+func TestResumeApplyPermanentReplanRefusalFailsTheApply(t *testing.T) {
+	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{plan: &storage.Plan{ID: 5}})
+	client.planetscaleEngine = &replanRefusingEngine{planErr: engine.NewPermanentError("live schema drifted from the reviewed plan")}
+
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
+
+	require.ErrorContains(t, err, "live schema drifted from the reviewed plan")
+	assert.Equal(t, state.Apply.Failed, applyStore.apply.State)
+	assert.Equal(t, "re-plan failed during recovery: re-plan failed: live schema drifted from the reviewed plan", applyStore.apply.ErrorMessage)
+	assert.Equal(t, state.Task.Failed, tasks[0].State)
+}
+
+// A deferred cutover apply whose engine cutover signal is absent, and whose
+// re-plan then fails transiently, is left waiting for cutover and the error
+// returned. Paused instead, the next claim would see a failed_retryable apply,
+// skip the signal check, and resume the remaining tasks rather than stopping
+// for manual reconciliation.
+func TestResumeApplyReplanFailureWithAbsentCutoverSignalIsLeftAsFound(t *testing.T) {
+	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{plan: &storage.Plan{ID: 5}})
+	client.planetscaleEngine = &replanRefusingEngine{planErr: errors.New("target unavailable")}
+	apply.State = state.Apply.WaitingForCutover
+	apply.SetOptions(storage.ApplyOptions{DeferCutover: true})
+	tasks[0].State = state.Task.WaitingForCutover
+
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
+
+	require.ErrorContains(t, err, "target unavailable")
+	assert.ErrorContains(t, err, "apply-recover-plan")
+	assert.Equal(t, state.Apply.WaitingForCutover, applyStore.apply.State)
+	assert.Empty(t, applyStore.apply.ErrorMessage)
+	assert.Equal(t, state.Task.WaitingForCutover, tasks[0].State)
+}
+
 // A multi-operation drive whose recovery cannot re-plan it pauses its own
 // operation row for retry and records the cause there, for the operator's
 // projection to lift onto the parent. The parent row is the operator's to

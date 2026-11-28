@@ -3136,7 +3136,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 
 	rp, err := c.replanAndFilterTasks(ctx, apply, tasks, plan)
 	if err != nil {
-		return c.pauseForReplanFailure(ctx, apply, tasks, err)
+		return c.pauseForReplanFailure(ctx, apply, tasks, err, deferredCutoverSignalAbsent)
 	}
 
 	activeTasks := rp.ActiveTasks
@@ -3318,10 +3318,21 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 // fails the apply once it runs out, and records the cause on the apply where
 // the operator reads it.
 //
-// An apply in its revert phase is left as found and the error returned: the
-// pause rewrites every non-terminal task as failed_retryable, which erases the
-// revert-phase task states a later recovery reattaches to the engine by.
-func (c *LocalClient) pauseForReplanFailure(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, err error) error {
+// A refusal the engine reports as permanent fails the apply at once through
+// handleGroupedResumeFailure, the same settlement a grouped recovery gives its
+// re-plan refusals: every retry would refuse it again, so spending the budget
+// on it only delays the failure the operator has to act on.
+//
+// Two applies are left as found and the error returned, so the next claim
+// runs the recovery again from the state that selected it:
+//   - An apply in its revert phase: the pause rewrites every non-terminal task
+//     as failed_retryable, which erases the revert-phase task states a later
+//     recovery reattaches to the engine by.
+//   - A deferred cutover apply whose engine cutover signal is absent: the
+//     pause would move it out of waiting_for_cutover, and the next claim would
+//     then skip the signal check and resume the remaining tasks instead of
+//     stopping for manual reconciliation.
+func (c *LocalClient) pauseForReplanFailure(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, err error, deferredCutoverSignalAbsent bool) error {
 	if c.driveCancelled(ctx, apply, "while re-planning the apply for recovery") {
 		return nil
 	}
@@ -3329,6 +3340,16 @@ func (c *LocalClient) pauseForReplanFailure(ctx context.Context, apply *storage.
 		c.logger.Error("re-plan failed during recovery of an apply in its revert phase; leaving it as found so a later recovery reattaches to the revert, and the current apply owner will exit for operator retry",
 			append(apply.MutableLogAttrs(), "error", err)...)
 		return fmt.Errorf("re-plan failed during recovery for apply %s (database %s): %w", apply.ApplyIdentifier, apply.Database, err)
+	}
+	if !engine.IsRetryable(err) {
+		c.logger.Error("re-plan refused permanently during recovery; failing the apply",
+			append(apply.MutableLogAttrs(), "error", err)...)
+		return c.handleGroupedResumeFailure(ctx, apply, tasks, fmt.Errorf("re-plan failed during recovery: %w", err))
+	}
+	if deferredCutoverSignalAbsent {
+		c.logger.Error("re-plan failed during recovery of a deferred cutover apply whose engine cutover signal is absent; leaving it as found so the next claim checks the signal again, and the current apply owner will exit for operator retry",
+			append(apply.MutableLogAttrs(), "error", err)...)
+		return fmt.Errorf("re-plan failed during recovery for deferred cutover apply %s (database %s): %w", apply.ApplyIdentifier, apply.Database, err)
 	}
 	c.logger.Error("re-plan failed during recovery; pausing the apply for operator retry",
 		append(apply.MutableLogAttrs(), "error", err)...)
