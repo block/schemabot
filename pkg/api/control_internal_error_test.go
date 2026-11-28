@@ -414,9 +414,19 @@ func TestRollbackPlanAnswerCarriesOnlyRefusals(t *testing.T) {
 		source      *storage.Plan
 		setupApply  func(*storage.Apply)
 		wantContain []string
+		wantAbsent  []string
 		wantExact   string
 		wantFixed   bool
 	}{
+		{
+			name: "local refusal whose cause quotes code on the target",
+			client: &mockTernClient{planErr: fmt.Errorf("plan namespace payments: %w", &engine.PlanRefusedError{
+				Err: engine.OperatorErrorf(errors.New("ERROR: CREATE INDEX must use CONCURRENTLY (dba policy on db-7.internal) (SQLSTATE P0001)"),
+					"code on database %q raised SQLSTATE P0001 while SchemaBot planned", "payments"),
+			})},
+			wantContain: []string{`code on database "payments" raised SQLSTATE P0001 while SchemaBot planned`},
+			wantAbsent:  []string{"db-7.internal", "must use CONCURRENTLY"},
+		},
 		{
 			name:        "local engine refusal",
 			client:      &mockTernClient{planErr: fmt.Errorf("plan namespace payments: %w", &engine.PlanRefusedError{Err: refusal})},
@@ -487,6 +497,9 @@ func TestRollbackPlanAnswerCarriesOnlyRefusals(t *testing.T) {
 			assert.True(t, strings.HasPrefix(resp.Error, `rollback plan failed: rollback plan for database "payments" (staging): `), resp.Error)
 			for _, want := range tc.wantContain {
 				assert.Contains(t, resp.Error, want)
+			}
+			for _, absent := range tc.wantAbsent {
+				assert.NotContains(t, resp.Error, absent)
 			}
 		})
 	}

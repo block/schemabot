@@ -4191,8 +4191,14 @@ func PlanRefusalProblems(err error) ([]engine.PlanProblem, int) {
 
 // planRefusalReason is a refusal's own text, without the gRPC status prefix a
 // remote data plane's answer carries. It reads the status itself, since
-// grpcstatus.FromError puts the whole wrapped text back into the message.
+// grpcstatus.FromError puts the whole wrapped text back into the message. A
+// local refusal gives its authored text, so a refusal whose cause quotes code
+// on the target keeps that cause in the server log.
 func planRefusalReason(err error) string {
+	if refusal, ok := errors.AsType[*engine.PlanRefusedError](err); ok {
+		text, _ := refusal.AuthoredText()
+		return text
+	}
 	var remote interface{ GRPCStatus() *grpcstatus.Status }
 	if errors.As(err, &remote) {
 		if st := remote.GRPCStatus(); st != nil {
