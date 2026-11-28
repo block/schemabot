@@ -61,7 +61,7 @@ func TestPullCmdLintIsOptIn(t *testing.T) {
 	assert.True(t, cli.Pull.Lint)
 }
 
-// Pull renders readable SQL for humans by default; -o json emits the full
+// Pull renders readable SQL for humans by default; -o json (or --json) emits the full
 // API response for scripts and tooling.
 func TestPullCmdOutputDefaultsToPretty(t *testing.T) {
 	var cli struct {

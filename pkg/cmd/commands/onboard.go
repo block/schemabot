@@ -358,7 +358,7 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 
 	if len(formatErrors) > 0 {
 		return nil, fmt.Errorf("onboarding refused; no files were written:\n%w\n\n"+
-			"To recover, use pull with -o json and the same database, environment, connection, and namespace flags to retrieve the original SQL. "+
+			"To recover, use pull with --json and the same database, environment, connection, and namespace flags to retrieve the original SQL. "+
 			"Create the schema root manually, preserving every managed table, schema option, comment, and namespace artifact; format the SQL across multiple lines. "+
 			"Then run plan against the source environment and require no schema changes. "+
 			"See docs/cli.md#recovering-from-onboarding-formatting-errors. "+

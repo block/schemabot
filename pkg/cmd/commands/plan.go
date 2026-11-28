@@ -2,7 +2,6 @@ package commands
 
 import (
 	"cmp"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -827,8 +826,7 @@ func sortEnvironments(envs []string) {
 func planFingerprint(result *apitypes.PlanResponse) string {
 	// Check for errors first
 	if len(result.Errors) > 0 {
-		data, _ := json.Marshal(result.Errors)
-		return "errors:" + string(data)
+		return fmt.Sprintf("errors:%q", result.Errors)
 	}
 
 	var ddls []string
@@ -888,17 +886,10 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 	sort.Strings(exempt)
 	unmatchedDrops := slices.Sorted(slices.Values(result.UnmatchedDropTables))
 
-	data, _ := json.Marshal(struct {
-		DDLs      []string `json:"ddls"`
-		VSchemas  []string `json:"vschemas"`
-		Finalizes []string `json:"finalizes"`
-		Unsafe    []string `json:"unsafe"`
-		Blocked   []string `json:"blocked"`
-		Lint      []string `json:"lint"`
-		Exempt    []string `json:"exempt"`
-		Unmatched []string `json:"unmatched_drop_tables"`
-	}{ddls, vschemas, finalizes, unsafeFindings, blocked, lint, exempt, unmatchedDrops})
-	return string(data)
+	// %q quotes every element, so no value can run into the next one and two
+	// different plans can never format to the same string.
+	return fmt.Sprintf("ddls=%q vschemas=%q finalizes=%q unsafe=%q blocked=%q lint=%q exempt=%q unmatched_drop_tables=%q",
+		ddls, vschemas, finalizes, unsafeFindings, blocked, lint, exempt, unmatchedDrops)
 }
 
 // renderedNamespace is the namespace a plan's output lists a change under: a

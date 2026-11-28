@@ -340,13 +340,13 @@ rerunning `onboard` does not fix the refusal, because the command pulls the live
 schema again.
 
 To build the schema root manually, retrieve the original definitions with
-`pull -o json`, using the same database, environment, profile or endpoint,
+`pull --json`, using the same database, environment, profile or endpoint,
 type override, and concrete namespace selection as the failed onboarding.
 Omit `--table`: recovery needs the complete managed schema, including namespace
 artifacts. For example, a one-table MySQL database returns:
 
 ```console
-$ schemabot pull -d shop -e staging -o json
+$ schemabot pull -d shop -e staging --json
 {
   "database": "shop",
   "type": "mysql",
@@ -1580,8 +1580,7 @@ Prefer structured output when another program consumes the result:
 
 | Commands | JSON option |
 |---|---|
-| `databases`, `status`, `progress`, `list-plans`, `logs`, `locks`, `plan`, `init`, `settings`, `freeze list`, `freeze show`, `freeze override`, `checks show` | `--json` |
-| `pull` | `-o json` |
+| `databases`, `status`, `progress`, `list-plans`, `logs`, `locks`, `plan`, `pull`, `init`, `settings`, `freeze list`, `freeze show`, `freeze override`, `checks show` | `--json` |
 
 For example:
 
