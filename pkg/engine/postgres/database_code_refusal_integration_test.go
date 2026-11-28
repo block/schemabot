@@ -36,6 +36,19 @@ func TestEnginePlanRefusesWhenAnEventTriggerRaisesOnTheScratchSchema(t *testing.
 			END $$;
 			CREATE EVENT TRIGGER refuse_create_index ON ddl_command_start WHEN TAG IN ('CREATE INDEX')
 				EXECUTE FUNCTION public.refuse_create_index()`,
+		// A start guard that also covers CREATE SCHEMA cannot exempt the
+		// scratch schema's own creation by current_schema(), which still
+		// names the caller's schema then, so it lets CREATE SCHEMA through.
+		"ddl_command_start on CREATE SCHEMA too": `
+			CREATE FUNCTION public.refuse_create_index() RETURNS event_trigger LANGUAGE plpgsql AS $$
+			BEGIN
+				IF current_setting('test.exempt_scratch', true) = 'on' AND (tg_tag = 'CREATE SCHEMA' OR current_schema() LIKE 'pgsprite\_scratch\_%') THEN
+					RETURN;
+				END IF;
+				RAISE EXCEPTION 'CREATE INDEX must use CONCURRENTLY (dba policy on db-7.internal)';
+			END $$;
+			CREATE EVENT TRIGGER refuse_create_index ON ddl_command_start WHEN TAG IN ('CREATE INDEX', 'CREATE SCHEMA')
+				EXECUTE FUNCTION public.refuse_create_index()`,
 		"ddl_command_end": `
 			CREATE FUNCTION public.refuse_create_index() RETURNS event_trigger LANGUAGE plpgsql AS $$
 			DECLARE
@@ -89,7 +102,8 @@ CREATE INDEX accounts_email_idx ON accounts (email);`,
 				`Planning builds the declared tables in a schema named pgsprite_scratch_<suffix>, in a transaction it always rolls back, `+
 				`so an event trigger on DDL fires there too, on its CREATE SCHEMA and on the DDL inside it. `+
 				`Have the trigger allow both for a schema whose name starts with pgsprite_scratch_ `+
-				`(at ddl_command_start, check current_schema(); at ddl_command_end, check each command's schema_name, `+
+				`(at ddl_command_start, check current_schema(), and let CREATE SCHEMA through, since its new name is not visible until ddl_command_end; `+
+				`at ddl_command_end, check each command's schema_name, `+
 				`and the object_identity of a CREATE SCHEMA), then plan again`, text)
 			assert.NotContains(t, text, "db-7.internal", "the trigger's raised text stays in the cause")
 			pgErr, ok := errors.AsType[*pgconn.PgError](err)
