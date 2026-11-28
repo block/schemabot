@@ -89,7 +89,9 @@ const (
 	// outcome degrades to a cancellation. Nothing after the build
 	// charges the gap: pg-sprite runs its post-failure catalog verdict on
 	// a detached context of its own, the cleanup of an operator-cancelled
-	// build runs detached under cancelledIndexCleanupBound, and the terminal
+	// build runs detached under cancelledIndexCleanupBound, the drop of the
+	// leftover a build refused on the table's rows runs detached under
+	// dataFaultIndexCleanupBound, and the terminal
 	// publish reads the tracker the same way. The bound is sized to cover
 	// setup even when every one of its steps runs to the server-side limit
 	// the pool sets for it — the connect timeout for the dial, the
@@ -1034,14 +1036,25 @@ func dataFaultIndexWording(invalidErr *executor.InvalidIndexError, cleanup *data
 		w.remedyRest = fmt.Sprintf(", named %s (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run",
 			quarantinedNames(cleanup.skipped))
 	case cleanup != nil && cleanup.cleaned && len(cleanup.skipped) > 0:
-		w.causeAfter += ", and its invalid leftover, quarantined, " + leftoverStillChecks(invalidErr.Build)
-		w.lead = operatorDrops
-		w.remedyRest = fmt.Sprintf(", named %s, since the server refuses to drop it concurrently (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run",
+		// pg-sprite quarantines this build's leftover only once it proves it
+		// droppable, and then drops it, so a sweep that dropped nothing found
+		// the leftover already gone; what it stepped over is older debris, and
+		// the cause names only that.
+		w.causeAfter += ", and older invalid indexes stay quarantined"
+		w.lead = "an operator must drop them"
+		w.remedyRest = fmt.Sprintf(", named %s, since the server refuses to drop them concurrently (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run",
 			quarantinedNames(cleanup.skipped))
 	case cleanup != nil && cleanup.cleaned && len(cleanup.dropped) > 0:
 		w.causeAfter += ", and its invalid leftover was dropped"
 	case cleanup != nil && cleanup.cleaned:
 		w.causeAfter += ", and its invalid leftover was already gone"
+	case cleanup != nil && cleanup.existing != nil && errors.Is(cleanup.existing.Cleanup, executor.ErrInvalidIndexBuildInFlight):
+		// Another build holds the index the drop found: another drive's
+		// recovery removed this build's leftover and started its own build
+		// under the name. That index is not this build's to drop, so the
+		// operator is told to leave it.
+		w.causeAfter += ", and another build now holds the name"
+		w.remedyRest = fmt.Sprintf(", then re-run once that build ends; leave its index, %q.%q, alone", cleanup.existing.Schema, cleanup.existing.Index)
 	case cleanup != nil && cleanup.existing != nil:
 		// The drop failed after it found the leftover, possibly after it
 		// quarantined it under a new name, which the rerun's build does not

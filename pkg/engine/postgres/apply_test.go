@@ -1477,7 +1477,9 @@ func TestEveryRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
 			pastFirstStep: true, namesIndex: true},
 		"invalid index the rows violate, beside another quarantined entry": {cause: mixedDataFaultSweep(widest),
 			pastFirstStep: true, namesIndex: true},
-		"invalid index the rows violate, drop failed after quarantining it": {cause: failedDataFaultDrop(widest),
+		"invalid index the rows violate, drop failed after quarantining it": {cause: failedDataFaultDrop(widest, executor.ErrInvalidIndexBuilderUnobservable),
+			pastFirstStep: true, namesIndex: true},
+		"invalid index the rows violate, another build now holds the name": {cause: failedDataFaultDrop(widest, executor.ErrInvalidIndexBuildInFlight),
 			pastFirstStep: true, namesIndex: true},
 		"invalid index the rows violate, not proven its own": {cause: &executor.InvalidIndexError{Schema: widest, Index: widest, Table: widest,
 			Build: &pgconn.PgError{Code: "23505"}, Cleanup: executor.ErrAbandonmentUnproven},
@@ -4552,11 +4554,11 @@ func mixedDataFaultSweep(name string) error {
 
 // failedDataFaultDrop is a unique build that failed on duplicate rows whose
 // cleanup quarantined the leftover under name and then failed to drop it.
-func failedDataFaultDrop(name string) error {
+func failedDataFaultDrop(name string, found error) error {
 	verdict := &executor.InvalidIndexError{Schema: name, Index: name, Table: name,
 		Build: &pgconn.PgError{Code: "23505"}, Cleanup: executor.ErrBuildLeftInvalidIndex}
 	return &dataFaultIndexCleanupError{err: verdict, verdict: verdict,
-		existing: &executor.InvalidIndexError{Schema: name, Index: name, Table: name, Cleanup: executor.ErrInvalidIndexBuildInFlight}}
+		existing: &executor.InvalidIndexError{Schema: name, Index: name, Table: name, Cleanup: found}}
 }
 
 // A unique build that fails on duplicate rows leaves an invalid index that
@@ -4590,14 +4592,14 @@ func TestBuildIndexConcurrentlyDropsTheIndexADataFaultLeft(t *testing.T) {
 			verdict: own(duplicate), drop: droppedNothing, drops: 1,
 			detail: `index "public"."users_email_idx" was not built: rows duplicate its key (23505), and its invalid leftover was already gone; correct the rows, then re-run`,
 		},
-		"quarantined": {
+		"stepped over older debris": {
 			verdict: own(duplicate), drops: 1,
 			drop: func() (executor.IndexRecoveryReport, error) {
 				return executor.IndexRecoveryReport{Skipped: []executor.QuarantinedIndex{
 					{Schema: "public", Index: "pgsprite_abandoned_42", IndexOID: 42}}}, nil
 			},
-			detail: `index "public"."users_email_idx" was not built: rows duplicate its key (23505), and its invalid leftover, quarantined, still rejects writes that duplicate its key; ` +
-				`an operator must drop it, named "public"."pgsprite_abandoned_42", since the server refuses to drop it concurrently (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run`,
+			detail: `index "public"."users_email_idx" was not built: rows duplicate its key (23505), and older invalid indexes stay quarantined; ` +
+				`an operator must drop them, named "public"."pgsprite_abandoned_42", since the server refuses to drop them concurrently (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run`,
 		},
 		"dropped one entry and stepped over another": {
 			verdict: own(duplicate), drops: 1,
@@ -4613,9 +4615,16 @@ func TestBuildIndexConcurrentlyDropsTheIndexADataFaultLeft(t *testing.T) {
 		"drop failed after quarantining the leftover": {
 			verdict: own(duplicate), drops: 1,
 			drop: dropFailed(&executor.InvalidIndexError{Schema: "public", Index: "pgsprite_abandoned_42", Table: "users",
-				BuilderPID: 7, Cleanup: executor.ErrInvalidIndexBuildInFlight}),
+				Cleanup: executor.ErrInvalidIndexBuilderUnobservable}),
 			detail: `index "public"."users_email_idx" was not built: rows duplicate its key (23505), and its invalid leftover still rejects writes that duplicate its key; ` +
 				`an operator must drop it, named "public"."pgsprite_abandoned_42" (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run`,
+		},
+		"another build now holds the name": {
+			verdict: own(duplicate), drops: 1,
+			drop: dropFailed(&executor.InvalidIndexError{Schema: "public", Index: "users_email_idx", Table: "users",
+				BuilderPID: 7, Cleanup: executor.ErrInvalidIndexBuildInFlight}),
+			detail: `index "public"."users_email_idx" was not built: rows duplicate its key (23505), and another build now holds the name; ` +
+				`correct the rows, then re-run once that build ends; leave its index, "public"."users_email_idx", alone`,
 		},
 		"drop failed without saying where the leftover is": {
 			verdict: own(duplicate), drop: dropFailed(errors.New("lock not granted")), drops: 1,
@@ -4634,11 +4643,13 @@ func TestBuildIndexConcurrentlyDropsTheIndexADataFaultLeft(t *testing.T) {
 			if drop == nil {
 				drop = dropFailed(errors.New("no drop is expected"))
 			}
-			calls := scriptConcurrentIndex(t, func() error { return tc.verdict }, func() error {
-				return errors.New("no rebuild is expected")
-			}, drop)
+			// The apply's context is cancelled as the build fails, so the
+			// drop proves it runs detached from it.
 			applyCtx, cancel := context.WithCancel(t.Context())
 			defer cancel()
+			calls := scriptConcurrentIndex(t, func() error { cancel(); return tc.verdict }, func() error {
+				return errors.New("no rebuild is expected")
+			}, drop)
 
 			before := time.Now()
 			err := buildIndexConcurrently(applyCtx, nil, concurrentIndexChange(time.Hour), newTestTracker(t), slog.New(slog.DiscardHandler))
