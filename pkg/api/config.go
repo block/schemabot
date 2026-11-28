@@ -541,6 +541,11 @@ func (c *ServerConfig) StorageRetentionApplyLogs() (time.Duration, bool, error) 
 	if err != nil {
 		return 0, false, err
 	}
+	// The store measures the window in whole microseconds, so a shorter one
+	// would be refused by every count and delete.
+	if window < time.Microsecond {
+		return 0, false, fmt.Errorf("storage_retention.apply_logs must be at least 1µs, got %q", c.StorageRetention.ApplyLogs)
+	}
 	return window, true, nil
 }
 

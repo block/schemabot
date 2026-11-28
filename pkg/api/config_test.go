@@ -5677,6 +5677,7 @@ func TestStorageRetentionConfig(t *testing.T) {
 		}{
 			{"zero", "0s", "storage_retention.apply_logs must be positive"},
 			{"negative", "-1h", "storage_retention.apply_logs must be positive"},
+			{"below a microsecond", "999ns", "storage_retention.apply_logs must be at least 1µs"},
 			{"unparseable", "ninety days", "storage_retention.apply_logs"},
 		} {
 			t.Run(tc.name, func(t *testing.T) {

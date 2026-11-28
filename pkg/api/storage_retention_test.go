@@ -50,6 +50,9 @@ type retentionWebhookStore struct {
 	failAfter int
 	counted   int64
 	countErr  error
+	// blockCount makes a count wait until its context ends, as a count over a
+	// large backlog would.
+	blockCount bool
 	// onDelete runs inside each delete call, before it answers.
 	onDelete func(call int)
 
@@ -77,8 +80,12 @@ func (s *retentionWebhookStore) DeleteTerminalOlderThan(_ context.Context, age t
 	return 0, nil
 }
 
-func (s *retentionWebhookStore) CountTerminalOlderThan(_ context.Context, age time.Duration) (int64, error) {
+func (s *retentionWebhookStore) CountTerminalOlderThan(ctx context.Context, age time.Duration) (int64, error) {
 	s.countCalls = append(s.countCalls, age)
+	if s.blockCount {
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}
 	return s.counted, s.countErr
 }
 
@@ -151,6 +158,7 @@ func deletingSettings() storageRetentionSettings {
 		batchSize:     3,
 		webhookEvents: 168 * time.Hour,
 		maxBatches:    10,
+		countTimeout:  time.Minute,
 	}
 }
 
@@ -276,6 +284,30 @@ func TestStorageRetentionPassLogsAFailedDryRunCount(t *testing.T) {
 	require.Len(t, failed, 1, logs.String())
 	assert.Equal(t, "webhook_events", failed[0]["table"])
 	assert.Equal(t, true, failed[0]["dry_run"])
+}
+
+// A dry-run count that runs past its deadline gives up on its own, so a slow
+// count over a large backlog cannot hold the election. The pass reports no
+// figure for that table, never zero, and still counts the other table.
+func TestStorageRetentionDryRunCountGivesUpAtItsDeadline(t *testing.T) {
+	events := &retentionWebhookStore{blockCount: true}
+	applyLogs := &retentionApplyLogStore{counted: 4}
+	svc, logs := newRetentionServiceWithApplyLogs(t, StorageRetentionConfig{}, &retentionApplyStore{}, events, applyLogs)
+	settings := deletingSettingsWithApplyLogs()
+	settings.dryRun = true
+	settings.countTimeout = 10 * time.Millisecond
+
+	svc.runStorageRetentionPass(t.Context(), settings)
+
+	timedOut := logEntries(t, logs, "storage retention dry run could not count")
+	require.Len(t, timedOut, 1, logs.String())
+	assert.Equal(t, "webhook_events", timedOut[0]["table"])
+	assert.Equal(t, "WARN", timedOut[0]["level"])
+	assert.Equal(t, "10ms", timedOut[0]["count_timeout"])
+	complete := logEntries(t, logs, "storage retention pass complete")
+	require.Len(t, complete, 1, logs.String())
+	assert.Equal(t, "apply_logs", complete[0]["table"])
+	assert.InDelta(t, 4, complete[0]["rows_would_delete"], 0)
 }
 
 // Losing the election is the expected outcome on every instance but one, so

@@ -1784,7 +1784,9 @@ tables are purged independently, so a failure on one does not stop the other.
 
 Read a dry run's log line before turning deletion on: set `enabled: true`, let a
 pass run, and check `rows_would_delete` for each table, `webhook_events` and,
-when you set `apply_logs`, `apply_logs`.
+when you set `apply_logs`, `apply_logs`. Each count has one minute to finish; a
+table whose count runs out of time logs a warning that the pass has no figure
+for it, rather than a count of zero, and the other table is still counted.
 
 ### Apply log window
 

@@ -62,6 +62,12 @@ const (
 	// webhook inbox's own claims and writes.
 	storageRetentionBatchPause = 200 * time.Millisecond
 
+	// storageRetentionCountTimeout bounds one dry-run count. A count reads every
+	// eligible row, so on a large backlog it can run long; the bound keeps one
+	// slow count from holding the election, and the other table is still
+	// counted.
+	storageRetentionCountTimeout = time.Minute
+
 	// storageRetentionApplyLogsUnset is what the startup line reports for the
 	// apply logs window when none is configured, which means every apply log is
 	// kept.
@@ -82,10 +88,12 @@ type storageRetentionSettings struct {
 	applyLogs      time.Duration
 	purgeApplyLogs bool
 
-	// maxBatches and batchPause pace a pass that deletes. They are fields so a
-	// test can shrink them; storageRetentionPass sets them to the constants.
-	maxBatches int
-	batchPause time.Duration
+	// maxBatches and batchPause pace a pass that deletes, and countTimeout
+	// bounds each dry-run count. They are fields so a test can shrink them;
+	// storageRetentionPass sets them to the constants.
+	maxBatches   int
+	batchPause   time.Duration
+	countTimeout time.Duration
 }
 
 // storageRetentionPass returns the pass to run, how often to run it, and true,
@@ -126,6 +134,7 @@ func (s *Service) storageRetentionPass() (func(context.Context), time.Duration, 
 		purgeApplyLogs: purgeApplyLogs,
 		maxBatches:     storageRetentionMaxBatches,
 		batchPause:     storageRetentionBatchPause,
+		countTimeout:   storageRetentionCountTimeout,
 	}
 	applyLogsWindow := storageRetentionApplyLogsUnset
 	if purgeApplyLogs {
@@ -211,7 +220,16 @@ func (s *Service) purgeTable(
 	logger := s.logger.With("table", table, "window", window.String(), "dry_run", settings.dryRun)
 
 	if settings.dryRun {
-		wouldDelete, err := count(ctx, window)
+		countCtx, cancel := context.WithTimeout(ctx, settings.countTimeout)
+		defer cancel()
+		wouldDelete, err := count(countCtx, window)
+		if err != nil && ctx.Err() == nil && errors.Is(countCtx.Err(), context.DeadlineExceeded) {
+			// The count ran out of time, not the server: there is no figure for
+			// this pass, which is not the same as nothing to delete.
+			logger.Warn("storage retention dry run could not count the rows a purge would delete before its deadline; this pass reports no figure for the table",
+				"count_timeout", settings.countTimeout.String(), "error", err)
+			return err
+		}
 		if err != nil {
 			return logStorageRetentionFailure(ctx, logger, 0, 0, err)
 		}
