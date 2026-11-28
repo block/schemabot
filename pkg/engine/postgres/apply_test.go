@@ -1800,6 +1800,32 @@ func TestClassifyApplyFailureRetriesOnlyWhatARetryCanClear(t *testing.T) {
 	assert.Equal(t, "PostgreSQL schema change failed; see server logs", dropped.detail)
 }
 
+// A trigger or function in the database that raises on the statement, such
+// as an event trigger a DBA installed to guard DDL, raises again on every
+// retry, so the apply ends at once. The detail names the SQLSTATE and the
+// server log, never the message, which is untrusted text.
+func TestClassifyApplyFailureRaisedByDatabaseCode(t *testing.T) {
+	for _, code := range []string{sqlstateRaiseException, sqlstateAssertFailure} {
+		raised := fmt.Errorf("execute: %w", &pgconn.PgError{Code: code, Message: "DROP TABLE is blocked by the DBA policy"})
+
+		failure := classifyApplyFailure(raised, "orders", nil)
+
+		assert.False(t, failure.retryable, code)
+		assert.Equal(t, `a trigger or function in the database refused the statement on "orders" (SQLSTATE `+code+
+			`); its message is in the server log; change or disable it, then apply again`, failure.detail)
+		assert.NotContains(t, failure.detail, "DBA policy")
+	}
+}
+
+// A failure no classifier recognizes stays retryable and names the server's
+// SQLSTATE when it has one, never the server's message.
+func TestClassifyApplyFailureNamesAnUnclassifiedSQLSTATE(t *testing.T) {
+	failure := classifyApplyFailure(fmt.Errorf("execute: %w", &pgconn.PgError{Code: "XX000", Message: "internal detail"}), "orders", nil)
+
+	assert.True(t, failure.retryable)
+	assert.Equal(t, "PostgreSQL schema change failed (SQLSTATE XX000); see server logs", failure.detail)
+}
+
 // A statement the server refuses for a missing grant, such as a foreign key
 // whose referenced table the engine role cannot reference, says a grant is
 // missing instead of reporting a generic failure.

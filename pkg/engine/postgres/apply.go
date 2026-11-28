@@ -710,7 +710,53 @@ func classifyApplyFailure(err error, table string, validates *schemadiff.Constra
 	if detail, ok := missingGrantDetail(err, table); ok {
 		return applyFailure{detail: detail, retryable: true}
 	}
-	return applyFailure{detail: "PostgreSQL schema change failed; see server logs", retryable: true}
+	// A trigger or function in the database that raises on the statement,
+	// such as an event trigger a DBA installed to guard DDL, raises again on
+	// every retry until someone changes it.
+	if detail, ok := raisedByDatabaseCodeDetail(err, table); ok {
+		return applyFailure{detail: detail}
+	}
+	return applyFailure{detail: unclassifiedFailureDetail(err), retryable: true}
+}
+
+// sqlstateRaiseException and sqlstateAssertFailure are the SQLSTATEs of a
+// RAISE EXCEPTION and a failed ASSERT that sets no code of its own, which
+// for a schema change means code in the database, such as an event trigger
+// or a function a trigger calls, refused the statement.
+const (
+	sqlstateRaiseException = "P0001"
+	sqlstateAssertFailure  = "P0004"
+)
+
+// raisedByDatabaseCodeDetail names a statement that a trigger or function in
+// the database refused. The server's message is the one its author wrote for
+// whoever meets the refusal, but it is untrusted text, so the detail names
+// the SQLSTATE and points at the server log, where the message is.
+func raisedByDatabaseCodeDetail(err error, table string) (string, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return "", false
+	}
+	switch pgErr.Code {
+	case sqlstateRaiseException, sqlstateAssertFailure:
+		return sanitizeReasonText(fmt.Sprintf(
+			"a trigger or function in the database refused the statement on %q (SQLSTATE %s); its message is in the server log; change or disable it, then apply again",
+			table, pgErr.Code)), true
+	default:
+		return "", false
+	}
+}
+
+// unclassifiedFailureDetail is the detail of a failure no classifier above
+// recognizes. It names the server's SQLSTATE when there is one, which is the
+// handle an operator searches the server log and the PostgreSQL error codes
+// for, and never the server's message, which can quote row values.
+func unclassifiedFailureDetail(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code != "" {
+		return sanitizeReasonText(fmt.Sprintf("PostgreSQL schema change failed (SQLSTATE %s); see server logs", pgErr.Code))
+	}
+	return "PostgreSQL schema change failed; see server logs"
 }
 
 // missingGrantDetail names a statement the server refused because the engine

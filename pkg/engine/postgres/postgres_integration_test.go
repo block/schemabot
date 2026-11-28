@@ -2405,6 +2405,38 @@ func TestEngineApplyPartitionedParentConcurrentIndexRefusal(t *testing.T) {
 	assert.Contains(t, progress.ErrorMessage, "cannot build parent-level indexes concurrently")
 }
 
+// An event trigger a DBA installed to guard DDL refuses the statement. The
+// trigger raises again on every retry, so the apply fails at once rather
+// than spending its retries, and the failure names the SQLSTATE and the
+// server log where the trigger's message is, without rendering the message.
+func TestEngineApplyRefusedByAnEventTriggerFailsAtOnce(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "event_trigger_refusal_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.accounts (id bigint PRIMARY KEY)")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), `
+		CREATE FUNCTION public.block_alter() RETURNS event_trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			RAISE EXCEPTION 'ALTER TABLE is blocked by the DBA policy';
+		END $$`)
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(),
+		"CREATE EVENT TRIGGER block_alter ON ddl_command_start WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION public.block_alter()")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = db.ExecContext(t.Context(), "DROP EVENT TRIGGER IF EXISTS block_alter")
+	})
+
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "accounts", "ALTER TABLE public.accounts ADD COLUMN email text"))
+	require.NoError(t, err)
+	failed := awaitPostgresProgress(t, eng, "accounts")
+	require.Equal(t, engine.StateFailed, failed.State, "progress: %+v", failed)
+	assert.False(t, failed.Retryable, "the trigger refuses the statement the same way on every retry")
+	assert.Equal(t, `a trigger or function in the database refused the statement on "accounts" (SQLSTATE P0001); `+
+		`its message is in the server log; change or disable it, then apply again`, failed.ErrorMessage)
+	assert.NotContains(t, failed.ErrorMessage, "DBA policy")
+}
+
 // TestEngineApplyConcurrentIndexRecoversAbandonedInvalid proves an abandoned
 // invalid index already occupying the target name — on the target table,
 // with no backend building it — is recovered inside the apply, not handed to

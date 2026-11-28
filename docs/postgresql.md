@@ -1540,6 +1540,20 @@ the live database before doing more work. An index build is the exception: it
 runs outside a transaction, and the next drive recovers any invalid index it
 leaves. See [Index builds](#index-builds).
 
+**Failures a retry cannot clear end the apply at once.** SchemaBot retries
+a failure that can clear on its own, such as lock contention or a dropped
+connection. These fail the apply on the first attempt instead:
+
+- Rows that break a constraint the statement adds or validates.
+- Objects that depend on what the statement drops.
+- A trigger or function in the database that raises on the statement, such
+  as an event trigger that guards DDL (SQLSTATE `P0001` or `P0004`). The
+  failure names the SQLSTATE. The trigger's message is in the server log.
+  Change or disable the trigger, then apply again.
+
+Any other failure names the server's SQLSTATE, when the server sent one, so
+you can find it in the server log.
+
 **Rollback:**
 
 - Rollback covers the same tables the plan manages. It leaves out
