@@ -68,5 +68,5 @@ func (cmd *ReleaseCmd) Run(g *Globals) error {
 		return nil
 	}
 	fmt.Println()
-	return WatchApplyProgressByApplyID(ep, cmd.ApplyID, true)
+	return watchControlledApply(ep, cmd.ApplyID, cmd.Environment, true)
 }
