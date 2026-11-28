@@ -60,7 +60,7 @@ func planRowSecurityOperation(ctx context.Context, pool *pgxpool.Pool, namespace
 	}
 	reason := "Row security changes alter who can access rows; review the complete policy and settings replacement"
 	if deniesEveryRow(wanted.RowSecurity) {
-		reason += ". " + denyAllReason
+		reason += "; " + denyAllReason
 	}
 	return []engine.TableChange{{
 		Table: desired.Table(), Operation: ddl.StatementAlterTable,
@@ -71,8 +71,9 @@ func planRowSecurityOperation(ctx context.Context, pool *pgxpool.Pool, namespace
 
 // denyAllReason names what a table with row security on and no permissive
 // policy does to the application, so the plan says it rather than leaving
-// the reviewer to work it out from the statements.
-const denyAllReason = "After this change row security is on with no policy that grants access, so every role subject to it reads no rows and every write fails; declare a permissive policy in the same file"
+// the reviewer to work it out from the statements. It is one finding, so it
+// carries no "; ", which separates the findings a reason lists.
+const denyAllReason = "after this change row security is on with no policy that grants access, so every role subject to it reads no rows and every write fails: declare a permissive policy in the same file"
 
 // deniesEveryRow reports row security that is on with no permissive
 // policy. PostgreSQL grants a row only through a permissive policy, and
@@ -103,13 +104,48 @@ func unsupportedRowSecurityShape(namespace string, live schemadiff.Model, err er
 	if !ok {
 		return nil, false
 	}
-	why := ": " + shape.Error()
+	why := rowSecurityShapePhrase(shape)
 	if errors.Is(shape, schemadiff.ErrUnrenderableForeignKey) {
-		why = ", because it is in a foreign key relationship (" + strings.Join(quoteAll(foreignKeyRelationships(namespace, live)), ", ") + ")"
+		why = "it is in a foreign key relationship (" + strings.Join(quoteAll(foreignKeyRelationships(namespace, live)), ", ") + ")"
 	}
 	return &engine.PlanRefusedError{Err: fmt.Errorf(
-		"SchemaBot does not manage row security on table %q yet%s; remove the row security statements from its schema file, then plan again",
+		"SchemaBot does not manage row security on table %q yet, because %s; remove the row security statements from its schema file, then plan again",
 		live.Table, why)}, true
+}
+
+// rowSecurityShapePhrases says, in the operator's terms, what about a table
+// keeps the row security path from managing it. The planning library's own
+// text speaks of rendering a desired schema, which the operator never sees.
+var rowSecurityShapePhrases = []struct {
+	shape  error
+	phrase string
+}{
+	{schemadiff.ErrUnrenderableDefault, "it has a column whose default comes from a sequence"},
+	{schemadiff.ErrUnrenderablePartition, "it is partitioned"},
+	{schemadiff.ErrUnrenderableInheritance, "it uses table inheritance"},
+	{schemadiff.ErrUnrenderableForeignKey, "it is in a foreign key relationship"},
+	{schemadiff.ErrUnrenderableUnlogged, "it is unlogged"},
+	{schemadiff.ErrUnrenderableCollation, "it has a column with an explicit collation"},
+	{schemadiff.ErrUnrenderableVirtual, "it has a virtual generated column"},
+	{schemadiff.ErrUnrenderableToastOptions, "it sets TOAST storage parameters"},
+	{schemadiff.ErrUnrenderableSequenceOptions, "it owns a sequence with options other than the defaults"},
+	{schemadiff.ErrUnrenderableMergedConstraints, "it has constraints that repeat each other on the same columns"},
+	{schemadiff.ErrUnrenderableUnattachedIndex, "it is a partitioned table with an index that is not attached on every partition"},
+	{schemadiff.ErrUnrenderablePartitionedRowSecurity, "it is a partitioned table"},
+	{schemadiff.ErrUnrenderableRowSecurity, "its row security settings are of a kind SchemaBot cannot compare yet"},
+}
+
+// rowSecurityShapePhrase names the shape, or says only that the table's
+// definition is the cause when the planning library reports a shape this
+// build has no phrase for.
+func rowSecurityShapePhrase(shape error) string {
+	for _, p := range rowSecurityShapePhrases {
+		if errors.Is(shape, p.shape) {
+			return p.phrase
+		}
+	}
+	slog.Warn("row security refusal names a table shape with no phrase; rendering the generic one", "shape", shape.Error())
+	return "of a part of its definition SchemaBot cannot compare yet"
 }
 
 // foreignKeyRelationships names a table's own foreign keys and the foreign

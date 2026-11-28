@@ -12,6 +12,7 @@ import (
 
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/ui"
 	"github.com/stretchr/testify/require"
 )
 
@@ -120,7 +121,16 @@ func TestUnsupportedRowSecurityShape(t *testing.T) {
 	require.True(t, ok)
 	var refused *engine.PlanRefusedError
 	require.ErrorAs(t, refusal, &refused)
-	assert.Equal(t, `SchemaBot does not manage row security on table "events" yet: unlogged tables cannot be rendered as a desired schema; remove the row security statements from its schema file, then plan again`, refusal.Error())
+	assert.Equal(t, `SchemaBot does not manage row security on table "events" yet, because it is unlogged; remove the row security statements from its schema file, then plan again`, refusal.Error())
+
+	collation := fmt.Errorf("%w: %w", executor.ErrRowSecurityRefused, schemadiff.ErrUnrenderableCollation)
+	refusal, ok = unsupportedRowSecurityShape("public", live, collation)
+	require.True(t, ok)
+	assert.Contains(t, refusal.Error(), `on table "events" yet, because it has a column with an explicit collation; remove`)
+
+	wrapped := fmt.Errorf("%w: %w", executor.ErrRowSecurityRefused, schemadiff.ErrUnrenderableUnlogged)
+	assert.Equal(t, "of a part of its definition SchemaBot cannot compare yet", rowSecurityShapePhrase(errors.New("a shape added later")))
+	assert.Equal(t, "it is unlogged", rowSecurityShapePhrase(wrapped))
 
 	_, ok = unsupportedRowSecurityShape("public", live, fmt.Errorf("%w: %w: %w", executor.ErrRowSecurityRefused, executor.ErrRowSecurityPrivileges, schemadiff.ErrUnrenderableUnlogged))
 	assert.False(t, ok, "a missing privilege is fixed by a grant, not by the file")
@@ -137,4 +147,6 @@ func TestDeniesEveryRow(t *testing.T) {
 	assert.True(t, deniesEveryRow(schemadiff.RowSecurity{Enabled: true}))
 	assert.True(t, deniesEveryRow(schemadiff.RowSecurity{Enabled: true, Policies: []schemadiff.Policy{{Name: "narrow"}}}))
 	assert.False(t, deniesEveryRow(schemadiff.RowSecurity{Enabled: true, Policies: []schemadiff.Policy{{Name: "narrow"}, {Name: "readers", Permissive: true}}}))
+
+	assert.Len(t, ui.LintReasons(denyAllReason), 1, "the deny-all warning and its fix are one finding")
 }

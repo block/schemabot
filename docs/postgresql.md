@@ -1275,10 +1275,11 @@ A plan that leaves RLS on with no permissive policy says so in its unsafe
 reason. PostgreSQL grants rows only through a permissive policy, so every
 role subject to RLS reads no rows and every write fails until one exists.
 
-SchemaBot does not manage RLS yet on a table that has a foreign key or that a
-foreign key references. The plan is refused with the table and the keys
-named. Remove the RLS statements from that table's file to plan its other
-changes.
+SchemaBot does not manage RLS yet on some tables: one that has a foreign key
+or that a foreign key references, one with a column of an explicit collation,
+and a few other shapes. The plan is refused with the table and the reason
+named, and the keys when a foreign key is the reason. Remove the RLS
+statements from that table's file to plan its other changes.
 
 **How a policy change runs.** A table's policy, setting, and comment changes
 are one operation:
