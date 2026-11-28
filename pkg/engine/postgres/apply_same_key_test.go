@@ -282,3 +282,104 @@ func TestApplyRefusesARequestWithoutAnIdentity(t *testing.T) {
 		})
 	}
 }
+
+// waitHookHandler runs onWait each time an apply logs that it is waiting for
+// the previous drive, before the apply reaches its wait.
+type waitHookHandler struct {
+	slog.Handler
+	onWait func()
+}
+
+func (h waitHookHandler) Handle(ctx context.Context, record slog.Record) error {
+	if strings.Contains(record.Message, "waiting for the previous drive") {
+		h.onWait()
+	}
+	return h.Handler.Handle(ctx, record)
+}
+
+// A drive being brought down cancels its context while the engine halts the
+// older drive it was waiting on, so both are ready when the waiting apply
+// wakes. Whichever it wakes on, the caller has ended, and no drive is started
+// for it. The cancellation and the older drive's exit both land before the
+// wait, in every round, so a waiter that skips the check after waking is
+// accepted in most rounds.
+func TestApplyWhoseWaitEndsAsTheRunningDriveExitsStartsNoDrive(t *testing.T) {
+	const rounds = 40
+	const key = "task-a"
+	started := 0
+	for range rounds {
+		first, second := finishingExecutor(), finishingExecutor()
+		eng := engineWithExecutors(t, map[string]*scriptedExecutor{sameKeyFirstDDL: first, sameKeySecondDDL: second})
+		resume := &engine.ResumeState{MigrationContext: key}
+		_, err := eng.Apply(t.Context(), sameKeyApplyRequest(resume, sameKeyFirstDDL, slog.New(slog.NewTextHandler(io.Discard, nil))))
+		require.NoError(t, err)
+		first.tracker(t)
+
+		ctx, cancel := context.WithCancel(t.Context())
+		logger := slog.New(waitHookHandler{Handler: slog.NewTextHandler(io.Discard, nil), onWait: func() {
+			cancel()
+			first.release()
+			eng.mu.Lock()
+			done := eng.progress[key].done
+			eng.mu.Unlock()
+			<-done
+		}})
+		got, err := eng.Apply(ctx, sameKeyApplyRequest(resume, sameKeySecondDDL, logger))
+		if err == nil && got != nil && got.Accepted {
+			started++
+		} else {
+			require.ErrorIs(t, err, context.Canceled)
+		}
+		cancel()
+	}
+	assert.Zero(t, started, "drives started for a caller whose wait had ended")
+}
+
+const sameKeyThirdDDL = "ALTER TABLE public.users ADD COLUMN nickname text"
+
+// Two applies waiting on one running drive wake together when it exits. One
+// claims the identity, and the other waits again for that new drive rather
+// than starting a second drive beside it.
+func TestApplyWaitersClaimTheIdentityOneAtATime(t *testing.T) {
+	first, second, third := finishingExecutor(), finishingExecutor(), finishingExecutor()
+	eng := engineWithExecutors(t, map[string]*scriptedExecutor{sameKeyFirstDDL: first, sameKeySecondDDL: second, sameKeyThirdDDL: third})
+	resume := &engine.ResumeState{MigrationContext: "task-a"}
+	_, err := eng.Apply(t.Context(), sameKeyApplyRequest(resume, sameKeyFirstDDL, slog.New(slog.NewTextHandler(io.Discard, nil))))
+	require.NoError(t, err)
+	first.tracker(t)
+
+	loggerB, waitingB := newWaitSignalLogger()
+	loggerC, waitingC := newWaitSignalLogger()
+	outB := applyAsync(t.Context(), eng, sameKeyApplyRequest(resume, sameKeySecondDDL, loggerB))
+	outC := applyAsync(t.Context(), eng, sameKeyApplyRequest(resume, sameKeyThirdDDL, loggerC))
+	awaitWaitSignal(t, waitingB)
+	awaitWaitSignal(t, waitingC)
+
+	first.release()
+	var winner, loser *scriptedExecutor
+	var loserWaiting <-chan struct{}
+	var loserOutcome <-chan applyOutcome
+	select {
+	case got := <-outB:
+		require.NoError(t, got.err)
+		winner, loser, loserWaiting, loserOutcome = second, third, waitingC, outC
+	case got := <-outC:
+		require.NoError(t, got.err)
+		winner, loser, loserWaiting, loserOutcome = third, second, waitingB, outB
+	case <-time.After(backgroundApplyDeadline):
+		require.Fail(t, "neither waiting apply was accepted")
+	}
+	winner.tracker(t)
+	awaitWaitSignal(t, loserWaiting)
+	requireNoExecutorStart(t, loser, "the second waiter started a drive beside the first")
+	select {
+	case <-loserOutcome:
+		require.Fail(t, "the second waiter returned while the new drive was running")
+	default:
+	}
+
+	winner.release()
+	got := awaitApplyOutcome(t, loserOutcome)
+	require.NoError(t, got.err)
+	loser.tracker(t)
+}

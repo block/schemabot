@@ -1961,12 +1961,13 @@ func newTestTracker(t *testing.T) *progress.Tracker {
 }
 
 // claimTracked claims a progress entry for key the way Apply does, failing the
-// test if the claim is refused. The claim is made under the test's context, so
-// a claim that would have to wait for a running entry fails when the test ends
-// rather than hanging.
+// test if the claim is refused. A claim that would have to wait for a running
+// entry fails once backgroundApplyDeadline passes rather than hanging.
 func claimTracked(t *testing.T, eng *Engine, key string, result *engine.ProgressResult, tracker *progress.Tracker, logger *slog.Logger, shape buildShape, cancelApply context.CancelFunc, owner string) chan struct{} {
 	t.Helper()
-	done, err := eng.claimProgress(t.Context(), key, result, tracker, logger, shape, cancelApply, owner)
+	ctx, cancel := context.WithTimeout(t.Context(), backgroundApplyDeadline)
+	defer cancel()
+	done, err := eng.claimProgress(ctx, key, result, tracker, logger, shape, cancelApply, owner)
 	require.NoError(t, err)
 	return done
 }

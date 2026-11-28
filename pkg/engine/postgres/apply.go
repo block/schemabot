@@ -232,6 +232,12 @@ type targetConn struct {
 // Apply starts one native-safe PostgreSQL change under pg-sprite's bounded
 // optimistic executor. A greenfield table and its declared indexes are
 // admitted as one create-set task whose sequence steps commit independently.
+//
+// An Apply whose identity is still held by a running drive waits for that
+// drive to exit before it claims the identity. The wait is a backstop: it
+// does not re-plan the change or consume control requests, so a caller is
+// expected to drain the older drive and re-plan before calling Apply, as the
+// drive layer does.
 func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.ApplyResult, error) {
 	change, err := validateOptimisticApply(req)
 	if err != nil {
@@ -3556,10 +3562,25 @@ func progressResult(state engine.State, phase string, started time.Time, change 
 // The returned channel is the drive's to close once its terminal result is
 // published; Cancel waits on it for the outcome.
 func (e *Engine) claimProgress(ctx context.Context, key string, result *engine.ProgressResult, tracker *progress.Tracker, logger *slog.Logger, shape buildShape, cancelApply context.CancelFunc, owner string) (chan struct{}, error) {
+	var waitStarted time.Time
 	for {
+		// Checked again after every wake: when the previous drive exits as
+		// ctx ends, the select below can wake on either, and a caller whose
+		// wait ended must never get a drive started for it.
+		if err := ctx.Err(); err != nil && !waitStarted.IsZero() {
+			return nil, fmt.Errorf("wait for the previous PostgreSQL schema change %q to exit: %w", key, err)
+		}
 		done, previous := e.claimIfKeyFree(key, result, tracker, logger, shape, cancelApply, owner)
 		if previous == nil {
+			if !waitStarted.IsZero() {
+				logger.Info("PostgreSQL apply claimed its identity after the previous drive exited",
+					"task_id", key, "namespace", result.Tables[0].Namespace, "table", result.Tables[0].Table,
+					"waited", time.Since(waitStarted))
+			}
 			return done, nil
+		}
+		if waitStarted.IsZero() {
+			waitStarted = time.Now()
 		}
 		logger.Info("PostgreSQL apply waiting for the previous drive under the same identity to exit",
 			"task_id", key, "namespace", result.Tables[0].Namespace, "table", result.Tables[0].Table)
