@@ -81,6 +81,10 @@ func (f *fakeWebhookEventStore) TerminateStuckProcessing(context.Context, string
 	return 0, errors.New("unused")
 }
 
+func (f *fakeWebhookEventStore) DeleteTerminalOlderThan(context.Context, time.Duration, int) (int64, error) {
+	return 0, errors.New("unused")
+}
+
 func newInboxMetricsTestService(t *testing.T, store storage.WebhookEventStore) *Service {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))

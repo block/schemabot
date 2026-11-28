@@ -3523,6 +3523,16 @@ var WebhookEventStatesAll = []string{
 	WebhookEventSuperseded,
 }
 
+// WebhookEventStatesTerminal lists the webhook inbox states no driver or sweep
+// moves a row out of. Only an explicit GitHub Redeliver reopens such a row, so
+// these are the only states retention may delete.
+var WebhookEventStatesTerminal = []string{
+	WebhookEventCompleted,
+	WebhookEventFailed,
+	WebhookEventFailedPermanent,
+	WebhookEventSuperseded,
+}
+
 // WebhookInboxStats is a point-in-time snapshot of the durable webhook inbox
 // used for steady-state observability.
 type WebhookInboxStats struct {

@@ -767,6 +767,16 @@ type WebhookEventStore interface {
 	// (for metrics/alerting) and draining the stuck-processing gauge without
 	// operator action. Returns the number of rows terminated.
 	TerminateStuckProcessing(ctx context.Context, reason string) (int64, error)
+
+	// DeleteTerminalOlderThan deletes at most limit rows that are in a terminal
+	// state (WebhookEventStatesTerminal) and were received more than age ago,
+	// oldest first, and returns how many it deleted. It never deletes a pending,
+	// processing, or retryable row, however old. The cutoff is measured on the
+	// database clock, so clock skew between server pods cannot move it. A caller
+	// that wants to drain a backlog calls it repeatedly until it returns fewer
+	// rows than limit. An age or limit that is not positive is an error and
+	// deletes nothing.
+	DeleteTerminalOlderThan(ctx context.Context, age time.Duration, limit int) (int64, error)
 }
 
 // PlanListPosition is a plan's place in the newest-first plan listing: its

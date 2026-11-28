@@ -645,6 +645,78 @@ func (s *webhookEventStore) TerminateStuckProcessing(ctx context.Context, reason
 	return rows, nil
 }
 
+// DeleteTerminalOlderThan deletes at most limit terminal rows received more
+// than age ago, oldest first, and returns how many it deleted. It never
+// deletes a pending, processing, or retryable row, however old, because those
+// are work a driver still owns.
+//
+// The cutoff is rendered as database-clock SQL rather than computed from the
+// caller's time.Now(), so the same age cuts at the same instant on every pod.
+// received_at, not completed_at, dates a row: every row has it, and it is what
+// the received_at index serves. The state test is a residual filter on the
+// rows that index returns.
+//
+// A batch is two statements because MySQL rejects LIMIT inside an IN subquery
+// and PostgreSQL has no DELETE ... LIMIT: select a page of primary keys, then
+// delete by primary key. The DELETE repeats the state and cutoff predicates,
+// so a row that Redeliver reopened between the two statements is not deleted.
+func (s *webhookEventStore) DeleteTerminalOlderThan(ctx context.Context, age time.Duration, limit int) (int64, error) {
+	if age.Microseconds() <= 0 {
+		return 0, fmt.Errorf("delete terminal webhook events: age must be positive, got %s", age)
+	}
+	if limit <= 0 {
+		return 0, fmt.Errorf("delete terminal webhook events: limit must be positive, got %d", limit)
+	}
+
+	cutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(age.Microseconds())), IntervalMicrosecond)
+	terminalIn := placeholders(len(storage.WebhookEventStatesTerminal))
+
+	selectArgs := append(stringArgs(storage.WebhookEventStatesTerminal), limit)
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id
+		FROM webhook_events
+		WHERE received_at < `+cutoff+` AND state IN (`+terminalIn+`)
+		ORDER BY received_at, id
+		LIMIT ?
+	`, selectArgs...)
+	if err != nil {
+		return 0, fmt.Errorf("select terminal webhook events older than %s: %w", age, err)
+	}
+	defer utils.CloseAndLog(rows)
+	ids := make([]any, 0, limit)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return 0, fmt.Errorf("scan terminal webhook event id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterate terminal webhook event ids: %w", err)
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+
+	deleteArgs := make([]any, 0, len(ids)+len(storage.WebhookEventStatesTerminal))
+	deleteArgs = append(deleteArgs, ids...)
+	deleteArgs = append(deleteArgs, stringArgs(storage.WebhookEventStatesTerminal)...)
+	result, err := s.db.ExecContext(ctx, `
+		DELETE FROM webhook_events
+		WHERE id IN (`+placeholders(len(ids))+`)
+			AND received_at < `+cutoff+` AND state IN (`+terminalIn+`)
+	`, deleteArgs...)
+	if err != nil {
+		return 0, fmt.Errorf("delete %d terminal webhook events older than %s: %w", len(ids), age, err)
+	}
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read deleted terminal webhook events rows affected: %w", err)
+	}
+	return deleted, nil
+}
+
 func scanWebhookEvent(row *sql.Row) (*storage.WebhookEvent, error) {
 	event, err := scanWebhookEventInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
