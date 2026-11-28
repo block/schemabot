@@ -19,6 +19,10 @@ import (
 )
 
 type initStageMsg string
+
+// initDetailMsg replaces the line shown under the current step, such as how
+// far a download has come. A new step clears it.
+type initDetailMsg string
 type initFinishedMsg struct {
 	result *initResult
 	err    error
@@ -27,6 +31,7 @@ type initProgress struct {
 	heading  string
 	spinner  spinner.Model
 	stages   []string
+	detail   string
 	run      tea.Cmd
 	cancel   context.CancelFunc
 	stopping bool
@@ -41,6 +46,9 @@ func (m *initProgress) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = max(20, min(72, msg.Width-4))
 	case initStageMsg:
 		m.stages = append(m.stages, string(msg))
+		m.detail = ""
+	case initDetailMsg:
+		m.detail = string(msg)
 	case initFinishedMsg:
 		m.finished = &msg
 		return m, tea.Quit
@@ -67,6 +75,9 @@ func (m *initProgress) View() string {
 		}
 		b.WriteString(marker + " " + s + "\n")
 	}
+	if m.detail != "" && len(m.stages) > 0 {
+		b.WriteString("  " + initDetailStyle.Render(m.detail) + "\n")
+	}
 	if m.stopping {
 		b.WriteString("\nFinishing cleanup…\n")
 	} else {
@@ -74,16 +85,23 @@ func (m *initProgress) View() string {
 	}
 	return "\n" + lipgloss.NewStyle().Width(m.width).PaddingLeft(2).Render(b.String())
 }
+
+var initDetailStyle = lipgloss.NewStyle().Faint(true)
+
 func (cmd *InitCmd) initializeWithUI(ctx context.Context, g *Globals) (*initResult, error) {
 	if !cmd.interactive {
 		return cmd.initialize(ctx, g)
 	}
-	return runInitProgress(ctx, "connect and verify", func(runCtx context.Context, report func(string)) (*initResult, error) {
+	return runInitProgress(ctx, "connect and verify", func(runCtx context.Context, report, _ func(string)) (*initResult, error) {
 		cmd.progress = report
 		defer func() { cmd.progress = nil }()
 		return cmd.initialize(runCtx, g)
 	}, tea.WithInput(os.Stdin), tea.WithOutput(os.Stdout))
 }
+
+// initProgressSetup is a setup run under the progress display: step starts a
+// new step and detail replaces the line under the current one.
+type initProgressSetup func(ctx context.Context, step, detail func(string)) (*initResult, error)
 
 type initProgressProgram interface {
 	Run() (tea.Model, error)
@@ -91,7 +109,9 @@ type initProgressProgram interface {
 	Kill()
 }
 
-func runInitProgress(ctx context.Context, heading string, initialize func(context.Context, func(string)) (*initResult, error), options ...tea.ProgramOption) (*initResult, error) {
+// runInitProgress shows a setup while it runs. The setup reports each step as
+// it starts, and may report a detail line under the current step.
+func runInitProgress(ctx context.Context, heading string, initialize initProgressSetup, options ...tea.ProgramOption) (*initResult, error) {
 	options = append(options, tea.WithoutSignalHandler())
 	return runInitProgressProgram(ctx, initialize, func(model tea.Model) initProgressProgram {
 		model.(*initProgress).heading = heading
@@ -105,7 +125,7 @@ func runInitProgress(ctx context.Context, heading string, initialize func(contex
 // setup can tell this from the operator stopping it (initStoppedByOperator).
 var errInitDisplayClosed = errors.New("setup display closed")
 
-func runInitProgressProgram(ctx context.Context, initialize func(context.Context, func(string)) (*initResult, error), newProgram func(tea.Model) initProgressProgram) (*initResult, error) {
+func runInitProgressProgram(ctx context.Context, initialize initProgressSetup, newProgram func(tea.Model) initProgressProgram) (*initResult, error) {
 	runCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(errInitDisplayClosed)
 	s := spinner.New()
@@ -134,7 +154,9 @@ func runInitProgressProgram(ctx context.Context, initialize func(context.Context
 			return
 		}
 		initialized = true
-		outcome.result, outcome.err = initialize(runCtx, func(stage string) { p.Send(initStageMsg(stage)) })
+		outcome.result, outcome.err = initialize(runCtx,
+			func(stage string) { p.Send(initStageMsg(stage)) },
+			func(detail string) { p.Send(initDetailMsg(detail)) })
 	}()
 	m.run = func() tea.Msg { close(started); <-finished; return outcome }
 	_, runErr := p.Run()
