@@ -12,7 +12,7 @@
 # Build stage. It runs on the build machine's own platform and Go cross-compiles
 # for the target, so a multi-arch build does not compile Go under QEMU emulation,
 # which is many times slower.
-FROM --platform=$BUILDPLATFORM golang:1.26.11-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine AS builder
 
 # The Alpine CDN intermittently answers "temporary error (try again later)" and a
 # single failed fetch fails the whole build, so every apk add in this repo's
@@ -53,7 +53,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     -o /schemabot-e2e ./cmd/schemabot-e2e
 
 # Runtime stage
-FROM alpine:3.19
+FROM alpine:3.24
 
 # Retried for the reason given on the builder stage's apk add above.
 RUN for attempt in 1 2 3 4 5; do \
