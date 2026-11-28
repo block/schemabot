@@ -298,10 +298,9 @@ Tolerance stops at the wire, deliberately. The HTTP JSON API and the server conf
 fields they do not recognize, because there an unknown field is a caller's mistake or an
 operator's typo rather than a peer on a different release, and ignoring it would swallow intent.
 *Enforced:* the additive-only proto and storage-schema rules, checked before a tag
-([release.md](release.md)); strict decoding on the HTTP API handlers
-(`pkg/api/control_handlers.go`, `pkg/api/freeze_handlers.go`, `pkg/api/lock_handlers.go`,
-`pkg/api/plan_handlers.go`, `pkg/api/settings_handlers.go`, `pkg/api/storage_schema_handlers.go`,
-`pkg/api/webhook_ops_handlers.go`) and on config load
+([release.md](release.md)); strict decoding of every HTTP API request body through
+`decodeStrictJSONBody` (`pkg/api/health_handlers.go`), which
+`TestEveryRequestBodyIsDecodedStrictly` holds every handler in `pkg/api` to; and on config load
 (`pkg/api/config.go`).
 
 ### AV-7: An acknowledged delivery is a promise
