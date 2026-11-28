@@ -5726,6 +5726,7 @@ func TestStorageRetentionConfig(t *testing.T) {
 			{"interval below the floor", StorageRetentionConfig{Interval: "59s"}, "storage_retention.interval must be at least 1m0s"},
 			{"unparseable window", StorageRetentionConfig{WebhookEvents: "a week"}, "storage_retention.webhook_events"},
 			{"negative window", StorageRetentionConfig{WebhookEvents: "-1h"}, "storage_retention.webhook_events must be positive"},
+			{"window one minute under GitHub's redelivery limit", StorageRetentionConfig{WebhookEvents: "71h59m"}, "at least 72h0m0s"},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				tc.retention.Enabled = true

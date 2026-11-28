@@ -441,8 +441,9 @@ type StorageRetentionConfig struct {
 
 	// WebhookEvents is how long a finished row stays in the webhook inbox, as a
 	// Go duration string (e.g. "168h"). Defaults to 7 days. It may not be
-	// shorter than the webhook reconcile window or the 3 days GitHub keeps a
-	// delivery redeliverable; see serve.Build.
+	// shorter than MinStorageRetentionWebhookEvents, the 3 days GitHub keeps a
+	// delivery redeliverable, or than a raised webhook reconcile window; see
+	// serve.Build.
 	WebhookEvents string `yaml:"webhook_events,omitempty"`
 }
 
@@ -469,6 +470,15 @@ const (
 	// DefaultStorageRetentionWebhookEvents is how long a finished webhook inbox
 	// row is kept when storage_retention.webhook_events is not set.
 	DefaultStorageRetentionWebhookEvents = 7 * 24 * time.Hour
+
+	// MinStorageRetentionWebhookEvents bounds storage_retention.webhook_events
+	// from below. It is how far back GitHub lets an operator redeliver a
+	// webhook delivery: the inbox row is what makes a redelivery's side effects
+	// run at most once (AV-7), so a shorter window would let a redelivery of a
+	// purged delivery run as a first delivery. It also clears what the webhook
+	// reconciler reads with its default lookback; a raised lookback is checked
+	// in serve.Build, which is where the lookback is resolved.
+	MinStorageRetentionWebhookEvents = 72 * time.Hour
 )
 
 // StorageRetentionEnabled reports whether this process should run the storage
@@ -497,10 +507,20 @@ func (c *ServerConfig) StorageRetentionInterval() (time.Duration, error) {
 }
 
 // StorageRetentionWebhookEvents returns how long a finished webhook inbox row
-// is kept, falling back to the default when not configured. The caller that
-// knows the webhook reconcile window checks this against it.
+// is kept, falling back to the default when not configured, and refuses a
+// window shorter than MinStorageRetentionWebhookEvents. The caller that knows
+// a raised webhook reconcile lookback checks the window against it too.
 func (c *ServerConfig) StorageRetentionWebhookEvents() (time.Duration, error) {
-	return parsePositiveDuration("storage_retention.webhook_events", c.StorageRetention.WebhookEvents, DefaultStorageRetentionWebhookEvents)
+	window, err := parsePositiveDuration("storage_retention.webhook_events", c.StorageRetention.WebhookEvents, DefaultStorageRetentionWebhookEvents)
+	if err != nil {
+		return 0, err
+	}
+	if window < MinStorageRetentionWebhookEvents {
+		return 0, fmt.Errorf("storage_retention.webhook_events is %s, shorter than the %s GitHub keeps a delivery redeliverable: "+
+			"a redelivery of a purged delivery would run its side effects again; set storage_retention.webhook_events to at least %s",
+			window, MinStorageRetentionWebhookEvents, MinStorageRetentionWebhookEvents)
+	}
+	return window, nil
 }
 
 // StorageRetentionBatchSize returns how many rows one purge delete removes,

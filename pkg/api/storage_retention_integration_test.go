@@ -137,15 +137,23 @@ func runStorageRetentionPassAgainstRealStorage(t *testing.T, stor storage.Storag
 	requireRowsRemaining(5, "a second pass finds nothing to delete")
 
 	// Two instances running the pass at once is also safe: the second steps aside
-	// while the first holds the election.
+	// while the first holds the election. The holder also gives up when its
+	// bounded context ends, so a failed assertion before close(finish) cannot
+	// leave the election held.
 	electionHeld := make(chan struct{})
 	finish := make(chan struct{})
 	done := make(chan error, 1)
+	holdCtx, cancelHold := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelHold()
 	go func() {
-		done <- stor.Applies().WithStorageRetentionElection(ctx, func(context.Context) error {
+		done <- stor.Applies().WithStorageRetentionElection(holdCtx, func(electedCtx context.Context) error {
 			close(electionHeld)
-			<-finish
-			return nil
+			select {
+			case <-finish:
+				return nil
+			case <-electedCtx.Done():
+				return fmt.Errorf("hold storage retention election: %w", electedCtx.Err())
+			}
 		})
 	}()
 	select {

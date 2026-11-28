@@ -723,6 +723,16 @@ type WebhookEventStore interface {
 	// MarkCompleted marks a claimed event terminal-successful.
 	MarkCompleted(ctx context.Context, id int64, leaseToken string) error
 
+	// MarkSuperseded marks a claimed auto-plannable pull_request event
+	// superseded because the driver found, while processing it, that the
+	// pull request's head had already moved past the event's head, so nothing
+	// was planned. Unlike a completed row, a superseded row never counts as
+	// coverage for its head, so a completed covering row always means its
+	// head was evaluated while it was the pull request's head. Returns
+	// ErrWebhookEventLeaseLost when the lease token is stale, and
+	// ErrWebhookEventNotFound when the row is gone.
+	MarkSuperseded(ctx context.Context, id int64, leaseToken string) error
+
 	// MarkFailed marks a claimed event failed. A non-nil retryAfter keeps it
 	// retryable after that time; nil makes the failure terminal but still
 	// recoverable: the reconciler may synthesize a recovery delivery for its
@@ -2346,6 +2356,17 @@ type ApplyLogStore interface {
 	// limit, or a limit above MaxApplyLogPurgeBatch, is an error and deletes
 	// nothing.
 	DeleteForSettledAppliesOlderThan(ctx context.Context, age time.Duration, limit int) (int64, error)
+
+	// CountForSettledAppliesOlderThan returns how many log entries
+	// DeleteForSettledAppliesOlderThan would be free to delete for the same age,
+	// with no limit: entries of applies settled more than age ago, measured on the
+	// database clock, that no driver holds a fresh lease on. It changes nothing,
+	// so a dry run can report what a purge would remove. The figure holds as of
+	// the call: a later purge can remove more or fewer entries. The count reads
+	// every eligible entry, so callers bound it with a deadline and treat a
+	// deadline error as no count, never as zero. An age that is not positive is
+	// an error.
+	CountForSettledAppliesOlderThan(ctx context.Context, age time.Duration) (int64, error)
 }
 
 // ControlRequestStore manages durable user control requests.

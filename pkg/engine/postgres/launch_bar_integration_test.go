@@ -67,16 +67,18 @@ func TestEnginePostgresLaunchBar(t *testing.T) {
 	pulled := response.Namespaces["public"]
 	require.NotNil(t, pulled)
 
-	assert.Equal(t, []string{"accounts", "events", "notes", "orders", "users"}, sortedKeys(pulled.Tables))
+	assert.Equal(t, []string{"accounts", "events", "notes", "orders", "tags", "users"}, sortedKeys(pulled.Tables))
 	assert.Contains(t, pulled.Tables["orders"], `CONSTRAINT "orders_user_id_fkey" FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE`)
 	assert.Contains(t, pulled.Tables["events"], "WITH (fillfactor='70')")
+	// A column's explicit collation is part of the file, so the baseline
+	// below plans nothing for it.
+	assert.Contains(t, pulled.Tables["tags"], `COLLATE`)
 
 	skipped := map[string]string{}
 	for _, table := range pulled.SkippedTables {
 		skipped[table.GetTable()] = table.GetReason()
 	}
 	assert.Equal(t, map[string]string{
-		"tags":             schemadiff.ErrUnrenderableCollation.Error(),
 		"sessions":         schemadiff.ErrUnrenderableUnlogged.Error(),
 		"archived_records": "schema files cannot describe its table inheritance",
 		"records":          schemadiff.ErrUnrenderableInheritance.Error(),

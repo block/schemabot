@@ -313,6 +313,7 @@ func TestStorageRetentionPassStartsOnlyWhenEnabled(t *testing.T) {
 		{name: "invalid interval", cfg: StorageRetentionConfig{Enabled: true, Interval: "hourly"}},
 		{name: "invalid batch size", cfg: StorageRetentionConfig{Enabled: true, BatchSize: -1}},
 		{name: "invalid window", cfg: StorageRetentionConfig{Enabled: true, WebhookEvents: "a week"}},
+		{name: "window below GitHub's redelivery limit", cfg: StorageRetentionConfig{Enabled: true, DryRun: boolPtr(false), WebhookEvents: "24h"}},
 		{
 			name: "enabled alone is a dry run", cfg: StorageRetentionConfig{Enabled: true},
 			starts: true, wantInterval: time.Hour, wantCount: 1,

@@ -49,6 +49,10 @@ func (f *fakeWebhookEventStore) MarkCompleted(context.Context, int64, string) er
 	return errors.New("unused")
 }
 
+func (f *fakeWebhookEventStore) MarkSuperseded(context.Context, int64, string) error {
+	return errors.New("unused")
+}
+
 func (f *fakeWebhookEventStore) MarkFailed(context.Context, int64, string, string, *time.Time) error {
 	return errors.New("unused")
 }
