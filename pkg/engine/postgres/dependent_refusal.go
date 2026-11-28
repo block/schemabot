@@ -11,7 +11,8 @@ import (
 // dependentObjectCauses names the objects that keep PostgreSQL from
 // running a refused column change: the views, row security policies,
 // triggers, and generated columns that read a column the statement retypes
-// or drops, and the partitioned tables whose key includes it. PostgreSQL
+// or drops, the publications whose column list or row filter names it, and
+// the partitioned tables whose key includes it. PostgreSQL
 // refuses the change while any of them stands, even a type change that
 // rewrites nothing, so the operator's next step is to change those objects,
 // and naming them saves a search of the catalog. Each cause is a clause of
@@ -41,6 +42,9 @@ func dependentObjectCauses(decisions []planner.Decision) ([]string, *unrecognize
 		}
 		if cause != "" {
 			causes = append(causes, cause)
+		}
+		if len(d.DependentPublications) > 0 {
+			causes = append(causes, publicationsCause(d.Kind, d.DependentPublications))
 		}
 		if len(d.PartitionKeyTables) > 0 {
 			causes = append(causes, fmt.Sprintf("it changes or drops a column in the partition key of %s, which PostgreSQL never allows; create a new partitioned table with the new key and move the rows into it",
@@ -192,6 +196,30 @@ func generatedColumnsCause(kind pgstatement.OpKind, columns []string) string {
 	}
 	return fmt.Sprintf("it changes or drops a column that %s %s, which SchemaBot cannot run yet; make the change outside SchemaBot through a separately reviewed process",
 		named, reads)
+}
+
+// publicationsCause is the clause for a column change that publications
+// name in a column list or row filter, which PostgreSQL refuses while they
+// do. Taking the column out of a publication changes what its subscribers
+// receive, so for a change that keeps the column the clause says to put it
+// back and what subscribers miss until then.
+func publicationsCause(kind pgstatement.OpKind, publications []string) string {
+	n := len(publications)
+	verb := "changes or drops a column"
+	switch kind {
+	case pgstatement.OpDropColumn:
+		verb = "drops a column"
+	case pgstatement.OpAlterColumnType:
+		verb = "changes the type of a column"
+	}
+	cause := fmt.Sprintf("it %s that %s %s in a column list or row filter, which PostgreSQL refuses; "+
+		"take the column out of %s column list and row filter outside SchemaBot with ALTER PUBLICATION ... SET TABLE",
+		verb, planner.DependentsPhrase("publication", "publications", publications), plural(n, "names", "name"),
+		plural(n, "the publication's", "each publication's"))
+	if kind == pgstatement.OpDropColumn {
+		return cause
+	}
+	return cause + ", and put it back once this change has run; until it is back, subscribers do not receive the column, or receive rows the row filter would have held back"
 }
 
 // plural picks the singular or plural form for n.

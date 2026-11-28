@@ -6,6 +6,7 @@ import (
 
 	pgplan "github.com/block/pg-sprite/pkg/plan"
 	"github.com/block/pg-sprite/pkg/planner"
+	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/router"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -20,6 +21,7 @@ var plannerRefusalSentences = map[planner.Reason]string{
 	planner.ReasonNotNullWithoutDefault: `statement for table "users" is refused: it adds a NOT NULL column with no default to a table that holds rows, which PostgreSQL refuses because every existing row would hold NULL; give the column a default, or add it without NOT NULL, fill every row, then declare NOT NULL in a later change, which SchemaBot runs online, then plan again`,
 	planner.ReasonReplicaIdentity:       `statement for table "users" is refused: it drops the index, key, or column the table's replica identity uses, which makes every UPDATE and DELETE on the table fail while a publication publishes them; point the table's replica identity at another index outside SchemaBot with ALTER TABLE ... REPLICA IDENTITY, then plan again`,
 	planner.ReasonCascadingDrop:         `statement for table "users" is refused: it drops with CASCADE, which also drops the views, policies, and foreign keys that depend on what it drops, none of which the plan shows; drop each dependent object as its own change, and remove CASCADE, then plan again`,
+	planner.ReasonColumnLimit:           `statement for table "users" is refused: it adds a column to a table that has used all 1600 of PostgreSQL's column numbers, and a dropped column keeps its number until its table is rebuilt; copy the table into a new one, which gives back the numbers its dropped columns hold (VACUUM FULL does not), then plan again`,
 	planner.ReasonUnsupportedOperation:  `statement for table "users" is refused: it uses an operation SchemaBot's PostgreSQL support has no safe way to run; make the change outside SchemaBot through a separately reviewed process, then plan again`,
 }
 
@@ -65,7 +67,7 @@ func TestPlannerRefusalReasonCoversEveryReason(t *testing.T) {
 				executionVerdict(pgplan.FormatVersion, refusedStatement(reason), "users", nil))
 		})
 	}
-	assert.Len(t, plannerRefusalClauses, len(plannerRefusalSentences), "a clause has no golden sentence")
+	assert.Len(t, plannerRefusalSentences, len(plannerRefusalClauses)+len(plannerRefusalClauseFuncs), "a clause has no golden sentence")
 }
 
 // A statement refused for two reasons names both fixes in one sentence, and
@@ -134,4 +136,33 @@ func TestPlannerRefusalReasonUnknownReasonBesideADependentObject(t *testing.T) {
 		reason:       `statement for table "users" is refused: it cannot be executed safely as written`,
 		unrecognized: &unrecognizedPlannerVocabulary{kind: "refusal_reason", value: "future-reason"},
 	}, executionVerdict(pgplan.FormatVersion, st, "users", nil))
+}
+
+// A column-limit refusal names the tables at the limit from the planner's
+// read of the catalog: a partition that has used every column number is the
+// table to rebuild, not its parent, and numbers left on the table are
+// offered as columns the change could add instead.
+func TestPlannerRefusalNamesTheTablesAtTheColumnLimit(t *testing.T) {
+	cases := map[string]struct {
+		numbers *preflight.ColumnNumbers
+		want    string
+	}{
+		"a full partition": {
+			numbers: &preflight.ColumnNumbers{Fullest: []preflight.FullTable{{Name: `"public"."users_2026"`, Partition: true}}},
+			want:    `statement for table "users" is refused: it adds a column to a table whose partition "public"."users_2026" has used all 1600 of PostgreSQL's column numbers, and a dropped column keeps its number until its table is rebuilt; copy partition "public"."users_2026" into a new table, which gives back the numbers its dropped columns hold (VACUUM FULL does not), then detach the partition and attach the copy in its place, then plan again`,
+		},
+		"numbers left on the table": {
+			numbers: &preflight.ColumnNumbers{Left: 2, Fullest: []preflight.FullTable{{Name: `"public"."users"`, Root: true}}},
+			want:    `statement for table "users" is refused: it adds a column to a table that has used all but 2 of PostgreSQL's 1600 column numbers, and a dropped column keeps its number until its table is rebuilt; copy the table into a new one, which gives back the numbers its dropped columns hold (VACUUM FULL does not), or add at most 2 columns, then plan again`,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			st := pgplan.Statement{Disposition: router.DispositionRefuse, Decisions: []planner.Decision{
+				{Route: planner.RouteRefuse, Reason: planner.ReasonColumnLimit, ColumnLimit: tc.numbers},
+			}}
+			assert.Equal(t, stepVerdict{mode: engine.ExecutionModeBlocked, reason: tc.want},
+				executionVerdict(pgplan.FormatVersion, st, "users", nil))
+		})
+	}
 }
