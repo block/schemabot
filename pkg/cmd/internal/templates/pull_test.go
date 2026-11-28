@@ -101,6 +101,24 @@ func TestWritePullSchema_LintAuditRendersAsComments(t *testing.T) {
 	assert.Contains(t, violations, "--   [error] users: Primary key column \"id\" has type \"int\"\n--   Use BIGINT UNSIGNED instead.\n",
 		"every line of a multi-line message is a SQL comment")
 
+	// The linter's advice is what makes a finding the pull will not fix
+	// actionable, so it renders under the finding rather than being dropped,
+	// and every line of it stays a SQL comment.
+	advised := captureStdout(t, func() {
+		WritePullSchema(response([]*apitypes.LintViolationResponse{
+			{
+				Table:      "orders",
+				Column:     "id",
+				Severity:   "warning",
+				Message:    `Primary key column "id" in table "orders" uses "integer"`,
+				Suggestion: "Change column \"id\" to a supported column type (\"bigint\", \"uuid\")\nor pick one the audit allows.",
+			},
+		}))
+	})
+	assert.Contains(t, advised, "--   [warning] orders: Primary key column \"id\" in table \"orders\" uses \"integer\"\n")
+	assert.Contains(t, advised, "--     Change column \"id\" to a supported column type (\"bigint\", \"uuid\")\n--     or pick one the audit allows.\n",
+		"advice is indented under its finding and every line stays a SQL comment")
+
 	clean := captureStdout(t, func() {
 		WritePullSchema(response([]*apitypes.LintViolationResponse{}))
 	})

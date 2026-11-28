@@ -280,6 +280,12 @@ func writePulledLint(violations []*apitypes.LintViolationResponse) {
 			line += v.Table + ": "
 		}
 		writeCommented("--   ", line+v.Message)
+		// The linter's advice, indented under the finding it belongs to.
+		// writeCommented prefixes every line, so advice that wraps stays
+		// commented and the output remains valid SQL.
+		if v.Suggestion != "" {
+			writeCommented("--     ", v.Suggestion)
+		}
 	}
 }
 

@@ -458,11 +458,12 @@ func lintPulledNamespaces(resp *apitypes.PullSchemaResponse, dialect schema.Dial
 		violations := make([]*apitypes.LintViolationResponse, 0, len(results))
 		for _, r := range results {
 			violations = append(violations, &apitypes.LintViolationResponse{
-				Message:  r.Message,
-				Table:    r.Table,
-				Column:   r.Column,
-				Linter:   r.Linter,
-				Severity: r.Severity,
+				Message:    r.Message,
+				Table:      r.Table,
+				Column:     r.Column,
+				Linter:     r.Linter,
+				Severity:   r.Severity,
+				Suggestion: r.Suggestion,
 			})
 		}
 		sort.Slice(violations, func(i, j int) bool {

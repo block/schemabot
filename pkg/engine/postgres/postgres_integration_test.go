@@ -3023,10 +3023,10 @@ func TestEnginePullSchemaLintsRenderedTables(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []lint.Result{
 		{Table: "Events", Linter: "name_case", Severity: "warning", Message: `table name "Events" is not lowercase`},
-		{Table: "legacy_orders", Column: "id", Linter: "primary_key", Severity: "warning", Message: `Primary key column "id" in table "legacy_orders" uses "integer"; allowed types: bigint, uuid`},
+		{Table: "legacy_orders", Column: "id", Linter: "primary_key", Severity: "warning", Message: `Primary key column "id" in table "legacy_orders" uses "integer"`, Suggestion: `Change column "id" to a supported column type ("bigint", "uuid")`},
 		{Table: "legacy_orders", Column: "weight", Linter: "has_float", Severity: "warning", Message: `Column "weight" in table "legacy_orders" uses "real" data type`},
-		{Table: "sessions", Linter: "redundant_indexes", Severity: "warning", Message: `Index "sessions_account_idx" on column "account_id" is redundant - covered by index "sessions_account_seen_idx" on columns ("account_id", "seen_at")`},
-		{Table: "sessions", Column: "token", Linter: "primary_key", Severity: "warning", Message: `Primary key column "token" in table "sessions" uses "character(36)"; allowed types: bigint, uuid`},
+		{Table: "sessions", Linter: "redundant_indexes", Severity: "warning", Message: `Index "sessions_account_idx" on column "account_id" is redundant - covered by index "sessions_account_seen_idx" on columns ("account_id", "seen_at")`, Suggestion: `Consider dropping index "sessions_account_idx" as it is fully covered by "sessions_account_seen_idx". The longer index can satisfy all queries that would use the shorter index.`},
+		{Table: "sessions", Column: "token", Linter: "primary_key", Severity: "warning", Message: `Primary key column "token" in table "sessions" uses "character(36)"`, Suggestion: `Change column "token" to a supported column type ("bigint", "uuid")`},
 	}, results)
 }
 

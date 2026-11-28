@@ -298,6 +298,11 @@ Presentation notes:
   section, so a reviewer or an agent can cite a finding by its number. The
   numbering continues across table and target headings and into the
   collapsed block, so no two findings in the section share a number.
+- A finding whose linter offers advice carries it in italics, indented under
+  the finding rather than numbered as one of its own: the message says what is
+  wrong, the advice says what to change. Most findings are not auto-fixable, so
+  the advice is what makes one actionable. Rules that offer none render the
+  message alone.
 - Quoted identifiers and types inside finding messages (index names, column
   types) render as inline code.
 - The CLI and the plan comment share the same severity reading: ⚠️ marks

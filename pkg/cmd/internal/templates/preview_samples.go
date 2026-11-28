@@ -41,7 +41,13 @@ func samplePartitionedPlanChanges() []DDLChange {
 func samplePlanLintViolations() []apitypes.LintViolationResponse {
 	return []apitypes.LintViolationResponse{
 		{Message: "has_float: New column uses floating-point data type", Table: "orders", Linter: "has_float"},
-		{Message: "no_default: Column added without DEFAULT value", Table: "users", Linter: "no_default"},
+		{
+			Message:    `Primary key column "id" has type "int"`,
+			Table:      "users",
+			Column:     "id",
+			Linter:     "primary_key",
+			Suggestion: `Change column "id" to a supported column type ("BIGINT", "BINARY", "VARBINARY")`,
+		},
 	}
 }
 

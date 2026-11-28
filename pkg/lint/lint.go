@@ -75,6 +75,11 @@ type Result struct {
 	Message  string // Human-readable description
 	Severity string // "warning" or "error"
 	IsUnsafe bool   // True if this is an unsafe/destructive change
+	// Suggestion is the linter's own advice on what to do about the finding,
+	// empty when the linter offers none. The message says what is wrong; this
+	// says what to change, which is what an operator reading a finding they
+	// cannot auto-fix actually needs.
+	Suggestion string
 }
 
 // LintStatements analyzes DDL statements for lint issues and unsafe changes.
@@ -261,13 +266,19 @@ func (l *Linter) convertViolation(v spiritlint.Violation) Result {
 	// - "invisible_index_before_drop" with raiseError=true (DROP INDEX without making invisible)
 	isUnsafe := v.Severity == spiritlint.SeverityError
 
+	suggestion := ""
+	if v.Suggestion != nil {
+		suggestion = *v.Suggestion
+	}
+
 	return Result{
-		Table:    table,
-		Column:   column,
-		Linter:   linterName,
-		Message:  v.Message,
-		Severity: severity,
-		IsUnsafe: isUnsafe,
+		Table:      table,
+		Column:     column,
+		Linter:     linterName,
+		Message:    v.Message,
+		Severity:   severity,
+		IsUnsafe:   isUnsafe,
+		Suggestion: suggestion,
 	}
 }
 
@@ -276,11 +287,12 @@ func ToEngineWarnings(results []Result) []engine.LintViolation {
 	warnings := make([]engine.LintViolation, len(results))
 	for i, r := range results {
 		warnings[i] = engine.LintViolation{
-			Table:    r.Table,
-			Column:   r.Column,
-			Linter:   r.Linter,
-			Message:  r.Message,
-			Severity: r.Severity,
+			Table:      r.Table,
+			Column:     r.Column,
+			Linter:     r.Linter,
+			Message:    r.Message,
+			Severity:   r.Severity,
+			Suggestion: r.Suggestion,
 		}
 	}
 	return warnings

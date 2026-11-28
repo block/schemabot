@@ -246,12 +246,13 @@ func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 
 	for _, w := range resp.LintViolations {
 		httpResp.LintResults = append(httpResp.LintResults, &apitypes.LintViolationResponse{
-			Message:  w.Message,
-			Table:    w.Table,
-			Column:   w.Column,
-			Linter:   w.Linter,
-			Severity: w.Severity,
-			FixType:  w.FixType,
+			Message:    w.Message,
+			Table:      w.Table,
+			Column:     w.Column,
+			Linter:     w.Linter,
+			Severity:   w.Severity,
+			FixType:    w.FixType,
+			Suggestion: w.Suggestion,
 		})
 	}
 

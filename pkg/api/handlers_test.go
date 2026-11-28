@@ -2711,9 +2711,9 @@ func TestExecutePullSchemaLintsPostgresNamespaces(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	assert.Equal(t, []*apitypes.LintViolationResponse{
-		{Table: "events", Linter: "primary_key", Severity: "warning", Message: "No primary key defined"},
+		{Table: "events", Linter: "primary_key", Severity: "warning", Message: "No primary key defined", Suggestion: "Every table should have an explicit primary key"},
 		{Table: "events", Column: "weight", Linter: "has_float", Severity: "warning", Message: `Column "weight" in table "events" uses "real" data type`},
-		{Table: "orders", Column: "id", Linter: "primary_key", Severity: "warning", Message: `Primary key column "id" in table "orders" uses "integer"; allowed types: bigint, uuid`},
+		{Table: "orders", Column: "id", Linter: "primary_key", Severity: "warning", Message: `Primary key column "id" in table "orders" uses "integer"`, Suggestion: `Change column "id" to a supported column type ("bigint", "uuid")`},
 	}, resp.Namespaces["public"].Lint)
 	require.NotNil(t, resp.Namespaces["billing"].Lint)
 	assert.Empty(t, resp.Namespaces["billing"].Lint)

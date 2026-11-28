@@ -2170,13 +2170,15 @@ func (x *SchemaChange) GetRollbackBlockers() []*SkippedTable {
 // LintViolation represents a schema linting violation.
 // Violations with severity "error" block apply unless --allow-unsafe is passed.
 type LintViolation struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Message       string                 `protobuf:"bytes,1,opt,name=message,proto3" json:"message,omitempty"`
-	Table         string                 `protobuf:"bytes,2,opt,name=table,proto3" json:"table,omitempty"`
-	Column        string                 `protobuf:"bytes,3,opt,name=column,proto3" json:"column,omitempty"`
-	Linter        string                 `protobuf:"bytes,4,opt,name=linter,proto3" json:"linter,omitempty"`
-	FixType       string                 `protobuf:"bytes,5,opt,name=fix_type,json=fixType,proto3" json:"fix_type,omitempty"`
-	Severity      string                 `protobuf:"bytes,6,opt,name=severity,proto3" json:"severity,omitempty"` // "error", "warning", or "info"
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Message  string                 `protobuf:"bytes,1,opt,name=message,proto3" json:"message,omitempty"`
+	Table    string                 `protobuf:"bytes,2,opt,name=table,proto3" json:"table,omitempty"`
+	Column   string                 `protobuf:"bytes,3,opt,name=column,proto3" json:"column,omitempty"`
+	Linter   string                 `protobuf:"bytes,4,opt,name=linter,proto3" json:"linter,omitempty"`
+	FixType  string                 `protobuf:"bytes,5,opt,name=fix_type,json=fixType,proto3" json:"fix_type,omitempty"`
+	Severity string                 `protobuf:"bytes,6,opt,name=severity,proto3" json:"severity,omitempty"` // "error", "warning", or "info"
+	// What the linter advises changing. Empty when the linter offers none.
+	Suggestion    string `protobuf:"bytes,7,opt,name=suggestion,proto3" json:"suggestion,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2249,6 +2251,13 @@ func (x *LintViolation) GetFixType() string {
 func (x *LintViolation) GetSeverity() string {
 	if x != nil {
 		return x.Severity
+	}
+	return ""
+}
+
+func (x *LintViolation) GetSuggestion() string {
+	if x != nil {
+		return x.Suggestion
 	}
 	return ""
 }
@@ -6142,14 +6151,17 @@ const file_tern_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a@\n" +
 	"\x12OriginalFilesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xa6\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xc6\x01\n" +
 	"\rLintViolation\x12\x18\n" +
 	"\amessage\x18\x01 \x01(\tR\amessage\x12\x14\n" +
 	"\x05table\x18\x02 \x01(\tR\x05table\x12\x16\n" +
 	"\x06column\x18\x03 \x01(\tR\x06column\x12\x16\n" +
 	"\x06linter\x18\x04 \x01(\tR\x06linter\x12\x19\n" +
 	"\bfix_type\x18\x05 \x01(\tR\afixType\x12\x1a\n" +
-	"\bseverity\x18\x06 \x01(\tR\bseverity\"\xd7\x01\n" +
+	"\bseverity\x18\x06 \x01(\tR\bseverity\x12\x1e\n" +
+	"\n" +
+	"suggestion\x18\a \x01(\tR\n" +
+	"suggestion\"\xd7\x01\n" +
 	"\fExistingCopy\x12\x1c\n" +
 	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x12 \n" +
 	"\vdisposition\x18\x02 \x01(\tR\vdisposition\x12\x16\n" +

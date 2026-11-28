@@ -54,6 +54,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 💡 **Lint Warnings**: 2 advisory findings
 1. `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 2. `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
+   *Consider dropping index `idx_category` as it is fully covered by `idx_category_price`. The longer index can satisfy all queries that would use the shorter index.*
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -2232,6 +2233,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 💡 **Lint Warnings**: 2 advisory findings
 1. `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 2. `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
+   *Consider dropping index `idx_category` as it is fully covered by `idx_category_price`. The longer index can satisfy all queries that would use the shorter index.*
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -2528,6 +2530,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 💡 **Lint Warnings**: 2 advisory findings
 1. `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 2. `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
+   *Consider dropping index `idx_category` as it is fully covered by `idx_category_price`. The longer index can satisfy all queries that would use the shorter index.*
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -2588,6 +2591,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 💡 **Lint Warnings**: 2 advisory findings
 1. `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 2. `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
+   *Consider dropping index `idx_category` as it is fully covered by `idx_category_price`. The longer index can satisfy all queries that would use the shorter index.*
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -2654,6 +2658,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 💡 **Lint Warnings**: 2 advisory findings
 1. `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 2. `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
+   *Consider dropping index `idx_category` as it is fully covered by `idx_category_price`. The longer index can satisfy all queries that would use the shorter index.*
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -2718,6 +2723,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 💡 **Lint Warnings**: 2 advisory findings
 1. `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 2. `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
+   *Consider dropping index `idx_category` as it is fully covered by `idx_category_price`. The longer index can satisfy all queries that would use the shorter index.*
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -2784,6 +2790,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 💡 **Lint Warnings**: 2 advisory findings
 1. `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 2. `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
+   *Consider dropping index `idx_category` as it is fully covered by `idx_category_price`. The longer index can satisfy all queries that would use the shorter index.*
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -3654,6 +3661,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 💡 **Lint Warnings**: 2 advisory findings
 1. `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 2. `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
+   *Consider dropping index `idx_category` as it is fully covered by `idx_category_price`. The longer index can satisfy all queries that would use the shorter index.*
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -4145,7 +4153,8 @@ That command wasn't recognized. Available commands:
 
 💡 Lint Warnings (2):
   • orders: has_float: New column uses floating-point data type
-  • users: no_default: Column added without DEFAULT value
+  • users: Primary key column "id" has type "int"
+    Change column "id" to a supported column type ("BIGINT", "BINARY", "VARBINARY")
 
 📋 Plan: 2 tables to create, 1 table to alter
 
@@ -4467,7 +4476,8 @@ Production
 
 💡 Lint Warnings (2):
   • orders: has_float: New column uses floating-point data type
-  • users: no_default: Column added without DEFAULT value
+  • users: Primary key column "id" has type "int"
+    Change column "id" to a supported column type ("BIGINT", "BINARY", "VARBINARY")
 
 📋 Plan: 2 tables to create, 1 table to alter
 
