@@ -27,6 +27,18 @@ var plannerRefusalClauses = map[planner.Reason]string{
 		"make the change outside SchemaBot through a separately reviewed process",
 }
 
+// plannerRefusalClauseFuncs holds the clause for each refusing planner
+// reason whose decision carries what the clause names. A column-limit
+// decision names the tables at the limit, the altered table or its
+// partitions and inheritance children, and how many column numbers are left,
+// so the clause points the operator at the tables to rebuild.
+var plannerRefusalClauseFuncs = map[planner.Reason]func(planner.Decision) string{
+	planner.ReasonColumnLimit: func(d planner.Decision) string {
+		return "it adds a column to " + planner.ColumnLimitSubject(d.ColumnLimit) +
+			", and a dropped column keeps its number until its table is rebuilt; " + planner.ColumnLimitHelp(d.ColumnLimit)
+	},
+}
+
 // dependentRefusalReasons are the planner reasons whose refusal names the
 // objects in the way, which dependentObjectCauses renders.
 var dependentRefusalReasons = []planner.Reason{
@@ -34,6 +46,7 @@ var dependentRefusalReasons = []planner.Reason{
 	planner.ReasonDependentPolicy,
 	planner.ReasonDependentTrigger,
 	planner.ReasonDependentGeneratedColumn,
+	planner.ReasonDependentPublication,
 	planner.ReasonPartitionKey,
 }
 
@@ -78,6 +91,9 @@ func plannerRefusalClauseList(decisions []planner.Decision) (clauses []string, u
 			continue
 		}
 		clause, known := plannerRefusalClauses[d.Reason]
+		if render, detailed := plannerRefusalClauseFuncs[d.Reason]; detailed {
+			clause, known = render(d), true
+		}
 		if !known {
 			return nil, d.Reason
 		}

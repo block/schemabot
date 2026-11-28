@@ -2143,6 +2143,18 @@ func TestExecutionVerdictNamesTheObjectsThatBlockAColumnChange(t *testing.T) {
 			want: `statement for table "orders" is refused: it drops a column that generated column "public"."orders"."total" reads; if it should go too, remove it from the file and apply that first, or to keep it, make the change outside SchemaBot through a separately reviewed process, then plan again`,
 		},
 		{
+			name: "a publication on a dropped column",
+			decision: planner.Decision{Reason: planner.ReasonDependentPublication, Kind: pgstatement.OpDropColumn,
+				DependentPublications: []string{`"orders_feed"`}},
+			want: `statement for table "orders" is refused: it drops a column that publication "orders_feed" names in a column list or row filter, which PostgreSQL refuses; take the column out of the publication's column list and row filter outside SchemaBot with ALTER PUBLICATION ... SET TABLE, then plan again`,
+		},
+		{
+			name: "two publications on a type change",
+			decision: planner.Decision{Reason: planner.ReasonDependentPublication, Kind: pgstatement.OpAlterColumnType,
+				DependentPublications: []string{`"orders_feed"`, `"search_feed"`}},
+			want: `statement for table "orders" is refused: it changes the type of a column that publications "orders_feed", "search_feed" name in a column list or row filter, which PostgreSQL refuses; take the column out of each publication's column list and row filter outside SchemaBot with ALTER PUBLICATION ... SET TABLE, and put it back once this change has run; until it is back, subscribers do not receive the column, or receive rows the row filter would have held back, then plan again`,
+		},
+		{
 			name:     "a partition key",
 			decision: planner.Decision{Reason: planner.ReasonPartitionKey, PartitionKeyTables: []string{`"public"."orders"`}},
 			want:     `statement for table "orders" is refused: it changes or drops a column in the partition key of "public"."orders", which PostgreSQL never allows; create a new partitioned table with the new key and move the rows into it, then plan again`,
