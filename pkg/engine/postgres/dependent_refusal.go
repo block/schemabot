@@ -45,6 +45,21 @@ func dependentObjectCauses(decisions []planner.Decision) []string {
 	return causes
 }
 
+// recreatableDependentsNoun names the kinds of recreatable dependents that
+// read the column, such as "the policy" or "the policies and the trigger",
+// for the steps that act on them, where a bare pronoun could be read as
+// the column.
+func recreatableDependentsNoun(d planner.Decision) string {
+	var parts []string
+	if k := len(d.DependentPolicies); k > 0 {
+		parts = append(parts, "the "+plural(k, "policy", "policies"))
+	}
+	if k := len(d.DependentTriggers); k > 0 {
+		parts = append(parts, "the "+plural(k, "trigger", "triggers"))
+	}
+	return strings.Join(parts, " and ")
+}
+
 // recreatableDependents names the row security policies and triggers that
 // read the column, the dependents that can be dropped and recreated around
 // the change and that the planner gives one manual path for, and counts
@@ -70,10 +85,10 @@ func recreatableDependents(d planner.Decision) (named string, n int) {
 // manages a table's policies through its schema file but never its
 // triggers, so a trigger is changed outside SchemaBot.
 func recreatableDependentsCause(d planner.Decision, named string, n int) string {
-	reads, them := plural(n, "reads", "read"), plural(n, "it", "them")
+	reads, them, noun := plural(n, "reads", "read"), plural(n, "it", "them"), recreatableDependentsNoun(d)
 	switch d.DependentFix {
 	case planner.DependentFixRewriteDependents:
-		change := fmt.Sprintf("change %s so %s no longer %s the column", them, plural(n, "it", "they"), reads)
+		change := fmt.Sprintf("change %s so %s no longer %s the column", noun, plural(n, "it", "they"), reads)
 		switch {
 		case len(d.DependentTriggers) == 0:
 			change += " and apply that first"
@@ -85,7 +100,7 @@ func recreatableDependentsCause(d planner.Decision, named string, n int) string 
 		return fmt.Sprintf("it drops a column that %s %s; %s", named, reads, change)
 	case planner.DependentFixRecreateAroundChange:
 		return fmt.Sprintf("it changes the type of a column that %s %s, which SchemaBot cannot run yet; the change does not rewrite the table, so outside SchemaBot, through a separately reviewed process, drop %s, change the column, and recreate %s in one transaction, which never leaves the table without %s",
-			named, reads, them, them, them)
+			named, reads, noun, them, them)
 	case planner.DependentFixExpandContract:
 		where := ""
 		switch {
@@ -93,10 +108,10 @@ func recreatableDependentsCause(d planner.Decision, named string, n int) string 
 		case len(d.DependentPolicies) == 0:
 			where = " outside SchemaBot"
 		default:
-			where = " (the policies in the schema file, the triggers outside SchemaBot)"
+			where = " (policies in the file, triggers outside SchemaBot)"
 		}
-		return fmt.Sprintf("it changes the type of a column that %s %s, and the change rewrites the table, which SchemaBot cannot run yet; add a column of the new type instead, have the application write to both and backfill it, point %s at the new column%s and switch reads to it, and last drop the old column once nothing uses it, each as its own change",
-			named, reads, them, where)
+		return fmt.Sprintf("it changes the type of a column that %s %s and rewrites the table, which SchemaBot cannot run yet; add a column of the new type, have the application write to both while you backfill it, move %s%s and reads to it, and drop the old column once unused, each as its own change",
+			named, reads, noun, where)
 	}
 	slog.Warn("planner names a dependent fix with no sentence; rendering the generic one", "dependent_fix", string(d.DependentFix))
 	return fmt.Sprintf("it changes or drops a column that %s %s, which SchemaBot cannot run yet; make the change outside SchemaBot through a separately reviewed process",
