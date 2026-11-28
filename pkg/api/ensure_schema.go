@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/spirit/pkg/sentinel"
+	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 
@@ -494,6 +496,11 @@ func ensureMySQLSchema(parent context.Context, dsn string, logger *slog.Logger, 
 	})
 	eng := spirit.New(spirit.Config{Logger: spiritLogger})
 
+	workingTables, err := storageSpiritWorkingTables(schemaFiles)
+	if err != nil {
+		return err
+	}
+
 	// Fast path: plan without a lock. If no changes, return immediately.
 	// This is the common case (99% of deploys) and avoids lock overhead.
 	planResult, err := eng.Plan(ctx, &engine.PlanRequest{
@@ -505,7 +512,7 @@ func ensureMySQLSchema(parent context.Context, dsn string, logger *slog.Logger, 
 		return fmt.Errorf("plan schema: %w", err)
 	}
 	if planResult.NoChanges {
-		staleTables, err := staleSpiritTableNames(ctx, dsn)
+		staleTables, err := staleSpiritTableNames(ctx, dsn, workingTables, logger)
 		if err != nil {
 			return fmt.Errorf("check stale Spirit tables: %w", err)
 		}
@@ -550,7 +557,7 @@ func ensureMySQLSchema(parent context.Context, dsn string, logger *slog.Logger, 
 	// lock. During a rolling deploy, another pod may be actively applying
 	// SchemaBot storage DDL; cleaning before the lock can delete that pod's
 	// shadow tables and make Spirit cancel with "table definition changed".
-	if err := cleanStaleSpiritTables(ctx, dsn, logger); err != nil {
+	if err := cleanStaleSpiritTables(ctx, dsn, workingTables, logger); err != nil {
 		return fmt.Errorf("clean stale Spirit tables: %w", err)
 	}
 
@@ -1386,7 +1393,50 @@ func flatTableChanges(changes []engine.SchemaChange) []engine.TableChange {
 	return tables
 }
 
-func staleSpiritTableNames(ctx context.Context, dsn string) ([]string, error) {
+// storageSpiritWorkingTables returns the names of the working tables Spirit
+// creates while it changes the storage tables the given schema declares: each
+// table's copy, the original it renames away at cutover, and its checkpoint,
+// plus the checkpoint and the sentinel one Spirit run shares across tables.
+// Spirit's own naming functions build the names, so a table name long enough
+// to be truncated maps to the name Spirit gives its working tables. A table
+// that only looks like one of these, such as `_audit_old` created by an
+// operator, is not in the set. The storage tables declare no foreign keys, so
+// Spirit creates no foreign key probe tables for them.
+//
+// It reads each file with the same split and CREATE TABLE parse as the engine's
+// plan, so any file the plan accepts, including one declaring several tables,
+// yields every table in it. The names keep the declared spelling: on a server
+// with lower_case_table_names set, a table declared in mixed case would get
+// working tables this set does not name, and startup would leave them in place
+// rather than drop them. The embedded storage tables are all lowercase.
+func storageSpiritWorkingTables(schemaFiles schema.SchemaFiles) (map[string]bool, error) {
+	names := map[string]bool{
+		sentinel.TableName:          true,
+		spiritSharedCheckpointTable: true,
+	}
+	for namespace, ns := range schemaFiles {
+		for file, content := range ns.Files {
+			stmts, err := ddl.SplitStatements(content)
+			if err != nil {
+				return nil, fmt.Errorf("split statements in storage schema file %s/%s: %w", namespace, file, err)
+			}
+			for _, stmt := range stmts {
+				ct, err := statement.ParseCreateTable(stmt)
+				if err != nil {
+					return nil, fmt.Errorf("read the CREATE TABLE statements in storage schema file %s/%s: %w", namespace, file, err)
+				}
+				names[utils.NewTableName(ct.TableName)] = true
+				names[utils.OldTableName(ct.TableName)] = true
+				names[utils.CheckpointTableName(ct.TableName)] = true
+			}
+		}
+	}
+	return names, nil
+}
+
+// staleSpiritTableNames lists the working tables in the storage database that
+// a Spirit run on it left behind, sorted by name.
+func staleSpiritTableNames(ctx context.Context, dsn string, workingTables map[string]bool, logger *slog.Logger) ([]string, error) {
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
@@ -1406,12 +1456,21 @@ func staleSpiritTableNames(ctx context.Context, dsn string) ([]string, error) {
 
 	var names []string
 	for _, t := range tables {
-		if ddl.IsSpiritInternalTable(t.Name) {
+		if workingTables[t.Name] {
 			names = append(names, t.Name)
+		} else if strings.HasPrefix(t.Name, "_") {
+			logNotSpiritWorkingTable(logger, t.Name)
 		}
 	}
 	sort.Strings(names)
 	return names, nil
+}
+
+// logNotSpiritWorkingTable records why startup leaves an underscore-prefixed
+// table in the storage database: it is not a working table Spirit gives a
+// storage table, so it is not startup's to drop.
+func logNotSpiritWorkingTable(logger *slog.Logger, name string) {
+	logger.Debug("leaving table in place: not a Spirit working table of a storage table", "table", name)
 }
 
 // readEmbeddedSchemaFiles reads the embedded MySQL schema files into a SchemaFiles map.
@@ -1604,12 +1663,14 @@ func releaseEnsureSchemaLock(ctx context.Context, locker namedlock.Locker, conn 
 	utils.CloseAndLog(conn)
 }
 
-// cleanStaleSpiritTables drops any Spirit internal tables left behind by a
-// previous interrupted schema change on the SchemaBot storage database. Callers
-// must hold the EnsureSchema advisory lock before invoking this helper. These
-// are temporary tables (_tablename_new, _tablename_old, _tablename_chkpnt,
-// _spirit_sentinel, _spirit_checkpoint) that Spirit normally cleans up after
-// cutover. If a pod is killed mid-apply, they persist until the next startup.
+// cleanStaleSpiritTables drops the Spirit working tables a previous interrupted
+// schema change left behind on the SchemaBot storage database. Callers must
+// hold the EnsureSchema advisory lock before invoking this helper.
+// workingTables names the tables to drop (see storageSpiritWorkingTables);
+// Spirit normally drops them itself after cutover. If a pod is killed
+// mid-apply, they persist until the next startup. A table is dropped only when
+// its name is exactly one Spirit gives a working table of a storage table, so
+// a table that only resembles one is left in place.
 //
 // Dropping them is a choice rather than a consequence. A checkpoint is durable
 // state on the target, not a handle held by the process that wrote it, and
@@ -1628,7 +1689,7 @@ func releaseEnsureSchemaLock(ctx context.Context, locker namedlock.Locker, conn 
 //
 // This must NOT be used on target databases, where a user's schema change may
 // be in progress or resumable.
-func cleanStaleSpiritTables(ctx context.Context, dsn string, logger *slog.Logger) error {
+func cleanStaleSpiritTables(ctx context.Context, dsn string, workingTables map[string]bool, logger *slog.Logger) error {
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
@@ -1657,7 +1718,10 @@ func cleanStaleSpiritTables(ctx context.Context, dsn string, logger *slog.Logger
 	)
 
 	for _, t := range tables {
-		if !ddl.IsSpiritInternalTable(t.Name) {
+		if !workingTables[t.Name] {
+			if strings.HasPrefix(t.Name, "_") {
+				logNotSpiritWorkingTable(logger, t.Name)
+			}
 			continue
 		}
 		staleCount++
