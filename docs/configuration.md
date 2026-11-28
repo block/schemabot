@@ -1779,22 +1779,35 @@ pass run, and check `rows_would_delete` for the `webhook_events` table.
 ### Webhook inbox window
 
 The inbox is also how SchemaBot tells whether it has already planned a pull
-request's latest commit. The pass never deletes that record: for each pull
-request it keeps the newest finished delivery that planned a commit, however
-old, so retention never makes the webhook reconciler plan a commit again. The
-table therefore keeps about one row per pull request, plus every delivery newer
-than the window.
+request's latest commit. For each pull request the pass keeps the newest
+finished delivery that planned a commit, however old. Retention never makes a
+commit that was not planned read as planned. At worst the webhook reconciler
+plans a pull request once more, for example when the pull request goes back to
+an older commit whose delivery has aged out. The table therefore keeps about
+one row per pull request, plus every delivery newer than the window.
 
-As a second safeguard, `webhook_events` cannot be shorter than the time the
-reconciler still looks back over: its lookback plus its grace period plus the
-cool-off after which a failed delivery stops counting as planned. With the
-default reconciler lookback of 48 hours that is a little under 49 hours.
+Finished deliveries include failed ones. A delivery that failed for good is
+kept for the window like any other, then deleted, and it stops counting in the
+`schemabot.webhook.inbox_depth` gauge once it is gone.
 
-SchemaBot refuses to start when `webhook_events` is below that floor, and the
-error names both values. The reconciler's lookback is set with the
-`WEBHOOK_RECONCILE_LOOKBACK` environment variable, and raising it raises the
-floor. If you raise `WEBHOOK_RECONCILE_LOOKBACK`, raise `webhook_events` with
-it.
+`webhook_events` has a floor, the longer of two times:
+
+- **The 3 days GitHub keeps a delivery redeliverable.** The inbox row is what
+  stops a redelivered delivery from running its side effects twice, so a
+  shorter window would let a redelivery run as if it were new.
+- **The time the reconciler still looks back over:** its lookback plus its
+  grace period plus the cool-off after which a failed delivery stops counting
+  as planned. With the default reconciler lookback of 48 hours that is a little
+  under 49 hours, so the 3-day limit is the floor by default.
+
+SchemaBot refuses to start when `webhook_events` is below the floor, and the
+error names the values behind it. The reconciler's lookback is set with the
+`WEBHOOK_RECONCILE_LOOKBACK` environment variable, and raising it above about
+71 hours raises the floor. Each instance checks the floor against its own
+environment when it starts, so if you raise `WEBHOOK_RECONCILE_LOOKBACK`, raise
+it on every instance and raise `webhook_events` with it.
+
+`interval` cannot be shorter than one minute.
 
 ## Spirit Run Settings
 

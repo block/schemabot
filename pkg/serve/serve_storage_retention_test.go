@@ -13,12 +13,16 @@ import (
 )
 
 // A retention window shorter than what the webhook reconciler still reads would
-// make it synthesize deliveries it already has, so startup refuses it and the
-// error names the key to change and the numbers behind the floor.
+// make it synthesize deliveries it already has, and one shorter than GitHub's
+// redelivery limit would let a redelivery of a purged delivery run again, so
+// startup refuses both and the error names the key to change and the numbers
+// behind the floor.
 func TestValidateStorageRetentionWindows(t *testing.T) {
-	// With the default 48h lookback the floor is the lookback plus the grace
-	// plus the failed-delivery cool-off.
-	defaultFloor := 48*time.Hour + 15*time.Minute + storage.WebhookEventFailedCoverageCoolOff
+	// With the default 48h lookback the reconciler reads the lookback plus the
+	// grace plus the failed-delivery cool-off, which is under GitHub's 3-day
+	// redelivery limit, so the redelivery limit is the floor.
+	defaultCoverage := 48*time.Hour + 15*time.Minute + storage.WebhookEventFailedCoverageCoolOff
+	redeliveryFloor := 72 * time.Hour
 
 	for _, tc := range []struct {
 		name      string
@@ -35,25 +39,40 @@ func TestValidateStorageRetentionWindows(t *testing.T) {
 			retention: api.StorageRetentionConfig{Enabled: true},
 		},
 		{
-			name:      "exactly the floor is allowed",
-			retention: api.StorageRetentionConfig{Enabled: true, WebhookEvents: defaultFloor.String()},
+			name:      "exactly the redelivery floor is allowed",
+			retention: api.StorageRetentionConfig{Enabled: true, WebhookEvents: redeliveryFloor.String()},
 		},
 		{
-			name:      "a window below the default floor is refused",
-			retention: api.StorageRetentionConfig{Enabled: true, WebhookEvents: "24h"},
+			name:      "a window above the reconciler's reach but below the redelivery limit is refused",
+			retention: api.StorageRetentionConfig{Enabled: true, WebhookEvents: "60h"},
 			wantErr: []string{
-				"storage_retention.webhook_events is 24h0m0s",
-				"its lookback is 48h0m0s",
-				"WEBHOOK_RECONCILE_LOOKBACK",
-				"15m0s grace",
-				"30m0s failed-delivery cool-off",
-				"at least " + defaultFloor.String(),
+				"storage_retention.webhook_events is 60h0m0s",
+				"72h0m0s GitHub keeps a delivery redeliverable",
+				"at least 72h0m0s",
 			},
 		},
 		{
-			name:      "a window one minute under the floor is refused",
-			retention: api.StorageRetentionConfig{Enabled: true, WebhookEvents: (defaultFloor - time.Minute).String()},
+			name:      "exactly the reconciler's reach is still below the redelivery limit",
+			retention: api.StorageRetentionConfig{Enabled: true, WebhookEvents: defaultCoverage.String()},
+			wantErr:   []string{"at least 72h0m0s"},
+		},
+		{
+			name:      "a window one minute under the redelivery floor is refused",
+			retention: api.StorageRetentionConfig{Enabled: true, WebhookEvents: (redeliveryFloor - time.Minute).String()},
 			wantErr:   []string{"storage_retention.webhook_events"},
+		},
+		{
+			name:      "a raised lookback names the reconciler's terms",
+			retention: api.StorageRetentionConfig{Enabled: true, WebhookEvents: "80h"},
+			lookback:  "100h",
+			wantErr: []string{
+				"storage_retention.webhook_events is 80h0m0s",
+				"its lookback is 100h0m0s",
+				"WEBHOOK_RECONCILE_LOOKBACK",
+				"15m0s grace",
+				"30m0s failed-delivery cool-off",
+				"at least 100h45m0s",
+			},
 		},
 		{
 			name:      "a raised lookback raises the floor above the default window",
@@ -71,15 +90,15 @@ func TestValidateStorageRetentionWindows(t *testing.T) {
 			lookback:  "200h",
 		},
 		{
-			name:      "a shortened lookback lowers the floor",
+			name:      "a shortened lookback cannot lower the floor below the redelivery limit",
 			retention: api.StorageRetentionConfig{Enabled: true, WebhookEvents: "13h"},
 			lookback:  "12h",
+			wantErr:   []string{"at least 72h0m0s"},
 		},
 		{
 			name:      "a malformed lookback leaves the default in force",
-			retention: api.StorageRetentionConfig{Enabled: true, WebhookEvents: "24h"},
+			retention: api.StorageRetentionConfig{Enabled: true, WebhookEvents: "73h"},
 			lookback:  "soon",
-			wantErr:   []string{"its lookback is 48h0m0s"},
 		},
 		{
 			name:      "an unparseable window is reported as the config error it is",
@@ -117,4 +136,16 @@ func TestReconcileInboxCoverageWindowAddsEveryTermToTheLookback(t *testing.T) {
 	raised := webhook.ReconcileInboxCoverageWindow(10 * time.Hour)
 	assert.Equal(t, 10*time.Hour, raised.Lookback)
 	assert.Equal(t, window.Grace, raised.Grace)
+}
+
+// Build is what every deployment goes through, so the window floor is checked
+// there, before any storage is opened, and a server with a short window never
+// starts.
+func TestBuildRefusesARetentionWindowBelowTheFloor(t *testing.T) {
+	t.Setenv("WEBHOOK_RECONCILE_LOOKBACK", "")
+	cfg := &api.ServerConfig{StorageRetention: api.StorageRetentionConfig{Enabled: true, WebhookEvents: "24h"}}
+
+	_, err := Build(t.Context(), cfg)
+
+	require.ErrorContains(t, err, "storage_retention.webhook_events is 24h0m0s")
 }

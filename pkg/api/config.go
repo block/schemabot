@@ -431,7 +431,8 @@ type StorageRetentionConfig struct {
 	DryRun *bool `yaml:"dry_run,omitempty"`
 
 	// Interval is how often the pass runs, as a Go duration string (e.g. "1h").
-	// Defaults to one hour.
+	// Defaults to one hour and may not be shorter than
+	// MinStorageRetentionInterval.
 	Interval string `yaml:"interval,omitempty"`
 
 	// BatchSize is how many rows one delete statement removes. Defaults to 500
@@ -440,7 +441,8 @@ type StorageRetentionConfig struct {
 
 	// WebhookEvents is how long a finished row stays in the webhook inbox, as a
 	// Go duration string (e.g. "168h"). Defaults to 7 days. It may not be
-	// shorter than the webhook reconcile window; see serve.Build.
+	// shorter than the webhook reconcile window or the 3 days GitHub keeps a
+	// delivery redeliverable; see serve.Build.
 	WebhookEvents string `yaml:"webhook_events,omitempty"`
 }
 
@@ -449,6 +451,11 @@ const (
 	// runs when storage_retention.interval is not set. Retention is not
 	// latency-sensitive, so a slow cadence loses nothing.
 	DefaultStorageRetentionInterval = 1 * time.Hour
+
+	// MinStorageRetentionInterval bounds storage_retention.interval from below,
+	// so a value such as 1s typed for 1h cannot run an election, a scan of the
+	// inbox, and a log line every second on every operator.
+	MinStorageRetentionInterval = 1 * time.Minute
 
 	// DefaultStorageRetentionBatchSize is how many rows one delete removes when
 	// storage_retention.batch_size is not set.
@@ -479,7 +486,14 @@ func (c *ServerConfig) StorageRetentionDryRun() bool {
 // StorageRetentionInterval returns how often the storage retention pass runs,
 // falling back to the default when not configured.
 func (c *ServerConfig) StorageRetentionInterval() (time.Duration, error) {
-	return parsePositiveDuration("storage_retention.interval", c.StorageRetention.Interval, DefaultStorageRetentionInterval)
+	interval, err := parsePositiveDuration("storage_retention.interval", c.StorageRetention.Interval, DefaultStorageRetentionInterval)
+	if err != nil {
+		return 0, err
+	}
+	if interval < MinStorageRetentionInterval {
+		return 0, fmt.Errorf("storage_retention.interval must be at least %s, got %q", MinStorageRetentionInterval, c.StorageRetention.Interval)
+	}
+	return interval, nil
 }
 
 // StorageRetentionWebhookEvents returns how long a finished webhook inbox row

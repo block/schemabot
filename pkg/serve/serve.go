@@ -1830,7 +1830,8 @@ func parseWebhookReconcileScanBounds(logger *slog.Logger) (maxPages int, lookbac
 }
 
 // validateStorageRetentionWindows refuses a storage_retention window that would
-// delete rows another part of SchemaBot still reads. It lives here because the
+// delete rows another part of SchemaBot still reads, or rows GitHub can still
+// redeliver against (githubRedeliveryWindow). It lives here because the
 // reconcile lookback is resolved from WEBHOOK_RECONCILE_LOOKBACK in this
 // package, so this is the one place that knows both the configured window and
 // the lookback in force. It fails startup rather than clamping, because a
@@ -1851,14 +1852,26 @@ func validateStorageRetentionWindows(cfg *api.ServerConfig) error {
 	// lookback, so this check reads it quietly.
 	_, lookback := parseWebhookReconcileScanBounds(slog.New(slog.DiscardHandler))
 	coverage := webhook.ReconcileInboxCoverageWindow(lookback)
-	if window >= coverage.Total() {
+	floor := max(coverage.Total(), githubRedeliveryWindow)
+	if window >= floor {
 		return nil
+	}
+	if coverage.Total() < githubRedeliveryWindow {
+		return fmt.Errorf("storage_retention.webhook_events is %s, shorter than the %s GitHub keeps a delivery redeliverable: "+
+			"a redelivery of a purged delivery would run its side effects again; set storage_retention.webhook_events to at least %s",
+			window, githubRedeliveryWindow, floor)
 	}
 	return fmt.Errorf("storage_retention.webhook_events is %s, shorter than the %s the webhook reconciler still reads: "+
 		"its lookback is %s (WEBHOOK_RECONCILE_LOOKBACK, or its default when unset) plus a %s grace plus a %s failed-delivery cool-off; "+
 		"set storage_retention.webhook_events to at least %s, or shorten WEBHOOK_RECONCILE_LOOKBACK",
-		window, coverage.Total(), coverage.Lookback, coverage.Grace, coverage.FailedCoverageCoolOff, coverage.Total())
+		window, coverage.Total(), coverage.Lookback, coverage.Grace, coverage.FailedCoverageCoolOff, floor)
 }
+
+// githubRedeliveryWindow is how far back GitHub lets an operator redeliver a
+// webhook delivery. The inbox row is what makes a redelivery's side effects run
+// at most once (AV-7), so a retention window shorter than this would let a
+// redelivery of a purged delivery run as a first delivery.
+const githubRedeliveryWindow = 72 * time.Hour
 
 // maxSynchronizeQuietPeriod caps WEBHOOK_SYNCHRONIZE_QUIET_PERIOD. Every push
 // waits this long for its plan and its Check Run, so a value such as 15m

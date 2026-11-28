@@ -90,10 +90,12 @@ const (
 )
 
 // InboxCoverageWindow is how long the reconciler may still ask the inbox
-// whether a pull request head was planned. The inbox purge already keeps the
-// newest finished row that covers each pull request, so it never removes a
-// head's coverage. Refusing a retention window shorter than Total is a second
-// safeguard: no row is deleted while the reconciler can still ask about it.
+// whether a pull request head was planned. The inbox purge keeps the newest
+// finished row that covers each pull request, so a purge can only make the
+// reconciler plan a head again, never make an unplanned head read as planned.
+// Refusing a retention window shorter than Total keeps every row the reconciler
+// reads by update time. It does not cover the delivery a target observation
+// names, which can be any age; losing that one costs a replan, not a check.
 type InboxCoverageWindow struct {
 	// Lookback is how far back in update time the reconciler scans pull
 	// requests.

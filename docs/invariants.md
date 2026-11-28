@@ -579,8 +579,9 @@ is neither one existing installs grant nor optional behind a server config key.
 
 SchemaBot deletes a row from its own storage only when the work the row records is finished and no
 reader still depends on it. Work that is still waiting, running, or retrying is never deleted, and
-neither is a finished row that a reader treats as proof the work was done. Deletion runs on one
-elected instance from the maintenance loop, never from a request handler.
+neither is a finished row that a reader treats as proof the work was done. Deletion runs from the
+maintenance loop, never from a request handler, and each delete repeats its own eligibility test, so
+the rule holds even when two instances delete at once.
 
 *Breaks if violated:* an acknowledged delivery is lost before it runs (AV-7), or the webhook
 reconciler finds no proof that a pull request's head was planned and plans it again, replaying a
@@ -588,10 +589,10 @@ failure that was dead-lettered on purpose. *Enforced:* the storage retention pas
 (`pkg/api/storage_retention.go`); the purge predicate `webhookPurgeCandidate`, which deletes only
 terminal rows and keeps the newest row covering each pull request
 (`pkg/storage/internal/sqlstore/webhook_events.go`); `validateStorageRetentionWindows`
-(`pkg/serve/serve.go`), which refuses to start with a webhook inbox window shorter than
-`ReconcileInboxCoverageWindow` (`pkg/webhook/durable_reconcile.go`); and
-`TestStorageRetentionPassPurgesOnlyOldFinishedRowsOnMySQL` and its PostgreSQL twin
-(`pkg/api/storage_retention_integration_test.go`).
+(`pkg/serve/serve.go`, called from `Build`), which refuses to start with a webhook inbox window
+shorter than `ReconcileInboxCoverageWindow` (`pkg/webhook/durable_reconcile.go`) or than GitHub's
+redelivery limit; and `TestStorageRetentionPassPurgesOnlyOldFinishedRowsOnMySQL` and its PostgreSQL
+twin (`pkg/api/storage_retention_integration_test.go`).
 
 ## Merge gate (MG)
 

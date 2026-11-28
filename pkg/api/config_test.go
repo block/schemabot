@@ -5723,6 +5723,7 @@ func TestStorageRetentionConfig(t *testing.T) {
 		}{
 			{"unparseable interval", StorageRetentionConfig{Interval: "hourly"}, "storage_retention.interval"},
 			{"zero interval", StorageRetentionConfig{Interval: "0s"}, "storage_retention.interval must be positive"},
+			{"interval below the floor", StorageRetentionConfig{Interval: "59s"}, "storage_retention.interval must be at least 1m0s"},
 			{"unparseable window", StorageRetentionConfig{WebhookEvents: "a week"}, "storage_retention.webhook_events"},
 			{"negative window", StorageRetentionConfig{WebhookEvents: "-1h"}, "storage_retention.webhook_events must be positive"},
 		} {
