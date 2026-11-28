@@ -3559,7 +3559,8 @@ var WebhookEventStatesAll = []string{
 // moves a row out of. Only an explicit GitHub Redeliver reopens such a row, so
 // these are the only states retention may delete. A completed or permanently
 // failed row is also what HasEventForHead counts as coverage for its head, so
-// deleting it lets the reconciler treat that head as never planned.
+// DeleteTerminalOlderThan keeps the newest covering row of each pull request.
+// Purging therefore never makes the reconciler plan a head again.
 var WebhookEventStatesTerminal = []string{
 	WebhookEventCompleted,
 	WebhookEventFailed,
