@@ -79,7 +79,7 @@ func TestEnginePlanForeignKeys(t *testing.T) {
 	}, executableDDL(t, result, "payments"), "the undeclared live foreign key is planned to run as a drop")
 	dropFK := byDDL["ALTER TABLE public.payments DROP CONSTRAINT payments_order_id_fkey"]
 	assert.True(t, dropFK.IsUnsafe, "a foreign-key drop needs --allow-unsafe")
-	assert.Equal(t, `statement removes live structure from table "payments"`, dropFK.UnsafeReason)
+	assert.Equal(t, `statement drops foreign key "payments_order_id_fkey" from table "payments": rows written after the drop are not checked against FOREIGN KEY (order_id) REFERENCES orders(id), so they can point at rows that do not exist`, dropFK.UnsafeReason)
 	assert.Contains(t, dropFK.Metadata, reviewedDropMetadataKey, "the plan records the key it reviewed, so the apply can check it")
 
 	dropCrossNamespaceFK, ok := byDDL["ALTER TABLE public.invoices DROP CONSTRAINT invoices_account_id_fkey"]
