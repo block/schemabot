@@ -226,10 +226,10 @@ The CLI adds this line above the table's SQL:
 -- Table `orders` — rows ~18,402,551, size ~4.0 GiB (engine estimates)
 ```
 
-To see the structured payload, add `-o json`:
+To see the structured payload, add `--json`:
 
 ```sh
-schemabot pull -d shop -e production --table orders --catalog-detail detailed -o json
+schemabot pull -d shop -e production --table orders --catalog-detail detailed --json
 ```
 
 The pretty view keeps columns and indexes in the SQL instead of repeating them.
@@ -2665,7 +2665,7 @@ complement the live snapshot; they are not a stream of every schema change
 made by any means.
 
 The CLI exposes the same reads: `schemabot status`, `databases`, `list-plans`,
-and `logs` accept `--json`; `schemabot pull` uses `-o json`.
+`logs`, and `pull` accept `--json`.
 
 ## What SchemaBot does not remember
 

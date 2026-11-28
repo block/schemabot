@@ -219,3 +219,32 @@ func TestFreezeReadsJSON(t *testing.T) {
 		assert.Equal(t, override, got)
 	})
 }
+
+// pull --json prints the same document as -o json, after any --table filter,
+// so an agent uses the one JSON flag every other read command takes.
+func TestPullJSONMatchesOutputJSON(t *testing.T) {
+	pulled := &apitypes.PullSchemaResponse{
+		Database: "shop", Type: "mysql", Environment: "staging", TableCount: 2,
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"shop": {Tables: map[string]string{
+				"orders":    "CREATE TABLE `orders` (`id` bigint NOT NULL);",
+				"customers": "CREATE TABLE `customers` (`id` bigint NOT NULL);",
+			}},
+		},
+	}
+	api := &jsonAPI{replies: map[string]jsonReply{"POST /api/pull": {body: pulled}}}
+	endpoint := api.start(t)
+
+	viaFlag, err := runLockCmd(endpoint, (&PullCmd{Database: "shop", Environment: "staging", Table: "orders", Output: "pretty", JSON: true}).Run)
+	require.NoError(t, err)
+	viaOutput, err := runLockCmd(endpoint, (&PullCmd{Database: "shop", Environment: "staging", Table: "orders", Output: "json"}).Run)
+	require.NoError(t, err)
+	assert.JSONEq(t, viaOutput, viaFlag)
+
+	var doc apitypes.PullSchemaResponse
+	require.NoError(t, json.Unmarshal([]byte(viaFlag), &doc), viaFlag)
+	require.Contains(t, doc.Namespaces, "shop")
+	assert.Equal(t, map[string]string{"orders": "CREATE TABLE `orders` (`id` bigint NOT NULL);"}, doc.Namespaces["shop"].Tables)
+	assert.EqualValues(t, 1, doc.TableCount, "the table count follows the --table filter")
+	assert.Equal(t, 2, api.hits["POST /api/pull"])
+}

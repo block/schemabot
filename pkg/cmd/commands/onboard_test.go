@@ -152,7 +152,7 @@ func TestBuildOnboardWritePlanReportsAllFormattingFailures(t *testing.T) {
 	assert.Contains(t, lines[1], "namespace a table a: cannot preserve MySQL comments")
 	assert.Contains(t, lines[2], "namespace a table b: formatter could not prove statement 1 preserved its SQL")
 	assert.Contains(t, lines[3], "namespace z table c: formatter could not prove statement 1 preserved its SQL")
-	assert.Contains(t, err.Error(), "pull with -o json")
+	assert.Contains(t, err.Error(), "pull with --json")
 	assert.Contains(t, err.Error(), "plan against the source environment and require no schema changes")
 	assert.Contains(t, err.Error(), "onboard pulls the source again")
 	content, err := os.ReadFile(existing)

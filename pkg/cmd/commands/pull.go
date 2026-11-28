@@ -24,6 +24,13 @@ type PullCmd struct {
 	CatalogDetail string   `help:"Structured catalog detail to include" default:"basic" enum:"basic,detailed"`
 	Lint          bool     `help:"Run the schema linters over every pulled table and include the violations per namespace"`
 	Output        string   `short:"o" help:"Output format: pretty renders the schema as readable SQL, json emits the API response after any --table filter" default:"pretty" enum:"pretty,json"`
+	JSON          bool     `help:"Print the API response as JSON, after any --table filter. Overrides -o, so --json -o pretty prints JSON"`
+}
+
+// outputJSON reports whether the pull prints JSON. --json matches every other
+// read command, and -o json stays for scripts that already use it.
+func (cmd *PullCmd) outputJSON() bool {
+	return cmd.JSON || cmd.Output == "json"
 }
 
 // Run executes the pull command.
@@ -33,7 +40,7 @@ func (cmd *PullCmd) Run(g *Globals) error {
 		return err
 	}
 	var resp *apitypes.PullSchemaResponse
-	err = withLoading("Pulling live schema...", true, func() error {
+	err = withLoading("Pulling live schema...", !cmd.outputJSON(), func() error {
 		var pullErr error
 		resp, pullErr = client.CallPullSchemaAPIWithOptions(ep, cmd.Database, cmd.Type, cmd.Environment, client.PullSchemaOptions{
 			Namespaces:    cmd.Namespaces,
@@ -56,7 +63,7 @@ func (cmd *PullCmd) Run(g *Globals) error {
 			return err
 		}
 	}
-	if cmd.Output == "json" {
+	if cmd.outputJSON() {
 		if err := writePullSchemaResponse(os.Stdout, resp); err != nil {
 			return fmt.Errorf("write pull schema response: %w", err)
 		}

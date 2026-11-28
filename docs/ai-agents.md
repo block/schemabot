@@ -103,8 +103,7 @@ formatted for a terminal.
 
 | Commands | JSON option |
 |---|---|
-| `databases`, `status`, `progress`, `list-plans`, `logs`, `locks`, `plan`, `init`, `settings`, `freeze list`, `freeze show`, `freeze override`, `checks show` | `--json` |
-| `pull` | `-o json` |
+| `databases`, `status`, `progress`, `list-plans`, `logs`, `locks`, `plan`, `pull`, `init`, `settings`, `freeze list`, `freeze show`, `freeze override`, `checks show` | `--json` |
 
 `apply -o json` streams progress as the change runs rather than returning a
 single JSON document. `progress --json` prints one snapshot and never opens
