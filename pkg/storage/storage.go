@@ -786,16 +786,32 @@ type WebhookEventStore interface {
 	// of the same page or a redelivery reopened a row in it, so a sweep runs
 	// under WithStorageRetentionElection to run alone and leaves anything still old for its next
 	// pass. An age or limit that is not positive, or a limit above
-	// MaxWebhookEventPurgeBatch, is an error and deletes nothing. Deleting a
-	// completed or permanently failed row also drops the coverage
-	// HasEventForHead reports for its head.
+	// MaxWebhookEventPurgeBatch, is an error and deletes nothing.
+	//
+	// It keeps the newest covering row of each pull request. A row that
+	// HasEventForHead would count as coverage (a completed row, a dead-lettered
+	// row, or a failed organic row inside its cool-off) is deleted only when a
+	// newer row that covers permanently, a completed or permanently failed
+	// auto-plan row in either GUID form, exists for the same provider,
+	// repository, and pull request, where newer means a higher row id. A newer
+	// row that is still in flight, or failed inside its cool-off, covers now but
+	// can lose that coverage, so it never justifies a delete. The id, not
+	// received_at, orders them because a Redeliver reopen keeps a row's id and
+	// resets its received_at. The table keeps about one row per pull request however
+	// old it is. The keep is per pull request, not per head, and the delivery that
+	// recorded the pull request's current target can be deleted on age alone, so a
+	// purge can make the reconciler evaluate a pull request once more. It never
+	// makes an unplanned head read as planned. Rows
+	// that cover nothing (failed outside its cool-off, failed synthesized,
+	// superseded, other event types or actions, rows with no pull request) are
+	// deleted on age alone.
 	DeleteTerminalOlderThan(ctx context.Context, age time.Duration, limit int) (int64, error)
 
 	// CountTerminalOlderThan returns how many rows DeleteTerminalOlderThan
 	// would be free to delete for the same age: terminal rows received more than
-	// age ago, measured on the database clock. It changes nothing, so a dry run
-	// can report what a purge would remove. An age that is not positive is an
-	// error.
+	// age ago, measured on the database clock, other than the newest covering
+	// row of each pull request. It changes nothing, so a dry run can report what
+	// a purge would remove. An age that is not positive is an error.
 	CountTerminalOlderThan(ctx context.Context, age time.Duration) (int64, error)
 }
 
