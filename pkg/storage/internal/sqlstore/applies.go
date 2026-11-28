@@ -3311,6 +3311,33 @@ func (s *applyStore) WithBranchReconcileElection(ctx context.Context, fn func(co
 	return err
 }
 
+// storageRetentionLockName elects the one instance that purges old rows from
+// SchemaBot's own tables each pass. One lock covers every table the purge
+// handles, so tables added later share a single election and never purge in
+// parallel with each other.
+const storageRetentionLockName = "schemabot_storage_retention"
+
+// storageRetentionSweep identifies the storage retention pass to the shared
+// election.
+var storageRetentionSweep = strandedSweep{
+	lockName: storageRetentionLockName,
+	busy:     storage.ErrStorageRetentionBusy,
+	subject:  "old storage rows",
+}
+
+// WithStorageRetentionElection runs fn on the elected instance, holding the
+// lock until fn returns. See storage.ApplyStore for the contract.
+func (s *applyStore) WithStorageRetentionElection(ctx context.Context, fn func(context.Context) error) error {
+	if fn == nil {
+		return fmt.Errorf("work function is required to purge old storage rows under election")
+	}
+	_, err := reapUnderElection(ctx, s.db, s.locker, storageRetentionSweep,
+		func(ctx context.Context) ([]struct{}, error) {
+			return nil, fn(ctx)
+		})
+	return err
+}
+
 // ExpireRetryable elects one instance per pass and expires under the lock. See
 // storage.ApplyStore for the contract.
 func (s *applyStore) ExpireRetryable(ctx context.Context, endedOperationStopTypes []string, limit int) ([]*storage.RetryableApplyExpiration, error) {

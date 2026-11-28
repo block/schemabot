@@ -24,7 +24,20 @@ type webhookEventStore struct {
 	dialect    Dialect
 	identity   identityInserter
 	classifier ErrorClassifier
+	// hooks lets a test act between two statements that do not run in one
+	// transaction, to pin the guard the second one carries. Both are nil
+	// outside tests.
+	hooks webhookEventHooks
 }
+
+type webhookEventHooks struct {
+	afterDuplicateInsert func()
+	afterPurgeSelect     func()
+}
+
+// maxCreateAttempts bounds how often Create re-inserts a delivery whose row a
+// purge deleted between the duplicate-key insert and the reopen.
+const maxCreateAttempts = 3
 
 func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEvent) (bool, error) {
 	if event.DeliveryID == "" {
@@ -64,25 +77,53 @@ func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEv
 	// Producers of deferred work — a redundant convergence signal that should
 	// lose the race to the primary delivery — use it to schedule dispatch
 	// without holding the delivery outside the inbox.
-	id, err := s.identity.InsertID(ctx, s.db, `
-		INSERT INTO webhook_events (
-			provider, delivery_id, event, action, repository, pull_request, head_sha, tenant_id,
-			payload, state, attempts, retry_after, received_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, provider, event.DeliveryID, event.Event, event.Action, event.Repository, event.PullRequest, event.HeadSHA, event.TenantID,
-		payload, state, event.Attempts, nullTimePtr(event.RetryAfter), receivedAt)
-	if err != nil {
-		if s.classifier.IsDuplicateKey(err) {
-			return s.reopenTerminalWebhookEvent(ctx, provider, event.DeliveryID, payload, receivedAt)
+	//
+	// A duplicate GUID means the row exists, and the reopen decides whether to
+	// run it again. Retention can delete a terminal row between the failed
+	// insert and the reopen, so a reopen that matches nothing checks that the
+	// row is still there and inserts again if it is gone: a delivery that is
+	// acknowledged always has a row (AV-7).
+	for attempt := 1; ; attempt++ {
+		id, err := s.identity.InsertID(ctx, s.db, `
+			INSERT INTO webhook_events (
+				provider, delivery_id, event, action, repository, pull_request, head_sha, tenant_id,
+				payload, state, attempts, retry_after, received_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, provider, event.DeliveryID, event.Event, event.Action, event.Repository, event.PullRequest, event.HeadSHA, event.TenantID,
+			payload, state, event.Attempts, nullTimePtr(event.RetryAfter), receivedAt)
+		if err == nil {
+			event.ID = id
+			event.Provider = provider
+			event.State = state
+			event.Payload = []byte(payload)
+			event.ReceivedAt = receivedAt
+			return true, nil
 		}
-		return false, fmt.Errorf("insert webhook event (provider=%s, delivery_id=%s): %w", provider, event.DeliveryID, err)
+		if !s.classifier.IsDuplicateKey(err) {
+			return false, fmt.Errorf("insert webhook event (provider=%s, delivery_id=%s): %w", provider, event.DeliveryID, err)
+		}
+		if s.hooks.afterDuplicateInsert != nil {
+			s.hooks.afterDuplicateInsert()
+		}
+		reopened, err := s.reopenTerminalWebhookEvent(ctx, provider, event.DeliveryID, payload, receivedAt)
+		if err != nil {
+			return false, err
+		}
+		if reopened {
+			return true, nil
+		}
+		existing, err := s.GetByDeliveryID(ctx, provider, event.DeliveryID)
+		if err != nil {
+			return false, fmt.Errorf("check webhook delivery after its reopen matched no row (provider=%s, delivery_id=%s): %w", provider, event.DeliveryID, err)
+		}
+		if existing != nil {
+			// The row is in flight, so this delivery is a duplicate.
+			return false, nil
+		}
+		if attempt == maxCreateAttempts {
+			return false, fmt.Errorf("create webhook event (provider=%s, delivery_id=%s): its row was deleted between the insert and the reopen %d times", provider, event.DeliveryID, attempt)
+		}
 	}
-	event.ID = id
-	event.Provider = provider
-	event.State = state
-	event.Payload = []byte(payload)
-	event.ReceivedAt = receivedAt
-	return true, nil
 }
 
 // reopenTerminalWebhookEvent handles the duplicate-GUID branch of Create.
@@ -132,9 +173,9 @@ func (s *webhookEventStore) reopenTerminalWebhookEvent(ctx context.Context, prov
 			lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
 			retry_after = NULL, completed_at = NULL, started_at = NULL, updated_at = NOW()
 		WHERE provider = ? AND delivery_id = ?
-			AND (state IN (?, ?, ?, ?) OR (state = ? AND lease_expires_at <= `+s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond)+`))
-	`, storage.WebhookEventPending, payload, receivedAt, provider, deliveryID,
-		storage.WebhookEventFailed, storage.WebhookEventFailedPermanent, storage.WebhookEventCompleted, storage.WebhookEventSuperseded, storage.WebhookEventProcessing)
+			AND (state IN (`+placeholders(len(storage.WebhookEventStatesTerminal))+`) OR (state = ? AND lease_expires_at <= `+s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond)+`))
+	`, append(append([]any{storage.WebhookEventPending, payload, receivedAt, provider, deliveryID},
+		stringArgs(storage.WebhookEventStatesTerminal)...), storage.WebhookEventProcessing)...)
 	if err != nil {
 		return false, fmt.Errorf("reopen webhook delivery for redelivery (provider=%s, delivery_id=%s): %w", provider, deliveryID, err)
 	}
@@ -643,6 +684,106 @@ func (s *webhookEventStore) TerminateStuckProcessing(ctx context.Context, reason
 		return 0, fmt.Errorf("read terminate stuck processing rows affected: %w", err)
 	}
 	return rows, nil
+}
+
+// DeleteTerminalOlderThan deletes at most limit terminal rows received more
+// than age ago, oldest first, and returns how many it deleted. It never
+// deletes a pending, processing, or retryable row, however old, because those
+// are work a driver still owns.
+//
+// The cutoff is rendered as database-clock SQL rather than computed from the
+// caller's time.Now(), so the same age cuts at the same instant on every pod.
+// received_at, not completed_at, dates a row: every row has it, and it is what
+// the received_at index serves. The state test is a residual filter on the
+// rows that index returns.
+//
+// A batch is two statements because MySQL rejects LIMIT inside an IN subquery
+// and PostgreSQL has no DELETE ... LIMIT: select a page of primary keys, then
+// delete by primary key. The DELETE repeats the state and cutoff predicates,
+// so a row that Redeliver reopened between the two statements is not deleted.
+func (s *webhookEventStore) DeleteTerminalOlderThan(ctx context.Context, age time.Duration, limit int) (int64, error) {
+	if age.Microseconds() <= 0 {
+		return 0, fmt.Errorf("delete terminal webhook events: age must be positive, got %s", age)
+	}
+	if limit <= 0 {
+		return 0, fmt.Errorf("delete terminal webhook events: limit must be positive, got %d", limit)
+	}
+	if limit > storage.MaxWebhookEventPurgeBatch {
+		return 0, fmt.Errorf("delete terminal webhook events: limit %d is above the largest batch, %d", limit, storage.MaxWebhookEventPurgeBatch)
+	}
+
+	cutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(age.Microseconds())), IntervalMicrosecond)
+	terminalIn := placeholders(len(storage.WebhookEventStatesTerminal))
+
+	selectArgs := append(stringArgs(storage.WebhookEventStatesTerminal), limit)
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id
+		FROM webhook_events
+		WHERE received_at < `+cutoff+` AND state IN (`+terminalIn+`)
+		ORDER BY received_at, id
+		LIMIT ?
+	`, selectArgs...)
+	if err != nil {
+		return 0, fmt.Errorf("select terminal webhook events older than %s: %w", age, err)
+	}
+	defer utils.CloseAndLog(rows)
+	ids := make([]any, 0, limit)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return 0, fmt.Errorf("scan terminal webhook event id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterate terminal webhook event ids: %w", err)
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	if s.hooks.afterPurgeSelect != nil {
+		s.hooks.afterPurgeSelect()
+	}
+
+	deleteArgs := make([]any, 0, len(ids)+len(storage.WebhookEventStatesTerminal))
+	deleteArgs = append(deleteArgs, ids...)
+	deleteArgs = append(deleteArgs, stringArgs(storage.WebhookEventStatesTerminal)...)
+	result, err := s.db.ExecContext(ctx, `
+		DELETE FROM webhook_events
+		WHERE id IN (`+placeholders(len(ids))+`)
+			AND received_at < `+cutoff+` AND state IN (`+terminalIn+`)
+	`, deleteArgs...)
+	if err != nil {
+		return 0, fmt.Errorf("delete %d terminal webhook events older than %s: %w", len(ids), age, err)
+	}
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read deleted terminal webhook events rows affected: %w", err)
+	}
+	return deleted, nil
+}
+
+// CountTerminalOlderThan counts the rows DeleteTerminalOlderThan may delete for
+// the same age, using the same cutoff and state predicate so a dry run reports
+// what a real purge would remove.
+func (s *webhookEventStore) CountTerminalOlderThan(ctx context.Context, age time.Duration) (int64, error) {
+	if age.Microseconds() <= 0 {
+		return 0, fmt.Errorf("count terminal webhook events: age must be positive, got %s", age)
+	}
+
+	cutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(age.Microseconds())), IntervalMicrosecond)
+	var count int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM webhook_events
+		WHERE received_at < `+cutoff+` AND state IN (`+placeholders(len(storage.WebhookEventStatesTerminal))+`)
+	`, stringArgs(storage.WebhookEventStatesTerminal)...).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count terminal webhook events older than %s: %w", age, err)
+	}
+	return count, nil
 }
 
 func scanWebhookEvent(row *sql.Row) (*storage.WebhookEvent, error) {

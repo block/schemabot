@@ -148,6 +148,171 @@ func assertFailedRowCoverageCoolOff(t *testing.T, store storage.Storage, db *sql
 	}
 }
 
+// Retention deletes only rows no driver or sweep will touch again. An old row
+// in each terminal state goes; an old pending, processing, or retryable row
+// stays however old it is, and so does a terminal row still inside the window.
+func TestWebhookEventStore_DeleteTerminalOlderThan(t *testing.T) {
+	clearTables(t)
+	assertDeleteTerminalOlderThan(t, NewMySQL(testDB), testDB, MySQLDialect{}, func(query string) string { return query })
+}
+
+// assertDeleteTerminalOlderThan ages rows on the database clock and checks
+// which survive a purge. The aging statement is rendered SQL, so each dialect
+// suite runs it; rebind adapts that raw statement's placeholders.
+func assertDeleteTerminalOlderThan(t *testing.T, store storage.Storage, db *sql.DB, dialect Dialect, rebind func(string) string) {
+	t.Helper()
+	ctx := t.Context()
+	retention := 30 * 24 * time.Hour
+	ago := func(d time.Duration) string {
+		return dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+			LiteralIntervalAmount(uint64(d.Microseconds())), IntervalMicrosecond)
+	}
+	seed := func(deliveryID, state string, receivedAgo time.Duration) {
+		t.Helper()
+		_, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
+			DeliveryID: deliveryID,
+			Event:      "pull_request",
+			Action:     "synchronize",
+			Repository: "block/example",
+			Payload:    []byte(`{}`),
+		})
+		require.NoError(t, err, deliveryID)
+		_, err = db.ExecContext(ctx, rebind(`UPDATE webhook_events SET state = ?, received_at = `+ago(receivedAgo)+
+			` WHERE delivery_id = ?`), state, deliveryID)
+		require.NoError(t, err, deliveryID)
+	}
+	exists := func(deliveryID string) bool {
+		t.Helper()
+		event, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, deliveryID)
+		require.NoError(t, err, deliveryID)
+		return event != nil
+	}
+
+	seed("invalid-args-row", storage.WebhookEventCompleted, retention+time.Hour)
+	for _, tc := range []struct {
+		name  string
+		age   time.Duration
+		limit int
+	}{
+		{"zero age", 0, 10},
+		{"negative age", -time.Hour, 10},
+		{"zero limit", retention, 0},
+		{"negative limit", retention, -1},
+		{"limit above the largest batch", retention, storage.MaxWebhookEventPurgeBatch + 1},
+	} {
+		deleted, err := store.WebhookEvents().DeleteTerminalOlderThan(ctx, tc.age, tc.limit)
+		require.Error(t, err, tc.name)
+		assert.Equal(t, int64(0), deleted, tc.name)
+	}
+	require.True(t, exists("invalid-args-row"), "an invalid call must delete nothing")
+	deleted, err := store.WebhookEvents().DeleteTerminalOlderThan(ctx, retention, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), deleted)
+
+	old := retention + time.Hour
+	young := retention - time.Hour
+	oldTerminal := []string{
+		storage.WebhookEventCompleted, storage.WebhookEventFailed,
+		storage.WebhookEventFailedPermanent, storage.WebhookEventSuperseded,
+	}
+	oldInFlight := []string{
+		storage.WebhookEventPending, storage.WebhookEventProcessing, storage.WebhookEventFailedRetryable,
+	}
+	for _, state := range oldTerminal {
+		seed("old-"+state, state, old)
+	}
+	for _, state := range oldInFlight {
+		seed("old-"+state, state, old)
+	}
+	for _, state := range oldTerminal {
+		seed("young-"+state, state, young)
+	}
+
+	counted, err := store.WebhookEvents().CountTerminalOlderThan(ctx, retention)
+	require.NoError(t, err)
+	assert.Equal(t, int64(len(oldTerminal)), counted, "the count sees the rows a purge may delete, and no others")
+	for _, age := range []time.Duration{0, -time.Hour} {
+		_, err = store.WebhookEvents().CountTerminalOlderThan(ctx, age)
+		require.Error(t, err, "age %s", age)
+	}
+	require.True(t, exists("old-"+storage.WebhookEventCompleted), "counting must delete nothing")
+
+	deleted, err = store.WebhookEvents().DeleteTerminalOlderThan(ctx, retention, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(len(oldTerminal)), deleted, "one old row per terminal state")
+	counted, err = store.WebhookEvents().CountTerminalOlderThan(ctx, retention)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), counted, "nothing terminal and old is left to count")
+	for _, state := range oldTerminal {
+		assert.False(t, exists("old-"+state), "old %s row must be deleted", state)
+		assert.True(t, exists("young-"+state), "young %s row must be kept", state)
+	}
+	for _, state := range oldInFlight {
+		assert.True(t, exists("old-"+state), "old %s row must be kept", state)
+	}
+	deleted, err = store.WebhookEvents().DeleteTerminalOlderThan(ctx, retention, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), deleted, "a second purge finds nothing left")
+
+	// The limit caps one call, and the oldest rows go first.
+	seed("batch-oldest", storage.WebhookEventCompleted, old+2*time.Hour)
+	seed("batch-middle", storage.WebhookEventCompleted, old+time.Hour)
+	seed("batch-newest", storage.WebhookEventCompleted, old)
+	deleted, err = store.WebhookEvents().DeleteTerminalOlderThan(ctx, retention, 2)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), deleted)
+	assert.False(t, exists("batch-oldest"))
+	assert.False(t, exists("batch-middle"))
+	assert.True(t, exists("batch-newest"), "the limit leaves the newest row for the next call")
+	deleted, err = store.WebhookEvents().DeleteTerminalOlderThan(ctx, retention, 2)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), deleted, "the next call takes the rest")
+	assert.False(t, exists("batch-newest"))
+
+	// A Redeliver that reopens a row after the purge selected it keeps the row:
+	// the delete checks state and age again.
+	inbox := store.WebhookEvents().(*webhookEventStore)
+	t.Cleanup(func() { inbox.hooks = webhookEventHooks{} })
+	seed("race-reopened", storage.WebhookEventCompleted, old)
+	seed("race-purged", storage.WebhookEventCompleted, old)
+	inbox.hooks.afterPurgeSelect = func() {
+		inbox.hooks.afterPurgeSelect = nil
+		created, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
+			DeliveryID: "race-reopened", Event: "pull_request", Action: "synchronize",
+			Repository: "block/example", Payload: []byte(`{}`),
+		})
+		require.NoError(t, err)
+		require.True(t, created, "the redelivery reopens the completed row")
+	}
+	deleted, err = store.WebhookEvents().DeleteTerminalOlderThan(ctx, retention, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), deleted, "only the row nobody reopened is deleted")
+	assert.False(t, exists("race-purged"))
+	reopened, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "race-reopened")
+	require.NoError(t, err)
+	require.NotNil(t, reopened, "a row reopened between the select and the delete must survive")
+	assert.Equal(t, storage.WebhookEventPending, reopened.State)
+
+	// A purge that deletes a row between a redelivery's duplicate insert and
+	// its reopen does not lose the redelivery: Create inserts the row again.
+	seed("race-recreated", storage.WebhookEventCompleted, old)
+	inbox.hooks.afterDuplicateInsert = func() {
+		inbox.hooks.afterDuplicateInsert = nil
+		_, err := db.ExecContext(ctx, rebind(`DELETE FROM webhook_events WHERE delivery_id = ?`), "race-recreated")
+		require.NoError(t, err)
+	}
+	created, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
+		DeliveryID: "race-recreated", Event: "pull_request", Action: "synchronize",
+		Repository: "block/example", Payload: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	assert.True(t, created, "the redelivery is accepted, so it must have a row")
+	recreated, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "race-recreated")
+	require.NoError(t, err)
+	require.NotNil(t, recreated, "an accepted redelivery has a row to drive")
+	assert.Equal(t, storage.WebhookEventPending, recreated.State)
+}
+
 // createCoalescingEvent inserts a delivery for the SupersedeIfCovered tests
 // with receivedAgo controlling its position in the (received_at, id) newness
 // ordering, then optionally drives it into a non-pending state via SQL.
