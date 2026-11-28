@@ -1126,6 +1126,19 @@ func TestFollowFailureWarningDropsTerminalEscapes(t *testing.T) {
 	assert.Equal(t, "Warning: failed to fetch logs (attempt 1/10), retrying in 1ms: storage unavailable"+terminalAttackCleaned+" Warning: the apply was cancelled\n", warning)
 }
 
+// The error that ends a tail names each unreadable source with text the server
+// sent, so it reaches the terminal without control runes and on one line.
+func TestUnreadableSourcesErrorDropsTerminalEscapes(t *testing.T) {
+	refused := deploymentFollowError("target-a"+lineBreakAttack, "remote-1", "No log."+terminalAttack+"\nError: forged")
+	refused.Code = apitypes.DeploymentLogCodeNotFound
+	refused.Reason = apitypes.DeploymentLogReasonNotFound + terminalAttack
+
+	unreadable := unreadableSourcesError(&apitypes.DeploymentLogsResponse{Errors: []*apitypes.DeploymentLogError{refused}})
+
+	require.NotNil(t, unreadable)
+	assert.Equal(t, "no data-plane log source could be read: target-a"+terminalAttackCleaned+" / spirit (remote-1): No log."+terminalAttackCleaned+" Error: forged (remote_log_not_found"+terminalAttackCleaned+")", unreadable.Error())
+}
+
 // The logs command prints each entry's time in UTC with the zone named, the
 // same way the PR comment's log section does, whatever the local zone of the
 // machine running the CLI.

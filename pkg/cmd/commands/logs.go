@@ -470,11 +470,11 @@ func unreadableSourcesError(result *apitypes.DeploymentLogsResponse) *deployment
 // this CLI does not know, may recover and is retried.
 func isPermanentDeploymentLogError(sourceErr *apitypes.DeploymentLogError) bool {
 	switch {
-	case sourceErr.Code == "RemoteLogNotFound" && sourceErr.Reason == "remote_log_not_found":
+	case sourceErr.Code == apitypes.DeploymentLogCodeNotFound && sourceErr.Reason == apitypes.DeploymentLogReasonNotFound:
 		return true
-	case sourceErr.Code == "UnsupportedCapability" && sourceErr.Reason == "upgrade_required":
+	case sourceErr.Code == apitypes.DeploymentLogCodeUnsupported && sourceErr.Reason == apitypes.DeploymentLogReasonUpgradeRequired:
 		return true
-	case sourceErr.Code == "MalformedRemoteLog" && sourceErr.Reason == "malformed_remote_log":
+	case sourceErr.Code == apitypes.DeploymentLogCodeMalformed && sourceErr.Reason == apitypes.DeploymentLogReasonMalformed:
 		return true
 	default:
 		return false
