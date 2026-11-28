@@ -2,6 +2,7 @@ package commands
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/block/schemabot/pkg/cmd/client"
@@ -25,6 +26,34 @@ var knownSettings = map[string]settingInfo{
 // SettingsCmd manages server settings (git-style get/set/list).
 type SettingsCmd struct {
 	Args []string `arg:"" optional:"" help:"[key] [value] - list all, get, or set a setting"`
+	JSON bool     `help:"Output as JSON"`
+}
+
+// settingJSON is one setting as `settings --json` reports it.
+type settingJSON struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+	// Set is true when the server stores a value for the key. When it is
+	// false, Value is the default the server falls back to.
+	Set         bool   `json:"set"`
+	Default     string `json:"default,omitempty"`
+	Description string `json:"description,omitempty"`
+}
+
+// settingsListJSON is the `settings --json` document for the full list.
+type settingsListJSON struct {
+	Settings []settingJSON `json:"settings"`
+}
+
+// newSettingJSON describes key from its stored value, if any. An unknown key
+// carries no default or description.
+func newSettingJSON(key, stored string, set bool) settingJSON {
+	info := knownSettings[key]
+	out := settingJSON{Key: key, Value: stored, Set: set, Default: info.Default, Description: info.Description}
+	if !set {
+		out.Value = info.Default
+	}
+	return out
 }
 
 // Run executes the settings command.
@@ -37,15 +66,15 @@ func (cmd *SettingsCmd) Run(g *Globals) error {
 	switch len(cmd.Args) {
 	case 0:
 		// List all settings
-		return listSettings(ep)
+		return listSettings(ep, cmd.JSON)
 	case 1:
 		// Get a setting
-		return getSetting(ep, cmd.Args[0])
+		return getSetting(ep, cmd.Args[0], cmd.JSON)
 	default:
 		// Set a setting
 		key := cmd.Args[0]
 		value := strings.Join(cmd.Args[1:], " ")
-		return setSetting(ep, key, value)
+		return setSetting(ep, key, value, cmd.JSON)
 	}
 }
 
@@ -61,9 +90,9 @@ func validateSettingKey(key string) error {
 	return nil
 }
 
-func listSettings(endpoint string) error {
+func listSettings(endpoint string, outputJSON bool) error {
 	var settings []*client.Setting
-	err := withLoading("Loading settings...", true, func() error {
+	err := withLoading("Loading settings...", !outputJSON, func() error {
 		var loadErr error
 		settings, loadErr = client.ListSettings(endpoint)
 		return loadErr
@@ -76,6 +105,20 @@ func listSettings(endpoint string) error {
 	currentValues := make(map[string]string)
 	for _, s := range settings {
 		currentValues[s.Key] = s.Value
+	}
+
+	if outputJSON {
+		keys := make([]string, 0, len(knownSettings))
+		for key := range knownSettings {
+			keys = append(keys, key)
+		}
+		slices.Sort(keys)
+		doc := settingsListJSON{Settings: make([]settingJSON, 0, len(keys))}
+		for _, key := range keys {
+			value, set := currentValues[key]
+			doc.Settings = append(doc.Settings, newSettingJSON(key, value, set && value != ""))
+		}
+		return writeJSON(doc)
 	}
 
 	fmt.Printf("%sSettings%s\n\n", templates.ANSIBold, templates.ANSIReset)
@@ -93,15 +136,19 @@ func listSettings(endpoint string) error {
 	return nil
 }
 
-func getSetting(endpoint, key string) error {
+func getSetting(endpoint, key string, outputJSON bool) error {
 	var value string
-	err := withLoading("Loading setting...", true, func() error {
+	err := withLoading("Loading setting...", !outputJSON, func() error {
 		var loadErr error
 		value, loadErr = client.GetSetting(endpoint, key)
 		return loadErr
 	})
 	if err != nil {
 		return err
+	}
+
+	if outputJSON {
+		return writeJSON(newSettingJSON(key, value, value != ""))
 	}
 
 	if value == "" {
@@ -112,15 +159,19 @@ func getSetting(endpoint, key string) error {
 	return nil
 }
 
-func setSetting(endpoint, key, value string) error {
+func setSetting(endpoint, key, value string, outputJSON bool) error {
 	if err := validateSettingKey(key); err != nil {
 		return err
 	}
 
-	if err := withLoading("Updating setting...", true, func() error {
+	if err := withLoading("Updating setting...", !outputJSON, func() error {
 		return client.SetSetting(endpoint, key, value)
 	}); err != nil {
 		return err
+	}
+
+	if outputJSON {
+		return writeJSON(newSettingJSON(key, value, true))
 	}
 
 	fmt.Printf("%s%s set to %s%s\n", templates.ANSIGreen, key, value, templates.ANSIReset)

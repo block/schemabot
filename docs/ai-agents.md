@@ -103,12 +103,12 @@ formatted for a terminal.
 
 | Commands | JSON option |
 |---|---|
-| `databases`, `status`, `list-plans`, `logs`, `plan`, `init`, `checks show` | `--json` |
+| `databases`, `status`, `progress`, `list-plans`, `logs`, `locks`, `plan`, `init`, `settings`, `freeze list`, `freeze show`, `freeze override`, `checks show` | `--json` |
 | `pull` | `-o json` |
 
 `apply -o json` streams progress as the change runs rather than returning a
-single JSON document. `progress` has no JSON option; use `status --json`
-instead.
+single JSON document. `progress --json` prints one snapshot and never opens
+the interactive watcher.
 
 For more output options, see
 [Use the CLI from scripts and agents](cli.md#use-the-cli-from-scripts-and-agents).

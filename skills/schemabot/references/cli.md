@@ -62,6 +62,6 @@ schemabot logs apply-3f9a2c71
 
 ## Use it from an agent
 
-- Prefer `--json` where a command offers it (`databases`, `status`, `list-plans`, `logs`, `plan`), and `status --json` for a snapshot.
-- Never run a watching `progress`: it runs until the change finishes, and its keys change the apply. Take a `status` or `progress --no-watch` snapshot and check again later.
+- Prefer `--json` where a command offers it (`databases`, `status`, `progress`, `list-plans`, `logs`, `locks`, `plan`), and `status --json` or `progress --json` for a snapshot.
+- Never run a watching `progress`: it runs until the change finishes, and its keys change the apply. Take a `status`, `progress --no-watch`, or `progress --json` snapshot and check again later.
 - [Use the CLI from scripts and agents](https://github.com/block/schemabot/blob/main/docs/cli.md#use-the-cli-from-scripts-and-agents) covers exit codes and output formats.

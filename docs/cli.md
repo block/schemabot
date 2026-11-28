@@ -1575,7 +1575,7 @@ Prefer structured output when another program consumes the result:
 
 | Commands | JSON option |
 |---|---|
-| `databases`, `status`, `list-plans`, `logs`, `plan`, `init`, `checks show` | `--json` |
+| `databases`, `status`, `progress`, `list-plans`, `logs`, `locks`, `plan`, `init`, `settings`, `freeze list`, `freeze show`, `freeze override`, `checks show` | `--json` |
 | `pull` | `-o json` |
 
 For example:
@@ -1597,8 +1597,8 @@ $ schemabot databases --json
 
 `apply -o json` controls its progress stream; it is not a single JSON response
 for the entire command, which also prints the plan and other messages.
-For fully structured writes, use the API. `progress` has no JSON output flag;
-use `status --json` for a structured snapshot.
+For fully structured writes, use the API. `progress --json` prints one
+snapshot of the change and never opens the interactive watcher.
 
 `plan` exits non-zero when any environment's plan is one `apply` refuses
 whatever its flags: the plan reports errors, a rollout member needs attention,
