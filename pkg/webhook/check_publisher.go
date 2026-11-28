@@ -107,6 +107,16 @@ func (h *Handler) verifyPublicationPRInfo(ctx context.Context, client *ghclient.
 			h.logger.Info("discarding check publication because PR target changed", "repo", repo, "pr", pr, "head_sha", headSHA, "operation", operation)
 			return false, nil
 		}
+		if closedSinceSnapshot(&snapshot.info, prInfo) {
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:  operation,
+				Repository: repo,
+				Status:     "skipped",
+			})
+			h.logger.Info("discarding check publication because the PR closed after the work started; a closed PR's check state is not recreated",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "operation", operation, "merged", prInfo.Merged)
+			return false, nil
+		}
 	}
 	decision, err := h.evaluatePRTarget(ctx, client, repo, prInfo)
 	if err != nil {

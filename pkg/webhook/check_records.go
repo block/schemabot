@@ -493,6 +493,22 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 			repo, pr, environment, schema.Type, schema.Database, headSHA, prInfo.HeadSHA)
 	}
 
+	if prInfo.IsClosed() {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "plan_check_recorded",
+			Repository:   repo,
+			Database:     schema.Database,
+			DatabaseType: schema.Type,
+			Environment:  environment,
+			Status:       "skipped",
+		})
+		h.logger.Info("stored check state not written because the PR is closed",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "environment", environment,
+			"database_type", schema.Type, "database", schema.Database, "merged", prInfo.Merged)
+		return headSHA, nil, fmt.Errorf("plan check record for repo %s pr %d environment %s database %s: %w",
+			repo, pr, environment, schema.Database, errPRClosed)
+	}
+
 	decision, targetErr := h.evaluatePRTarget(ctx, client, repo, prInfo)
 	if targetErr != nil {
 		return headSHA, nil, targetErr
