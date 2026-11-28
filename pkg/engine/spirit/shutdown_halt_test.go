@@ -248,6 +248,34 @@ func TestDrainContextEndsWithTheCallersContext(t *testing.T) {
 	assert.Nil(t, eng.runningSchemaChange)
 }
 
+// A drive whose context has already ended can still drain a schema change
+// whose run has returned: with no runner alive there is nothing to wait for,
+// so the drain releases the change and returns nil instead of the context's
+// error. The run has returned and the context has ended before the drain
+// starts, so the drain must prefer the return every time; the attempts repeat
+// it so a drain that picked between the two at random would fail. A run that
+// returns only after the wait has begun races the context, which no test
+// can schedule; runExit.wait checks for the return again when the context
+// ends for that case.
+func TestDrainContextWithAnEndedCallerAndNoRunnerAliveReleasesTheChange(t *testing.T) {
+	ended, cancel := context.WithCancel(t.Context())
+	cancel()
+	for attempt := range 100 {
+		eng := New(Config{})
+		rm := &runningSchemaChange{
+			database: "orders",
+			tables:   []string{"line_items"},
+			state:    engine.StateCompleted,
+		}
+		startTestRun(eng, rm, func() {})
+		eng.runningSchemaChange = rm
+		waitForTestRun(t, eng, rm)
+
+		require.NoError(t, eng.DrainContext(ended), "attempt %d", attempt)
+		assert.Nil(t, eng.runningSchemaChange, "attempt %d: the drained change is released", attempt)
+	}
+}
+
 // A run publishes its tables under the engine lock after it is tracked, so a
 // drain that gives up on a run still starting reads them under the same lock
 // when it names the run in its error.

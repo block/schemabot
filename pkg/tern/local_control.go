@@ -1666,10 +1666,12 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 	}
 
 	stopCtx := context.WithoutCancel(ctx)
-	resp, err := c.stopOwnedApply(stopCtx, &ternv1.StopRequest{
-		ApplyId:     apply.ApplyIdentifier,
-		Environment: apply.Environment,
-	}, controlRequestCaller(controlReq))
+	resp, err := sendUntilSettled(ctx, c, logger, apply, "stop", storage.LogEventStopRequested, func() (*ternv1.StopResponse, error) {
+		return c.stopOwnedApply(stopCtx, &ternv1.StopRequest{
+			ApplyId:     apply.ApplyIdentifier,
+			Environment: apply.Environment,
+		}, controlRequestCaller(controlReq))
+	})
 	if err != nil {
 		if settled, settleErr := c.failPendingRequestForSettledOutcome(stopCtx, logger, apply, storage.ControlOperationStop, storage.LogEventStopRequested, controlReq, err); settled {
 			// The request is resolved terminally but no stop took effect: the
@@ -1757,10 +1759,12 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 	}
 
 	cancelCtx := context.WithoutCancel(ctx)
-	resp, err := c.cancelOwnedApply(cancelCtx, &ternv1.CancelRequest{
-		ApplyId:     apply.ApplyIdentifier,
-		Environment: apply.Environment,
-	}, controlRequestCaller(controlReq))
+	resp, err := sendUntilSettled(ctx, c, logger, apply, "cancel", storage.LogEventCancelRequested, func() (*ternv1.CancelResponse, error) {
+		return c.cancelOwnedApply(cancelCtx, &ternv1.CancelRequest{
+			ApplyId:     apply.ApplyIdentifier,
+			Environment: apply.Environment,
+		}, controlRequestCaller(controlReq))
+	})
 	if err != nil {
 		if settled, settleErr := c.failPendingRequestForSettledOutcome(cancelCtx, logger, apply, storage.ControlOperationCancel, storage.LogEventCancelRequested, controlReq, err); settled {
 			// See the stop counterpart: the change already settled, so the drive
@@ -1799,6 +1803,45 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 		return true, nil
 	}
 	return true, nil
+}
+
+// controlSettleRetryPause spaces the attempts of a stop or cancel the engine
+// has not settled yet, so an engine that reports it without waiting cannot
+// spin the drive.
+const controlSettleRetryPause = time.Second
+
+// sendUntilSettled sends a stop or cancel again while the engine reports that
+// the runner it interrupted has not returned (engine.NotSettledError), for as
+// long as this drive holds its claim. Only the engine that started the runner
+// can see it, and that engine is in this process, so the command is retried
+// here rather than handed back: a drive that exited would let a peer claim the
+// apply, and the peer's engine, which tracks no runner, would settle the
+// command while the runner here is still alive (OW-3). Each attempt is bounded
+// by the engine's own settle wait, so the drive's heartbeat keeps the claim,
+// and a lost claim or a shutdown ends the loop between attempts with the
+// request still pending. The first wait is recorded on the apply's timeline so
+// the operator sees why the command has not taken effect.
+func sendUntilSettled[R any](ctx context.Context, c *LocalClient, logger *slog.Logger, apply *storage.Apply, operation, event string, send func() (R, error)) (R, error) {
+	resp, err := send()
+	for attempt := 1; engine.IsNotSettled(err); attempt++ {
+		if attempt == 1 {
+			// Written past the drive's end, like the stop and cancel writes,
+			// so a drive that ends on its first wait still says why.
+			c.logApplyEvent(context.WithoutCancel(ctx), apply.ID, nil, storage.LogLevelWarn, event, storage.LogSourceSchemaBot,
+				fmt.Sprintf("The %s is waiting for the interrupted schema change to come down; SchemaBot keeps sending it until it does", operation), "", "")
+		}
+		select {
+		case <-ctx.Done():
+			logger.Warn(operation+" not settled and the drive is ending; leaving the request pending for the next drive",
+				append(apply.MutableLogAttrs(), "attempts", attempt, "error", err)...)
+			return resp, err
+		case <-time.After(controlSettleRetryPause):
+		}
+		logger.Warn(operation+" not settled; the interrupted runner is still alive, sending the "+operation+" again",
+			append(apply.MutableLogAttrs(), "attempts", attempt, "error", err)...)
+		resp, err = send()
+	}
+	return resp, err
 }
 
 // processPendingCancelOrStopControlRequest consumes whichever of the two the

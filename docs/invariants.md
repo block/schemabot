@@ -1438,7 +1438,10 @@ refusal (`resolveOrRetryRevertPhaseRequest` and `resolveOrRetryAutoSkipRevert`,
 terminal resolution of a typed unsupported-operation
 decline (`failPendingRequestForUnsupportedOperation`, `pkg/tern/local_control.go`), reached from
 the stop and cancel paths in that file and from the revert and skip-revert paths in
-`pkg/tern/local_apply_grouped.go`, the engine contract suite, which holds every engine to that
+`pkg/tern/local_apply_grouped.go`, the Spirit engine's bounded wait for the runner a stop or
+cancel interrupted (`waitForInterruptedRunner`, `pkg/engine/spirit/control.go`) and the drive's
+resend of a stop or cancel the engine has not settled while it holds the claim
+(`sendUntilSettled`, `pkg/tern/local_control.go`), the engine contract suite, which holds every engine to that
 typed decline for a start, cutover, revert, or skip-revert it does not support
 (`pkg/engine/enginetest`), the claim arms that hand a pending cancel to a rollout's
 stopped and cutover-parked operations and a pending stop to its cutover-parked ones, and that keep
