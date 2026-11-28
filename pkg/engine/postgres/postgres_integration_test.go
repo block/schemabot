@@ -1053,8 +1053,8 @@ func TestEnginePlanPrivilegeRefusal(t *testing.T) {
 		"the reason must name the tier whose access is missing")
 	assert.Contains(t, change.ModeReason, "provision with: GRANT",
 		"the reason must carry the exact provisioning statement")
-	assert.Contains(t, change.ModeReason, "pg_has_role(plan_limited,",
-		"the reason must carry the exact failed catalog check")
+	assert.Contains(t, change.ModeReason, `TO "plan_limited"`,
+		"the provisioning statement must grant the access to the engine role")
 	causes := engine.BlockedCauses(change.ModeReason)
 	require.Len(t, causes, 2, "the privilege gap and the size ceiling are independent causes")
 	assert.Contains(t, causes[0], "in-place changes that need ownership", "the privilege cause comes first")
