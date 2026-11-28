@@ -2032,8 +2032,10 @@ A `drop_tables` entry that names no live table on the target plans nothing.
 The planner reports it in `unmatched_drop_tables`, in the order the config
 lists the entries, and the PR comment and CLI print one line per entry for the
 first 20 and count the rest in one more line. On a plan with a `rollout`, the
-field describes the primary target only, and neither the PR comment nor the
-CLI prints it. Like
+field describes the primary target only, and `rollout.unmatched_drop_tables`
+lists the entries that name no table on any target. The PR comment and CLI
+print that list instead, so an entry another target still drops a table for
+is not reported. It is empty when a target could not be planned. Like
 `exempt_tables`, the field is carried on the response to the plan request only
 and is omitted when every entry matched.
 

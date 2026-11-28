@@ -323,6 +323,13 @@ func withUnmatchedDropTablesInEveryPlan(results map[string]*apitypes.PlanRespons
 		}
 		copied := *result
 		copied.UnmatchedDropTables = common
+		// A rollout's section reads its own list, so it is narrowed too, on
+		// a copy that leaves the caller's response untouched.
+		if rollout := result.WholeRollout(); rollout != nil {
+			rolloutCopy := *rollout
+			rolloutCopy.UnmatchedDropTables = common
+			copied.Rollout = &rolloutCopy
+		}
 		narrowed[env] = &copied
 	}
 	return narrowed
@@ -432,22 +439,21 @@ func writeRolloutPlanBody(result *apitypes.PlanResponse, isApply bool) {
 		templates.WriteNoChanges()
 	}
 	templates.WriteExemptTables(result.ExemptTables)
-	// A rollout reports no unmatched drop_tables entries; see
-	// shownUnmatchedDropTables. Nor does it report rollback blockers:
-	// rollback is refused for an environment with more than one target
-	// whatever each member saved, so naming tables as the reason would point
-	// the reader at the wrong cause.
+	templates.WriteUnmatchedDropTables(shownUnmatchedDropTables(result))
+	// A rollout reports no rollback blockers: rollback is refused for an
+	// environment with more than one target whatever each member saved, so
+	// naming tables as the reason would point the reader at the wrong cause.
 }
 
 // shownUnmatchedDropTables is the unmatched drop_tables entries the plan
-// reports. A rollout plan reports none, as the PR comment does: the entries
-// describe the primary target alone, while every other member is planned with
-// the same list and drops a table it still has, so a line saying the entry
-// drops nothing could sit beside that member's DROP and tell the reader to
-// remove the entry the drop depends on.
+// reports. A rollout plan reports the entries no member matched, as the PR
+// comment does: the top-level list describes the primary target alone, while
+// every other member is planned with the same list and can drop a table it
+// still has, so a line saying the entry drops nothing could sit beside that
+// member's DROP and tell the reader to remove the entry the drop depends on.
 func shownUnmatchedDropTables(result *apitypes.PlanResponse) []string {
-	if result.WholeRollout() != nil {
-		return nil
+	if rollout := result.WholeRollout(); rollout != nil {
+		return rollout.UnmatchedDropTables
 	}
 	return result.UnmatchedDropTables
 }

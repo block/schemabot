@@ -122,8 +122,9 @@ func TestRenderPlanComment_UnmatchedDropTablesOnlyDisclosureOnCleanPlan(t *testi
 }
 
 // unmatchedDropRolloutDrift is a clean rollout of two independent targets in
-// which the primary has no table _jobs_old, and so reports the entry as naming
-// no table, while the other target still has it and plans the drop.
+// which the primary has neither _jobs_old nor _jobs_olds, while the other
+// target still has _jobs_old and plans the drop. The rollout lists only the
+// entry no target matched.
 func unmatchedDropRolloutDrift() *DeploymentDriftData {
 	return &DeploymentDriftData{
 		Computed: true, Clean: true, Independent: true,
@@ -135,16 +136,18 @@ func unmatchedDropRolloutDrift() *DeploymentDriftData {
 			{Members: []string{"primary/app_1"}, Primary: true},
 			{Members: []string{"primary/app_2"}, Changes: []KeyspaceChangeData{{Keyspace: "app", Statements: []string{"DROP TABLE `_jobs_old`"}}}},
 		},
+		UnmatchedDropTables: []string{"_jobs_olds"},
 	}
 }
 
-// A rollout plan reports no unmatched drop_tables entry: the primary's entries
-// say nothing about the other targets, and here the other target drops the
-// table the primary reports as missing. The comment shows that target's DROP
-// and no line telling the reader to remove the entry it depends on, whether
-// it renders every target's plan, the primary's plan alone, or the
+// A rollout plan reports an unmatched drop_tables entry only when no target
+// has the table. _jobs_old is missing on the primary target, but the other
+// target drops it, so the comment shows that DROP and no line telling the
+// reader to remove the entry it depends on. _jobs_olds names no table on
+// either target, so it is reported once. This holds whether the comment
+// renders every target's plan, the primary's plan alone, or the
 // environment's section of a multi-environment comment.
-func TestRenderPlanComment_RolloutReportsNoUnmatchedDropTables(t *testing.T) {
+func TestRenderPlanComment_RolloutReportsOnlyEntriesNoTargetMatched(t *testing.T) {
 	withTargetPlans := PlanCommentData{
 		Database: "testapp", Environment: "production", IsMySQL: true, DatabaseType: "mysql",
 		UnmatchedDropTables: []string{"_jobs_old", "_jobs_olds"},
@@ -152,7 +155,8 @@ func TestRenderPlanComment_RolloutReportsNoUnmatchedDropTables(t *testing.T) {
 	}
 	out := RenderPlanComment(withTargetPlans)
 	assert.Contains(t, out, "DROP TABLE `_jobs_old`", out)
-	assert.NotContains(t, out, "names no table", out)
+	assert.NotContains(t, out, "entry `_jobs_old` names no table", out)
+	assert.Equal(t, 1, strings.Count(out, unmatchedDropLine+"\n"), out)
 
 	primaryOnly := withTargetPlans
 	primaryOnly.DeploymentDrift = &DeploymentDriftData{
@@ -161,20 +165,54 @@ func TestRenderPlanComment_RolloutReportsNoUnmatchedDropTables(t *testing.T) {
 			{Deployment: "primary", Target: "app_1", Primary: true, Class: "match"},
 			{Deployment: "primary", Target: "app_2", Class: "match"},
 		},
+		UnmatchedDropTables: []string{"_jobs_olds"},
 	}
 	out = RenderPlanComment(primaryOnly)
 	assert.Contains(t, out, "No schema changes detected", out)
-	assert.NotContains(t, out, "names no table", out)
+	assert.NotContains(t, out, "entry `_jobs_old` names no table", out)
+	assert.Equal(t, 1, strings.Count(out, unmatchedDropLine+"\n"), out)
 
 	staging := unmatchedDropPlanData()
-	staging.UnmatchedDropTables = []string{"_jobs_olds"}
+	staging.Changes = nil
+	staging.UnmatchedDropTables = []string{"_jobs_old", "_jobs_olds"}
 	production := withTargetPlans
 	out = RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
 		Database: "testapp", Environments: []string{"staging", "production"},
 		Plans: map[string]*PlanCommentData{"staging": &staging, "production": &production},
 	})
 	assert.Contains(t, out, "### Production", out)
-	assert.NotContains(t, out, "names no table", out)
+	assert.NotContains(t, out, "entry `_jobs_old` names no table", out)
+	assert.Equal(t, 2, strings.Count(out, unmatchedDropLine+"\n"), "each environment's section reports the entry no target matched:\n%s", out)
+}
+
+// Staging still has _jobs_old, so its plan reports only the typo _jobs_olds,
+// while no target of the production rollout has either table. The production
+// section reports _jobs_olds and not _jobs_old: telling the reader to remove
+// _jobs_old would drop the entry staging's drop depends on.
+func TestRenderMultiEnvPlanComment_RolloutListNarrowedToEntriesEveryEnvironmentReports(t *testing.T) {
+	staging := unmatchedDropPlanData()
+	production := PlanCommentData{Database: "testapp", Environment: "production", IsMySQL: true, DeploymentDrift: unmatchedDropRolloutDrift()}
+	production.DeploymentDrift.UnmatchedDropTables = []string{"_jobs_old", "_jobs_olds"}
+
+	out := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database: "testapp", Environments: []string{"staging", "production"},
+		Plans: map[string]*PlanCommentData{"staging": &staging, "production": &production},
+	})
+
+	assert.NotContains(t, out, "entry `_jobs_old` names no table", out)
+	assert.Contains(t, out, unmatchedDropLine, out)
+}
+
+// A rollout whose list is empty, because a target could not be planned or
+// the rollup was not computed, reports nothing, whatever the primary's own
+// list says: what the other target holds is unknown.
+func TestRenderPlanComment_RolloutWithoutAListReportsNoUnmatchedDropTables(t *testing.T) {
+	data := PlanCommentData{
+		Database: "testapp", Environment: "production", IsMySQL: true, DatabaseType: "mysql",
+		UnmatchedDropTables: []string{"_jobs_olds"},
+		DeploymentDrift:     &DeploymentDriftData{Computed: false},
+	}
+	assert.NotContains(t, RenderPlanComment(data), "names no table")
 }
 
 // The plan summary carries the line on both of its branches.
