@@ -1,8 +1,12 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -144,4 +148,48 @@ func TestStopCompletionSettlesSupersededCutoverFirst(t *testing.T) {
 			assert.Contains(t, control.failureReasons[storage.ControlOperationCutover], "superseded by stop")
 		})
 	}
+}
+
+// The engine accepts an immediate stop, but SchemaBot's storage fails while it
+// marks the durable stop request complete. Operators read the apply log
+// through the CLI and API, and it can reach PR comments, so the entry says
+// what happened and what to do without the storage error's host and port. The
+// server log keeps the raw cause with the apply's identifiers for triage.
+func TestImmediateStopCompletionFailureKeepsStorageErrorOutOfApplyLog(t *testing.T) {
+	const storageAddress = "10.0.0.5:3306"
+	apply := activeTestApply("apply-stop-storage-down")
+	apply.ExternalID = "remote-stop-storage-down"
+	client := &mockTernClient{stopResp: &ternv1.StopResponse{Accepted: true, StoppedCount: 1}}
+	svc, stores := newControlTestServiceWithStores(client, apply, nil)
+	stores.applies.err = errors.New("dial tcp " + storageAddress + ": i/o timeout")
+	var logs bytes.Buffer
+	svc.logger = slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	svc.tryImmediateStopAfterQueue(t.Context(), client, apply, apply.ExternalID, "cli:alice")
+
+	require.NotNil(t, client.stopReq, "the engine receives the immediate stop")
+	require.True(t, hasApplyLogMessageContaining(stores.applyLogs.logs, "SchemaBot could not record it as complete; the durable stop request remains pending"),
+		"the apply log records that the stop is still pending")
+	for _, entry := range stores.applyLogs.logs {
+		assert.NotContains(t, entry.Message, storageAddress, "no apply log entry names the storage address")
+		assert.NotContains(t, entry.Message, "dial tcp", "no apply log entry carries the storage error text")
+	}
+
+	var failures []map[string]any
+	for line := range strings.SplitSeq(strings.TrimSpace(logs.String()), "\n") {
+		var entry map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &entry), "log line must be JSON: %s", line)
+		if entry["msg"] == "immediate stop accepted but durable stop request completion failed; durable stop request remains pending for apply owner retry" {
+			failures = append(failures, entry)
+		}
+	}
+	require.Len(t, failures, 1, "the server log records the completion failure; got: %s", logs.String())
+	failure := failures[0]
+	assert.Equal(t, "ERROR", failure["level"])
+	assert.Equal(t, "complete_immediate_stop", failure["operation"])
+	assert.Equal(t, apply.ApplyIdentifier, failure["apply_id"])
+	assert.Equal(t, apply.Database, failure["database"])
+	assert.Equal(t, apply.Environment, failure["environment"])
+	assert.Equal(t, "cli:alice", failure["requested_by"])
+	assert.Contains(t, failure["error"], storageAddress, "the server log keeps the raw cause")
 }
