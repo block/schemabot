@@ -223,6 +223,28 @@ func TestDurableWebhookDispatchMetricsFailedPermanentOutcome(t *testing.T) {
 	assertStringAttr(t, durationPoints[0].Attributes, "outcome", "failed_permanent")
 }
 
+// An auto-plan delivery whose head the PR had already moved past planned
+// nothing, so the driver marks it superseded: it is neither completed, which
+// would count it as coverage for that head, nor failed or dead-lettered.
+func TestDurableWebhookDispatchMetricsHeadMovedOutcome(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
+	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
+	h := newDurableDriverHandler(t, store, nil, nil)
+	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+		return false, fmt.Errorf("durable delivery for an old head: %w", errAutoPlanHeadMoved)
+	}
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	require.Len(t, store.superseded, 1)
+	assert.Empty(t, store.completed, "a delivery that planned nothing must not be completed")
+	assert.Empty(t, store.failed)
+	assert.Empty(t, store.failedPermanent)
+	durationPoints := collectDispatchHistogramPoints(t, reader, "schemabot.webhook.dispatch_duration_seconds")
+	require.Len(t, durationPoints, 1)
+	assertStringAttr(t, durationPoints[0].Attributes, "outcome", "superseded")
+}
+
 // A retryable failure on the final budgeted attempt records the failed
 // outcome: the delivery is terminal but stays eligible for reconciler
 // resurrection and GitHub Redeliver, unlike a dead-lettered one.

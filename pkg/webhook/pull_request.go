@@ -456,6 +456,10 @@ type autoPlanDispatch struct {
 	// changedFiles counts the files the PR proposes against the default
 	// branch, as a size hint for the plan a deferred dispatch skipped.
 	changedFiles int
+	// headMoved means the PR's head had moved past the dispatched head, so
+	// nothing was planned for it. The push that moved the head has its own
+	// delivery, which plans the new head.
+	headMoved bool
 }
 
 // dispatchAutoPlanForPR is runAutoPlanForPR with options; see its comment.
@@ -489,7 +493,9 @@ func (h *Handler) dispatchAutoPlanForPR(ctx context.Context, client *ghclient.In
 		return autoPlanDispatch{message: "target eligibility could not be verified"}, fmt.Errorf("evaluate target for %s#%d: %w", repo, pr, err)
 	}
 	if prInfo.HeadSHA != headSHA {
-		return autoPlanDispatch{message: "auto-plan discarded because the PR moved during discovery"}, nil
+		h.logger.Info("discarding auto-plan because the PR head moved past the delivery's head before discovery; the push that moved it plans the new head",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "current_head_sha", prInfo.HeadSHA, "source", source, "delivery_id", deliveryID)
+		return autoPlanDispatch{message: "auto-plan discarded because the PR moved during discovery", headMoved: true}, nil
 	}
 	if err := h.recordPRTargetObservation(ctx, repo, pr, prInfo, decision, deliveryID); err != nil {
 		h.logger.Error("auto-plan could not record PR target observation", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
@@ -549,7 +555,7 @@ func (h *Handler) dispatchAutoPlanForPR(ctx context.Context, client *ghclient.In
 		h.logger.Info("discarding auto-plan because the PR moved while it was being discovered; the event that moved it re-plans",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "base_ref", baseRef,
 			"source", source, "delivery_id", deliveryID)
-		return autoPlanDispatch{message: "auto-plan discarded because the PR moved during discovery"}, nil
+		return autoPlanDispatch{message: "auto-plan discarded because the PR moved during discovery", headMoved: moved == autoPlanHeadMoved}, nil
 	}
 
 	changedFiles, files := discovery.changedFiles, discovery.files
