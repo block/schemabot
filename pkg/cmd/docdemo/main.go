@@ -330,7 +330,10 @@ func freezeDemo() Demo {
 	if !strings.Contains(refused, "production is frozen. This change did not start.") {
 		panic("freeze refusal changed: " + refused)
 	}
-	lifted := capture(func() { t.WriteFreezeLifted(freeze) })
+	liftedFreeze := freeze
+	liftedAt := time.Date(2026, 1, 20, 16, 0, 0, 0, time.UTC)
+	liftedFreeze.InEffect, liftedFreeze.LiftedAt, liftedFreeze.LiftedBy, liftedFreeze.LiftReason = false, &liftedAt, "alice", "Holidays are over"
+	lifted := capture(func() { t.WriteFreezeLifted(liftedFreeze) })
 	frames := []Frame{
 		{3, `schemabot freeze -e production --reason "Holiday code freeze"`, "Start a holiday code freeze", created},
 		{2, "schemabot apply -s ./schema -e production", "A schema change is ready to ship", confirm + "▌"},

@@ -5620,6 +5620,135 @@ func TestBranchReconcileConfig(t *testing.T) {
 	})
 }
 
+// A batch size the config accepts must be one the store accepts too, or every
+// pass with the largest allowed batch_size would fail before deleting a row.
+func TestStorageRetentionBatchSizeFitsTheStoreLimit(t *testing.T) {
+	assert.LessOrEqual(t, MaxStorageRetentionBatchSize, storage.MaxWebhookEventPurgeBatch)
+}
+
+func TestStorageRetentionConfig(t *testing.T) {
+	boolPtr := func(b bool) *bool { return &b }
+	databases := map[string]DatabaseConfig{
+		"mydb": {
+			Type: "mysql",
+			Environments: map[string]EnvironmentConfig{
+				"staging": {DSN: "root:pass@tcp(localhost:3306)/mydb"},
+			},
+		},
+	}
+	validate := func(retention StorageRetentionConfig) error {
+		cfg := ServerConfig{Databases: databases, StorageRetention: retention}
+		return cfg.Validate()
+	}
+
+	t.Run("parsed from YAML", func(t *testing.T) {
+		var cfg ServerConfig
+		require.NoError(t, yaml.Unmarshal([]byte(
+			"storage_retention:\n  enabled: true\n  dry_run: false\n  interval: 2h\n  batch_size: 1000\n  webhook_events: 240h\n"), &cfg))
+		assert.Equal(t, StorageRetentionConfig{
+			Enabled: true, DryRun: boolPtr(false), Interval: "2h", BatchSize: 1000, WebhookEvents: "240h",
+		}, cfg.StorageRetention)
+	})
+
+	t.Run("off with the documented defaults when not configured", func(t *testing.T) {
+		cfg := ServerConfig{}
+		assert.False(t, cfg.StorageRetentionEnabled())
+		assert.True(t, cfg.StorageRetentionDryRun())
+		interval, err := cfg.StorageRetentionInterval()
+		require.NoError(t, err)
+		assert.Equal(t, time.Hour, interval)
+		batchSize, err := cfg.StorageRetentionBatchSize()
+		require.NoError(t, err)
+		assert.Equal(t, 500, batchSize)
+		window, err := cfg.StorageRetentionWebhookEvents()
+		require.NoError(t, err)
+		assert.Equal(t, 168*time.Hour, window)
+	})
+
+	t.Run("enabling it alone keeps it a dry run", func(t *testing.T) {
+		cfg := ServerConfig{StorageRetention: StorageRetentionConfig{Enabled: true}}
+		assert.True(t, cfg.StorageRetentionEnabled())
+		assert.True(t, cfg.StorageRetentionDryRun(), "nothing is deleted until dry_run is set false")
+	})
+
+	t.Run("dry run can be turned off only explicitly", func(t *testing.T) {
+		cfg := ServerConfig{StorageRetention: StorageRetentionConfig{Enabled: true, DryRun: boolPtr(false)}}
+		assert.False(t, cfg.StorageRetentionDryRun())
+	})
+
+	t.Run("configured values are used", func(t *testing.T) {
+		cfg := ServerConfig{StorageRetention: StorageRetentionConfig{
+			Interval: "30m", BatchSize: 2000, WebhookEvents: "72h",
+		}}
+		interval, err := cfg.StorageRetentionInterval()
+		require.NoError(t, err)
+		assert.Equal(t, 30*time.Minute, interval)
+		batchSize, err := cfg.StorageRetentionBatchSize()
+		require.NoError(t, err)
+		assert.Equal(t, 2000, batchSize)
+		window, err := cfg.StorageRetentionWebhookEvents()
+		require.NoError(t, err)
+		assert.Equal(t, 72*time.Hour, window)
+	})
+
+	t.Run("batch size bounds", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			size    int
+			wantErr string
+		}{
+			{name: "smallest", size: 1},
+			{name: "largest", size: MaxStorageRetentionBatchSize},
+			{name: "negative", size: -1, wantErr: "storage_retention.batch_size must be positive"},
+			{name: "past the largest", size: MaxStorageRetentionBatchSize + 1, wantErr: "storage_retention.batch_size must be at most 5000"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				cfg := ServerConfig{StorageRetention: StorageRetentionConfig{BatchSize: tc.size}}
+				got, err := cfg.StorageRetentionBatchSize()
+				if tc.wantErr != "" {
+					assert.ErrorContains(t, err, tc.wantErr)
+					return
+				}
+				require.NoError(t, err)
+				assert.Equal(t, tc.size, got)
+			})
+		}
+	})
+
+	t.Run("durations must parse and be positive", func(t *testing.T) {
+		for _, tc := range []struct {
+			name      string
+			retention StorageRetentionConfig
+			wantErr   string
+		}{
+			{"unparseable interval", StorageRetentionConfig{Interval: "hourly"}, "storage_retention.interval"},
+			{"zero interval", StorageRetentionConfig{Interval: "0s"}, "storage_retention.interval must be positive"},
+			{"interval below the floor", StorageRetentionConfig{Interval: "59s"}, "storage_retention.interval must be at least 1m0s"},
+			{"unparseable window", StorageRetentionConfig{WebhookEvents: "a week"}, "storage_retention.webhook_events"},
+			{"negative window", StorageRetentionConfig{WebhookEvents: "-1h"}, "storage_retention.webhook_events must be positive"},
+			{"window one minute under GitHub's redelivery limit", StorageRetentionConfig{WebhookEvents: "71h59m"}, "at least 72h0m0s"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				tc.retention.Enabled = true
+				assert.ErrorContains(t, validate(tc.retention), tc.wantErr)
+			})
+		}
+	})
+
+	t.Run("validate rejects a bad batch size when enabled", func(t *testing.T) {
+		assert.ErrorContains(t, validate(StorageRetentionConfig{Enabled: true, BatchSize: MaxStorageRetentionBatchSize + 1}), "storage_retention.batch_size")
+	})
+
+	t.Run("validate ignores bad values when disabled", func(t *testing.T) {
+		assert.NoError(t, validate(StorageRetentionConfig{BatchSize: -5, Interval: "hourly", WebhookEvents: "a week"}))
+	})
+
+	t.Run("unknown keys are rejected", func(t *testing.T) {
+		_, err := ParseServerConfig([]byte("storage_retention:\n  apply_logs: 2160h\n"))
+		require.ErrorContains(t, err, "apply_logs")
+	})
+}
+
 func TestSupportChannelConfig(t *testing.T) {
 	validConfig := func() ServerConfig {
 		return ServerConfig{

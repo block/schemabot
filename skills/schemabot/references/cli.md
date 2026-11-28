@@ -15,7 +15,7 @@ schemabot status
 
 If the server requires authentication, `schemabot login` caches a token. [Connect to a server](https://github.com/block/schemabot/blob/main/docs/cli.md#connect-to-a-server) has the details. If your team runs the CLI through its own wrapper, use that instead; see [Your team's wrapper](#your-teams-wrapper).
 
-An authentication or permission error (`401` or `403`) means the account lacks access. Say which permission is missing and ask the user or an operator. Never try other credentials or work around the check.
+A `403` means the account lacks a permission. Say which one, and ask the user or an operator to grant it. A `401` means the token is missing, expired, or invalid, so the user needs to log in again or fix their token. In either case, never try other credentials or work around the check.
 
 ## Your team's wrapper
 
@@ -62,6 +62,6 @@ schemabot logs apply-3f9a2c71
 
 ## Use it from an agent
 
-- Prefer `--json` where a command offers it (`databases`, `status`, `list-plans`, `logs`, `plan`), and `status --json` for a snapshot.
-- Never run a watching `progress`: it runs until the change finishes, and its keys change the apply. Take a `status` or `progress --no-watch` snapshot and check again later.
+- Prefer `--json` where a command offers it (`databases`, `status`, `progress`, `list-plans`, `logs`, `locks`, `plan`), and `status --json` or `progress --json` for a snapshot.
+- Never run a watching `progress`: it runs until the change finishes, and its keys change the apply. Take a `status`, `progress --no-watch`, or `progress --json` snapshot and check again later.
 - [Use the CLI from scripts and agents](https://github.com/block/schemabot/blob/main/docs/cli.md#use-the-cli-from-scripts-and-agents) covers exit codes and output formats.

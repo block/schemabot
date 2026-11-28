@@ -83,9 +83,12 @@ that cover nothing (failed outside its cool-off, superseded, other event types)
 are deleted on age alone. GitHub lets an operator redeliver only deliveries from
 the past 3 days, and a redelivery reopens a terminal row anyway, so dedup needs
 nothing longer. `DeleteTerminalOlderThan` deletes in batches, selecting the page
-through `idx_received_at` and probing the PR index for a newer covering row;
-the periodic sweep that calls it is not wired up yet. Until then the table is
-append-mostly and growth is bounded by webhook volume, not by retries.
+through `idx_received_at` and probing the PR index for a newer covering row.
+The storage retention pass calls it on a schedule once an operator turns on
+`storage_retention` (see [Configuration](../../docs/configuration.md)); until
+then the table is append-mostly and growth is bounded by webhook volume, not by
+retries. Deleting only finished rows that no reader needs is AV-18 in
+[invariants.md](../../docs/invariants.md).
 
 ## Key Types
 

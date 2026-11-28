@@ -111,6 +111,30 @@ func IsOutcomeUnknown(err error) bool {
 	return errors.As(err, &unknown)
 }
 
+// NotSettledError wraps an error to indicate the engine took a control
+// operation, such as a stop or cancel, but the work it interrupted has not
+// come down within the engine's wait. The schema change keeps the outcome the
+// operation asked for, but that outcome is not settled while the work can
+// still change the target. It stays retryable: a caller consuming a durable
+// control request leaves the request pending and sends the operation again,
+// never resolving it as done or failed.
+type NotSettledError struct {
+	Err error
+}
+
+func (e *NotSettledError) Error() string { return e.Err.Error() }
+func (e *NotSettledError) Unwrap() error { return e.Err }
+
+// IsNotSettled reports whether err indicates the engine took a control
+// operation whose interrupted work has not come down yet.
+func IsNotSettled(err error) bool {
+	if err == nil {
+		return false
+	}
+	var notSettled *NotSettledError
+	return errors.As(err, &notSettled)
+}
+
 // AlreadyCompletedError wraps an error to indicate the engine's backend
 // rejected a control operation because the schema change had already completed
 // before the operation arrived. The backend's terminal outcome is

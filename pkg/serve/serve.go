@@ -663,6 +663,9 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	if err := cfg.ValidateExperimentalStrata(); err != nil {
 		return nil, err
 	}
+	if err := validateStorageRetentionWindows(cfg); err != nil {
+		return nil, err
+	}
 	o := options{logger: slog.Default()}
 	for _, opt := range opts {
 		opt(&o)
@@ -1824,6 +1827,39 @@ func parseWebhookReconcileScanBounds(logger *slog.Logger) (maxPages int, lookbac
 		}
 	}
 	return maxPages, lookback
+}
+
+// validateStorageRetentionWindows refuses a storage_retention window that would
+// delete rows the webhook reconciler still reads. The fixed floor, GitHub's
+// redelivery limit, is api.MinStorageRetentionWebhookEvents and is checked by
+// the config itself; a raised reconcile lookback can lift the floor above it,
+// and that lookback is resolved from WEBHOOK_RECONCILE_LOOKBACK in this
+// package, so this is the one place that knows both the configured window and
+// the lookback in force. It fails startup rather than clamping, because a
+// silently raised window would hide that the operator's value was wrong.
+//
+// A server that does not run the webhook reconciler is checked too: it shares
+// its storage with deployments that do, and a deployment that omits the
+// variable runs the default lookback.
+func validateStorageRetentionWindows(cfg *api.ServerConfig) error {
+	if !cfg.StorageRetentionEnabled() {
+		return nil
+	}
+	window, err := cfg.StorageRetentionWebhookEvents()
+	if err != nil {
+		return err
+	}
+	// The malformed-value diagnosis belongs to the one place that applies the
+	// lookback, so this check reads it quietly.
+	_, lookback := parseWebhookReconcileScanBounds(slog.New(slog.DiscardHandler))
+	coverage := webhook.ReconcileInboxCoverageWindow(lookback)
+	if window >= coverage.Total() {
+		return nil
+	}
+	return fmt.Errorf("storage_retention.webhook_events is %s, shorter than the %s the webhook reconciler still reads: "+
+		"its lookback is %s (WEBHOOK_RECONCILE_LOOKBACK, or its default when unset) plus a %s grace plus a %s failed-delivery cool-off; "+
+		"set storage_retention.webhook_events to at least %s, or shorten WEBHOOK_RECONCILE_LOOKBACK",
+		window, coverage.Total(), coverage.Lookback, coverage.Grace, coverage.FailedCoverageCoolOff, coverage.Total())
 }
 
 // maxSynchronizeQuietPeriod caps WEBHOOK_SYNCHRONIZE_QUIET_PERIOD. Every push

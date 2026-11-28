@@ -50,13 +50,13 @@ See what is frozen:
 ```console
 $ schemabot freeze show freeze-3f9a1c2e7b4d8a06
 Freeze freeze-3f9a1c2e7b4d8a06  production (on demand, in effect)
-     Scope:    whole environment
-     Window:   2026-12-18T17:00:00Z until lifted
-     Reason:   Holiday code freeze
-     By:       alice
-     Running:  continue (applies already running in scope)
-     Source:   manual
-     Created:  2026-12-18T17:00:00Z
+     Scope:     whole environment
+     Window:    2026-12-18T17:00:00Z until lifted
+     Reason:    Holiday code freeze
+     By:        alice
+     Running:   continue (applies already running in scope)
+     Source:    manual
+     Created:   2026-12-18T17:00:00Z
 ```
 
 Lift it when you are done. Changes that the freeze refused do not run on their
@@ -64,7 +64,8 @@ own; their owners run them again.
 
 ```console
 $ schemabot unfreeze freeze-3f9a1c2e7b4d8a06 --reason "Holidays are over"
-✓ freeze-3f9a1c2e7b4d8a06 lifted.
+✓ freeze-3f9a1c2e7b4d8a06 lifted by alice at 2027-01-04T09:00:00Z: Holidays are over.
+   Scope:  whole environment in production
 ```
 
 To freeze less than the whole environment, add `--database` or `--deployment`.
@@ -88,34 +89,50 @@ $ schemabot freeze -e production --planned --reason "Launch week code freeze" \
    Running applies: continue
 ```
 
-`freeze list` shows the freezes in effect, the scheduled ones, and the recent
-ones of any state. `-e` narrows it to one environment:
+`freeze list` shows the freezes in effect, the scheduled ones, and the ones
+that recently ended. Each freeze is listed once, under its current state. `-e`
+narrows it to one environment:
 
 ```console
 $ schemabot freeze list -e production
 In effect (1)
   1. freeze-3f9a1c2e7b4d8a06  production (on demand, in effect)
-     Scope:    whole environment
-     Window:   2026-12-18T17:00:00Z until lifted
-     Reason:   Holiday code freeze
-     By:       alice
+     Scope:     whole environment
+     Window:    2026-12-18T17:00:00Z until lifted
+     Reason:    Holiday code freeze
+     By:        alice
 
 Scheduled (1)
   1. freeze-b62e0d9c41f7a385  production (planned)
-     Scope:    whole environment
-     Window:   2027-02-01T17:00:00Z until 2027-02-08T17:00:00Z
-     Reason:   Launch week code freeze
-     By:       alice
+     Scope:     whole environment
+     Window:    2027-02-01T17:00:00Z until 2027-02-08T17:00:00Z
+     Reason:    Launch week code freeze
+     By:        alice
 
-Recent (2)
-  1. freeze-b62e0d9c41f7a385  production (planned)
-     ...
-  2. freeze-3f9a1c2e7b4d8a06  production (on demand, in effect)
-     ...
+Recently ended (1)
+  1. freeze-71d0e4a2c9b85f13  production (on demand, lifted)
+     Scope:     whole environment
+     Window:    2026-12-02T09:00:00Z until lifted at 2026-12-02T11:30:00Z
+     Reason:    Payments latency incident
+     By:        alice
+     Lifted:    by carol at 2026-12-02T11:30:00Z: incident resolved
 ```
 
-`unfreeze` ends a planned freeze early, or cancels it before it starts. See
-the [CLI reference](cli.md#freeze-an-environment) for every flag.
+`unfreeze` ends a freeze early, or cancels a planned one before it starts. It
+confirms who lifted the freeze, when, why, and what it covered:
+
+```console
+$ schemabot unfreeze freeze-71d0e4a2c9b85f13 --reason "incident resolved"
+✓ freeze-71d0e4a2c9b85f13 lifted by carol at 2026-12-02T11:30:00Z: incident resolved.
+   Scope:  whole environment in production
+```
+
+A planned freeze cancelled before it starts never held anything. `unfreeze`
+says `cancelled before it started` instead of `lifted`, and `freeze list`
+shows it as `(planned, cancelled)` with its planned window, and a
+`Cancelled:` row in place of `Lifted:` for who cancelled it, when, and why.
+
+See the [CLI reference](cli.md#freeze-an-environment) for every flag.
 
 ## When a freeze refuses your change
 
@@ -149,7 +166,7 @@ too.
 `schemabot plan` warns you the same way. Under the plan, it names the freezes
 in effect and those scheduled, and says to apply with `--override "<reason>"`
 if the change can't wait. A plan that apply refuses whatever its flags, such
-as one with a blocked change, names no freeze, as the plan comment does not. The response to `POST /api/plan` carries them in
+as one with a blocked change, names no freeze, as the plan comment does not. `schemabot apply` refused for an unsafe change names the freezes under its plan the same way. While one is in effect, the retry command it offers carries `--override` too: your reason if the command gave one, or the placeholder to replace. So `--allow-unsafe` is not followed by a freeze refusal you could not see coming. The response to `POST /api/plan` carries them in
 `freezes`, in effect first, each with `in_effect`.
 
 You have two choices:
@@ -177,9 +194,19 @@ On a pull request, the refusal comment says which policy applies: "Go ahead with
 
 ### From the CLI
 
-Under the default policy the command with `--override "<reason>"` runs like
-any other. Under `approval`, SchemaBot still refuses the change and records
-the request. The approver reads the reason:
+Under the default policy the command with `--override "<reason>"` runs, and
+its output names the override that let it through:
+
+```console
+$ schemabot apply -s schema -e production --override "Hotfix: checkout needs the gift_note column"
+...
+Apply started: apply-2f6b0c91d4e8a357
+❄️ production is frozen; override ovr-5a9e17c3b2d04f68 let this change through. See it with 'schemabot freeze override ovr-5a9e17c3b2d04f68'.
+```
+
+With `--output json --no-watch` the output carries the request ID in
+`freeze_override`. Under `approval`, SchemaBot still refuses the change and
+records the request. The approver reads the reason:
 
 ```console
 $ schemabot apply -s schema -e production --override "Hotfix: checkout needs the gift_note column"
@@ -273,7 +300,7 @@ request body. A caller it could not verify is recorded as `unverified`.
 | Call | Does | Success |
 |---|---|---|
 | `POST /api/freezes` | Set or schedule a freeze | `201` with the freeze |
-| `GET /api/freezes?environment=&recent=` | List freezes `in_effect`, `scheduled` and `recent` (`recent` is 1 to 200, default 20) | `200` |
+| `GET /api/freezes?environment=&recent=` | List freezes `in_effect`, `scheduled` and `recent`, the ones that have ended (`recent` is 1 to 200, default 20) | `200` |
 | `GET /api/freezes/{id}` | Read one freeze | `200` with the freeze |
 | `POST /api/freezes/{id}/lift` | Lift a freeze early, or cancel a scheduled one | `200` with the lifted freeze |
 | `GET /api/freezes/overrides/{id}` | Read an override request | `200` with the request |
@@ -331,7 +358,8 @@ The response has `"in_effect": false` until the freeze starts.
 
 `GET /api/freezes?environment=production` returns three arrays of freeze
 objects: `in_effect`, oldest start first; `scheduled`, soonest first; and
-`recent`, newest first, which also includes the ones in the other two. To see
+`recent`, the freezes that have ended (lifted, cancelled, or past their end),
+newest first. Each freeze is in one array only. To see
 what holds production now:
 
 ```console
@@ -569,33 +597,9 @@ carries these rules, and [working with AI agents](ai-agents.md) explains why.
 | Tell the user a change is frozen, by whom, why, and until when | Ask for an override with `--override`, in any environment |
 | Wait and check again, or suggest waiting | Approve an override, on the CLI, the API or a pull request |
 
-Recognize a refusal by its signal, not its wording:
-
-- **CLI:** exit code 1 with the `❄️ <environment> is frozen` line, and nothing started.
-- **API:** `409` with `error_code: "change_gate_refused"`. Read `blockers` for the freezes.
-- **Pull request:** a comment whose heading starts with `❄️` and contains `Blocked by`: `Blocked by a Freeze` for one freeze, `Blocked by Freezes` for several. The plan comment also says the change was not applied.
-
-When a freeze refuses a change, the agent:
-
-1. Stops. It does not retry in a loop, rewrite the change, or try another environment, deployment or credential to get past the freeze.
-2. Tells the user which freeze holds the change, its reason, and when it ends.
-3. Hands over the exact `--override` command if the user says the change can't wait. The override reason is recorded as the user's, so the user writes it and runs it.
-
-A plan comment's `❄️ <environment> is frozen` notice is a warning, not a
-refusal, and the same rules hold: the agent tells the user, and the apply
-command with `--override` in that comment is the user's to post.
-
-`change_gate_unavailable` is different: it is a retryable storage problem.
-Retry it with backoff, like any other `503`.
-
-You can copy this into your agent's instructions:
-
-> - If SchemaBot says an environment is frozen, stop. Tell me which freeze
->   holds the change, why, and when it ends.
-> - Do not ask for an override with `--override`, set or lift a freeze, or
->   approve an override request. Give me the exact command instead.
-> - You may run `schemabot freeze list` and `schemabot freeze show` to check
->   on a freeze.
+An agent with the [SchemaBot agent skill](ai-agents.md#install-the-agent-skill)
+follows these rules. Its [freezes](../skills/schemabot/references/refusals-and-failures.md#freezes) reference has the signals
+of a refusal and what the agent does next.
 
 ## Configure who may freeze and approve
 
