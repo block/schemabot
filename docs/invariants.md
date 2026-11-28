@@ -1005,8 +1005,10 @@ settles to permanent `failed` when the attempt budget is spent or the recovery w
 *Enforced:* retry preparation in the drive loop (`pkg/api/operator.go`), the re-plan before a drive
 starts again a task another run held the table from (`pkg/tern/local_apply_sequential.go`), the
 resume re-plan that settles a task whose change already landed and whose stored resume state records
-no deploy request to reattach to (`pkg/tern/local_control_resume.go`),
-the group_finalizer drive, which pauses its task-less operation as `failed_retryable` on an error
+no deploy request to reattach to (`pkg/tern/local_control_resume.go`), the recovery that cannot
+re-plan an apply outside its revert phase or an absent deferred cutover signal, which pauses it
+for retry so each attempt is charged against the budget instead of leaving it running and claimable
+forever (`pauseForReplanFailure`, same file), the group_finalizer drive, which pauses its task-less operation as `failed_retryable` on an error
 retrying can cure instead of failing it (`driveGroupFinalizer`, same file), the conflict check,
 which pauses a stale apply for retry when its engine reports a retryable failure so the next
 recovery is charged against the budget (`pauseStaleApplyForRetry` in `pkg/tern/local_apply.go`),

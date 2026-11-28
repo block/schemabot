@@ -24,11 +24,11 @@ func ClassifyStatement(stmt string) (StatementType, string, error) {
 	return defaultParser.Classify(stmt)
 }
 
-// statementPreview returns the leading text of a statement for error messages,
+// StatementPreview returns the leading text of a statement for error messages,
 // truncated so multi-statement blobs do not flood logs. Truncation counts
 // runes, not bytes, so multi-byte identifiers are never split into invalid
 // UTF-8.
-func statementPreview(stmt string) string {
+func StatementPreview(stmt string) string {
 	const maxPreview = 80
 	s := strings.TrimSpace(stmt)
 	count := 0

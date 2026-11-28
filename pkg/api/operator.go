@@ -4059,8 +4059,9 @@ func (s *Service) markOperationFromOwnResult(ctx context.Context, driverID int, 
 			// the parent instead would read the still-running parent of an
 			// operation-lease-only drive, take the "leave claimable" branch, and
 			// return updated=false — stranding a failed or stopped operation with
-			// its parent never projected and its target blocked.
-			if currentOp != nil && state.IsTerminalApplyState(currentOp.State) {
+			// its parent never projected and its target blocked. A pause for
+			// retry is the drive's outcome too, though not a terminal one.
+			if currentOp != nil && driveRecordedOperationOutcome(currentOp.State) {
 				return true, nil
 			}
 			return s.persistOperationState(ctx, driverID, op, apply.State, apply.ErrorMessage)
@@ -4072,6 +4073,13 @@ func (s *Service) markOperationFromOwnResult(ctx context.Context, driverID int, 
 	}
 	derived := state.DeriveApplyState(taskStates)
 	return s.persistOperationState(ctx, driverID, op, derived, firstFailedTaskError(tasks))
+}
+
+// driveRecordedOperationOutcome reports whether an operation row holds an
+// outcome its drive wrote: a terminal state, or a pause for retry, which is
+// resumable and so not terminal, but is as much the drive's result.
+func driveRecordedOperationOutcome(opState string) bool {
+	return state.IsTerminalApplyState(opState) || state.IsState(opState, state.ApplyOperation.FailedRetryable)
 }
 
 // firstFailedTaskError returns the ErrorMessage of the first failed task, used

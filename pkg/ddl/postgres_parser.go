@@ -30,13 +30,13 @@ func (postgresStatementParser) Split(content string) ([]string, error) {
 	}
 	result, err := pgquery.Parse(content)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse SQL statements %q: %w", statementPreview(content), err)
+		return nil, fmt.Errorf("failed to parse SQL statements %q: %w", StatementPreview(content), err)
 	}
 	var stmts []string
 	for _, raw := range result.GetStmts() {
 		span, err := statementSpan(content, raw)
 		if err != nil {
-			return nil, fmt.Errorf("failed to split SQL statements %q: %w", statementPreview(content), err)
+			return nil, fmt.Errorf("failed to split SQL statements %q: %w", StatementPreview(content), err)
 		}
 		stmt := strings.TrimSpace(span)
 		if stmt != "" {
@@ -73,16 +73,16 @@ func statementSpan(content string, raw *pgproto.RawStmt) (string, error) {
 func (postgresStatementParser) Classify(stmt string) (StatementType, string, error) {
 	result, err := pgquery.Parse(stmt)
 	if err != nil {
-		return StatementUnknown, "", fmt.Errorf("classify statement %q: %w", statementPreview(stmt), err)
+		return StatementUnknown, "", fmt.Errorf("classify statement %q: %w", StatementPreview(stmt), err)
 	}
 	stmts := result.GetStmts()
 	if len(stmts) == 0 {
-		return StatementUnknown, "", fmt.Errorf("no classification result for statement %q", statementPreview(stmt))
+		return StatementUnknown, "", fmt.Errorf("no classification result for statement %q", StatementPreview(stmt))
 	}
 	if len(stmts) > 1 {
 		return StatementUnknown, "", fmt.Errorf(
 			"expected a single statement but %q parsed as %d statements; split with the parser's Split before classifying",
-			statementPreview(stmt), len(stmts),
+			StatementPreview(stmt), len(stmts),
 		)
 	}
 	stmtType, table := classifyPostgresNode(stmts[0].GetStmt())
@@ -92,7 +92,7 @@ func (postgresStatementParser) Classify(stmt string) (StatementType, string, err
 func (postgresStatementParser) DropTargets(stmt string) (DropTargets, error) {
 	result, err := pgquery.Parse(stmt)
 	if err != nil {
-		return DropTargets{}, fmt.Errorf("parse drop targets from statement %q: %w", statementPreview(stmt), err)
+		return DropTargets{}, fmt.Errorf("parse drop targets from statement %q: %w", StatementPreview(stmt), err)
 	}
 	stmts := result.GetStmts()
 	if len(stmts) != 1 {
@@ -128,7 +128,7 @@ func (postgresStatementParser) DropTargets(stmt string) (DropTargets, error) {
 func (postgresStatementParser) createSetRelation(stmt string) (relationIdentity, error) {
 	result, err := pgquery.Parse(stmt)
 	if err != nil {
-		return relationIdentity{}, fmt.Errorf("parse create-set statement %q: %w", statementPreview(stmt), err)
+		return relationIdentity{}, fmt.Errorf("parse create-set statement %q: %w", StatementPreview(stmt), err)
 	}
 	stmts := result.GetStmts()
 	if len(stmts) != 1 {
@@ -152,7 +152,7 @@ func (postgresStatementParser) createSetRelation(stmt string) (relationIdentity,
 func (postgresStatementParser) CreateTableColumns(stmt string) ([]string, error) {
 	result, err := pgquery.Parse(stmt)
 	if err != nil {
-		return nil, fmt.Errorf("parse CREATE TABLE %q: %w", statementPreview(stmt), err)
+		return nil, fmt.Errorf("parse CREATE TABLE %q: %w", StatementPreview(stmt), err)
 	}
 	stmts := result.GetStmts()
 	if len(stmts) != 1 {
@@ -181,7 +181,7 @@ func (postgresStatementParser) CreateTableColumns(stmt string) ([]string, error)
 func postgresCreateTableColumn(createTableDDL, columnName string) (*pgproto.ParseResult, *pgproto.Node_CreateStmt, *pgproto.Node, error) {
 	result, err := pgquery.Parse(createTableDDL)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("parse CREATE TABLE %q: %w", statementPreview(createTableDDL), err)
+		return nil, nil, nil, fmt.Errorf("parse CREATE TABLE %q: %w", StatementPreview(createTableDDL), err)
 	}
 	stmts := result.GetStmts()
 	if len(stmts) != 1 {
@@ -345,7 +345,7 @@ func postgresNonVolatileExpression(expr *pgproto.Node) bool {
 func (postgresStatementParser) CreateIndex(stmt string) (string, string, bool, error) {
 	result, err := pgquery.Parse(stmt)
 	if err != nil {
-		return "", "", false, fmt.Errorf("parse CREATE INDEX %q: %w", statementPreview(stmt), err)
+		return "", "", false, fmt.Errorf("parse CREATE INDEX %q: %w", StatementPreview(stmt), err)
 	}
 	stmts := result.GetStmts()
 	if len(stmts) != 1 {
@@ -368,13 +368,13 @@ func (postgresStatementParser) CreateIndex(stmt string) (string, string, bool, e
 func (postgresStatementParser) CostScalesWithTableSize(stmt string) (bool, error) {
 	result, err := pgquery.Parse(stmt)
 	if err != nil {
-		return false, fmt.Errorf("parse statement %q: %w", statementPreview(stmt), err)
+		return false, fmt.Errorf("parse statement %q: %w", StatementPreview(stmt), err)
 	}
 	stmts := result.GetStmts()
 	if len(stmts) != 1 {
 		return false, fmt.Errorf(
 			"expected a single statement but %q parsed as %d statements; split with the parser's Split first",
-			statementPreview(stmt), len(stmts),
+			StatementPreview(stmt), len(stmts),
 		)
 	}
 	switch node := stmts[0].GetStmt().GetNode().(type) {

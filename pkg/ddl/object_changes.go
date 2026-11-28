@@ -101,7 +101,7 @@ const mysqlPrimaryKeyName = "primary"
 func (tidbStatementParser) ObjectChanges(stmt string) (ObjectChanges, error) {
 	parsed, err := statement.New(stmt)
 	if err != nil {
-		return ObjectChanges{}, fmt.Errorf("parse object changes from statement %q: %w", statementPreview(stmt), err)
+		return ObjectChanges{}, fmt.Errorf("parse object changes from statement %q: %w", StatementPreview(stmt), err)
 	}
 	if len(parsed) != 1 {
 		return ObjectChanges{}, fmt.Errorf("expected one statement for object changes, got %d", len(parsed))
@@ -264,7 +264,7 @@ func renameOrModify(changes *ObjectChanges, kind SchemaObjectKind, from, to stri
 func (postgresStatementParser) ObjectChanges(stmt string) (ObjectChanges, error) {
 	result, err := pgquery.Parse(stmt)
 	if err != nil {
-		return ObjectChanges{}, fmt.Errorf("parse object changes from statement %q: %w", statementPreview(stmt), err)
+		return ObjectChanges{}, fmt.Errorf("parse object changes from statement %q: %w", StatementPreview(stmt), err)
 	}
 	stmts := result.GetStmts()
 	if len(stmts) != 1 {
