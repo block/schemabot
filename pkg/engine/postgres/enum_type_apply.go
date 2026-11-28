@@ -107,13 +107,9 @@ func enumTypeRefusal(err error, typeName string) *refusal {
 	}
 	var privilegeErr *preflight.PrivilegeError
 	if errors.As(err, &privilegeErr) {
-		remedy := fmt.Sprintf("provision with: %s (verified by: %s)", privilegeErr.Grant, privilegeErr.Check)
-		if privilegeErr.Hint != "" {
-			remedy += "; " + privilegeErr.Hint
-		}
 		return &refusal{reason: "insufficient-privileges",
 			cause:         fmt.Sprintf("the engine role lacks access to alter enum type %s", quotedTable(typeName)),
-			remedy:        remedy,
+			remedy:        privilegeRemedy(privilegeErr),
 			provisionable: true}
 	}
 	if errors.Is(err, preflight.ErrEnumTypeNotFound) {

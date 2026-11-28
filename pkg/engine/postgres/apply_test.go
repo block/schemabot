@@ -58,7 +58,6 @@ func TestClassifyRefusal(t *testing.T) {
 				"in-place changes that need ownership",
 				`table "users"`,
 				`GRANT "app_owner" TO "limited" WITH INHERIT TRUE`,
-				"pg_has_role(limited, app_owner, 'USAGE')",
 				"membership must be inheritable",
 			},
 		},
@@ -73,7 +72,6 @@ func TestClassifyRefusal(t *testing.T) {
 			wantReason: "insufficient-privileges",
 			wantDetail: []string{
 				`GRANT "app/owner" TO "evil role"`,
-				"pg_has_role(evil role, app/owner, 'USAGE')",
 				"membership must be inheritable",
 			},
 		},
@@ -1674,7 +1672,7 @@ func TestRefusalAfterCommittedCreateStepKeepsOwnRemedy(t *testing.T) {
 			name:       "privilege refusal keeps its provisioning remedy",
 			err:        &preflight.PrivilegeError{Tier: preflight.TierCreateTable, Check: "has_schema_privilege(limited, 'public', 'CREATE')", Grant: `GRANT CREATE ON SCHEMA "public" TO "limited"`},
 			wantReason: "insufficient-privileges",
-			wantRemedy: `provision with: GRANT CREATE ON SCHEMA "public" TO "limited" (verified by: has_schema_privilege(limited, 'public', 'CREATE'))`,
+			wantRemedy: `provision with: GRANT CREATE ON SCHEMA "public" TO "limited"`,
 		},
 		{
 			name:       "refusal without a remedy gets a re-plan",

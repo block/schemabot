@@ -3,6 +3,7 @@ package postgres
 import (
 	"testing"
 
+	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/schemadiff"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -152,4 +153,21 @@ func TestTableDropForApply(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The reason a table drop is refused for want of ownership ends in the
+// statement to run and, when the grant targets another role, the hint that
+// says so. The catalog check that found the access missing is left out.
+func TestPrivilegeDropReason(t *testing.T) {
+	privilege := &preflight.PrivilegeError{
+		Tier:  tableDropTier,
+		Check: "pg_has_role(drop_limited, app_owner, 'USAGE')",
+		Grant: `GRANT "app_owner" TO "drop_limited"`,
+	}
+	assert.Equal(t, `the engine role cannot drop it, because only the table's owner can drop a table — provision with: GRANT "app_owner" TO "drop_limited"`,
+		privilegeDropReason(privilege))
+
+	privilege.Hint = "the grant targets the owning role"
+	assert.Equal(t, `the engine role cannot drop it, because only the table's owner can drop a table — provision with: GRANT "app_owner" TO "drop_limited"; the grant targets the owning role`,
+		privilegeDropReason(privilege))
 }
