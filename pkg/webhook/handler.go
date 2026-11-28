@@ -1293,6 +1293,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"repo", repo)
 
 	metricApp := metricAppName(appName)
+	// The ownership check above does not run for repository-level webhooks and
+	// passes every repository when no apps are configured, so a delivery from
+	// an unmanaged repository can still reach the statuses recorded below.
+	metricRepo := h.metricRepo(repo)
 
 	// Repo-level webhook deliveries carry no installation id in the payload, so
 	// resolve the shared App's installation for the repo and stash it on the
@@ -1321,7 +1325,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if sw.statusCode() >= http.StatusInternalServerError {
 			return
 		}
-		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
+		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, metricRepo, "processed")
 	}
 	switch eventType {
 	case "issue_comment":
@@ -1353,7 +1357,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.writeJSON(w, http.StatusOK, map[string]string{
 			"message": fmt.Sprintf("event type '%s' ignored", eventType),
 		})
-		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "ignored")
+		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, metricRepo, "ignored")
 	}
 }
 
@@ -1556,6 +1560,19 @@ func (h *Handler) shouldRunPassingAggregateChecks(ctx context.Context, repo, ope
 // resolution for repos this deployment does not manage.
 func (h *Handler) isRepoAllowed(repo string) bool {
 	return h.service == nil || h.service.Config().IsRepoAllowed(repo)
+}
+
+// metricRepo returns the repository to record on
+// schemabot.webhook.events_total: the repository itself when this deployment
+// manages it, and "" when it does not. Any repository that installs the App
+// can deliver, so recording an unmanaged repository's name would add a series
+// for every repository that sends one; the delivery's log line names it
+// instead.
+func (h *Handler) metricRepo(repo string) string {
+	if repo == "" || !h.isRepoAllowed(repo) {
+		return ""
+	}
+	return repo
 }
 
 // resolveRepoWebhookInstallation resolves the shared App's installation id for

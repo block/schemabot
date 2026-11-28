@@ -351,7 +351,11 @@ func (h *Handler) durableWebhookClaimsSnapshot() [][]any {
 func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, store storage.WebhookEventStore, event *storage.WebhookEvent) {
 	claimedAt := time.Now()
 	appName := h.metricAppForRepo(event.Repository)
-	metrics.RecordWebhookEvent(ctx, appName, event.Event, event.Action, event.Repository, "durable_dispatch_started")
+	// A closed pull request is queued before the repository allowlist check,
+	// and a repository can leave the config while its rows wait, so the row's
+	// repository may be one this deployment no longer manages.
+	metricRepo := h.metricRepo(event.Repository)
+	metrics.RecordWebhookEvent(ctx, appName, event.Event, event.Action, metricRepo, "durable_dispatch_started")
 	if event.Attempts == 1 {
 		// Only the first claim measures inbox wait: started_at pins to the
 		// first claim, and a retry claim's wait is the retry window, not
@@ -370,7 +374,7 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 			// receipt — the pre-deferral behavior, never a bogus epoch lag.
 			lagSince = event.ReceivedAt
 		}
-		metrics.RecordWebhookInboxDispatchLag(ctx, appName, event.Event, event.Repository, time.Since(lagSince))
+		metrics.RecordWebhookInboxDispatchLag(ctx, appName, event.Event, metricRepo, time.Since(lagSince))
 	}
 
 	if event.Event == "pull_request" && isAutoPlannablePullRequestAction(event.Action) {
@@ -532,7 +536,7 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 		}
 		recordOutcome(outcome)
 		if outcome == "failed_permanent" {
-			metrics.RecordWebhookPermanentFailure(finishCtx, appName, event.Event, event.Action, event.Repository, failureReason)
+			metrics.RecordWebhookPermanentFailure(finishCtx, appName, event.Event, event.Action, metricRepo, failureReason)
 			origin := "organic"
 			if strings.HasPrefix(event.DeliveryID, storage.SynthesizedWebhookDeliveryIDPrefix) {
 				origin = "synthesized"
@@ -553,7 +557,7 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 					deadLetterAttrs...)
 			}
 		} else {
-			metrics.RecordWebhookEvent(finishCtx, appName, event.Event, event.Action, event.Repository, "durable_dispatch_"+outcome)
+			metrics.RecordWebhookEvent(finishCtx, appName, event.Event, event.Action, metricRepo, "durable_dispatch_"+outcome)
 		}
 		if notifyTerminalCommand {
 			h.postDurableCommandTerminalComment(event, processErr)
@@ -613,7 +617,7 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 		return
 	}
 	recordOutcome("completed")
-	metrics.RecordWebhookEvent(finishCtx, appName, event.Event, event.Action, event.Repository, "durable_dispatch_completed")
+	metrics.RecordWebhookEvent(finishCtx, appName, event.Event, event.Action, metricRepo, "durable_dispatch_completed")
 	h.logger.Info("durable webhook driver completed delivery",
 		"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 		"action", event.Action, "repo", event.Repository, "pr", event.PullRequest)
@@ -690,7 +694,7 @@ func (h *Handler) supersedeCoveredAutoPlan(ctx context.Context, driverID int, st
 		return false
 	}
 	metrics.RecordWebhookDispatchDuration(ctx, appName, event.Event, event.Repository, "superseded", time.Since(claimedAt))
-	metrics.RecordWebhookEvent(ctx, appName, event.Event, event.Action, event.Repository, "durable_dispatch_superseded")
+	metrics.RecordWebhookEvent(ctx, appName, event.Event, event.Action, h.metricRepo(event.Repository), "durable_dispatch_superseded")
 	h.logger.Info("durable webhook driver superseded stale auto-plan delivery; a newer delivery for the same pull request covers it",
 		"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 		"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
