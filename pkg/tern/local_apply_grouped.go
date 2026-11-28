@@ -1540,25 +1540,36 @@ func (s settledTaskSet) contains(task *storage.Task) bool {
 // names the operator's next step, so the failure message carries it unchanged.
 // Returns true when the apply was settled and this owner must exit the drive.
 func (c *LocalClient) failPermanentDeployRefusal(ctx context.Context, logger *slog.Logger, eng engine.Engine, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, ps *atomicPollState, startErr error) bool {
+	settled, err := c.settlePermanentStartRefusal(ctx, logger, eng, apply, tasks, creds, resumeState, startErr)
+	if settled {
+		ps.terminalErr = err
+	}
+	return settled
+}
+
+// settlePermanentStartRefusal is the settlement both the automatic start and
+// an operator's start use after the engine refused the deploy permanently; see
+// failPermanentDeployRefusal. It reports whether it settled the apply, and the
+// error from failing it when it did.
+func (c *LocalClient) settlePermanentStartRefusal(ctx context.Context, logger *slog.Logger, eng engine.Engine, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, startErr error) (bool, error) {
 	result, err := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
 		Database:    apply.Database,
 		Credentials: creds,
 		ResumeState: resumeState,
 	})
 	if err != nil {
-		logger.Warn("auto-deploy was refused with a permanent error, but the progress check confirming nothing started failed; the apply is not failed and the drive retries at the next progress tick",
+		logger.Warn("deploy start was refused with a permanent error, but the progress check confirming nothing started failed; the apply is not failed and the drive follows the engine's state at the next progress tick",
 			append(apply.MutableLogAttrs(), "start_error", startErr, "error", err)...)
-		return false
+		return false, nil
 	}
 	if !startRefusalLeftNothingRunning(result.State) {
-		logger.Warn("auto-deploy was refused with a permanent error, but the engine reports the change neither waiting for its deploy nor retired; the apply is not failed and the drive follows the engine's state at the next progress tick",
+		logger.Warn("deploy start was refused with a permanent error, but the engine reports the change neither waiting for its deploy nor retired; the apply is not failed and the drive follows the engine's state at the next progress tick",
 			append(apply.MutableLogAttrs(), "start_error", startErr, "engine_state", result.State)...)
-		return false
+		return false, nil
 	}
-	logger.Error("auto-deploy failed with permanent error",
+	logger.Error("deploy start failed with permanent error",
 		append(apply.MutableLogAttrs(), "error", startErr)...)
-	ps.terminalErr = c.failApplyAndNotify(ctx, apply, tasks, fmt.Sprintf("deploy could not start: %v", startErr))
-	return true
+	return true, c.failApplyAndNotify(ctx, apply, tasks, fmt.Sprintf("deploy could not start: %v", startErr))
 }
 
 // startRefusalLeftNothingRunning reports whether the engine state read after a
