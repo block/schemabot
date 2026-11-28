@@ -623,7 +623,7 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		// grant, and only the log carries it: the detail is kept generic
 		// because it is published to GitHub.
 		logger.Warn("PostgreSQL schema change refused",
-			"namespace", change.namespace, "table", change.table, "reason", r.reason, "error", err)
+			append([]any{"namespace", change.namespace, "table", change.table, "reason", r.reason, "error", err}, catalogErrorLogAttrs(err)...)...)
 		publish(progressResult(engine.StateFailed, "refused", started, change, recoveryContextDetail(err, r.detail)))
 		return
 	}
@@ -638,7 +638,8 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		logger.Warn("PostgreSQL native-safe schema change lost its lock budget; the drive will retry",
 			"namespace", change.namespace, "table", change.table, "error", err)
 	default:
-		logger.Error("PostgreSQL native-safe schema change failed", "namespace", change.namespace, "table", change.table, "error", err)
+		logger.Error("PostgreSQL native-safe schema change failed",
+			append([]any{"namespace", change.namespace, "table", change.table, "error", err}, catalogErrorLogAttrs(err)...)...)
 	}
 	result := progressResult(engine.StateFailed, "failed", started, change, failure.detail)
 	result.Retryable = failure.retryable
@@ -726,6 +727,25 @@ func missingGrantDetail(err error, table string) (string, bool) {
 	return sanitizeReasonText(fmt.Sprintf(
 		"the engine role lacks a privilege the statement on %q needs, such as REFERENCES on the table a foreign key references; the server log names it; grant it, then retry",
 		table)), true
+}
+
+// catalogErrorLogAttrs returns the server's DETAIL and HINT for a refusal
+// whose detail names catalog objects rather than row values: the objects
+// that depend on what a statement drops, or the privilege a statement
+// lacks. The operator-facing detail leaves them out and points at the
+// server log, so the log has to carry them. Other SQLSTATEs return nothing,
+// since a constraint violation's DETAIL quotes the rows' values.
+func catalogErrorLogAttrs(err error) []any {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return nil
+	}
+	switch pgErr.Code {
+	case sqlstateDependentObjectsStillExist, sqlstateInsufficientPrivilege:
+		return []any{"server_detail", pgErr.Detail, "server_hint", pgErr.Hint}
+	default:
+		return nil
+	}
 }
 
 // sqlstateDependentObjectsStillExist is the SQLSTATE the server raises when

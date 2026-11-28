@@ -1830,6 +1830,28 @@ func TestClassifyApplyFailureDependentObjects(t *testing.T) {
 	assert.NotContains(t, failure.detail, "orders_pub")
 }
 
+// The server log carries the objects a dependent-objects or privilege
+// refusal names, which the operator-facing detail leaves out, and never a
+// constraint violation's DETAIL, which quotes row values.
+func TestCatalogErrorLogAttrs(t *testing.T) {
+	dependents := fmt.Errorf("drop column: %w", &pgconn.PgError{
+		Code:   "2BP01",
+		Detail: `publication of table orders in publication orders_pub depends on column amt of table orders`,
+		Hint:   `Use DROP ... CASCADE to drop the dependent objects too.`,
+	})
+	assert.Equal(t, []any{
+		"server_detail", `publication of table orders in publication orders_pub depends on column amt of table orders`,
+		"server_hint", `Use DROP ... CASCADE to drop the dependent objects too.`,
+	}, catalogErrorLogAttrs(dependents))
+
+	grant := &pgconn.PgError{Code: "42501", Detail: "", Hint: ""}
+	assert.Equal(t, []any{"server_detail", "", "server_hint", ""}, catalogErrorLogAttrs(grant))
+
+	duplicate := &pgconn.PgError{Code: "23505", Detail: `Key (email)=(ada@example.com) is duplicated.`}
+	assert.Nil(t, catalogErrorLogAttrs(duplicate))
+	assert.Nil(t, catalogErrorLogAttrs(errors.New("connection reset")))
+}
+
 func TestProgressResultReportsCreateSequenceLength(t *testing.T) {
 	result := progressResult(engine.StateRunning, "running", time.Now(), nativeApply{
 		namespace: "public",
