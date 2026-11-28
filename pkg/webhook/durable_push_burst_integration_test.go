@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -264,4 +265,54 @@ func TestE2EDurableDispatchKeepsTheCurrentHeadThroughAReplayedPushCycle(t *testi
 		"the late delivery finds the pull request has left its head, so it ends superseded")
 	assert.Equal(t, []string{pushBurstPullRequestRead}, slices.Sorted(maps.Keys(f.requestsSince(before))),
 		"the late delivery may read the pull request, and must publish nothing on a head the pull request has left")
+}
+
+// moveDuringDiscovery runs move once, from the default branch tip read that
+// discovery makes after the driver has confirmed the claimed head and before
+// the plan is published.
+func (f *pushBurstFixture) moveDuringDiscovery(move func()) {
+	var once sync.Once
+	tip := func() string {
+		once.Do(move)
+		return "def456"
+	}
+	f.result.BaseTip.Store(&tip)
+}
+
+// A push is claimed while its head is still the PR's head, and another push
+// lands while discovery runs. Nothing is published for the claimed head, and
+// the delivery ends superseded, so the inbox holds no row that counts as
+// coverage for a head that was never planned as the PR's head.
+func TestE2EDurableDispatchSupersedesAPushWhoseHeadMovesDuringDiscovery(t *testing.T) {
+	const (
+		dbName      = "webhook_push_moved_in_discovery"
+		claimedHead = "discovery-head-claimed"
+		pushedHead  = "discovery-head-pushed"
+	)
+	f := newPushBurstFixture(t, dbName, claimedHead)
+	f.moveDuringDiscovery(func() { f.result.MovedHeadSHA.Store(new(pushedHead)) })
+	f.push(t, "discovery-push", "abc123", claimedHead)
+
+	assert.Equal(t, storage.WebhookEventSuperseded, f.drive(t, "discovery-push"))
+	covered, err := f.store.HasEventForHead(t.Context(), storage.WebhookProviderGitHub, "octocat/hello-world", 1, claimedHead)
+	require.NoError(t, err)
+	assert.False(t, covered, "a head that was never planned as the PR's head must not read as covered")
+	assert.Empty(t, f.result.comments, "nothing is published for a head the PR moved past")
+}
+
+// A push is claimed and the PR is retargeted while discovery runs. The plan is
+// discarded, because it was computed against the old base, and the retarget's
+// own delivery plans the PR again. The claimed head is still the PR's head, so
+// the delivery ends completed: it is not the head-moved case.
+func TestE2EDurableDispatchCompletesAPushWhoseBaseMovesDuringDiscovery(t *testing.T) {
+	const (
+		dbName      = "webhook_push_retargeted_in_discovery"
+		claimedHead = "retarget-head-claimed"
+	)
+	f := newPushBurstFixture(t, dbName, claimedHead)
+	f.moveDuringDiscovery(func() { f.result.BaseRef.Store(new("release-1")) })
+	f.push(t, "retarget-push", "abc123", claimedHead)
+
+	assert.Equal(t, storage.WebhookEventCompleted, f.drive(t, "retarget-push"))
+	assert.Empty(t, f.result.comments, "a plan computed against the old base is not published")
 }

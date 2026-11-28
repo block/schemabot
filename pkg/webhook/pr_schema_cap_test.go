@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -211,6 +212,33 @@ func TestPRSchemaCapRejectsMovedQueuedRevision(t *testing.T) {
 	_, err = f.admitPRSchemaCommand(t.Context(), f.client, schemaCapTestRepo, 1, expected)
 	require.ErrorIs(t, err, errPRSchemaMoved)
 	require.EqualValues(t, 1, f.fileReads.Load())
+}
+
+// The database limit re-reads the PR just before it publishes. A push seen
+// there means the delivery's head was never planned, so the auto-plan reports
+// the head moved and its delivery ends superseded; a retarget seen there
+// leaves the delivery's head current, so its delivery still completes.
+func TestPRSchemaCapLateReadTellsAPushFromARetarget(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		move      func(*schemaCapTestFixture)
+		headMoved bool
+	}{
+		{name: "push", move: func(f *schemaCapTestFixture) { f.head.Store("pushed") }, headMoved: true},
+		{name: "retarget", move: func(f *schemaCapTestFixture) { f.base.Store("release") }, headMoved: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newSchemaCapTestFixture(t, 1, 1, api.PRSchemaCapConfig{Label: schemaCapTestLabel}, nil)
+			info, err := f.client.FetchPullRequestNoCache(t.Context(), schemaCapTestRepo, 1)
+			require.NoError(t, err)
+			key := f.prPlanDiscoveryKey(schemaCapTestRepo, 1, info)
+			tt.move(f)
+
+			_, err = f.verifyPRSchemaRevision(t.Context(), f.client, key, info.State)
+			require.ErrorIs(t, err, errPRSchemaMoved, "every move refuses the publish")
+			assert.Equal(t, tt.headMoved, errors.Is(err, errPRSchemaHeadMoved))
+		})
+	}
 }
 
 type revokingSchemaCapPlanner struct {

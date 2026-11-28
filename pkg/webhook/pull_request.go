@@ -605,7 +605,7 @@ func (h *Handler) dispatchAutoPlanForPR(ctx context.Context, client *ghclient.In
 			})
 		}
 		if errors.Is(err, errPRSchemaMoved) {
-			return autoPlanDispatch{message: err.Error()}, nil
+			return autoPlanDispatch{message: err.Error(), headMoved: errors.Is(err, errPRSchemaHeadMoved)}, nil
 		}
 		if errors.Is(err, errPRSchemaCapHeld) {
 			h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
