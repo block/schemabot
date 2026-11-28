@@ -2617,11 +2617,11 @@ func TestEngineHaltForShutdownEndsAParkedConcurrentBuild(t *testing.T) {
 // TestEngineApplyConcurrentIndexRecoveryFailureIsNotCompletion proves a
 // recovery that clears the abandoned entry but whose build then fails
 // reports the failure, never a completion: the abandoned invalid index is
-// removed, the unique build fails on duplicate rows and leaves its own
-// invalid index under the name, and the apply is refused naming that index —
-// while the catalog still shows it invalid, the state a completion would have
-// misreported as the index the schema declares. The refusal is permanent: a
-// rerun meets the same duplicate rows, so the operator corrects them first.
+// removed, the unique build fails on duplicate rows, and the apply is
+// refused naming the index. The invalid index that failed build left is
+// dropped too, so it does not go on rejecting writes the live schema allows.
+// The refusal is permanent: a rerun meets the same duplicate rows, so the
+// operator corrects them first.
 func TestEngineApplyConcurrentIndexRecoveryFailureIsNotCompletion(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "recovery_failure_test")
 	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text)")
@@ -2642,16 +2642,58 @@ func TestEngineApplyConcurrentIndexRecoveryFailureIsNotCompletion(t *testing.T) 
 	require.Equal(t, engine.StateFailed, progress.State, "progress: %+v", progress)
 	assert.Equal(t, "refused", progress.Metadata["phase"])
 	assert.False(t, progress.Retryable, "a build the table's rows violate fails the same way on every rerun")
-	assert.Equal(t, `recovering abandoned invalid index "public"."orders_ref_key" failed: `+
-		`the table's rows cannot be indexed by index "public"."orders_ref_key", and the failed build left it invalid on the target; `+
-		`correct the rows, then re-run; the rerun removes the invalid index once it proves no build holds it`, progress.ErrorMessage)
+	assert.Equal(t, `index "public"."orders_ref_key" was not built: rows duplicate its key (23505), and its invalid leftover was dropped; `+
+		`correct the rows, then re-run`, progress.ErrorMessage)
 	assert.NotContains(t, progress.ErrorMessage, "ref-collision", "the server's unique-violation text never reaches the operator surface")
+	assertNoInvalidIndexOn(t, db, "orders")
+}
 
-	var valid bool
-	err = db.QueryRowContext(t.Context(),
-		`SELECT i.indisvalid FROM pg_index i WHERE i.indexrelid = to_regclass('public.orders_ref_key')`).Scan(&valid)
+// A unique index the application's rows break while it builds: the build
+// fails validation and PostgreSQL leaves the index invalid but still
+// maintained, so it would reject every insert that repeats a key, a rule the
+// live schema does not declare. The apply is refused naming the SQLSTATE,
+// the engine drops the leftover, and the application can write the
+// duplicate the live schema allows.
+func TestEngineApplyConcurrentUniqueIndexOnDuplicateRowsDropsItsLeftover(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "data_fault_leftover_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.products (id bigint PRIMARY KEY, sku text)")
 	require.NoError(t, err)
-	assert.False(t, valid, "the failed unique build leaves its own invalid index under the name")
+	_, err = db.ExecContext(t.Context(), "INSERT INTO public.products (id, sku) VALUES (1, 'SKU-1'), (2, 'sku-1')")
+	require.NoError(t, err)
+
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "products",
+		"CREATE UNIQUE INDEX CONCURRENTLY products_sku_key ON public.products (lower(sku))"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "products")
+	require.Equal(t, engine.StateFailed, progress.State, "progress: %+v", progress)
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable)
+	assert.Equal(t, `index "public"."products_sku_key" was not built: rows duplicate its key (23505), and its invalid leftover was dropped; `+
+		`correct the rows, then re-run`, progress.ErrorMessage)
+	assertNoInvalidIndexOn(t, db, "products")
+
+	_, err = db.ExecContext(t.Context(), "INSERT INTO public.products (id, sku) VALUES (3, 'Sku-1')")
+	require.NoError(t, err, "a write the live schema allows is not rejected by the failed build's index")
+}
+
+// assertNoInvalidIndexOn checks public.<table> carries no invalid index, under
+// its own name or a quarantine name.
+func assertNoInvalidIndexOn(t *testing.T, db *sql.DB, table string) {
+	t.Helper()
+	var invalid []string
+	rows, err := db.QueryContext(t.Context(), `
+		SELECT c.relname FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+		WHERE i.indrelid = to_regclass('public.' || $1) AND NOT i.indisvalid`, table)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(rows)
+	for rows.Next() {
+		var name string
+		require.NoError(t, rows.Scan(&name))
+		invalid = append(invalid, name)
+	}
+	require.NoError(t, rows.Err())
+	assert.Empty(t, invalid, "the failed build's invalid index is dropped")
 }
 
 // assertIndexValidWithoutDebris checks the named index on public.<table> is

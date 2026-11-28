@@ -485,7 +485,7 @@ applying the same plan again meets the same refusal.
 | The build failed part-way and left an invalid index | Retryable. The failure names the index | Nothing. The next drive removes the invalid index and builds again |
 | The duration bound ended the build | Retryable. The failure names `postgres.concurrent_index_max_duration` | Raise the setting before the retry, or it meets the same bound |
 | The duration bound ended the build, and it left nothing behind | Refused. The failure names the setting | Raise the setting, then apply again |
-| The build failed on the table's rows, such as duplicates under a unique index | Refused | Fix the rows, then apply again |
+| The build failed on the table's rows, such as duplicates under a unique index | Refused. The failure names the index and the SQLSTATE, such as `23505` for a duplicate key, and says what became of the invalid index the build left: dropped, already gone, held by another build, or still in place under a name the failure gives, because PostgreSQL refused to drop it | Fix the rows, then apply again. When the failure names an invalid index that is left, drop it first, since it still checks every write. On a partitioned table, the partition's invalid index stays until you drop it or the rerun builds it |
 | Another backend still holds the index or the table | Retryable. The failure names the index and the backend | Nothing. SchemaBot retries once that build ends |
 | An invalid index has the name but cannot be cleared by this change: it is on another table, backs a constraint, or belongs to a partitioned table | Refused. The failure names the index | Remove the index yourself, then apply again |
 | The target connection pool cannot hold the sessions the build needs | Refused | Raise the pool size in the target DSN |
@@ -518,6 +518,14 @@ recovery needs one more connection than the build alone.
 
 Leave an invalid index in place for SchemaBot to recover. Dropping it by hand
 can race a build the server is still running.
+
+A build that fails on the table's rows is the exception: SchemaBot drops its
+invalid index right away, through the same lock and drop. PostgreSQL keeps
+checking writes against an invalid index, so a unique one would reject every
+write that repeats a key, which the live schema allows. A retry cannot
+succeed before the rows are fixed, so waiting for it would only block those
+writes. If the drop fails, the failure says the index still rejects such
+writes.
 
 ### Partitioned index builds
 
