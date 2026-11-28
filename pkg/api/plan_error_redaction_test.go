@@ -226,6 +226,16 @@ func TestHandlePlanKeepsTextWrittenForTheReader(t *testing.T) {
 			wantCode:   apitypes.ErrCodeSchemaRefused,
 		},
 		{
+			name:    "engine declines the plan in its own words, with a cause from the target",
+			request: redactionPlanRequest(),
+			client: &mockTernClient{planErr: fmt.Errorf("plan via 10.0.0.5:5432: %w", &engine.PlanRefusedError{
+				Err: engine.OperatorErrorf(errors.New("ERROR: CREATE INDEX must use CONCURRENTLY on db-7.internal (SQLSTATE P0001)"), "have the trigger skip the scratch schema, then plan again"),
+			})},
+			want:       "plan failed: have the trigger skip the scratch schema, then plan again",
+			wantStatus: http.StatusUnprocessableEntity,
+			wantCode:   apitypes.ErrCodeSchemaRefused,
+		},
+		{
 			name:       "remote data plane declines the plan",
 			request:    redactionPlanRequest(),
 			client:     &mockTernClient{isRemote: true, planErr: status.Error(codes.FailedPrecondition, refusal)},

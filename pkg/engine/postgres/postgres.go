@@ -291,7 +291,11 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		return nil, fmt.Errorf("plan PostgreSQL database %q: %w", req.Database, err)
 	}
 	defer closePool()
-	return planSchemas(ctx, pool, req, e.tableSizeLimit, e.tableOwner)
+	result, err := planSchemas(ctx, pool, req, e.tableSizeLimit, e.tableOwner)
+	if err != nil {
+		return nil, databaseCodeRefusal(req.Database, err)
+	}
+	return result, nil
 }
 
 // openTargetPool opens the pg-sprite pool one engine operation runs on.

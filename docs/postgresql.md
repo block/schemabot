@@ -1410,6 +1410,19 @@ needs `CREATE` on the database and a read-write connection. A role granted
 only the apply privileges fails at plan time. A foreign key in a schema file
 also needs `SELECT` on the referenced table.
 
+**Event triggers.** The scratch schema is named `pgsprite_scratch_<suffix>`.
+An event trigger that enforces DDL rules, such as requiring `CONCURRENTLY` on
+`CREATE INDEX`, fires on it too. A trigger that raises an error there refuses
+every plan, and the plan names the SQLSTATE and this prefix. Have the trigger
+skip scratch schemas:
+
+```sql
+FOR cmd IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP
+  CONTINUE WHEN cmd.schema_name LIKE 'pgsprite\_scratch\_%';
+  -- your rule
+END LOOP;
+```
+
 ## Table ownership
 
 PostgreSQL gives every table exactly one owner: a role, initially whichever

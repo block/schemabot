@@ -1907,13 +1907,15 @@ func authoredPlanFailureText(err error) (string, bool) {
 // schema as written, and only that text, without any wrap an outer caller
 // added:
 //   - the engine declining the declared schema, which describes the change to
-//     make to the schema files, from a local engine (its own text) or a remote
+//     make to the schema files or to the target, from a local engine (its own
+//     text, without the cause of a refusal SchemaBot worded itself) or a remote
 //     data plane that answered FailedPrecondition (the status message, without
 //     the "rpc error" framing);
 //   - a schema file the drop check could not parse.
 func schemaRefusalText(err error) (string, bool) {
 	if refusal, ok := errors.AsType[*engine.PlanRefusedError](err); ok {
-		return refusal.Error(), true
+		text, _ := refusal.AuthoredText()
+		return text, true
 	}
 	if grpcstatus.Code(err) == grpccodes.FailedPrecondition {
 		// Convert(err).Message() would carry the whole wrap chain for a wrapped
