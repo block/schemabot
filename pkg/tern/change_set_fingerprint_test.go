@@ -94,22 +94,25 @@ func TestChangeSetFingerprint_VSchemaChangeSplitsAGroup(t *testing.T) {
 // split them too, and keep a finalize apart from a vschema change on the same
 // namespace, so grouping never merges members the comparison would not.
 func TestChangeSetFingerprint_FinalizeRequestSplitsAGroup(t *testing.T) {
-	change := func(metadata map[string]string) ChangeSet {
-		return ChangeSet{Changes: []*ternv1.SchemaChange{{
-			Namespace:    "testapp",
-			TableChanges: []*ternv1.TableChange{protoAlterUsersEmail()},
-			Metadata:     metadata,
-		}}}
-	}
-	plain := change(nil)
-	finalize := change(map[string]string{apitypes.NeedsFinalizerMetadataKey: "true"})
-	vschema := change(map[string]string{"vschema_changed": "true"})
+	plain := alterUsersEmailWithMetadata(nil)
+	finalize := alterUsersEmailWithMetadata(map[string]string{apitypes.NeedsFinalizerMetadataKey: "true"})
+	vschema := alterUsersEmailWithMetadata(map[string]string{"vschema_changed": "true"})
 
 	assert.NotEqual(t, fingerprint(t, plain), fingerprint(t, finalize))
 	assert.NotEqual(t, fingerprint(t, vschema), fingerprint(t, finalize))
 	diff, err := CompareChangeSets(schema.DialectMySQL, plain, finalize)
 	require.NoError(t, err)
 	assert.False(t, diff.Empty(), "the comparison and the key agree that these differ")
+}
+
+// alterUsersEmailWithMetadata is a one-namespace change set adding users.email,
+// with the namespace's metadata set to the given keys.
+func alterUsersEmailWithMetadata(metadata map[string]string) ChangeSet {
+	return ChangeSet{Changes: []*ternv1.SchemaChange{{
+		Namespace:    "testapp",
+		TableChanges: []*ternv1.TableChange{protoAlterUsersEmail()},
+		Metadata:     metadata,
+	}}}
 }
 
 // The key joins fields that can each hold anything a schema author wrote, so it
@@ -179,10 +182,42 @@ func TestChangeSetFingerprint_MalformedSetHasNoKey(t *testing.T) {
 	require.Error(t, err)
 }
 
+// Work only means something under the grammar it was read with, so two change
+// sets canonicalized under different dialects were never compared and must not
+// group together however alike their DDL renders.
+func TestChangeSetFingerprint_DialectSplitsAGroup(t *testing.T) {
+	cs := protoNonShardedSet(&ternv1.TableChange{
+		TableName:  "users",
+		Ddl:        "ALTER TABLE users ADD COLUMN email varchar(255)",
+		ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+		Namespace:  "testapp",
+	})
+
+	asMySQL, err := ChangeSetFingerprint(schema.DialectMySQL, cs)
+	require.NoError(t, err)
+	asPostgres, err := ChangeSetFingerprint(schema.DialectPostgres, cs)
+	require.NoError(t, err)
+
+	assert.NotEqual(t, asMySQL, asPostgres)
+}
+
+// The zero value is a change set nothing has read, which is not the same thing
+// as a member that plans nothing. Keying the two alike would group members whose
+// plans were never canonicalized in with the members that genuinely have no work
+// to do.
+func TestCanonicalChangeSet_ZeroValueKeysApartFromAnEmptyPlan(t *testing.T) {
+	nothingToRun, err := Canonicalize(schema.DialectMySQL, ChangeSet{})
+	require.NoError(t, err)
+
+	var unread CanonicalChangeSet
+	assert.NotEqual(t, nothingToRun.Fingerprint(), unread.Fingerprint())
+}
+
 // The contract the grouping rests on: two members share a key exactly when the
 // comparison reports no difference between them. If these two ever disagree, a
 // comment would either split one plan across several blocks or render two
-// different plans as one.
+// different plans as one. It holds for both forms of each operation, because
+// both read the same canonical change set.
 func TestChangeSetFingerprint_AgreesWithCompareChangeSets(t *testing.T) {
 	restyled := protoNonShardedSet(&ternv1.TableChange{
 		TableName:  "users",
@@ -203,6 +238,9 @@ func TestChangeSetFingerprint_AgreesWithCompareChangeSets(t *testing.T) {
 		{"extra change", protoNonShardedSet(protoAlterUsersEmail()), protoNonShardedSet(protoAlterUsersEmail(), protoAlterUsersPhone())},
 		{"different DDL", protoNonShardedSet(protoAlterUsersEmail()), protoNonShardedSet(protoAlterUsersPhone())},
 		{"duplicated change", protoNonShardedSet(protoAlterUsersEmail()), protoNonShardedSet(protoAlterUsersEmail(), protoAlterUsersEmail())},
+		{"vschema change on one side", alterUsersEmailWithMetadata(nil), alterUsersEmailWithMetadata(map[string]string{"vschema_changed": "true"})},
+		{"finalize on one side", alterUsersEmailWithMetadata(nil), alterUsersEmailWithMetadata(map[string]string{apitypes.NeedsFinalizerMetadataKey: "true"})},
+		{"finalize on both sides", alterUsersEmailWithMetadata(map[string]string{apitypes.NeedsFinalizerMetadataKey: "true"}), alterUsersEmailWithMetadata(map[string]string{apitypes.NeedsFinalizerMetadataKey: "true"})},
 	}
 
 	for _, tc := range cases {
@@ -211,6 +249,16 @@ func TestChangeSetFingerprint_AgreesWithCompareChangeSets(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, diff.Empty(), fingerprint(t, tc.baseline) == fingerprint(t, tc.candidate),
 				"fingerprint equality must agree with the comparison; diff: %+v", diff)
+
+			baseline, err := Canonicalize(schema.DialectMySQL, tc.baseline)
+			require.NoError(t, err)
+			candidate, err := Canonicalize(schema.DialectMySQL, tc.candidate)
+			require.NoError(t, err)
+			canonicalDiff, err := baseline.CompareTo(candidate)
+			require.NoError(t, err)
+			assert.Equal(t, canonicalDiff.Empty(), baseline.Fingerprint() == candidate.Fingerprint(),
+				"the value form must agree with itself; diff: %+v", canonicalDiff)
+			assert.Equal(t, diff, canonicalDiff, "the value form must agree with the one-shot comparison")
 		})
 	}
 }
