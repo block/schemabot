@@ -901,6 +901,7 @@ func blockMissingPrivilegesWithCheck(ctx context.Context, pool *pgxpool.Pool, da
 			// failure is not a fact about the target at all.
 			switch {
 			case r != nil && r.provisionable:
+				logFailedPrivilegeCheck(database, report, tier, err)
 				appendBlockedCauseAtTier(changes, tiers, tier, r.detail)
 			case r != nil:
 				slog.Warn("PostgreSQL privilege check refused the table; existing blocked plan verdicts remain unchanged",
@@ -925,6 +926,7 @@ func blockMissingPrivilegesWithCheck(ctx context.Context, pool *pgxpool.Pool, da
 		if errors.As(err, &privilegeErr) {
 			// Missing access is a property of this tier alone: steps at the
 			// other tiers keep their own verdicts, from their own checks.
+			logFailedPrivilegeCheck(database, report, tier, err)
 			blockChangesAtTier(changes, tiers, tier, r.detail)
 			continue
 		}
@@ -1366,6 +1368,19 @@ func blockExecutableChanges(changes []engine.TableChange, reason string) {
 			changes[i].ModeReason = reason
 		}
 	}
+}
+
+// logFailedPrivilegeCheck records what a refusal that names something to
+// provision found missing. The refusal shows the grant to run, not the
+// catalog check behind it, so when an operator runs the grant and the next
+// plan refuses again, this line names the check that still failed.
+func logFailedPrivilegeCheck(database string, report pgplan.Report, tier preflight.Tier, err error) {
+	attrs := []any{"database", database, "namespace", report.Schema, "table", report.Table, "tier", tier}
+	if privilegeErr, ok := errors.AsType[*preflight.PrivilegeError](err); ok {
+		slog.Info("PostgreSQL plan blocked: the engine role lacks access the plan needs", append(attrs, "check", privilegeErr.Check)...)
+		return
+	}
+	slog.Info("PostgreSQL plan blocked: the target lacks something the plan needs", append(attrs, "error", err)...)
 }
 
 // blockChangesAtTier marks every still-executable change whose step requires

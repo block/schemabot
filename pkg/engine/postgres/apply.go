@@ -1092,6 +1092,18 @@ func committedCreatePrefixDetail(err error, table string) (string, bool) {
 	return sanitizeReasonText(detail), true
 }
 
+// privilegeRemedy is the statement that provisions the access a privilege
+// refusal names, with the refusal's hint. The catalog check that failed is
+// how the engine proved the access missing, not something the reader runs,
+// so it is left out.
+func privilegeRemedy(err *preflight.PrivilegeError) string {
+	remedy := "provision with: " + err.Grant
+	if err.Hint != "" {
+		remedy += "; " + err.Hint
+	}
+	return remedy
+}
+
 // refusalForCause holds classifyRefusal's cause-to-refusal mapping; causes
 // and remedies leave unsanitized and classifyRefusal sanitizes the composed
 // detail at its return.
@@ -1110,13 +1122,9 @@ func refusalForCause(err error, table string) *refusal {
 			// would send them hunting for an object the target lacks.
 			object = "in the schema that would hold table " + quotedTable(table)
 		}
-		remedy := fmt.Sprintf("provision with: %s (verified by: %s)", privilegeErr.Grant, privilegeErr.Check)
-		if privilegeErr.Hint != "" {
-			remedy += "; " + privilegeErr.Hint
-		}
 		return &refusal{reason: "insufficient-privileges",
 			cause:         fmt.Sprintf("the engine role lacks access for %s %s", privilegeErr.Tier, object),
-			remedy:        remedy,
+			remedy:        privilegeRemedy(privilegeErr),
 			provisionable: true}
 	}
 	// An invalid-index verdict is decided by its own code, never by the build

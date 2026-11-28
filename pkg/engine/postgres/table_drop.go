@@ -345,11 +345,7 @@ func dependentsDropReason(dependents []string) string {
 }
 
 func privilegeDropReason(err *preflight.PrivilegeError) string {
-	reason := fmt.Sprintf("the engine role cannot drop it, because only the table's owner can drop a table — provision with: %s (verified by: %s)", err.Grant, err.Check)
-	if err.Hint != "" {
-		reason += "; " + err.Hint
-	}
-	return reason
+	return "the engine role cannot drop it, because only the table's owner can drop a table — " + privilegeRemedy(err)
 }
 
 // tableDropRefusals reads the reasons the target already gives to refuse
@@ -367,6 +363,10 @@ func tableDropRefusals(ctx context.Context, pool *pgxpool.Pool, namespace, table
 	}
 	_, err = preflight.CheckPrivileges(ctx, pool, namespace, table, preflight.Requirement{Tier: tableDropTier})
 	if privilegeErr, ok := errors.AsType[*preflight.PrivilegeError](err); ok {
+		slog.Info("PostgreSQL table drop refused: the engine role cannot drop the table",
+			"namespace", namespace,
+			"table", table,
+			"check", privilegeErr.Check)
 		reasons = append(reasons, privilegeDropReason(privilegeErr))
 	} else if err != nil {
 		return nil, fmt.Errorf("check the privileges to drop table %q: %w", table, err)
