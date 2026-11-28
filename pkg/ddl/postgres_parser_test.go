@@ -817,6 +817,122 @@ func TestPostgresAddColumnManualReason(t *testing.T) {
 			columnName: "external_id",
 			wantReason: "volatility cannot be proven",
 		},
+		{
+			name:       "pg_catalog now default",
+			createDDL:  "CREATE TABLE applies (id bigint, created_at timestamptz DEFAULT pg_catalog.now() NOT NULL)",
+			columnName: "created_at",
+		},
+		{
+			name:       "pg_catalog transaction_timestamp default",
+			createDDL:  "CREATE TABLE applies (id bigint, created_at timestamptz DEFAULT pg_catalog.transaction_timestamp())",
+			columnName: "created_at",
+		},
+		{
+			name:       "pg_catalog statement_timestamp default",
+			createDDL:  "CREATE TABLE applies (id bigint, created_at timestamptz DEFAULT pg_catalog.statement_timestamp())",
+			columnName: "created_at",
+		},
+		{
+			name:       "typecast pg_catalog now default",
+			createDDL:  "CREATE TABLE applies (id bigint, created_at timestamptz DEFAULT pg_catalog.now()::timestamptz)",
+			columnName: "created_at",
+		},
+		{
+			// An unqualified call resolves through search_path when the ALTER
+			// runs, so a user function named now() could shadow the built-in.
+			name:       "unqualified now default",
+			createDDL:  "CREATE TABLE applies (id bigint, created_at timestamptz DEFAULT now() NOT NULL)",
+			columnName: "created_at",
+			wantReason: "volatility cannot be proven",
+		},
+		{
+			name:       "unqualified transaction_timestamp default",
+			createDDL:  "CREATE TABLE applies (id bigint, created_at timestamptz DEFAULT transaction_timestamp())",
+			columnName: "created_at",
+			wantReason: "volatility cannot be proven",
+		},
+		{
+			name:       "unqualified statement_timestamp default",
+			createDDL:  "CREATE TABLE applies (id bigint, created_at timestamptz DEFAULT statement_timestamp())",
+			columnName: "created_at",
+			wantReason: "volatility cannot be proven",
+		},
+		{
+			name:       "typecast unqualified now default",
+			createDDL:  "CREATE TABLE applies (id bigint, created_at timestamptz DEFAULT now()::timestamptz)",
+			columnName: "created_at",
+			wantReason: "volatility cannot be proven",
+		},
+		{
+			name:       "pg_catalog now default called with a star",
+			createDDL:  "CREATE TABLE applies (id bigint, created_at timestamptz DEFAULT pg_catalog.now(*))",
+			columnName: "created_at",
+			wantReason: "volatility cannot be proven",
+		},
+		{
+			name:       "pg_catalog now default with an argument",
+			createDDL:  "CREATE TABLE applies (id bigint, created_at timestamptz DEFAULT pg_catalog.now(1))",
+			columnName: "created_at",
+			wantReason: "volatility cannot be proven",
+		},
+		{
+			name:       "other schema now default",
+			createDDL:  "CREATE TABLE applies (id bigint, created_at timestamptz DEFAULT myschema.now())",
+			columnName: "created_at",
+			wantReason: "volatility cannot be proven",
+		},
+		{
+			name:       "window pg_catalog now default",
+			createDDL:  "CREATE TABLE applies (id bigint, created_at timestamptz DEFAULT pg_catalog.now() OVER ())",
+			columnName: "created_at",
+			wantReason: "volatility cannot be proven",
+		},
+		{
+			name:       "filtered pg_catalog now default",
+			createDDL:  "CREATE TABLE applies (id bigint, created_at timestamptz DEFAULT pg_catalog.now() FILTER (WHERE true))",
+			columnName: "created_at",
+			wantReason: "volatility cannot be proven",
+		},
+		{
+			name:       "pg_catalog clock_timestamp default",
+			createDDL:  "CREATE TABLE applies (id bigint, created_at timestamptz DEFAULT pg_catalog.clock_timestamp())",
+			columnName: "created_at",
+			wantReason: "volatility cannot be proven",
+		},
+		{
+			// A cast to a user type may run a VOLATILE cast function, which
+			// PostgreSQL evaluates for every existing row.
+			name:       "pg_catalog now default cast to a user type",
+			createDDL:  "CREATE TABLE applies (id bigint, created_at app.event_time DEFAULT pg_catalog.now()::app.event_time)",
+			columnName: "created_at",
+			wantReason: "volatility cannot be proven",
+		},
+		{
+			// The conversion into the column's user type is implicit, and as
+			// unproven as an explicit cast.
+			name:       "pg_catalog now default on a user-typed column",
+			createDDL:  "CREATE TABLE applies (id bigint, created_at app.event_time DEFAULT pg_catalog.now())",
+			columnName: "created_at",
+			wantReason: "volatility cannot be proven",
+		},
+		{
+			name:       "current_timestamp default on a user-typed column",
+			createDDL:  "CREATE TABLE applies (id bigint, created_at app.event_time DEFAULT CURRENT_TIMESTAMP)",
+			columnName: "created_at",
+			wantReason: "volatility cannot be proven",
+		},
+		{
+			name:       "random default",
+			createDDL:  "CREATE TABLE applies (id bigint, jitter float8 DEFAULT pg_catalog.random())",
+			columnName: "jitter",
+			wantReason: "volatility cannot be proven",
+		},
+		{
+			name:       "count star default",
+			createDDL:  "CREATE TABLE applies (id bigint, n bigint DEFAULT pg_catalog.count(*))",
+			columnName: "n",
+			wantReason: "volatility cannot be proven",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -993,11 +1109,15 @@ func TestPostgresCostScalesWithTableSize(t *testing.T) {
 		{"add column only", `ALTER TABLE mutes ADD COLUMN reason varchar(255)`, false},
 		{"add column with constant default", `ALTER TABLE mutes ADD COLUMN state text DEFAULT 'active'`, false},
 		{"add column with cast constant default", `ALTER TABLE mutes ADD COLUMN payload jsonb DEFAULT '{}'::jsonb`, false},
-		{"add column with current_timestamp default", `ALTER TABLE mutes ADD COLUMN created_at timestamptz DEFAULT CURRENT_TIMESTAMP`, false},
-		{"add not null column with current_date default", `ALTER TABLE mutes ADD COLUMN day date NOT NULL DEFAULT CURRENT_DATE`, false},
-		{"add column with cast current_timestamp default", `ALTER TABLE mutes ADD COLUMN day date DEFAULT CURRENT_TIMESTAMP::date`, false},
-		{"add column with precision localtimestamp default", `ALTER TABLE mutes ADD COLUMN seen_at timestamp DEFAULT LOCALTIMESTAMP(3)`, false},
-		{"add column with function call default", `ALTER TABLE mutes ADD COLUMN created_at timestamptz DEFAULT now()`, true},
+		{"add column with current_timestamp default", `ALTER TABLE mutes ADD COLUMN created_at timestamptz DEFAULT CURRENT_TIMESTAMP`, true},
+		{"add not null column with current_date default", `ALTER TABLE mutes ADD COLUMN day date NOT NULL DEFAULT CURRENT_DATE`, true},
+		{"add column with cast current_timestamp default", `ALTER TABLE mutes ADD COLUMN day date DEFAULT CURRENT_TIMESTAMP::date`, true},
+		{"add column with precision localtimestamp default", `ALTER TABLE mutes ADD COLUMN seen_at timestamp DEFAULT LOCALTIMESTAMP(3)`, true},
+		{"add column with now default", `ALTER TABLE mutes ADD COLUMN created_at timestamptz DEFAULT now()`, true},
+		{"add column with pg_catalog now default", `ALTER TABLE mutes ADD COLUMN created_at timestamptz DEFAULT pg_catalog.now()`, true},
+		{"add column with cast pg_catalog now default", `ALTER TABLE mutes ADD COLUMN day date DEFAULT pg_catalog.now()::date`, true},
+		{"add enum column with a string default", `ALTER TABLE mutes ADD COLUMN status app.mute_status DEFAULT 'active'`, false},
+		{"add enum column with a cast string default", `ALTER TABLE mutes ADD COLUMN status app.mute_status DEFAULT 'active'::app.mute_status`, false},
 		{"add column with cast volatile function default", `ALTER TABLE mutes ADD COLUMN token text DEFAULT gen_random_uuid()::text`, true},
 		{"drop column", `ALTER TABLE mutes DROP COLUMN reason`, false},
 		{"set default", `ALTER TABLE mutes ALTER COLUMN count SET DEFAULT 0`, false},
