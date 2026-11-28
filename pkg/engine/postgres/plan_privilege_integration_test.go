@@ -73,8 +73,7 @@ func TestEnginePlanRefusesWhatThePlanningRoleCannotRead(t *testing.T) {
 			"orders.sql": "CREATE TABLE orders (id bigint PRIMARY KEY, customer_id bigint REFERENCES customers (id))",
 		}}})
 		assert.True(t, engine.IsPlanRefused(err), "%v", err)
-		assert.Contains(t, err.Error(), `plan PostgreSQL schema in "public"/"orders.sql": `)
-		assert.Contains(t, err.Error(), "; grant the planning role SELECT on the referenced table, then re-plan")
+		assert.EqualError(t, err, `grant SchemaBot's role SELECT on the table a foreign key references, then re-plan: permission denied for table customers (SQLSTATE 42501; file "public"/"orders.sql")`)
 	})
 
 	t.Run("a database the role cannot create the scratch schema in", func(t *testing.T) {

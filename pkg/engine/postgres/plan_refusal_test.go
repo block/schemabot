@@ -96,8 +96,6 @@ func TestPlannerRefusalTypesOnlyPlannerDeclines(t *testing.T) {
 		statement.ErrEnumLabel,
 		schemadiff.ErrUnsupportedChange,
 		schemadiff.ErrReferencedTableNotFound,
-		schemadiff.ErrReferencedTableNotReadable,
-		schemadiff.ErrReferencedTableNotReferenceable,
 		schemadiff.ErrDesiredPartitionOf,
 		schemadiff.ErrDesiredInherits,
 		schemadiff.ErrDesiredConstraintMerged,
@@ -163,6 +161,24 @@ func TestPlannerRefusalNamesTheGrantAPlanNeeds(t *testing.T) {
 		assert.True(t, engine.IsPlanRefused(err))
 		assert.ErrorIs(t, err, denied)
 		assert.EqualError(t, err, `grant SchemaBot's role the privilege this error names, then re-plan: permission denied for schema billing (SQLSTATE 42501; file "billing"/"invoices.sql")`)
+	})
+
+	t.Run("a referenced table the role cannot read", func(t *testing.T) {
+		denied := &pgconn.PgError{Severity: "ERROR", Code: "42501", Message: "permission denied for table customers"}
+		cause := fmt.Errorf(`plan PostgreSQL table "orders": %w`, fmt.Errorf("%w: public.customers: %w", schemadiff.ErrReferencedTableNotReadable, denied))
+		err := plannerRefusal("public", "orders.sql", cause)
+		assert.True(t, engine.IsPlanRefused(err))
+		assert.ErrorIs(t, err, schemadiff.ErrReferencedTableNotReadable)
+		assert.EqualError(t, err, `grant SchemaBot's role SELECT on the table a foreign key references, then re-plan: permission denied for table customers (SQLSTATE 42501; file "public"/"orders.sql")`)
+	})
+
+	t.Run("a referenced table the role cannot reference", func(t *testing.T) {
+		cause := fmt.Errorf(`plan PostgreSQL table "orders": %w`, fmt.Errorf("%w: public.customers(id)", schemadiff.ErrReferencedTableNotReferenceable))
+		err := plannerRefusal("public", "orders.sql", cause)
+		assert.True(t, engine.IsPlanRefused(err))
+		assert.ErrorIs(t, err, schemadiff.ErrReferencedTableNotReferenceable)
+		assert.EqualError(t, err, `grant SchemaBot's role REFERENCES on the table a foreign key references, then re-plan: `+
+			`planning role lacks REFERENCES on a table a foreign key references: public.customers(id) (file "public"/"orders.sql")`)
 	})
 
 	t.Run("a connection refused for a privilege shows the server's message alone", func(t *testing.T) {

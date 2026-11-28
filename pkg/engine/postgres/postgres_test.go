@@ -393,10 +393,11 @@ func TestExecutionVerdictGeneratedExpressionChange(t *testing.T) {
 	}, "events", nil))
 }
 
-// A foreign key the planner cannot bind fails the plan with the fix appended:
-// the referenced table must already exist on the target, and the planning
-// role must be able to read and reference it. The remedy matches through wrapping, and any
-// other failure gets none.
+// A foreign key that references a table the target does not have fails the
+// plan with the fix appended: the referenced table must already exist on the
+// target. The remedy matches through wrapping, and any other failure gets
+// none, a referenced table the planning role cannot read or reference
+// included, since that refusal leads with its grant.
 func TestReferencedTableRemedy(t *testing.T) {
 	for _, tt := range []struct {
 		name string
@@ -405,10 +406,8 @@ func TestReferencedTableRemedy(t *testing.T) {
 	}{
 		{"not found", fmt.Errorf("plan: %w: public.customers", schemadiff.ErrReferencedTableNotFound),
 			"; a foreign key can reference only a table that already exists on the target, so apply the referenced table first, then add the foreign key to the file in a later change"},
-		{"not readable", fmt.Errorf("plan: %w: public.customers", schemadiff.ErrReferencedTableNotReadable),
-			"; grant the planning role SELECT on the referenced table, then re-plan"},
-		{"not referenceable", fmt.Errorf("plan: %w: public.customers", schemadiff.ErrReferencedTableNotReferenceable),
-			"; grant the planning role REFERENCES on the referenced table, then re-plan"},
+		{"not readable", fmt.Errorf("plan: %w: public.customers", schemadiff.ErrReferencedTableNotReadable), ""},
+		{"not referenceable", fmt.Errorf("plan: %w: public.customers", schemadiff.ErrReferencedTableNotReferenceable), ""},
 		{"other failure", errors.New("connection reset"), ""},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

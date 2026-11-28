@@ -130,8 +130,6 @@ func plannerRefusal(namespace, filename string, err error) error {
 		errors.Is(err, schemadiff.ErrExpressionUnsettled),
 		errors.Is(err, schemadiff.ErrUnsupportedChange),
 		errors.Is(err, schemadiff.ErrReferencedTableNotFound),
-		errors.Is(err, schemadiff.ErrReferencedTableNotReadable),
-		errors.Is(err, schemadiff.ErrReferencedTableNotReferenceable),
 		errors.Is(err, executor.ErrPolicyRecursion),
 		errors.As(err, new(*removedRowSecurityError)):
 		return &engine.PlanRefusedError{Err: wrapped}
@@ -168,7 +166,13 @@ func (e *planningPrivilegeError) Unwrap() error { return e.err }
 // not show. The full chain goes to the server log.
 func planningPrivilegeRefusal(namespace, filename string, wrapped error) *planningPrivilegeError {
 	var text string
-	if privilege, ok := errors.AsType[*preflight.PrivilegeError](wrapped); ok {
+	if ref, ok := referencedTablePrivilege(wrapped); ok {
+		text = fmt.Sprintf("grant SchemaBot's role %s on the table a foreign key references, then re-plan: %s (", ref.privilege, ref.message)
+		if ref.sqlstate != "" {
+			text += "SQLSTATE " + ref.sqlstate + "; "
+		}
+		text += fmt.Sprintf("file %q/%q)", namespace, filename)
+	} else if privilege, ok := errors.AsType[*preflight.PrivilegeError](wrapped); ok {
 		text = "grant SchemaBot's role the privilege planning needs, then re-plan: " + privilege.Grant
 		if privilege.Hint != "" {
 			text += "; " + privilege.Hint
@@ -186,20 +190,56 @@ func planningPrivilegeRefusal(namespace, filename string, wrapped error) *planni
 	return &planningPrivilegeError{text: text, err: wrapped}
 }
 
-// referencedTableRemedy names the fix for a foreign key the planner cannot
-// bind. The planner copies each referenced table's shape from the live
-// database, so the referenced table must already exist on the target: a
-// schema file that creates it in the same plan does not help. The planning
-// role must also hold SELECT and REFERENCES on it. It returns an empty
-// string for every other failure.
-func referencedTableRemedy(err error) string {
+// referencedTableGrant is a privilege the planning role lacks on a table a
+// foreign key references, with the message that names the table.
+type referencedTableGrant struct {
+	// privilege is SELECT or REFERENCES.
+	privilege string
+	// message is the server's when the server refused the read, and
+	// pg-sprite's own error otherwise, without the context the engine
+	// wrapped around it.
+	message string
+	// sqlstate is the server's code, empty when pg-sprite checked the
+	// privilege itself.
+	sqlstate string
+}
+
+// referencedTablePrivilege returns the grant a foreign key's referenced table
+// needs, and false for any other failure.
+func referencedTablePrivilege(err error) (referencedTableGrant, bool) {
 	switch {
-	case errors.Is(err, schemadiff.ErrReferencedTableNotFound):
-		return "; a foreign key can reference only a table that already exists on the target, so apply the referenced table first, then add the foreign key to the file in a later change"
 	case errors.Is(err, schemadiff.ErrReferencedTableNotReadable):
-		return "; grant the planning role SELECT on the referenced table, then re-plan"
+		if denied, ok := errors.AsType[*pgconn.PgError](err); ok {
+			return referencedTableGrant{privilege: "SELECT", message: denied.Message, sqlstate: denied.Code}, true
+		}
+		return referencedTableGrant{privilege: "SELECT", message: sentinelCause(err, schemadiff.ErrReferencedTableNotReadable).Error()}, true
 	case errors.Is(err, schemadiff.ErrReferencedTableNotReferenceable):
-		return "; grant the planning role REFERENCES on the referenced table, then re-plan"
+		return referencedTableGrant{privilege: "REFERENCES", message: sentinelCause(err, schemadiff.ErrReferencedTableNotReferenceable).Error()}, true
+	}
+	return referencedTableGrant{}, false
+}
+
+// sentinelCause returns the error in err's chain that wraps sentinel most
+// directly: the error the planner returned, carrying its detail, with none of
+// the context the engine wrapped around it.
+func sentinelCause(err, sentinel error) error {
+	cause := err
+	for next := errors.Unwrap(cause); next != nil && !errors.Is(next, sentinel) && errors.Is(next, sentinel); next = errors.Unwrap(cause) {
+		cause = next
+	}
+	return cause
+}
+
+// referencedTableRemedy names the fix for a foreign key that references a
+// table the target does not have. The planner copies each referenced table's
+// shape from the live database, so the referenced table must already exist on
+// the target: a schema file that creates it in the same plan does not help. It
+// returns an empty string for every other failure; a referenced table the
+// planning role cannot read or reference is a planning privilege refusal,
+// which leads with the grant (see planningPrivilegeRefusal).
+func referencedTableRemedy(err error) string {
+	if errors.Is(err, schemadiff.ErrReferencedTableNotFound) {
+		return "; a foreign key can reference only a table that already exists on the target, so apply the referenced table first, then add the foreign key to the file in a later change"
 	}
 	return ""
 }
