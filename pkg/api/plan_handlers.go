@@ -1696,7 +1696,11 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, applyStorageFailedMessage(req.PlanID))
 			return
 		}
-		s.logger.Error("apply failed", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
+		attrs := []any{"plan_id", req.PlanID}
+		if planErr, ok := errors.AsType[*applyPlanError](err); ok {
+			attrs = planErr.LogAttrs()
+		}
+		s.logger.Error("apply failed", append(attrs, "environment", req.Environment, "error", err)...)
 		s.writeError(w, http.StatusInternalServerError, applyFailureMessage(req.PlanID, err))
 		return
 	}
@@ -2147,9 +2151,44 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 		return nil, 0, err
 	}
 	if err := s.authorizeStoredPlanSource(ctx, span, plan, req); err != nil {
-		return nil, 0, err
+		return nil, 0, &applyPlanError{Plan: plan, Err: err}
 	}
-	return s.queueValidatedApply(ctx, span, plan, req)
+	resp, storedApplyID, err := s.queueValidatedApply(ctx, span, plan, req)
+	if err != nil {
+		return nil, 0, &applyPlanError{Plan: plan, Err: err}
+	}
+	return resp, storedApplyID, nil
+}
+
+// applyPlanError carries the stored plan an apply failed for once the plan
+// loaded, so a caller's failure log can name the database and deployment
+// without reading the plan again. It reads and matches exactly as its cause
+// does, so every refusal keeps its own text and handling.
+type applyPlanError struct {
+	Plan *storage.Plan
+	Err  error
+}
+
+func (e *applyPlanError) Error() string { return e.Err.Error() }
+
+func (e *applyPlanError) Unwrap() error { return e.Err }
+
+// LogAttrs returns the plan's identity, routing, and PR provenance. Append
+// call-specific attributes after it.
+func (e *applyPlanError) LogAttrs() []any {
+	attrs := []any{
+		"plan_id", e.Plan.PlanIdentifier,
+		"database", e.Plan.Database,
+		"database_type", e.Plan.DatabaseType,
+		"deployment", e.Plan.Deployment,
+	}
+	if e.Plan.Repository != "" {
+		attrs = append(attrs, "repo", e.Plan.Repository)
+	}
+	if e.Plan.PullRequest > 0 {
+		attrs = append(attrs, "pr", e.Plan.PullRequest)
+	}
+	return attrs
 }
 
 // EnqueueAuthorizedApply queues an apply for a stored plan without evaluating

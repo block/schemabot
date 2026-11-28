@@ -111,6 +111,7 @@ var unmarkedErrorTypes = map[string]string{
 	"storageSchemaTargetError":         "text carries the target's error",
 	"webhookOpsRequestError":           "text carries the wrapped request error",
 	"blockedPlanError":                 "text is the cause's text",
+	"applyPlanError":                   "text is the cause's text",
 
 	// The webhook renders each of these with a template of its own.
 	"ChangeGateRefusedError":          "rendered by the change gate refusal comment",
@@ -137,6 +138,7 @@ var unmarkedErrorTypes = map[string]string{
 	"RolloutRollbackUnsupportedError": "answers a rollback",
 	"RolloutUnrenderedError":          "answers POST /api/plan, which the webhook does not call",
 	"terminalControlError":            "answers a control request",
+	"RepoGitHubAppNotConfiguredError": "answers a webhook delivery or a webhook operator request, which names it in a message of its own",
 	"controlOperationHTTPError":       "answers a control request",
 }
 

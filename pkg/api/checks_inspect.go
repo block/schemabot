@@ -42,11 +42,11 @@ type InspectedCheckRun = apitypes.InspectedCheckRun
 func (s *Service) handleChecksInspect(w http.ResponseWriter, r *http.Request) {
 	req, err := checksInspectRequestFromQuery(r.URL.Query())
 	if err != nil {
-		s.writeWebhookOpsError(w, err)
+		s.writeWebhookOpsError(w, "checks_inspect", req.Repo, err, "pr", req.PullRequest, "environment", req.Environment)
 		return
 	}
 	if err := validateChecksInspectRequest(s.config, req); err != nil {
-		s.writeWebhookOpsError(w, err)
+		s.writeWebhookOpsError(w, "checks_inspect", req.Repo, err, "pr", req.PullRequest, "environment", req.Environment)
 		return
 	}
 	if !s.checkChecksInspectCallerBudget(w, r, req) {
@@ -60,7 +60,7 @@ func (s *Service) handleChecksInspect(w http.ResponseWriter, r *http.Request) {
 	}
 	response, err := executeChecksInspectWith(ctx, s.config, s.storage, req, s.logger, resolve)
 	if err != nil {
-		s.writeWebhookOpsError(w, err)
+		s.writeWebhookOpsError(w, "checks_inspect", req.Repo, err, "pr", req.PullRequest, "environment", req.Environment)
 		return
 	}
 	s.writeJSON(w, http.StatusOK, response)
@@ -177,6 +177,12 @@ func inspectChecks(ctx context.Context, cfg *ServerConfig, store storage.Storage
 	// against, and a second read could disagree with the first and make two
 	// rows in one response answer different questions.
 	prInfo, err := client.FetchPullRequestNoCache(ctx, req.Repo, req.PullRequest)
+	if ghclient.IsNotFoundError(err) {
+		// The installation already resolved for this repository, so GitHub's
+		// 404 is about the number: most often a typo the operator corrects.
+		return nil, fmt.Errorf("read head commit for %s#%d: %w: %w", req.Repo, req.PullRequest,
+			operatorMessagef("GitHub has no pull request #%d in this repository. Check the pull request number.", req.PullRequest), err)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("read head commit for %s#%d: %w", req.Repo, req.PullRequest, err)
 	}

@@ -369,10 +369,14 @@ func TestApplyFailureKeepsReplanTextWhenPlanMemberDiffers(t *testing.T) {
 
 // An apply that fails inside SchemaBot answers 500 with a fixed message that
 // names the plan and says the apply may already be recorded. The cause stays
-// in the server log with the plan and environment.
+// in the server log with the plan, the environment, and the database and
+// deployment the plan routes to, so the line answers where the apply was
+// headed without a plan lookup.
 func TestHandleApplyAnswersFixedMessageWhenApplyFails(t *testing.T) {
 	plan := executeApplyTestPlan()
 	plan.Deployment = "user:pass@10.0.0.5:3306"
+	plan.Repository = "acme/web"
+	plan.PullRequest = 42
 	svc, _ := newQueueApplyTestService(plan, &mockTernClient{}, &capturingApplyStore{})
 	logs := captureServiceLogs(svc)
 
@@ -386,7 +390,36 @@ func TestHandleApplyAnswersFixedMessageWhenApplyFails(t *testing.T) {
 	line := requireLogLine(t, decodeLogLines(t, logs.Bytes()), "apply failed")
 	assert.Equal(t, "plan-1", line["plan_id"])
 	assert.Equal(t, "staging", line["environment"])
+	assert.Equal(t, "testdb", line["database"])
+	assert.Equal(t, "user:pass@10.0.0.5:3306", line["deployment"])
+	assert.Equal(t, "acme/web", line["repo"])
+	assert.InDelta(t, 42, line["pr"], 0)
 	assert.Contains(t, line["error"], "user:pass")
+}
+
+// An apply refused by its plan's source policy comes back with the stored plan
+// attached, so a caller logging the refusal names the database, deployment,
+// repository, and pull request without reading the plan again. The refusal
+// still matches as itself, so it keeps its own status and text.
+func TestExecuteApplyAttachesThePlanToASourcePolicyRefusal(t *testing.T) {
+	plan := executeApplyTestPlan()
+	plan.Repository = "acme/web"
+	plan.PullRequest = 42
+	plan.SchemaPath = "schema/testdb"
+	svc, _ := newQueueApplyTestService(plan, &mockTernClient{}, &capturingApplyStore{})
+	db := svc.config.Databases["testdb"]
+	db.AllowedRepos = []string{"acme/schema"}
+	svc.config.Databases["testdb"] = db
+
+	_, _, err := svc.ExecuteApply(t.Context(), ApplyRequest{PlanID: "plan-1", Environment: "staging"})
+
+	require.ErrorAs(t, err, new(*SourcePolicyError))
+	planErr, ok := errors.AsType[*applyPlanError](err)
+	require.True(t, ok, "the refusal carries the plan it refused: %v", err)
+	assert.Equal(t, []any{
+		"plan_id", "plan-1", "database", "testdb", "database_type", storage.DatabaseTypeMySQL,
+		"deployment", DefaultDeployment, "repo", "acme/web", "pr", 42,
+	}, planErr.LogAttrs())
 }
 
 // A failure SchemaBot wrote for the reader keeps its text, and an outer wrap
