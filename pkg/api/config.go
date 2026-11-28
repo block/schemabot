@@ -237,6 +237,11 @@ type ServerConfig struct {
 	// reclaims them. It is off by default.
 	BranchReconcile BranchReconcileConfig `yaml:"branch_reconcile,omitempty"`
 
+	// StorageRetention configures the background pass that deletes old rows
+	// from SchemaBot's own storage tables. It is off by default, and when
+	// enabled it only logs what it would delete until dry_run is set false.
+	StorageRetention StorageRetentionConfig `yaml:"storage_retention,omitempty"`
+
 	// Spirit overrides the Spirit engine's default run settings for every
 	// MySQL database this server drives directly. Unset fields keep the
 	// engine defaults (see pkg/engine/spirit), so the block is only needed
@@ -406,6 +411,131 @@ func (c *ServerConfig) BranchReconcileGrace() (time.Duration, error) {
 	}
 	if d <= 0 {
 		return 0, fmt.Errorf("branch_reconcile.grace must be positive, got %q", c.BranchReconcile.Grace)
+	}
+	return d, nil
+}
+
+// StorageRetentionConfig configures the pass that deletes old rows from
+// SchemaBot's own storage tables. Each table has its own retention key so a
+// table can be added later without renaming any key that exists today.
+type StorageRetentionConfig struct {
+	// Enabled starts the pass with the operator. Defaults to false, because a
+	// deleted row cannot be recovered and existing deployments keep every row
+	// today.
+	Enabled bool `yaml:"enabled,omitempty"`
+
+	// DryRun makes an enabled pass count the rows it would delete and log the
+	// count without deleting any. Defaults to true (nil = dry run), so turning
+	// the pass on never deletes anything until the operator has read what a
+	// pass would remove and sets this to false.
+	DryRun *bool `yaml:"dry_run,omitempty"`
+
+	// Interval is how often the pass runs, as a Go duration string (e.g. "1h").
+	// Defaults to one hour.
+	Interval string `yaml:"interval,omitempty"`
+
+	// BatchSize is how many rows one delete statement removes. Defaults to 500
+	// and may not exceed MaxStorageRetentionBatchSize.
+	BatchSize int `yaml:"batch_size,omitempty"`
+
+	// WebhookEvents is how long a finished row stays in the webhook inbox, as a
+	// Go duration string (e.g. "168h"). Defaults to 7 days. It may not be
+	// shorter than the webhook reconcile window; see serve.Build.
+	WebhookEvents string `yaml:"webhook_events,omitempty"`
+}
+
+const (
+	// DefaultStorageRetentionInterval is how often the storage retention pass
+	// runs when storage_retention.interval is not set. Retention is not
+	// latency-sensitive, so a slow cadence loses nothing.
+	DefaultStorageRetentionInterval = 1 * time.Hour
+
+	// DefaultStorageRetentionBatchSize is how many rows one delete removes when
+	// storage_retention.batch_size is not set.
+	DefaultStorageRetentionBatchSize = 500
+
+	// MaxStorageRetentionBatchSize bounds storage_retention.batch_size. A
+	// batch is deleted by primary key, so its size is the length of the IN
+	// list in one statement.
+	MaxStorageRetentionBatchSize = 5000
+
+	// DefaultStorageRetentionWebhookEvents is how long a finished webhook inbox
+	// row is kept when storage_retention.webhook_events is not set.
+	DefaultStorageRetentionWebhookEvents = 7 * 24 * time.Hour
+)
+
+// StorageRetentionEnabled reports whether this process should run the storage
+// retention pass. Defaults to false when not configured.
+func (c *ServerConfig) StorageRetentionEnabled() bool {
+	return c.StorageRetention.Enabled
+}
+
+// StorageRetentionDryRun reports whether the storage retention pass only counts
+// what it would delete. Defaults to true when not configured.
+func (c *ServerConfig) StorageRetentionDryRun() bool {
+	return c.StorageRetention.DryRun == nil || *c.StorageRetention.DryRun
+}
+
+// StorageRetentionInterval returns how often the storage retention pass runs,
+// falling back to the default when not configured.
+func (c *ServerConfig) StorageRetentionInterval() (time.Duration, error) {
+	return parsePositiveDuration("storage_retention.interval", c.StorageRetention.Interval, DefaultStorageRetentionInterval)
+}
+
+// StorageRetentionWebhookEvents returns how long a finished webhook inbox row
+// is kept, falling back to the default when not configured. The caller that
+// knows the webhook reconcile window checks this against it.
+func (c *ServerConfig) StorageRetentionWebhookEvents() (time.Duration, error) {
+	return parsePositiveDuration("storage_retention.webhook_events", c.StorageRetention.WebhookEvents, DefaultStorageRetentionWebhookEvents)
+}
+
+// StorageRetentionBatchSize returns how many rows one purge delete removes,
+// falling back to the default when not configured.
+func (c *ServerConfig) StorageRetentionBatchSize() (int, error) {
+	size := c.StorageRetention.BatchSize
+	switch {
+	case size == 0:
+		return DefaultStorageRetentionBatchSize, nil
+	case size < 0:
+		return 0, fmt.Errorf("storage_retention.batch_size must be positive, got %d", size)
+	case size > MaxStorageRetentionBatchSize:
+		return 0, fmt.Errorf("storage_retention.batch_size must be at most %d, got %d", MaxStorageRetentionBatchSize, size)
+	}
+	return size, nil
+}
+
+// validateStorageRetention checks every storage_retention value the pass reads.
+// It does not check webhook_events against the webhook reconcile window,
+// because that window depends on a process environment variable the config
+// does not carry; serve.Build checks it where both are known.
+func (c *ServerConfig) validateStorageRetention() error {
+	if !c.StorageRetentionEnabled() {
+		return nil
+	}
+	if _, err := c.StorageRetentionInterval(); err != nil {
+		return err
+	}
+	if _, err := c.StorageRetentionBatchSize(); err != nil {
+		return err
+	}
+	if _, err := c.StorageRetentionWebhookEvents(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// parsePositiveDuration parses a Go duration config value that must be
+// positive, returning fallback when the value is empty.
+func parsePositiveDuration(key, value string, fallback time.Duration) (time.Duration, error) {
+	if value == "" {
+		return fallback, nil
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("parse %s %q: %w", key, value, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("%s must be positive, got %q", key, value)
 	}
 	return d, nil
 }
@@ -2593,6 +2723,9 @@ func (c *ServerConfig) Validate() error {
 		if _, err := c.BranchReconcileGrace(); err != nil {
 			return err
 		}
+	}
+	if err := c.validateStorageRetention(); err != nil {
+		return err
 	}
 	// The server-wide policy carries no database type, so unlike a
 	// per-database block it is not rejected on a server that also registers

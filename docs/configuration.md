@@ -18,6 +18,7 @@
 - [Direct Execution](#direct-execution)
 - [Storage Dialect](#storage-dialect)
 - [Storage Connection Pool](#storage-connection-pool)
+- [Storage Retention](#storage-retention)
 - [Spirit Run Settings](#spirit-run-settings)
 - [Postgres](#postgres)
 - [Target TLS Posture](#target-tls-posture)
@@ -1743,6 +1744,57 @@ rejects the setting at config load.
 server and database from a secret, and a hand-written `schema_dsn` would not
 follow that secret when it changes. SchemaBot rejects the combination at config
 load; use `storage.dsn` with `schema_dsn`.
+
+## Storage Retention
+
+SchemaBot keeps every row it writes unless told otherwise. The
+`storage_retention` block turns on a background pass that deletes old rows from
+SchemaBot's own storage tables. It is off by default, and when enabled it only
+counts and logs what it would delete until `dry_run: false` is set, because a
+deleted row cannot be recovered. The pass covers one table today, the webhook
+inbox (`webhook_events`), and only deletes deliveries that have finished. It
+never deletes a delivery that is still pending, being processed, or waiting to
+retry, however old.
+
+```yaml
+storage_retention:
+  enabled: true         # default: false
+  dry_run: true         # default: true — count and log instead of deleting
+  interval: 1h          # default: 1h — how often the pass runs
+  batch_size: 500       # default: 500, at most 5000 — rows deleted per statement
+  webhook_events: 168h  # default: 168h (7 days) — how long a finished delivery is kept
+```
+
+Every instance runs the pass on its own interval, and an advisory lock lets one
+instance purge at a time. A pass deletes in batches with a short pause between
+them, and stops after a fixed number of batches so a large first backlog drains
+over several passes instead of holding the database in one long run. Each pass
+logs one line naming the table, the rows it deleted (or would delete, in a dry
+run), the batches it took, the window, and whether it was a dry run. A pass that
+fails logs at error level and the next interval tries again.
+
+Read a dry run's log line before turning deletion on: set `enabled: true`, let a
+pass run, and check `rows_would_delete` for the `webhook_events` table.
+
+### Webhook inbox window
+
+The inbox is also how SchemaBot tells whether it has already planned a pull
+request's latest commit. The pass never deletes that record: for each pull
+request it keeps the newest finished delivery that planned a commit, however
+old, so retention never makes the webhook reconciler plan a commit again. The
+table therefore keeps about one row per pull request, plus every delivery newer
+than the window.
+
+As a second safeguard, `webhook_events` cannot be shorter than the time the
+reconciler still looks back over: its lookback plus its grace period plus the
+cool-off after which a failed delivery stops counting as planned. With the
+default reconciler lookback of 48 hours that is a little under 49 hours.
+
+SchemaBot refuses to start when `webhook_events` is below that floor, and the
+error names both values. The reconciler's lookback is set with the
+`WEBHOOK_RECONCILE_LOOKBACK` environment variable, and raising it raises the
+floor. If you raise `WEBHOOK_RECONCILE_LOOKBACK`, raise `webhook_events` with
+it.
 
 ## Spirit Run Settings
 
