@@ -1715,19 +1715,23 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 			cause:  fmt.Sprintf("the attach to %s is not one ATTACH PARTITION ... FOR VALUES, the only form SchemaBot runs; nothing ran", quotedTable(table)),
 			remedy: "attach the partition outside SchemaBot, then " + replanRemedy}, true
 	case executor.CodeAttachPartitionTable:
-		// The table to attach, or the parent's DEFAULT partition, is not the
-		// shape the online attach proves; nothing was added, and only a change
-		// to those tables changes the outcome.
+		// The table to attach is missing, is not a plain table, is already a
+		// partition or inheritance child, or lacks the parent's columns by
+		// name, type, and collation, or the parent's DEFAULT partition is not
+		// a plain table. Nothing was added, and attaching outside SchemaBot
+		// fails the same way until the table matches.
 		return &refusal{reason: "attach-partition-table",
-			cause:  fmt.Sprintf("the table to attach to %s, or its DEFAULT partition, is not a plain table like the parent; nothing ran", quotedTable(table)),
-			remedy: "attach the partition outside SchemaBot, then " + replanRemedy}, true
+			cause:  fmt.Sprintf("the table to attach to %s is not a standalone table with the parent's column names, types, and collations; nothing ran", quotedTable(table)),
+			remedy: "make the table standalone and match the parent's columns, then " + replanRemedy}, true
 	case executor.CodeAttachPartitionDefaultWindow:
 		// Proving that the parent's DEFAULT partition holds no rows for the
-		// new range opens a window that blocks writes, which SchemaBot never
-		// accepts on the operator's behalf; nothing was added.
+		// new range adds a CHECK to it, and from then until the attach
+		// commits a write the parent routes there with a key inside the new
+		// range fails with a check violation. SchemaBot never accepts that
+		// window on the operator's behalf; nothing was added.
 		return &refusal{reason: "attach-partition-default-window",
-			cause:  fmt.Sprintf("%s has a DEFAULT partition, so an attach blocks writes while PostgreSQL scans it; nothing ran", quotedTable(table)),
-			remedy: "attach the partition outside SchemaBot, at a time writes can wait, then " + replanRemedy}, true
+			cause:  fmt.Sprintf("%s has a DEFAULT partition, so a write into the new range fails until the attach commits; nothing ran", quotedTable(table)),
+			remedy: "attach the partition outside SchemaBot, through a separately reviewed process, then " + replanRemedy}, true
 	case executor.CodeTimeZoneDrift:
 		// The planner keeps a change between timestamp and timestamptz in
 		// place only in UTC, and the session the change ran in is not; nothing

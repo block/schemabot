@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/block/pg-sprite/pkg/planner"
+	"github.com/block/pg-sprite/pkg/preflight"
 
 	"github.com/block/schemabot/pkg/engine"
 )
@@ -35,8 +36,25 @@ var plannerRefusalClauses = map[planner.Reason]string{
 var plannerRefusalClauseFuncs = map[planner.Reason]func(planner.Decision) string{
 	planner.ReasonColumnLimit: func(d planner.Decision) string {
 		return "it adds a column to " + planner.ColumnLimitSubject(d.ColumnLimit) +
-			", and a dropped column keeps its number until its table is rebuilt; " + planner.ColumnLimitHelp(d.ColumnLimit)
+			", and a dropped column keeps its number until its table is rebuilt; " + columnLimitFix(d.ColumnLimit)
 	},
+}
+
+// columnLimitNoneFree is the state pg-sprite's column-limit help ends with
+// when the table has no column number left. The subject already says every
+// number is used, and the refusal sentence ends with the step after the fix,
+// so the fix drops it rather than put that step after a state. An exported
+// rebuild phrase in pg-sprite, apart from the help's closing state, retires
+// this trim.
+const columnLimitNoneFree = "; until then no column number is free"
+
+// columnLimitFix is pg-sprite's column-limit help without its closing state.
+func columnLimitFix(numbers *preflight.ColumnNumbers) string {
+	help := planner.ColumnLimitHelp(numbers)
+	if fix, trimmed := strings.CutSuffix(help, columnLimitNoneFree); trimmed {
+		return fix
+	}
+	return help
 }
 
 // dependentRefusalReasons are the planner reasons whose refusal names the

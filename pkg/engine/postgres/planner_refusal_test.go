@@ -149,7 +149,7 @@ func TestPlannerRefusalNamesTheTablesAtTheColumnLimit(t *testing.T) {
 	}{
 		"a full partition": {
 			numbers: &preflight.ColumnNumbers{Fullest: []preflight.FullTable{{Name: `"public"."users_2026"`, Partition: true}}},
-			want:    `statement for table "users" is refused: it adds a column to a table whose partition "public"."users_2026" has used all 1600 of PostgreSQL's column numbers, and a dropped column keeps its number until its table is rebuilt; copy partition "public"."users_2026" into a new table, which gives back the numbers its dropped columns hold (VACUUM FULL does not), then detach the partition and attach the copy in its place; until then no column number is free, then plan again`,
+			want:    `statement for table "users" is refused: it adds a column to a table whose partition "public"."users_2026" has used all 1600 of PostgreSQL's column numbers, and a dropped column keeps its number until its table is rebuilt; copy partition "public"."users_2026" into a new table, which gives back the numbers its dropped columns hold (VACUUM FULL does not), then detach the partition and attach the copy in its place, then plan again`,
 		},
 		"numbers left on the table": {
 			numbers: &preflight.ColumnNumbers{Left: 2, Fullest: []preflight.FullTable{{Name: `"public"."users"`, Root: true}}},
