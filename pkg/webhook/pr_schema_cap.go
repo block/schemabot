@@ -26,6 +26,11 @@ func (e *prSchemaRefusalError) Error() string { return e.message }
 var (
 	errPRSchemaCapHeld = &prSchemaRefusalError{message: "SchemaBot planning is paused by the PR database limit"}
 	errPRSchemaMoved   = &prSchemaRefusalError{message: "the PR or database registrations changed during planning"}
+	// errPRSchemaHeadMoved is the errPRSchemaMoved a push causes. An auto-plan
+	// that meets it planned nothing for its head, so its delivery ends
+	// superseded rather than completed; a base, state, or registration change
+	// leaves the head the delivery carried still current.
+	errPRSchemaHeadMoved = fmt.Errorf("%w: the head commit moved", errPRSchemaMoved)
 )
 
 type prSchemaAdmission struct {
@@ -214,6 +219,9 @@ func (h *Handler) verifyPRSchemaRevision(ctx context.Context, client *ghclient.I
 	fresh, err := client.FetchPullRequestNoCache(ctx, key.repo, key.pr)
 	if err != nil {
 		return nil, err
+	}
+	if fresh.HeadSHA != key.revision.Head {
+		return nil, errPRSchemaHeadMoved
 	}
 	if h.prPlanDiscoveryKey(key.repo, key.pr, fresh) != key || fresh.State != state {
 		return nil, errPRSchemaMoved

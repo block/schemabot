@@ -1,11 +1,14 @@
 package webhook
 
 import (
+	"fmt"
 	"testing"
 	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
@@ -178,6 +181,62 @@ func TestDeploymentDriftPreview_DivergedAndErroredDetails(t *testing.T) {
 	// the sanitized detail, and the underlying error text is not leaked.
 	assert.Equal(t, erroredDriftDetail, preview.Deployments[2].Detail)
 	assert.NotContains(t, preview.Deployments[2].Detail, assert.AnError.Error())
+}
+
+// A rollout of orders to us and eu, where eu's data plane refuses a
+// drop_tables entry, names eu in the plan comment with the refusal's own text,
+// the detail the plan response gives the CLI for it, so the author reads what
+// to change in the schema files instead of a "see server logs" line. The wrap
+// around the refusal names the address eu was dialed at, and stays out. A
+// member that failed for any other reason keeps the fixed line.
+func TestDeploymentDriftPreview_RefusedMemberShowsTheRefusal(t *testing.T) {
+	const refusal = `drop_tables entry "orders_old" is also declared by a schema file in namespace "orders". Remove the entry or the schema file`
+	tests := []struct {
+		name       string
+		err        error
+		wantDetail string
+		wantLine   string
+	}{
+		{
+			name:       "refused",
+			err:        fmt.Errorf("plan member eu: dial tcp 10.0.0.5:9090: %w", status.Error(codes.FailedPrecondition, refusal)),
+			wantDetail: "refused: " + refusal,
+			wantLine:   "- `eu` ❌ could not plan — refused: drop_tables entry `orders_old` is also declared by a schema file in namespace `orders`. Remove the entry or the schema file\n",
+		},
+		{
+			name:       "internal",
+			err:        fmt.Errorf("plan member eu: dial tcp 10.0.0.5:9090: %w", status.Error(codes.Internal, "storage unavailable")),
+			wantDetail: erroredDriftDetail,
+			wantLine:   "- `eu` ❌ could not plan — diff failed; see server logs\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rollup := api.PlanRollup{
+				Planning: api.PlanIndependent,
+				Entries: []api.DeploymentRollupEntry{
+					{Deployment: "us", Class: api.DeploymentPlanned},
+					{Deployment: "eu", Class: api.DeploymentErrored, Err: tt.err},
+				},
+			}
+			preview := deploymentDriftPreview(rollup)
+			require.NotNil(t, preview)
+			require.Len(t, preview.Deployments, 2)
+			assert.Equal(t, tt.wantDetail, preview.Deployments[1].Detail)
+			if apiDetail, ok := api.MemberRefusalDetail(tt.err); ok {
+				assert.Equal(t, apiDetail, preview.Deployments[1].Detail, "the comment and the plan response give the same detail")
+			}
+
+			out := templates.RenderPlanComment(templates.PlanCommentData{
+				Database: "orders", Environment: "production", IsMySQL: true,
+				Changes:         []templates.KeyspaceChangeData{{Keyspace: "orders", Statements: []string{"DROP TABLE `orders_old`"}}},
+				DeploymentDrift: preview,
+			})
+			assert.Contains(t, out, tt.wantLine)
+			assert.NotContains(t, out, "10.0.0.5")
+			assert.NotContains(t, out, "rpc error")
+		})
+	}
 }
 
 // A rollup where one deployment addresses several targets names each failing

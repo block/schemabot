@@ -139,9 +139,11 @@ func (m *memoryFreezeStore) List(_ context.Context, environment string, recent i
 	current := m.filter(environment, func(f *storage.EnvironmentFreeze) bool {
 		return f.LiftedAt == nil && (f.EndsAt == nil || at.Before(*f.EndsAt))
 	})
-	all := m.filter(environment, func(*storage.EnvironmentFreeze) bool { return true })
-	slices.Reverse(all)
-	return &storage.FreezeListing{Now: at, Current: current, Recent: all[:min(recent, len(all))]}, nil
+	ended := m.filter(environment, func(f *storage.EnvironmentFreeze) bool {
+		return f.LiftedAt != nil || (f.EndsAt != nil && !at.Before(*f.EndsAt))
+	})
+	slices.Reverse(ended)
+	return &storage.FreezeListing{Now: at, Current: current, Recent: ended[:min(recent, len(ended))]}, nil
 }
 
 func (m *memoryFreezeStore) Now(context.Context) (time.Time, error) {
@@ -402,7 +404,8 @@ func TestFreezeAuditLinesNameTheActorAsCaller(t *testing.T) {
 }
 
 // The list splits current freezes into in effect and scheduled, and the
-// recent list holds every freeze of the environment, newest first.
+// recent list holds only the freezes that have ended, newest first, so no
+// freeze is listed twice.
 func TestFreezeList(t *testing.T) {
 	_, mux := newFreezeTestService(t, freezeConfig())
 
@@ -413,6 +416,10 @@ func TestFreezeList(t *testing.T) {
 		`{"environment":"staging","kind":"planned","starts_at":"2026-11-25T08:00:00Z","ends_at":"2026-11-30T08:00:00Z","reason":"holiday"}`)
 	require.Equal(t, http.StatusCreated, w.Code)
 	scheduled := decodeFreeze(t, w)
+	w = doFreezeRequest(t, mux, freezeAdmin, http.MethodPost, "/api/freezes", `{"environment":"staging","reason":"resolved incident"}`)
+	require.Equal(t, http.StatusCreated, w.Code)
+	lifted := decodeFreeze(t, w)
+	require.Equal(t, http.StatusOK, doFreezeRequest(t, mux, freezeAdmin, http.MethodPost, "/api/freezes/"+lifted.ID+"/lift", `{}`).Code)
 	w = doFreezeRequest(t, mux, freezeAdmin, http.MethodPost, "/api/freezes", `{"environment":"production","reason":"other"}`)
 	require.Equal(t, http.StatusCreated, w.Code)
 
@@ -424,7 +431,8 @@ func TestFreezeList(t *testing.T) {
 	assert.Equal(t, active.ID, list.InEffect[0].ID)
 	require.Len(t, list.Scheduled, 1)
 	assert.Equal(t, scheduled.ID, list.Scheduled[0].ID)
-	require.Len(t, list.Recent, 2)
+	require.Len(t, list.Recent, 1)
+	assert.Equal(t, lifted.ID, list.Recent[0].ID)
 
 	w = doFreezeRequest(t, mux, freezeAdmin, http.MethodGet, "/api/freezes?recent=0", "")
 	assert.Equal(t, http.StatusBadRequest, w.Code)
@@ -437,7 +445,7 @@ func TestFreezeList(t *testing.T) {
 // The list labels every freeze by the clock its snapshot was read at, not by
 // a separate read. Here the store's clock has moved past a planned start that
 // the service's own clock has not reached: the freeze is listed in effect,
-// in both lists, because that is what the snapshot's query selected.
+// because that is what the snapshot's query selected.
 func TestFreezeListLabelsByTheSnapshotClock(t *testing.T) {
 	service, mux := newFreezeTestService(t, freezeConfig())
 	w := doFreezeRequest(t, mux, freezeAdmin, http.MethodPost, "/api/freezes",
@@ -454,8 +462,8 @@ func TestFreezeListLabelsByTheSnapshotClock(t *testing.T) {
 	assert.Empty(t, list.Scheduled)
 	require.Len(t, list.InEffect, 1)
 	assert.Equal(t, planned.ID, list.InEffect[0].ID)
-	require.Len(t, list.Recent, 1)
-	assert.True(t, list.Recent[0].InEffect, "one freeze has one status in one response")
+	assert.True(t, list.InEffect[0].InEffect, "the freeze is labelled by the snapshot's clock")
+	assert.Empty(t, list.Recent, "a freeze in effect is not also listed as ended")
 }
 
 func TestServerConfig_ValidateFreeze(t *testing.T) {

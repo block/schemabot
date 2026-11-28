@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 
 	"github.com/block/pg-sprite/pkg/executor"
@@ -49,17 +50,212 @@ func planRowSecurityOperation(ctx context.Context, pool *pgxpool.Pool, namespace
 	preview, err := executor.PreviewRowSecurity(ctx, pool, namespace, desired, executor.Budget{
 		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
 	})
+	if refusal, ok := unsupportedRowSecurityShape(namespace, live, err); ok {
+		return nil, refusal
+	}
 	if err != nil {
 		return nil, err
 	}
 	if len(preview.Statements) == 0 {
 		return nil, nil
 	}
+	reason := "Row security changes alter who can access rows, so review the complete policy and settings replacement"
+	if denied := newlyDeniedCommands(live.RowSecurity, wanted.RowSecurity); len(denied) > 0 {
+		reason += "; " + denyReason(denied)
+	}
 	return []engine.TableChange{{
 		Table: desired.Table(), Operation: ddl.StatementAlterTable,
 		DDL:      strings.Join(preview.Statements, ";\n"),
-		IsUnsafe: true, UnsafeReason: "Row security changes alter who can access rows; review the complete policy and settings replacement",
+		IsUnsafe: true, UnsafeReason: reason,
 	}}, nil
+}
+
+// policyGrant is a command a row security policy can grant, with what a role
+// subject to row security gets from that command when no permissive policy
+// grants it.
+type policyGrant struct {
+	command schemadiff.PolicyCommand
+	name    string
+	denied  string
+}
+
+// policyGrants are the commands a policy can grant, in the order a reason
+// names them.
+var policyGrants = []policyGrant{
+	{schemadiff.PolicySelect, "SELECT", "reads no rows"},
+	{schemadiff.PolicyInsert, "INSERT", "has its inserts refused"},
+	{schemadiff.PolicyUpdate, "UPDATE", "changes no rows with its updates"},
+	{schemadiff.PolicyDelete, "DELETE", "changes no rows with its deletes"},
+}
+
+// deniedCommands returns the commands that row security that is on denies
+// to every role subject to it: those no permissive policy grants, either
+// for that command or for ALL. PostgreSQL grants a row only through a
+// permissive policy, and restrictive policies only narrow what those grant,
+// so a command with no permissive policy reaches no row.
+func deniedCommands(rs schemadiff.RowSecurity) []policyGrant {
+	if !rs.Enabled {
+		return nil
+	}
+	var denied []policyGrant
+	for _, grant := range policyGrants {
+		if !grantsCommand(rs.Policies, grant.command) {
+			denied = append(denied, grant)
+		}
+	}
+	return denied
+}
+
+// newlyDeniedCommands returns the commands wanted denies that live did not,
+// so the warning names what this change takes away rather than repeating,
+// on every change to a table, a design such as read-only access that the
+// table already has.
+func newlyDeniedCommands(live, wanted schemadiff.RowSecurity) []policyGrant {
+	before := deniedCommands(live)
+	var denied []policyGrant
+	for _, grant := range deniedCommands(wanted) {
+		if !slices.Contains(before, grant) {
+			denied = append(denied, grant)
+		}
+	}
+	return denied
+}
+
+// grantsCommand reports whether a permissive policy grants command, either
+// on its own or as part of ALL.
+func grantsCommand(policies []schemadiff.Policy, command schemadiff.PolicyCommand) bool {
+	for _, policy := range policies {
+		if policy.Permissive && (policy.Command == command || policy.Command == schemadiff.PolicyAll) {
+			return true
+		}
+	}
+	return false
+}
+
+// denyReason names what row security that denies the given commands does to
+// the application, so the plan says it rather than leaving the reviewer to
+// work it out from the policies. It is one finding, so it carries no "; ",
+// which separates the findings a reason lists.
+func denyReason(denied []policyGrant) string {
+	if len(denied) == len(policyGrants) {
+		return "after this change row security is on with no policy that grants access, so every role subject to it reads no rows, its inserts are refused, and its updates and deletes change no rows: declare a permissive policy in the same file"
+	}
+	names := make([]string, len(denied))
+	effects := make([]string, len(denied))
+	for i, grant := range denied {
+		names[i], effects[i] = grant.name, grant.denied
+	}
+	return fmt.Sprintf("after this change no permissive policy grants %s, so every role subject to row security %s: if the application runs %s, declare a permissive policy for %s in the same file",
+		joinSeries(names, "or"), joinSeries(effects, "and"), plural(len(denied), "it", "them"), plural(len(denied), "it", "them"))
+}
+
+// joinSeries joins items as an English series with conjunction before the
+// last one.
+func joinSeries(items []string, conjunction string) string {
+	switch len(items) {
+	case 0:
+		return ""
+	case 1:
+		return items[0]
+	case 2:
+		return items[0] + " " + conjunction + " " + items[1]
+	}
+	return strings.Join(items[:len(items)-1], ", ") + ", " + conjunction + " " + items[len(items)-1]
+}
+
+// unsupportedRowSecurityShape turns the executor's refusal of a table shape
+// the row security path cannot manage, such as a table in a foreign key
+// relationship, into a plan refusal that names the table and the shape. The
+// refusal stays until the file or the table changes, so planning again
+// cannot clear it. Any other error, privileges included, is not one.
+//
+// A table the target lacks has an empty live model: its keys are the file's
+// own, so the refusal names the shape without listing them.
+//
+// A table that has no row security yet gets its other changes planned once
+// the file declares none. A table that already has some keeps it whatever
+// the file says, and a file that stops declaring row security SchemaBot
+// applied is refused (RV-4), so there the author makes the file's
+// statements match the table's settings and policies instead.
+func unsupportedRowSecurityShape(namespace string, live schemadiff.Model, err error) (error, bool) {
+	if !errors.Is(err, executor.ErrRowSecurityRefused) || errors.Is(err, executor.ErrRowSecurityPrivileges) {
+		return nil, false
+	}
+	shape, ok := schemadiff.RenderRefusal(err)
+	if !ok {
+		return nil, false
+	}
+	why := rowSecurityShapePhrase(shape)
+	if keys := foreignKeyRelationships(namespace, live); errors.Is(shape, schemadiff.ErrUnrenderableForeignKey) && len(keys) > 0 {
+		why = "it is in a foreign key relationship (" + strings.Join(quoteAll(keys), ", ") + ")"
+	}
+	next := "remove the row security statements from its schema file, then plan again"
+	if hasRowSecurity(live.RowSecurity) {
+		next = "make the row security statements in its schema file match the table's current settings and policies, then plan again"
+	}
+	return &engine.PlanRefusedError{Err: &rowSecurityShapeError{table: live.Table, why: why, next: next}}, true
+}
+
+// rowSecurityShapeError is a table shape the row security path cannot
+// manage. Each one is about its own table and file, so the plan reports
+// every such table in a namespace at once rather than stopping at the
+// first, unless another file in that namespace fails the plan first.
+type rowSecurityShapeError struct {
+	table, why, next string
+}
+
+func (e *rowSecurityShapeError) Error() string {
+	return fmt.Sprintf("SchemaBot does not manage row security on table %q yet, because %s; %s", e.table, e.why, e.next)
+}
+
+// rowSecurityShapePhrases says, in the operator's terms, what about a table
+// keeps the row security path from managing it. The planning library's own
+// text speaks of rendering a desired schema, which the operator never sees.
+var rowSecurityShapePhrases = []struct {
+	shape  error
+	phrase string
+}{
+	{schemadiff.ErrUnrenderableDefault, "it has a column whose default draws from a sequence other than the one a serial column declares"},
+	{schemadiff.ErrMultipleOwnedSequences, "it has a column whose default uses more than one sequence the column owns"},
+	{schemadiff.ErrUnrenderablePartition, "it is a partition of a partitioned table"},
+	{schemadiff.ErrUnrenderableInheritance, "it uses table inheritance"},
+	{schemadiff.ErrUnrenderableForeignKey, "it is in a foreign key relationship"},
+	{schemadiff.ErrUnrenderableUnlogged, "it is unlogged"},
+	{schemadiff.ErrUnrenderableVirtual, "it has a virtual generated column"},
+	{schemadiff.ErrUnrenderableToastOptions, "it sets TOAST storage parameters"},
+	{schemadiff.ErrUnrenderableSequenceOptions, "it owns a sequence with options other than the defaults"},
+	{schemadiff.ErrUnrenderableMergedConstraints, "it has constraints that repeat each other on the same columns"},
+	{schemadiff.ErrUnrenderableUnattachedIndex, "it is a partitioned table with an index that is not attached on every partition"},
+	{schemadiff.ErrUnrenderablePartitionedRowSecurity, "it is a partitioned table"},
+	{schemadiff.ErrUnrenderableRowSecurity, "its row security settings are of a kind SchemaBot cannot compare yet"},
+}
+
+// rowSecurityShapePhrase names the shape, or says only that the table's
+// definition is the cause when the planning library reports a shape this
+// build has no phrase for.
+func rowSecurityShapePhrase(shape error) string {
+	for _, p := range rowSecurityShapePhrases {
+		if errors.Is(shape, p.shape) {
+			return p.phrase
+		}
+	}
+	slog.Warn("row security refusal names a table shape with no phrase; rendering the generic one", "shape", shape.Error())
+	return "of a part of its definition SchemaBot cannot compare yet"
+}
+
+// foreignKeyRelationships names a table's own foreign keys and the foreign
+// keys of other tables that reference it, as "table.constraint".
+func foreignKeyRelationships(namespace string, m schemadiff.Model) []string {
+	var keys []string
+	for _, con := range m.Constraints {
+		if con.ForeignKey {
+			keys = append(keys, m.Table+"."+con.Name)
+		}
+	}
+	for _, fk := range m.IncomingForeignKeys {
+		keys = append(keys, foreignKeyName(namespace, fk))
+	}
+	return keys
 }
 
 // planCreateWithRowSecurity plans a table the target lacks together with its
@@ -87,6 +283,9 @@ func planCreateWithRowSecurity(ctx context.Context, pool *pgxpool.Pool, namespac
 	}
 	if missing, ok := readsMissingTable(err, desired.Table()); ok {
 		return nil, &engine.PlanRefusedError{Err: missing}
+	}
+	if refusal, ok := unsupportedRowSecurityShape(namespace, schemadiff.Model{Table: desired.Table()}, err); ok {
+		return nil, refusal
 	}
 	if err != nil {
 		return nil, fmt.Errorf("preview creating table %q.%q with its row security: %w", namespace, desired.Table(), err)

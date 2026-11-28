@@ -562,6 +562,9 @@ func applyAndWatch(ctx context.Context, ep string, planResult *apitypes.PlanResp
 			"database":    database,
 			"environment": environment,
 		}
+		if applyResult.FreezeOverride != "" {
+			result["freeze_override"] = applyResult.FreezeOverride
+		}
 		enc := json.NewEncoder(os.Stdout)
 		_ = enc.Encode(result)
 		return applyID, nil
@@ -573,6 +576,7 @@ func applyAndWatch(ctx context.Context, ep string, planResult *apitypes.PlanResp
 	} else {
 		fmt.Printf("\n%s started successfully.\n", label)
 	}
+	templates.WriteFreezeOverrideUsed(applyResult.FreezeOverride, environment)
 
 	if !watch {
 		printWatchInstructions(applyID, database, environment)

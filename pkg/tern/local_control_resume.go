@@ -335,6 +335,13 @@ func (c *LocalClient) startDeferredDeploy(ctx context.Context, apply *storage.Ap
 	c.observeOperationDispatch(ctx)
 	result, err := eng.Start(withDriveWorkOwner(ctx), controlReq)
 	if err != nil {
+		var permanent *engine.PermanentError
+		if errors.As(err, &permanent) {
+			// The caller settles a permanent refusal the way the automatic
+			// start does, so it gets what that needs alongside the engine's
+			// refusal, unwrapped so the failure message reads as the engine's.
+			return &deferredDeployStart{tasks: applyTasks, credentials: creds, resumeState: controlReq.ResumeState}, err
+		}
 		return nil, fmt.Errorf("start deferred deploy: %w", err)
 	}
 	if !result.Accepted {
@@ -385,6 +392,23 @@ func (c *LocalClient) processPendingStartControlRequest(ctx context.Context, app
 	work := c.trackAcceptedEngineWork(ctx, logger)
 	defer work.haltUnlessPolled()
 	started, err := c.startDeferredDeploy(ctx, apply, controlRequestCaller(controlReq))
+	if err != nil && started != nil {
+		// A permanent refusal of an operator's start ends the apply as the
+		// automatic start's does: failed with the refusal once the engine
+		// confirms nothing is running, even when the engine retired the change
+		// it refused, rather than left for the next poll to read as a cancel.
+		settled, settleErr := c.settlePermanentStartRefusal(ctx, logger, c.getEngine(), apply, started.tasks, started.credentials, started.resumeState, err)
+		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, err.Error()); failErr != nil {
+			return true, fmt.Errorf("process pending start for apply %s: %w; fail pending start request: %w", apply.ApplyIdentifier, err, failErr)
+		}
+		if settleErr != nil {
+			return true, fmt.Errorf("fail apply %s after its start was refused: %w", apply.ApplyIdentifier, settleErr)
+		}
+		if settled {
+			return true, nil
+		}
+		return true, fmt.Errorf("process pending start for apply %s: %w", apply.ApplyIdentifier, err)
+	}
 	if err != nil {
 		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, err.Error()); failErr != nil {
 			return true, fmt.Errorf("process pending start for apply %s: %w; fail pending start request: %w", apply.ApplyIdentifier, err, failErr)

@@ -271,7 +271,8 @@ retry may succeed.
 
 In a rollout, a member the engine refuses is listed under the rollout's
 members needing attention, with the refusal as its detail, and the response
-is `200` for the members that planned.
+is `200` for the members that planned. The pull request's plan comment names
+the member with the same detail.
 
 ## Refused before an apply exists
 
@@ -460,15 +461,6 @@ sent after SchemaBot's is answered by SchemaBot's, so the apply still ends
 
 ## Guidance for agents
 
-- Treat terminal states as facts, not obstacles. If an apply is `failed`,
-  `cancelled`, or `reverted`, the next action is always a fresh plan — never a
-  mutation of the existing apply.
-- `failed_retryable` means wait. Recovery is automatic; re-planning while it is
-  still retrying will be blocked because the apply still counts as active on
-  its target.
-- Use the apply identifier (the user-facing string, not a numeric row ID) when
-  querying status, reading logs, or issuing control commands.
-- Control commands (`stop`, `start`, `cancel`, `cutover`, and the rest) are the
-  only supported way to influence a live apply. They are recorded durably
-  before they are acknowledged, so a command survives pod restarts and lease
-  handovers — issue it once and watch the status or PR comment for the effect.
+An agent with the [SchemaBot agent skill](ai-agents.md#install-the-agent-skill) reads these
+states for itself: a final state means a fresh plan, and `failed_retryable`
+means wait. Its [apply states](../skills/schemabot/references/refusals-and-failures.md#apply-states) reference has the details.

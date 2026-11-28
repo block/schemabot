@@ -284,12 +284,13 @@ func TestFreezes(t *testing.T, h Harness) {
 		assert.WithinDuration(t, now, listing.Now, time.Minute, "the listing carries the database clock")
 		assert.Equal(t, []string{active.Identifier, scheduled.Identifier}, freezeIdentifiers(listing.Current),
 			"current holds what is in effect or scheduled at the listing's clock, oldest start first")
-		assert.Equal(t, []string{scheduled.Identifier, active.Identifier, lifted.Identifier, ended.Identifier}, freezeIdentifiers(listing.Recent),
-			"recent holds every state, newest start first")
+		assert.Equal(t, []string{lifted.Identifier, ended.Identifier}, freezeIdentifiers(listing.Recent),
+			"recent holds the freezes that have ended, lifted or past their end, newest start first")
 
-		limited, err := store.Freezes().List(ctx, "production", 2)
+		limited, err := store.Freezes().List(ctx, "production", 1)
 		require.NoError(t, err)
-		assert.Equal(t, []string{scheduled.Identifier, active.Identifier}, freezeIdentifiers(limited.Recent))
+		assert.Equal(t, []string{lifted.Identifier}, freezeIdentifiers(limited.Recent),
+			"the limit is spent on ended freezes only, never on current ones")
 		assert.Len(t, limited.Current, 2, "recent does not limit current")
 
 		all, err := store.Freezes().List(ctx, "", 10)

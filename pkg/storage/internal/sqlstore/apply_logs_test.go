@@ -74,7 +74,24 @@ func assertDeleteForSettledAppliesOlderThan(t *testing.T, store storage.Storage,
 		return len(logs)
 	}
 
+	// assertCount checks what a dry run reports: the count equals want, and
+	// counting twice gives the same answer because it deletes nothing.
+	assertCount := func(want int64, msg string) {
+		t.Helper()
+		for range 2 {
+			counted, err := store.ApplyLogs().CountForSettledAppliesOlderThan(ctx, retention)
+			require.NoError(t, err, msg)
+			assert.Equal(t, want, counted, msg)
+		}
+	}
+
 	invalid := seed("logs_invalid_args", state.Apply.Completed, &old, 2)
+	for _, age := range []time.Duration{0, -time.Hour} {
+		counted, err := store.ApplyLogs().CountForSettledAppliesOlderThan(ctx, age)
+		require.Error(t, err, "a non-positive age %s must not be counted", age)
+		assert.Equal(t, int64(0), counted)
+	}
+	assertCount(2, "a dry run counts the entries of the old completed apply")
 	for _, tc := range []struct {
 		name  string
 		age   time.Duration
@@ -91,10 +108,12 @@ func assertDeleteForSettledAppliesOlderThan(t *testing.T, store storage.Storage,
 		assert.Equal(t, int64(0), deleted, tc.name)
 	}
 	require.Equal(t, 2, logCountOf(invalid), "an invalid call must delete nothing")
+	assertCount(2, "an invalid delete leaves the count unchanged")
 	deleted, err := store.ApplyLogs().DeleteForSettledAppliesOlderThan(ctx, retention, 100)
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), deleted)
 	assert.Equal(t, 0, logCountOf(invalid))
+	assertCount(0, "nothing is left to count after the purge")
 
 	const logsPerApply = 2
 	// Every settled state, so a state added to the list is purged here too.
@@ -116,6 +135,7 @@ func assertDeleteForSettledAppliesOlderThan(t *testing.T, store storage.Storage,
 	}
 	noCompletedAt := seed("logs_completed_without_completed_at", state.Apply.Completed, nil, logsPerApply)
 
+	assertCount(int64(len(oldSettled)*logsPerApply), "only the old settled applies count")
 	deleted, err = store.ApplyLogs().DeleteForSettledAppliesOlderThan(ctx, retention, 100)
 	require.NoError(t, err)
 	assert.Equal(t, int64(len(oldSettled)*logsPerApply), deleted, "every log of one old apply per settled state")
@@ -130,21 +150,25 @@ func assertDeleteForSettledAppliesOlderThan(t *testing.T, store storage.Storage,
 	deleted, err = store.ApplyLogs().DeleteForSettledAppliesOlderThan(ctx, retention, 100)
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), deleted, "a second purge finds nothing left")
+	assertCount(0, "stopped, in-flight, recent, and no completed_at applies are not counted")
 
 	// The limit caps one call, the apply that settled longest ago goes first, and
-	// a second call takes the rest.
+	// a second call takes the rest. The count has no limit.
 	older := old + 2*time.Hour
 	olderBatch := seed("logs_batch_older", state.Apply.Completed, &older, 3)
 	newerBatch := seed("logs_batch_newer", state.Apply.Completed, &old, 3)
+	assertCount(6, "the count covers every eligible entry, not one batch")
 	deleted, err = store.ApplyLogs().DeleteForSettledAppliesOlderThan(ctx, retention, 4)
 	require.NoError(t, err)
 	assert.Equal(t, int64(4), deleted)
 	assert.Equal(t, 0, logCountOf(olderBatch), "the apply that settled longest ago is taken first")
 	assert.Equal(t, 2, logCountOf(newerBatch), "the limit leaves the rest of the next apply for the next call")
+	assertCount(2, "the count shrinks by what the batch deleted")
 	deleted, err = store.ApplyLogs().DeleteForSettledAppliesOlderThan(ctx, retention, 4)
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), deleted, "the next call takes the rest")
 	assert.Equal(t, 0, logCountOf(newerBatch))
+	assertCount(0, "nothing is left to count after the last batch")
 	for _, applyState := range oldKept {
 		assert.Equal(t, logsPerApply, logCountOf(oldKeptApplies[applyState]), "batching leaves the logs of an old %s apply alone", applyState)
 	}
@@ -161,6 +185,7 @@ func assertDeleteForSettledAppliesOlderThan(t *testing.T, store storage.Storage,
 	_, err = db.ExecContext(ctx, rebind(`UPDATE applies SET lease_owner = 'driver-a', lease_token = 'apply-token', updated_at = `+
 		dialect.CurrentTimestamp(TimestampPrecisionDefault)+` WHERE id = ?`), liveParent.ID)
 	require.NoError(t, err)
+	assertCount(0, "an apply a driver still leases is not counted")
 	deleted, err = store.ApplyLogs().DeleteForSettledAppliesOlderThan(ctx, retention, 100)
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), deleted, "an apply a driver still leases keeps its logs")
@@ -171,6 +196,7 @@ func assertDeleteForSettledAppliesOlderThan(t *testing.T, store storage.Storage,
 	// delete checks the lease again.
 	claimedMidPurge := seed("logs_claimed_mid_purge", state.Apply.Completed, &old, logsPerApply)
 	purgedMidPurge := seed("logs_purged_mid_purge", state.Apply.Completed, &old, logsPerApply)
+	assertCount(int64(2*logsPerApply), "both unclaimed applies count before the claim")
 	logStore := store.ApplyLogs().(*applyLogStore)
 	t.Cleanup(func() { logStore.afterPurgeSelect = nil })
 	logStore.afterPurgeSelect = func() {

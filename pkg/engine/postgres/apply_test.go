@@ -58,7 +58,6 @@ func TestClassifyRefusal(t *testing.T) {
 				"in-place changes that need ownership",
 				`table "users"`,
 				`GRANT "app_owner" TO "limited" WITH INHERIT TRUE`,
-				"pg_has_role(limited, app_owner, 'USAGE')",
 				"membership must be inheritable",
 			},
 		},
@@ -73,7 +72,6 @@ func TestClassifyRefusal(t *testing.T) {
 			wantReason: "insufficient-privileges",
 			wantDetail: []string{
 				`GRANT "app/owner" TO "evil role"`,
-				"pg_has_role(evil role, app/owner, 'USAGE')",
 				"membership must be inheritable",
 			},
 		},
@@ -841,21 +839,22 @@ func TestInvalidIndexNamesCutsTheIndexLast(t *testing.T) {
 func TestInvalidIndexDetailKeepsItsRemedyLeadInsideTheClamp(t *testing.T) {
 	widest := strings.Repeat(`"`, maxIdentifierLength)
 	verdicts := map[string]*executor.InvalidIndexError{
-		"own leftover":                     {Cleanup: executor.ErrBuildLeftInvalidIndex},
-		"own leftover the bound cancelled": {Build: &executor.BudgetError{Cause: executor.CauseStatement, Budget: 36 * time.Hour}, Cleanup: executor.ErrBuildLeftInvalidIndex},
-		"abandoned":                        {Cleanup: executor.ErrAbandonedInvalidIndex},
-		"build in flight":                  {BuilderPID: math.MaxUint32, Cleanup: executor.ErrInvalidIndexBuildInFlight},
-		"builder unobservable":             {Cleanup: executor.ErrInvalidIndexBuilderUnobservable},
-		"on another table":                 {Cleanup: executor.ErrInvalidIndexOnOtherTable},
-		"the server will not drop":         {Cleanup: executor.ErrInvalidIndexNotDroppable},
-		"unproven":                         {Cleanup: errors.New("catalog read failed")},
+		"own leftover":                       {Cleanup: executor.ErrBuildLeftInvalidIndex},
+		"own leftover the bound cancelled":   {Build: &executor.BudgetError{Cause: executor.CauseStatement, Budget: 36 * time.Hour}, Cleanup: executor.ErrBuildLeftInvalidIndex},
+		"own leftover database code refused": {Build: &pgconn.PgError{Code: sqlstateRaiseException}, Cleanup: executor.ErrBuildLeftInvalidIndex},
+		"abandoned":                          {Cleanup: executor.ErrAbandonedInvalidIndex},
+		"build in flight":                    {BuilderPID: math.MaxUint32, Cleanup: executor.ErrInvalidIndexBuildInFlight},
+		"builder unobservable":               {Cleanup: executor.ErrInvalidIndexBuilderUnobservable},
+		"on another table":                   {Cleanup: executor.ErrInvalidIndexOnOtherTable},
+		"the server will not drop":           {Cleanup: executor.ErrInvalidIndexNotDroppable},
+		"unproven":                           {Cleanup: errors.New("catalog read failed")},
 	}
 	for name, verdict := range verdicts {
 		t.Run(name, func(t *testing.T) {
 			verdict.Schema, verdict.Index, verdict.Table = widest, widest, widest
 
 			detail := invalidIndexDetail(verdict)
-			_, remedy := invalidIndexAdvice(verdict, "")
+			_, remedy := invalidIndexAdvice(verdict, nil, "")
 
 			assert.NotContains(t, detail, widest, "no verdict renders an identifier raw")
 			lead := clauseSeparator + remedyLead(remedy)
@@ -889,6 +888,14 @@ func TestInvalidIndexRemedyLeadsWithTheInstruction(t *testing.T) {
 				Cleanup: executor.ErrBuildLeftInvalidIndex,
 			},
 			want: "the retry removes it",
+		},
+		{
+			name: "own leftover database code refused",
+			verdict: &executor.InvalidIndexError{
+				Build:   &pgconn.PgError{Code: sqlstateAssertFailure},
+				Cleanup: executor.ErrBuildLeftInvalidIndex,
+			},
+			want: "change the database code that refused it",
 		},
 		{
 			name:    "abandoned",
@@ -925,7 +932,7 @@ func TestInvalidIndexRemedyLeadsWithTheInstruction(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.verdict.Schema, tt.verdict.Index = "public", "orders_ref_idx"
 
-			_, remedy := invalidIndexAdvice(tt.verdict, "")
+			_, remedy := invalidIndexAdvice(tt.verdict, nil, "")
 
 			assert.Equal(t, tt.want, remedyLead(remedy), remedy)
 		})
@@ -1475,6 +1482,14 @@ func TestEveryRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
 		"invalid index the rows violate": {cause: &executor.InvalidIndexError{Schema: widest, Index: widest, Table: widest,
 			Build: &pgconn.PgError{Code: "23505"}, Cleanup: executor.ErrBuildLeftInvalidIndex},
 			pastFirstStep: true, namesIndex: true},
+		"invalid index the rows violate, left quarantined": {cause: quarantinedDataFaultLeftover(widest),
+			pastFirstStep: true, namesIndex: true},
+		"invalid index the rows violate, beside another quarantined entry": {cause: mixedDataFaultSweep(widest),
+			pastFirstStep: true, namesIndex: true},
+		"invalid index the rows violate, drop failed after quarantining it": {cause: failedDataFaultDrop(widest, executor.ErrInvalidIndexBuilderUnobservable),
+			pastFirstStep: true, namesIndex: true},
+		"invalid index the rows violate, another build now holds the name": {cause: failedDataFaultDrop(widest, executor.ErrInvalidIndexBuildInFlight),
+			pastFirstStep: true, namesIndex: true},
 		"invalid index the rows violate, not proven its own": {cause: &executor.InvalidIndexError{Schema: widest, Index: widest, Table: widest,
 			Build: &pgconn.PgError{Code: "23505"}, Cleanup: executor.ErrAbandonmentUnproven},
 			pastFirstStep: true, namesIndex: true},
@@ -1674,7 +1689,7 @@ func TestRefusalAfterCommittedCreateStepKeepsOwnRemedy(t *testing.T) {
 			name:       "privilege refusal keeps its provisioning remedy",
 			err:        &preflight.PrivilegeError{Tier: preflight.TierCreateTable, Check: "has_schema_privilege(limited, 'public', 'CREATE')", Grant: `GRANT CREATE ON SCHEMA "public" TO "limited"`},
 			wantReason: "insufficient-privileges",
-			wantRemedy: `provision with: GRANT CREATE ON SCHEMA "public" TO "limited" (verified by: has_schema_privilege(limited, 'public', 'CREATE'))`,
+			wantRemedy: `provision with: GRANT CREATE ON SCHEMA "public" TO "limited"`,
 		},
 		{
 			name:       "refusal without a remedy gets a re-plan",
@@ -1802,6 +1817,62 @@ func TestClassifyApplyFailureRetriesOnlyWhatARetryCanClear(t *testing.T) {
 	assert.Equal(t, "PostgreSQL schema change failed; see server logs", dropped.detail)
 }
 
+// A trigger or function in the database that raises on the statement, such
+// as an event trigger a DBA installed to guard DDL, raises again on every
+// retry, so the apply ends at once. The detail names the SQLSTATE and the
+// server log, never the message, which is untrusted text.
+func TestClassifyApplyFailureRaisedByDatabaseCode(t *testing.T) {
+	for _, code := range []string{sqlstateRaiseException, sqlstateAssertFailure} {
+		raised := fmt.Errorf("execute: %w", &pgconn.PgError{Code: code, Message: "DROP TABLE is blocked by the DBA policy"})
+
+		failure := classifyApplyFailure(raised, "orders", nil)
+
+		assert.False(t, failure.retryable, code)
+		assert.Equal(t, `a trigger or function in the database refused the statement on "orders" (SQLSTATE `+code+
+			`); its message is in the server log; change or disable it, then apply again`, failure.detail)
+		assert.NotContains(t, failure.detail, "DBA policy")
+	}
+}
+
+// A trigger or function in the database that raises inside a concurrent
+// index build, such as a function an index expression calls, leaves the
+// build's own invalid index. The retry would remove that leftover only to
+// meet the same refusal, so the apply ends at once, and the detail names the
+// SQLSTATE and the code to change rather than promising a retry.
+func TestInvalidIndexBuildRaisedByDatabaseCodeIsTerminal(t *testing.T) {
+	for _, code := range []string{sqlstateRaiseException, sqlstateAssertFailure} {
+		err := fmt.Errorf("execute: %w", &executor.InvalidIndexError{
+			Schema: "public", Index: "orders_total_idx", Table: "orders",
+			Build:   fmt.Errorf("create index: %w", &pgconn.PgError{Code: code, Message: "total must be positive"}),
+			Cleanup: executor.ErrBuildLeftInvalidIndex,
+		})
+		var invalidErr *executor.InvalidIndexError
+		require.ErrorAs(t, err, &invalidErr)
+		require.False(t, invalidErr.Code().Permanent(), "the verdict stays on the operational path")
+
+		assert.False(t, invalidIndexRetryable(invalidErr), code)
+		assert.Equal(t, `this build left its own invalid index "public"."orders_total_idx" on the target after a trigger or function in the database refused it (SQLSTATE `+code+
+			`); change the database code that refused it, or disable it, then apply again; its message is in the server log, and the next apply removes the leftover and rebuilds the index`,
+			invalidIndexDetail(invalidErr))
+	}
+
+	other := &executor.InvalidIndexError{Schema: "public", Index: "orders_total_idx", Table: "orders",
+		Build: &pgconn.PgError{Code: "57014"}, Cleanup: executor.ErrBuildLeftInvalidIndex}
+	assert.True(t, invalidIndexRetryable(other), "any other build cause keeps the retry")
+	abandoned := &executor.InvalidIndexError{Schema: "public", Index: "orders_total_idx", Table: "orders",
+		Build: &pgconn.PgError{Code: sqlstateRaiseException}, Cleanup: executor.ErrAbandonedInvalidIndex}
+	assert.True(t, invalidIndexRetryable(abandoned), "only the build's own leftover carries the refusal")
+}
+
+// A failure no classifier recognizes stays retryable and names the server's
+// SQLSTATE when it has one, never the server's message.
+func TestClassifyApplyFailureNamesAnUnclassifiedSQLSTATE(t *testing.T) {
+	failure := classifyApplyFailure(fmt.Errorf("execute: %w", &pgconn.PgError{Code: "XX000", Message: "internal detail"}), "orders", nil)
+
+	assert.True(t, failure.retryable)
+	assert.Equal(t, "PostgreSQL schema change failed (SQLSTATE XX000); see server logs", failure.detail)
+}
+
 // A statement the server refuses for a missing grant, such as a foreign key
 // whose referenced table the engine role cannot reference, says a grant is
 // missing instead of reporting a generic failure.
@@ -1812,6 +1883,62 @@ func TestClassifyApplyFailureMissingGrant(t *testing.T) {
 
 	assert.True(t, failure.retryable)
 	assert.Equal(t, `the engine role lacks a privilege the statement on "orders" needs, such as REFERENCES on the table a foreign key references; the server log names it; grant it, then retry`, failure.detail)
+}
+
+// A statement the server refuses because other objects depend on what it
+// drops, such as a column a publication names, ends the apply at
+// once: the dependency stays until someone removes it, so retrying cannot
+// clear it. The detail names the dependents the server lists, on one line
+// and cut when the list runs long, since the owner cannot read the server
+// log.
+func TestClassifyApplyFailureDependentObjects(t *testing.T) {
+	refusal := func(detail string) error {
+		return fmt.Errorf("drop column: %w", &pgconn.PgError{
+			Code:    "2BP01",
+			Message: `cannot drop column amt of table orders because other objects depend on it`,
+			Detail:  detail,
+		})
+	}
+
+	t.Run("names the dependents", func(t *testing.T) {
+		failure := classifyApplyFailure(refusal("publication of table orders in publication orders_pub depends on column amt of table orders\nview order_totals depends on column amt of table orders"), "orders", nil)
+		assert.False(t, failure.retryable, "the dependency stays until someone removes it")
+		assert.Equal(t, `other objects depend on what the statement on "orders" drops: publication of table orders in publication orders_pub depends on column amt of table orders, view order_totals depends on column amt of table orders; remove the dependency, then apply again`, failure.detail)
+	})
+
+	t.Run("cuts a long list", func(t *testing.T) {
+		failure := classifyApplyFailure(refusal(strings.Repeat("view v depends on column amt of table orders\n", 20)), "orders", nil)
+		assert.Contains(t, failure.detail, "…; remove the dependency, then apply again")
+		assert.Less(t, len([]rune(failure.detail)), maxDependentObjectsDetailLen+120)
+	})
+
+	t.Run("points at the server log without a list", func(t *testing.T) {
+		failure := classifyApplyFailure(refusal(""), "orders", nil)
+		assert.False(t, failure.retryable)
+		assert.Equal(t, `other objects depend on what the statement on "orders" drops, such as a publication that names the column; the server log names them; remove the dependency, then apply again`, failure.detail)
+	})
+}
+
+// The server log carries the objects a dependent-objects or privilege
+// refusal names, which the operator-facing detail leaves out, and never a
+// constraint violation's DETAIL, which quotes row values.
+func TestCatalogErrorLogAttrs(t *testing.T) {
+	dependents := fmt.Errorf("drop column: %w", &pgconn.PgError{
+		Code:   "2BP01",
+		Detail: `publication of table orders in publication orders_pub depends on column amt of table orders`,
+		Hint:   `Use DROP ... CASCADE to drop the dependent objects too.`,
+	})
+	assert.Equal(t, []any{
+		"server_detail", `publication of table orders in publication orders_pub depends on column amt of table orders`,
+		"server_hint", `Use DROP ... CASCADE to drop the dependent objects too.`,
+	}, catalogErrorLogAttrs(dependents))
+
+	grant := &pgconn.PgError{Code: "42501"}
+	assert.Empty(t, catalogErrorLogAttrs(grant), "a refusal with no DETAIL or HINT logs neither")
+
+	duplicate := &pgconn.PgError{Code: "23505", Detail: `Key (email)=(ada@example.com) is duplicated.`}
+	assert.Nil(t, catalogErrorLogAttrs(duplicate))
+	assert.Nil(t, catalogErrorLogAttrs(errors.New("connection reset")))
 }
 
 func TestProgressResultReportsCreateSequenceLength(t *testing.T) {
@@ -4012,6 +4139,17 @@ func TestRecoveryFailureDetailNamesTheAbandonedIndex(t *testing.T) {
 		assert.Equal(t, executor.CodeInvalidIndexUnproven, got.Code())
 	})
 
+	t.Run("a rebuild that fails on the table's rows keeps its own detail unprefixed", func(t *testing.T) {
+		rows := &executor.InvalidIndexError{Schema: "public", Index: "orders_ref_idx", Table: "orders",
+			Build: &pgconn.PgError{Code: "23505"}, Cleanup: executor.ErrBuildLeftInvalidIndex}
+		err := wrap(&dataFaultIndexCleanupError{err: rows, verdict: rows, cleaned: true,
+			dropped: []executor.DroppedIndex{{Schema: "public", Index: "pgsprite_abandoned_42", IndexOID: 42}}})
+		r := classifyRefusal(err, "orders")
+		require.NotNil(t, r)
+		detail := recoveryContextDetail(err, r.detail)
+		assert.Equal(t, `index "public"."orders_ref_idx" was not built: rows duplicate its key (23505), and its invalid leftover was dropped; correct the rows, then re-run`, detail)
+	})
+
 	t.Run("a failure outside any recovery is left alone", func(t *testing.T) {
 		detail := recoveryContextDetail(errors.New("connection reset"), "PostgreSQL schema change failed; see server logs")
 		assert.Equal(t, "PostgreSQL schema change failed; see server logs", detail)
@@ -4454,4 +4592,147 @@ func TestTableTooLargeRefusalReadsInBinaryUnits(t *testing.T) {
 
 	r = tableTooLargeRefusal(&preflight.SizeError{TotalBytes: 1073741825, LimitBytes: 1073741824})
 	assert.Equal(t, "the table is 1073741825 bytes with its indexes, over the 1073741824 bytes limit SchemaBot sets for a native-safe apply, not a PostgreSQL limit", r.cause)
+}
+
+// quarantinedDataFaultLeftover is a unique build that failed on duplicate
+// rows and whose invalid leftover the cleanup quarantined but the server
+// would not drop concurrently, the longest data-fault wording, with every
+// identifier set to name.
+func quarantinedDataFaultLeftover(name string) error {
+	verdict := &executor.InvalidIndexError{Schema: name, Index: name, Table: name,
+		Build: &pgconn.PgError{Code: "23505"}, Cleanup: executor.ErrBuildLeftInvalidIndex}
+	return &dataFaultIndexCleanupError{err: verdict, verdict: verdict, cleaned: true,
+		skipped: []executor.QuarantinedIndex{{Schema: name, Index: "pgsprite_abandoned_42", IndexOID: 42}}}
+}
+
+// mixedDataFaultSweep is quarantinedDataFaultLeftover where the sweep also
+// dropped another entry, so the wording cannot say which one was the build's.
+func mixedDataFaultSweep(name string) error {
+	cleanup := func() *dataFaultIndexCleanupError {
+		target := &dataFaultIndexCleanupError{}
+		_ = errors.As(quarantinedDataFaultLeftover(name), &target)
+		return target
+	}()
+	cleanup.dropped = []executor.DroppedIndex{{Schema: name, Index: "pgsprite_abandoned_41", IndexOID: 41}}
+	return cleanup
+}
+
+// failedDataFaultDrop is a unique build that failed on duplicate rows whose
+// cleanup quarantined the leftover under name and then failed to drop it.
+func failedDataFaultDrop(name string, found error) error {
+	verdict := &executor.InvalidIndexError{Schema: name, Index: name, Table: name,
+		Build: &pgconn.PgError{Code: "23505"}, Cleanup: executor.ErrBuildLeftInvalidIndex}
+	return &dataFaultIndexCleanupError{err: verdict, verdict: verdict,
+		existing: &executor.InvalidIndexError{Schema: name, Index: name, Table: name, Cleanup: found}}
+}
+
+// A unique build that fails on duplicate rows leaves an invalid index that
+// PostgreSQL still maintains on every write, so it rejects writes that
+// duplicate its key although the live schema declares no such rule. The
+// engine drops that leftover right away through pg-sprite's proven drop,
+// detached from the apply under its own bound, and the refusal says what
+// became of it; a leftover the build did not prove its own is never touched.
+func TestBuildIndexConcurrentlyDropsTheIndexADataFaultLeft(t *testing.T) {
+	duplicate := &pgconn.PgError{Code: "23505"}
+	expression := &pgconn.PgError{Code: "22012"}
+	own := func(build error) *executor.InvalidIndexError {
+		return &executor.InvalidIndexError{Schema: "public", Index: "users_email_idx", Table: "users",
+			Build: build, Cleanup: executor.ErrBuildLeftInvalidIndex}
+	}
+	for name, tc := range map[string]struct {
+		verdict *executor.InvalidIndexError
+		drop    dropScript
+		drops   int
+		detail  string
+	}{
+		"dropped": {
+			verdict: own(duplicate), drop: droppedOneIndex, drops: 1,
+			detail: `index "public"."users_email_idx" was not built: rows duplicate its key (23505), and its invalid leftover was dropped; correct the rows, then re-run`,
+		},
+		"dropped after an expression failed on a row": {
+			verdict: own(expression), drop: droppedOneIndex, drops: 1,
+			detail: `index "public"."users_email_idx" was not built: the rows violate it (22012), and its invalid leftover was dropped; correct the rows, then re-run`,
+		},
+		"already gone": {
+			verdict: own(duplicate), drop: droppedNothing, drops: 1,
+			detail: `index "public"."users_email_idx" was not built: rows duplicate its key (23505), and its invalid leftover was already gone; correct the rows, then re-run`,
+		},
+		"stepped over older debris": {
+			verdict: own(duplicate), drops: 1,
+			drop: func() (executor.IndexRecoveryReport, error) {
+				return executor.IndexRecoveryReport{Skipped: []executor.QuarantinedIndex{
+					{Schema: "public", Index: "pgsprite_abandoned_42", IndexOID: 42}}}, nil
+			},
+			detail: `index "public"."users_email_idx" was not built: rows duplicate its key (23505), and older invalid indexes stay quarantined; ` +
+				`an operator must drop them, named "public"."pgsprite_abandoned_42", since the server refuses to drop them concurrently (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run`,
+		},
+		"dropped one entry and stepped over another": {
+			verdict: own(duplicate), drops: 1,
+			drop: func() (executor.IndexRecoveryReport, error) {
+				return executor.IndexRecoveryReport{
+					Dropped: []executor.DroppedIndex{{Schema: "public", Index: "pgsprite_abandoned_41", IndexOID: 41}},
+					Skipped: []executor.QuarantinedIndex{{Schema: "public", Index: "pgsprite_abandoned_42", IndexOID: 42}},
+				}, nil
+			},
+			detail: `index "public"."users_email_idx" was not built: rows duplicate its key (23505), and invalid indexes the server refuses to drop concurrently stay quarantined; ` +
+				`an operator must drop them, named "public"."pgsprite_abandoned_42" (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run`,
+		},
+		"drop failed after quarantining the leftover": {
+			verdict: own(duplicate), drops: 1,
+			drop: dropFailed(&executor.InvalidIndexError{Schema: "public", Index: "pgsprite_abandoned_42", Table: "users",
+				Cleanup: executor.ErrInvalidIndexBuilderUnobservable}),
+			detail: `index "public"."users_email_idx" was not built: rows duplicate its key (23505), and its invalid leftover still rejects writes that duplicate its key; ` +
+				`an operator must drop it, named "public"."pgsprite_abandoned_42" (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run`,
+		},
+		"another build now holds the name": {
+			verdict: own(duplicate), drops: 1,
+			drop: dropFailed(&executor.InvalidIndexError{Schema: "public", Index: "users_email_idx", Table: "users",
+				BuilderPID: 7, Cleanup: executor.ErrInvalidIndexBuildInFlight}),
+			detail: `index "public"."users_email_idx" was not built: rows duplicate its key (23505), and another build now holds the name; ` +
+				`correct the rows, then re-run once that build ends; leave its index, "public"."users_email_idx", alone`,
+		},
+		"drop failed without saying where the leftover is": {
+			verdict: own(duplicate), drop: dropFailed(errors.New("lock not granted")), drops: 1,
+			detail: `index "public"."users_email_idx" was not built: rows duplicate its key (23505), and its invalid leftover still rejects writes that duplicate its key; ` +
+				`an operator must drop it, under this name or a pgsprite_abandoned_<oid> name (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run`,
+		},
+		"not proven its own": {
+			verdict: &executor.InvalidIndexError{Schema: "public", Index: "users_email_idx", Table: "users",
+				Build: duplicate, Cleanup: executor.ErrAbandonmentUnproven},
+			detail: `index "public"."users_email_idx" was not built: rows duplicate its key (23505), and an invalid index not proven its own holds the name; ` +
+				`correct the rows, then re-run; the rerun removes the invalid index once it proves no build holds it`,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			drop := tc.drop
+			if drop == nil {
+				drop = dropFailed(errors.New("no drop is expected"))
+			}
+			// The apply's context is cancelled as the build fails, so the
+			// drop proves it runs detached from it.
+			applyCtx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			calls := scriptConcurrentIndex(t, func() error { cancel(); return tc.verdict }, func() error {
+				return errors.New("no rebuild is expected")
+			}, drop)
+
+			before := time.Now()
+			err := buildIndexConcurrently(applyCtx, nil, concurrentIndexChange(time.Hour), newTestTracker(t), slog.New(slog.DiscardHandler))
+
+			require.Error(t, err)
+			r := classifyRefusal(err, "users")
+			require.NotNil(t, r)
+			assert.Equal(t, "data-fault", r.reason)
+			assert.Equal(t, tc.detail, r.detail)
+			require.Len(t, calls.drop, tc.drops)
+			if tc.drops == 0 {
+				return
+			}
+			assert.Equal(t, concurrentIndexDDL, calls.drop[0].sql)
+			assert.Equal(t, executor.ConcurrentBudget{CallerOwned: true}, calls.drop[0].budget)
+			assert.NoError(t, calls.drop[0].ctxErr)
+			require.True(t, calls.drop[0].hasDeadline)
+			assert.WithinDuration(t, before.Add(dataFaultIndexCleanupBound), calls.drop[0].deadline, time.Second)
+		})
+	}
 }

@@ -176,7 +176,13 @@ func deploymentDriftPreview(rollup api.PlanRollup) *templates.DeploymentDriftDat
 		case api.DeploymentDiverged:
 			entry.Detail = describeDriftDiff(e.Diff)
 		case api.DeploymentErrored:
-			// The raw diff error can wrap dial failures carrying internal
+			// A member the engine refused for the declared schema shows the
+			// refusal, the same detail the plan response gives the CLI for it.
+			if detail, ok := api.MemberRefusalDetail(e.Err); ok {
+				entry.Detail = detail
+				break
+			}
+			// Any other diff error can wrap dial failures carrying internal
 			// hostnames, IPs, or DSN fragments, so it stays out of the PR
 			// markdown. The root cause is logged with the deployment in
 			// RollupReviewTimeDrift; the preview shows only a sanitized line.

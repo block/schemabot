@@ -14,6 +14,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -254,4 +255,115 @@ func TestQuietChangeGateRefusalPrintsOnlyTheTemplate(t *testing.T) {
 	}), " "), err.Error())
 	assert.NotContains(t, err.Error(), "INJECTED")
 	assert.ErrorIs(t, err, apiErr, "the API error stays reachable for lock cleanup")
+}
+
+// An apply the server lets through a freeze on an override names the override
+// request, so the operator sees that the freeze was bypassed and which record
+// says so, in text and in JSON alike.
+func TestApplyNamesTheOverrideThatLetItThroughAFreeze(t *testing.T) {
+	accepted := apitypes.ApplyResponse{Accepted: true, ApplyID: "apply-1", FreezeOverride: "ovr-123"}
+
+	t.Run("text", func(t *testing.T) {
+		server, _, _ := gateApplyServer(t, http.StatusOK, accepted)
+		cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "production", AutoApprove: true, Override: "SEV-1234 fix the index", Output: OutputFormatLog}
+		var runErr error
+		out := stripAnsi(captureStdout(func() {
+			runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
+		}))
+		require.NoError(t, runErr)
+		assert.Contains(t, out, "Apply started: apply-1\n❄️ production is frozen; override ovr-123 let this change through. See it with 'schemabot freeze override ovr-123'.\n")
+	})
+
+	t.Run("json", func(t *testing.T) {
+		server, _, _ := gateApplyServer(t, http.StatusOK, accepted)
+		cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "production", AutoApprove: true, Override: "SEV-1234 fix the index", Output: OutputFormatJSON}
+		var runErr error
+		out := captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) })
+		require.NoError(t, runErr)
+		assert.Contains(t, out, `"freeze_override":"ovr-123"`)
+	})
+
+	t.Run("no freeze held it", func(t *testing.T) {
+		server, _, _ := gateApplyServer(t, http.StatusOK, apitypes.ApplyResponse{Accepted: true, ApplyID: "apply-1"})
+		cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "production", AutoApprove: true, Output: OutputFormatLog}
+		var runErr error
+		out := stripAnsi(captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) }))
+		require.NoError(t, runErr)
+		assert.NotContains(t, out, "override")
+	})
+}
+
+// An apply refused for its unsafe changes also shows the freezes that would
+// refuse it, as plan does, so allowing the unsafe changes is not followed by
+// a second refusal the operator could not see coming.
+func TestBlockUnsafeApplyShowsTheFreezesToo(t *testing.T) {
+	plan := planWithTablesAndEngine("mysql", &apitypes.TableChangeResponse{
+		TableName: "legacy", DDL: "DROP TABLE `legacy`", ChangeType: "drop", IsUnsafe: true, UnsafeReason: "drops a table",
+	})
+	plan.Freezes = []apitypes.Freeze{{ID: "freeze-abc", Environment: "production", Reason: "SEV-1234 payments latency", InEffect: true}}
+
+	var err error
+	out := stripAnsi(captureStdout(func() {
+		err = blockUnsafeApply(plan, "orders", "production", "schema", "", "", OutputFormatLog)
+	}))
+
+	require.ErrorIs(t, err, ErrSilent)
+	assert.Contains(t, out, "❄️ production is frozen, so applying this plan would be refused now.\n")
+	assert.Contains(t, out, "   freeze-abc  SEV-1234 payments latency  (until lifted)\n")
+	assert.Contains(t, out, `apply -s schema -e production --allow-unsafe --override "<why it can't wait>"`,
+		"the retry carries --override, so allowing the unsafe change is not refused by the freeze next")
+}
+
+// JSON output shows no plan, so the refusal itself names the freezes the
+// retry's --override placeholder is for. A reason the operator already gave
+// needs no explanation.
+func TestBlockUnsafeApplyJSONNamesTheFreezes(t *testing.T) {
+	plan := planWithTablesAndEngine("mysql", &apitypes.TableChangeResponse{
+		TableName: "legacy", DDL: "DROP TABLE `legacy`", ChangeType: "drop", IsUnsafe: true, UnsafeReason: "drops a table",
+	})
+	plan.Freezes = []apitypes.Freeze{
+		{ID: "freeze-abc", Environment: "production", Reason: "SEV-1234 payments latency", InEffect: true},
+		{ID: "freeze-next", Environment: "production", Reason: "holiday", InEffect: false},
+	}
+
+	err := blockUnsafeApply(plan, "orders", "production", "schema", "", "", OutputFormatJSON)
+	require.Error(t, err)
+	assert.Equal(t, "apply blocked: 1 unsafe change(s) detected (legacy: drops a table); to proceed with these destructive changes, re-run with: "+
+		cliname.Command("apply", "-s", "schema", "-e", "production", "--allow-unsafe", "--override", overrideReasonPlaceholder)+
+		"; production is frozen by freeze-abc (SEV-1234 payments latency), so replace the --override placeholder with why this change can't wait",
+		err.Error())
+
+	err = blockUnsafeApply(plan, "orders", "production", "schema", "", "Hotfix: checkout needs it", OutputFormatJSON)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "frozen by", "the operator's own reason needs no placeholder explanation")
+	assert.Contains(t, err.Error(), "--override 'Hotfix: checkout needs it'")
+}
+
+// The unsafe retry keeps the reason the operator already gave, and offers
+// no --override at all when no freeze is in effect.
+func TestBlockUnsafeApplyRetryOverride(t *testing.T) {
+	newPlan := func(inEffect bool) *apitypes.PlanResponse {
+		plan := planWithTablesAndEngine("mysql", &apitypes.TableChangeResponse{
+			TableName: "legacy", DDL: "DROP TABLE `legacy`", ChangeType: "drop", IsUnsafe: true, UnsafeReason: "drops a table",
+		})
+		plan.Freezes = []apitypes.Freeze{{ID: "freeze-abc", Environment: "production", Reason: "SEV-1234 payments latency", InEffect: inEffect}}
+		return plan
+	}
+	for name, tc := range map[string]struct {
+		inEffect bool
+		override string
+		want     string
+	}{
+		"the operator's own reason": {inEffect: true, override: "Hotfix: checkout needs it", want: "--allow-unsafe --override 'Hotfix: checkout needs it'\n"},
+		"a scheduled freeze only":   {inEffect: false, want: "apply -s schema -e production --allow-unsafe\n"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var err error
+			out := stripAnsi(captureStdout(func() {
+				err = blockUnsafeApply(newPlan(tc.inEffect), "orders", "production", "schema", "", tc.override, OutputFormatLog)
+			}))
+			require.ErrorIs(t, err, ErrSilent)
+			assert.Contains(t, out, tc.want)
+		})
+	}
 }

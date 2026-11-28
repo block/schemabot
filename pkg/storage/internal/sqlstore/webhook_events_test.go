@@ -313,6 +313,214 @@ func assertDeleteTerminalOlderThan(t *testing.T, store storage.Storage, db *sql.
 	assert.Equal(t, storage.WebhookEventPending, recreated.State)
 }
 
+// Retention keeps the newest covering row of each pull request, the row the
+// reconciler reads for its newest planned head: an old completed or
+// dead-lettered row survives unless a newer covering row exists for the same
+// pull request, and rows that cover nothing are deleted on age alone.
+func TestWebhookEventStore_PurgeKeepsNewestCoveringRow(t *testing.T) {
+	clearTables(t)
+	assertPurgeKeepsNewestCoveringRow(t, NewMySQL(testDB), testDB, MySQLDialect{}, func(query string) string { return query })
+}
+
+// assertPurgeKeepsNewestCoveringRow seeds one pull request per scenario with
+// every row older than the retention window, purges, and checks which rows
+// survive, that HasEventForHead still reports the heads that must stay
+// covered, and that the dry-run count equals what the purge deleted.
+func assertPurgeKeepsNewestCoveringRow(t *testing.T, store storage.Storage, db *sql.DB, dialect Dialect, rebind func(string) string) {
+	t.Helper()
+	ctx := t.Context()
+	const repo = "block/coverage"
+	retention := 30 * 24 * time.Hour
+	old := retention + time.Hour
+	ago := func(d time.Duration) string {
+		return dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+			LiteralIntervalAmount(uint64(d.Microseconds())), IntervalMicrosecond)
+	}
+	// seedRow inserts a delivery in order, so later seeds have higher ids. The
+	// row was received receivedAgo ago and reached its state finishedAgo ago.
+	seedRow := func(deliveryID, repository, event string, pr int, head, action, state string, receivedAgo, finishedAgo time.Duration) {
+		t.Helper()
+		_, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
+			DeliveryID: deliveryID, Event: event, Action: action,
+			Repository: repository, PullRequest: pr, HeadSHA: head, Payload: []byte(`{}`),
+		})
+		require.NoError(t, err, deliveryID)
+		_, err = db.ExecContext(ctx, rebind(`UPDATE webhook_events SET state = ?, received_at = `+ago(receivedAgo)+
+			`, completed_at = `+ago(finishedAgo)+`, updated_at = `+ago(finishedAgo)+` WHERE delivery_id = ?`), state, deliveryID)
+		require.NoError(t, err, deliveryID)
+	}
+	// seed inserts a pull_request delivery in the test's repository.
+	seed := func(deliveryID string, pr int, head, action, state string, receivedAgo, finishedAgo time.Duration) {
+		t.Helper()
+		seedRow(deliveryID, repo, "pull_request", pr, head, action, state, receivedAgo, finishedAgo)
+	}
+	exists := func(deliveryID string) bool {
+		t.Helper()
+		event, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, deliveryID)
+		require.NoError(t, err, deliveryID)
+		return event != nil
+	}
+	covered := func(pr int, head string) bool {
+		t.Helper()
+		found, err := store.WebhookEvents().HasEventForHead(ctx, storage.WebhookProviderGitHub, repo, pr, head)
+		require.NoError(t, err)
+		return found
+	}
+	completed, permanent := storage.WebhookEventCompleted, storage.WebhookEventFailedPermanent
+
+	// 1: the only covering row of its pull request.
+	seed("only-completed", 1, "head-1", "synchronize", completed, old, old)
+	// 2: a completed row with a newer completed row for another head.
+	seed("completed-older", 2, "head-1", "synchronize", completed, old, old)
+	seed("completed-newest", 2, "head-2", "synchronize", completed, old, old)
+	// 3: the same for dead-lettered rows, plus a synthesized-GUID one on its own.
+	seed("permanent-older", 3, "head-1", "synchronize", permanent, old, old)
+	seed("permanent-newest", 3, "head-2", "synchronize", permanent, old, old)
+	seed(storage.SynthesizedWebhookDeliveryIDPrefix+"permanent-only", 4, "head-1", "synchronize", permanent, old, old)
+	// 5: rows that cover nothing are deleted even when they are the newest for
+	// their pull request, and they do not displace the covering row beneath them.
+	seed("kept-beneath-failed", 5, "head-1", "synchronize", completed, old, old)
+	seed("failed-newest", 5, "head-2", "synchronize", storage.WebhookEventFailed, old, old)
+	seed("superseded-newest", 5, "head-3", "synchronize", storage.WebhookEventSuperseded, old, old)
+	seed("failed-alone", 6, "head-1", "synchronize", storage.WebhookEventFailed, old, old)
+	seed("superseded-alone", 7, "head-1", "synchronize", storage.WebhookEventSuperseded, old, old)
+	// 8: an action that never plans a head does not cover it.
+	seed("closed-alone", 8, "head-1", "closed", completed, old, old)
+	// 9: a newer row still in flight covers its head now but can lose that
+	// coverage (it can fail), so it does not justify deleting the older row until
+	// it completes.
+	seed("older-than-pending", 9, "head-1", "synchronize", completed, old, old)
+	seed("pending-newest", 9, "head-2", "synchronize", storage.WebhookEventPending, old, old)
+	// 10: a failed row still inside its cool-off covers its head, so it stays.
+	seed("failed-in-cool-off", 10, "head-1", "synchronize", storage.WebhookEventFailed, old, time.Minute)
+	// 11: Redeliver of an older head resets its received_at but keeps its id, so
+	// the current head's row, the newest by id, must still be kept.
+	seed("redelivered-older-head", 11, "head-1", "synchronize", completed, old, old)
+	seed("current-head", 11, "head-2", "synchronize", completed, old, old)
+	reopened, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
+		DeliveryID: "redelivered-older-head", Event: "pull_request", Action: "synchronize",
+		Repository: repo, PullRequest: 11, HeadSHA: "head-1", Payload: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	require.True(t, reopened, "the redelivery reopens the completed row with a fresh received_at")
+	_, err = db.ExecContext(ctx, rebind(`UPDATE webhook_events SET state = ? WHERE delivery_id = ?`), completed, "redelivered-older-head")
+	require.NoError(t, err)
+	// 16: a delivery for the earlier head that arrives after the current head
+	// was planned finds the head moved and ends superseded, so it is not a
+	// newer covering row and the current head's row is kept.
+	seed("before-late-arrival", 16, "head-1", "synchronize", completed, old, old)
+	seed("current-before-late-arrival", 16, "head-2", "synchronize", completed, old, old)
+	seed("late-arrival-earlier-head", 16, "head-1", "synchronize", storage.WebhookEventSuperseded, old, old)
+	// 17: a newer row of another event type on the same pull request plans
+	// nothing, so it does not justify deleting the covering row, even when its
+	// action shares a name with an auto-plan action.
+	seed("beneath-check-run", 17, "head-1", "synchronize", completed, old, old)
+	seedRow("check-run-newest", repo, "check_run", 17, "head-1", "completed", completed, old, old)
+	seedRow("issue-reopened-newest", repo, "issues", 17, "head-1", "reopened", completed, old, old)
+	// 18: nor does a newer pull_request row whose action never plans a head.
+	seed("beneath-closed", 18, "head-1", "synchronize", completed, old, old)
+	seed("closed-newest", 18, "head-1", "closed", completed, old, old)
+	// 19: a newer covering row in another repository with the same pull request
+	// number belongs to another pull request.
+	seed("beneath-other-repo", 19, "head-1", "synchronize", completed, old, old)
+	seedRow("other-repo-newest", "block/other", "pull_request", 19, "head-2", "synchronize", completed, old, old)
+	// 20: a covering-shaped row with no pull request can never cover a head.
+	seed("no-pull-request", 20, "head-1", "synchronize", completed, old, old)
+	_, err = db.ExecContext(ctx, rebind(`UPDATE webhook_events SET pull_request = 0 WHERE delivery_id = ?`), "no-pull-request")
+	require.NoError(t, err)
+
+	wantDeleted := []string{
+		"completed-older", "permanent-older", "failed-newest", "superseded-newest",
+		"failed-alone", "superseded-alone", "closed-alone",
+		"before-late-arrival", "late-arrival-earlier-head",
+		"check-run-newest", "issue-reopened-newest", "closed-newest", "no-pull-request",
+	}
+	wantKept := []string{
+		"only-completed", "completed-newest", "permanent-newest", "older-than-pending",
+		storage.SynthesizedWebhookDeliveryIDPrefix + "permanent-only", "kept-beneath-failed",
+		"pending-newest", "failed-in-cool-off", "redelivered-older-head", "current-head",
+		"current-before-late-arrival", "beneath-check-run", "beneath-closed",
+		"beneath-other-repo", "other-repo-newest",
+	}
+
+	counted, err := store.WebhookEvents().CountTerminalOlderThan(ctx, retention)
+	require.NoError(t, err)
+	assert.Equal(t, int64(len(wantDeleted)), counted, "the count sees what the purge may delete")
+	for _, deliveryID := range append(append([]string{}, wantDeleted...), wantKept...) {
+		require.True(t, exists(deliveryID), "counting must delete nothing: %s", deliveryID)
+	}
+
+	deleted, err := store.WebhookEvents().DeleteTerminalOlderThan(ctx, retention, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(len(wantDeleted)), deleted, "the purge deletes exactly the rows the count reported")
+	for _, deliveryID := range wantDeleted {
+		assert.False(t, exists(deliveryID), "%s is not the newest covering row of its pull request, so it must be deleted", deliveryID)
+	}
+	for _, deliveryID := range wantKept {
+		assert.True(t, exists(deliveryID), "%s must be kept", deliveryID)
+	}
+	counted, err = store.WebhookEvents().CountTerminalOlderThan(ctx, retention)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), counted, "what is left is all kept")
+
+	assert.True(t, covered(1, "head-1"), "the only completed row still covers its head")
+	assert.True(t, covered(2, "head-2"), "the newest completed row still covers its head")
+	assert.True(t, covered(3, "head-2"), "the newest dead-lettered row still covers its head")
+	assert.True(t, covered(4, "head-1"), "a synthesized dead-lettered row still covers its head")
+	assert.True(t, covered(5, "head-1"), "the covering row beneath uncovering newer rows still covers its head")
+	assert.True(t, covered(10, "head-1"), "a failed row in its cool-off still covers its head")
+	assert.True(t, covered(11, "head-2"), "a redelivered older head must not expose the current head")
+	assert.True(t, covered(16, "head-2"), "a late delivery for an earlier head must not expose the current head")
+
+	// Once the newer row completes, it justifies deleting the older one.
+	assert.True(t, exists("older-than-pending"), "a newer pending row must not justify the delete")
+	assert.True(t, covered(9, "head-1"))
+	_, err = db.ExecContext(ctx, rebind(`UPDATE webhook_events SET state = ? WHERE delivery_id = ?`), completed, "pending-newest")
+	require.NoError(t, err)
+	counted, err = store.WebhookEvents().CountTerminalOlderThan(ctx, retention)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), counted, "the older row is deletable once the newer row completes")
+	deleted, err = store.WebhookEvents().DeleteTerminalOlderThan(ctx, retention, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), deleted)
+	assert.False(t, exists("older-than-pending"))
+	assert.True(t, exists("pending-newest"))
+	assert.True(t, covered(9, "head-2"), "the completed newest row still covers its head")
+
+	// A newer row that stops covering permanently between the page select and the
+	// delete (a Redeliver reopens it) no longer justifies deleting the older row:
+	// the delete checks again.
+	inbox := store.WebhookEvents().(*webhookEventStore)
+	t.Cleanup(func() { inbox.hooks = webhookEventHooks{} })
+	seed("guard-oldest", 12, "head-0", "synchronize", completed, old, old)
+	seed("guard-older", 12, "head-1", "synchronize", completed, old, old)
+	seed("guard-newest", 12, "head-2", "synchronize", completed, old, old)
+	inbox.hooks.afterPurgeSelect = func() {
+		inbox.hooks.afterPurgeSelect = nil
+		_, hookErr := db.ExecContext(ctx, rebind(`UPDATE webhook_events SET state = ? WHERE delivery_id = ?`),
+			storage.WebhookEventPending, "guard-newest")
+		require.NoError(t, hookErr)
+	}
+	deleted, err = store.WebhookEvents().DeleteTerminalOlderThan(ctx, retention, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), deleted, "only the row still justified by a newer covering row is deleted")
+	assert.False(t, exists("guard-oldest"), "guard-older still covers beneath it")
+	assert.True(t, exists("guard-older"), "the row left with no newer covering row must survive")
+	assert.True(t, covered(12, "head-1"))
+
+	// Rows the purge must keep never fill its page: two protected rows older than
+	// a deletable one leave room for it even when the page holds one row.
+	seed("crowd-protected-1", 13, "head-1", "synchronize", completed, old+3*time.Hour, old+3*time.Hour)
+	seed("crowd-protected-2", 14, "head-1", "synchronize", completed, old+3*time.Hour, old+3*time.Hour)
+	seed("crowd-deletable", 15, "head-1", "synchronize", storage.WebhookEventFailed, old+2*time.Hour, old+2*time.Hour)
+	deleted, err = store.WebhookEvents().DeleteTerminalOlderThan(ctx, retention, 1)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), deleted, "the page holds the deletable row, not the protected rows older than it")
+	assert.False(t, exists("crowd-deletable"))
+	assert.True(t, exists("crowd-protected-1"))
+	assert.True(t, exists("crowd-protected-2"))
+}
+
 // createCoalescingEvent inserts a delivery for the SupersedeIfCovered tests
 // with receivedAgo controlling its position in the (received_at, id) newness
 // ordering, then optionally drives it into a non-pending state via SQL.
