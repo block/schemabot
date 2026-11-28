@@ -1721,8 +1721,8 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		// a plain table. Nothing was added, and attaching outside SchemaBot
 		// fails the same way until the table matches.
 		return &refusal{reason: "attach-partition-table",
-			cause:  fmt.Sprintf("the table to attach to %s is not a standalone table with the parent's column names, types, and collations; nothing ran", quotedTable(table)),
-			remedy: "make the table standalone and match the parent's columns, then " + replanRemedy}, true
+			cause:  fmt.Sprintf("the table to attach to %s isn't standalone or lacks the parent's columns, or the DEFAULT partition is not plain; nothing ran", quotedTable(table)),
+			remedy: "make it match, or attach outside SchemaBot when the DEFAULT partition is the cause, then " + replanRemedy}, true
 	case executor.CodeAttachPartitionDefaultWindow:
 		// Proving that the parent's DEFAULT partition holds no rows for the
 		// new range adds a CHECK to it, and from then until the attach

@@ -198,7 +198,6 @@ func generatedColumnsCause(kind pgstatement.OpKind, columns []string) string {
 		named, reads)
 }
 
-// plural picks the singular or plural form for n.
 // publicationsCause is the clause for a column change that publications
 // name in a column list or row filter, which PostgreSQL refuses while they
 // do. Taking the column out of a publication changes what its subscribers
@@ -223,6 +222,7 @@ func publicationsCause(kind pgstatement.OpKind, publications []string) string {
 	return cause + ", and put it back once this change has run; until it is back, subscribers do not receive the column, or receive rows the row filter would have held back"
 }
 
+// plural picks the singular or plural form for n.
 func plural(n int, one, many string) string {
 	if n == 1 {
 		return one
