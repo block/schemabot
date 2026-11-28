@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -12,6 +14,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/commands"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 )
 
@@ -188,5 +192,57 @@ func TestUsesLocalRuntime_FreezeCommands(t *testing.T) {
 		ctx, err := parser.Parse(args)
 		require.NoError(t, err, args)
 		assert.True(t, usesLocalRuntime(ctx.Command(), &cli), args)
+	}
+}
+
+// A command asked for JSON output that fails writes its error to stdout as a
+// JSON object, so a script parses the failure instead of meeting text where it
+// expects JSON. The code is the API's when the server gave one, the command's
+// own for an absence it decided, and absent otherwise; the message is cleaned
+// of terminal escapes as errorLine cleans it.
+func TestWriteJSONErrorNamesTheCodeAndCleansTheMessage(t *testing.T) {
+	for name, tc := range map[string]struct {
+		err  error
+		want string
+	}{
+		"absence the command decided": {
+			err:  &commands.NotFoundError{Message: `no schema change found for apply "apply-1" on this server`},
+			want: `{"error":{"code":"not_found","message":"no schema change found for apply \"apply-1\" on this server"}}`,
+		},
+		"server error code": {
+			err:  fmt.Errorf("get logs: %w", &client.APIError{Status: 404, ErrorCode: "not_found", Message: "apply not found"}),
+			want: `{"error":{"code":"not_found","message":"get logs: apply not found"}}`,
+		},
+		"plain error": {
+			err:  errors.New("dial tcp: connection refused\x1b[2J"),
+			want: `{"error":{"message":"dial tcp: connection refused[2J"}}`,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var out bytes.Buffer
+			writeJSONError(&out, tc.err)
+			assert.JSONEq(t, tc.want, out.String())
+		})
+	}
+}
+
+// Only a command run with --json reports its failure as JSON.
+func TestJSONOutputRequestedReadsTheCommandsJSONFlag(t *testing.T) {
+	for name, tc := range map[string]struct {
+		args []string
+		want bool
+	}{
+		"status with --json":    {args: []string{"status", "apply-1", "--json"}, want: true},
+		"status without --json": {args: []string{"status", "apply-1"}, want: false},
+		"logs with --json":      {args: []string{"logs", "apply-1", "--json"}, want: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var cli CLI
+			parser, err := kong.New(&cli, kong.Writers(io.Discard, io.Discard), kong.Vars{"cli_name": "schemabot"})
+			require.NoError(t, err)
+			ctx, err := parser.Parse(tc.args)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, jsonOutputRequested(ctx))
+		})
 	}
 }

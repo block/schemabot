@@ -4,8 +4,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -216,7 +218,11 @@ func main() {
 		// scripting it needs to tell two successful-but-different outcomes
 		// apart (see commands.ExitCodeFor); anything else exits 1.
 		if !errors.Is(err, commands.ErrSilent) {
-			fmt.Fprint(os.Stderr, errorLine(templates.ANSIRed, "Error", err))
+			if jsonOutputRequested(ctx) {
+				writeJSONError(os.Stdout, err)
+			} else {
+				fmt.Fprint(os.Stderr, errorLine(templates.ANSIRed, "Error", err))
+			}
 		}
 		os.Exit(commands.ExitCodeFor(err))
 	}
@@ -235,6 +241,50 @@ func errorLine(color, label string, err error) string {
 		line = color + line + templates.ANSIReset
 	}
 	return line + "\n"
+}
+
+// jsonOutputRequested reports whether the command that ran was asked for JSON
+// output with its --json flag.
+func jsonOutputRequested(ctx *kong.Context) bool {
+	for _, flag := range ctx.Flags() {
+		if flag.Name == "json" {
+			on, ok := ctx.FlagValue(flag).(bool)
+			return ok && on
+		}
+	}
+	return false
+}
+
+// jsonError is what a command asked for JSON output writes to stdout when it
+// fails, so a script parses the failure instead of meeting text where it
+// expects JSON. Code is the API's error code when the server gave one, or the
+// command's own for an absence it decided; it is empty for any other error.
+type jsonError struct {
+	Error jsonErrorBody `json:"error"`
+}
+
+type jsonErrorBody struct {
+	Code    string `json:"code,omitempty"`
+	Message string `json:"message"`
+}
+
+// writeJSONError writes err to w as a jsonError. Like errorLine, it removes
+// control runes from the text, which can quote the server.
+func writeJSONError(w io.Writer, err error) {
+	body := jsonErrorBody{Message: ui.TerminalSafe(err.Error())}
+	var coded interface{ ErrorCode() string }
+	var apiErr *client.APIError
+	switch {
+	case errors.As(err, &coded):
+		body.Code = coded.ErrorCode()
+	case errors.As(err, &apiErr):
+		body.Code = apiErr.ErrorCode
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	if encodeErr := enc.Encode(jsonError{Error: body}); encodeErr != nil {
+		fmt.Fprint(os.Stderr, errorLine(templates.ANSIRed, "Error", err))
+	}
 }
 
 // Only commands that use the schema API may implicitly start a selected runtime.

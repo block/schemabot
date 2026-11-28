@@ -7,6 +7,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
@@ -250,8 +251,7 @@ func showApplyByID(endpoint, applyID string, outputJSON, showLoader bool) error 
 	})
 	if err != nil {
 		if client.IsNotFound(err) && !deploymentNotConfigured(err) {
-			fmt.Printf("No schema change found for apply '%s'\n", applyID)
-			return nil
+			return applyNotFound(applyID)
 		}
 		return err
 	}
@@ -262,8 +262,7 @@ func showApplyByID(endpoint, applyID string, outputJSON, showLoader bool) error 
 
 	// Use the existing progress display
 	if result.State == "" || state.IsState(result.State, state.NoActiveChange) {
-		fmt.Printf("No schema change found for apply '%s'\n", applyID)
-		return nil
+		return applyNotFound(applyID)
 	}
 
 	// Display using the progress template
@@ -271,6 +270,25 @@ func showApplyByID(endpoint, applyID string, outputJSON, showLoader bool) error 
 	templates.WriteProgress(data)
 
 	return nil
+}
+
+// NotFoundError is a command's answer that what it was asked about does not
+// exist. It is an error, so the command exits non-zero and a script never
+// reads an absence as success; ErrorCode names it for JSON output.
+type NotFoundError struct {
+	Message string
+}
+
+func (e *NotFoundError) Error() string { return e.Message }
+
+// ErrorCode is the API's code for an absence, so JSON output names a
+// not-found the same whether the server or the CLI decided it.
+func (e *NotFoundError) ErrorCode() string { return apitypes.ErrCodeNotFound }
+
+// applyNotFound is the answer for an apply ID this server has no record of.
+func applyNotFound(applyID string) error {
+	return &NotFoundError{Message: fmt.Sprintf("no schema change found for apply %q on this server; check the ID against the applies %s lists",
+		applyID, cliname.Command("status"))}
 }
 
 // deploymentNotConfigured reports whether the server answered that it has no

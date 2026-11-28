@@ -66,11 +66,22 @@ func TestStatusByApplyIDReportsMissingDeploymentAsError(t *testing.T) {
 	assert.False(t, retry, "a deployment_not_found answer is not one the CLI retries")
 }
 
+// An apply ID the server has no record of is an error, in text and JSON
+// output alike, so the command exits non-zero and a script never reads the
+// absence as success. The error names the apply and carries the not_found
+// code JSON output reports.
 func TestStatusByApplyIDReportsUnknownApplyAsNotFound(t *testing.T) {
 	server := statusByApplyIDServer(t, http.StatusNotFound,
 		`{"error":"apply not found","error_code":"not_found"}`)
 
-	err := (&StatusCmd{ApplyIDArg: "apply-example-1", JSON: true}).Run(&Globals{Endpoint: server.URL})
+	for _, outputJSON := range []bool{false, true} {
+		err := (&StatusCmd{ApplyIDArg: "apply-example-1", JSON: outputJSON}).Run(&Globals{Endpoint: server.URL})
 
-	require.NoError(t, err)
+		var notFound *NotFoundError
+		require.ErrorAs(t, err, &notFound, "json=%v", outputJSON)
+		assert.Equal(t, apitypes.ErrCodeNotFound, notFound.ErrorCode())
+		assert.Contains(t, err.Error(), `no schema change found for apply "apply-example-1" on this server`)
+		assert.Contains(t, err.Error(), "check the ID against the applies")
+		assert.Equal(t, 1, ExitCodeFor(err))
+	}
 }

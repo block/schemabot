@@ -1595,6 +1595,22 @@ $ schemabot databases --json
 }
 ```
 
+A `--json` command that fails exits non-zero and writes the error to stdout
+as JSON, in place of the text error on stderr. `code` is the API's error code
+when there is one, and is left out otherwise:
+
+```console
+$ schemabot status apply-0000000000000000 --json
+{
+  "error": {
+    "code": "not_found",
+    "message": "no schema change found for apply \"apply-0000000000000000\" on this server; check the ID against the applies schemabot status lists"
+  }
+}
+$ echo $?
+1
+```
+
 `apply -o json` controls its progress stream; it is not a single JSON response
 for the entire command, which also prints the plan and other messages.
 For fully structured writes, use the API. `progress --json` prints one

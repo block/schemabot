@@ -950,9 +950,10 @@ retrying does not fix. When the server cannot read the apply or its tasks from
 its own storage, or the apply has no deployment recorded, the route answers
 `500` with `error_code` `storage_error` and a fixed message that names the apply
 and leaves the cause in the server logs; clients retry it as a transient failure.
-`schemabot status <apply_id>` prints "No schema change found" only for the
-unknown `apply_id`. It reports every other error answer as an error and exits
-non-zero.
+`schemabot status <apply_id>` reports an unknown `apply_id` as "no schema
+change found" and exits non-zero, as it does for every other error answer.
+With `--json`, it writes the error to stdout as
+`{"error": {"code": "not_found", "message": "…"}}`.
 
 <details>
 <summary>Request and response example</summary>
