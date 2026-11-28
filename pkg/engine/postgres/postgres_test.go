@@ -2123,7 +2123,13 @@ func TestExecutionVerdictNamesTheObjectsThatBlockAColumnChange(t *testing.T) {
 			name: "two triggers on a dropped column",
 			decision: planner.Decision{Reason: planner.ReasonDependentTrigger, Kind: pgstatement.OpDropColumn, DependentFix: planner.DependentFixRewriteDependents,
 				DependentTriggers: []string{`"audit" ON "public"."orders"`, `"stamp" ON "public"."orders"`}},
-			want: `statement for table "orders" is refused: it drops a column that triggers "audit" ON "public"."orders", "stamp" ON "public"."orders" read; change them so they no longer read the column and apply that first, then plan again`,
+			want: `statement for table "orders" is refused: it drops a column that triggers "audit" ON "public"."orders", "stamp" ON "public"."orders" read; outside SchemaBot, change them so they no longer read the column first, then plan again`,
+		},
+		{
+			name: "a policy and a trigger on a dropped column",
+			decision: planner.Decision{Reason: planner.ReasonDependentPolicy, Kind: pgstatement.OpDropColumn, DependentFix: planner.DependentFixRewriteDependents,
+				DependentPolicies: []string{`"owner_only" ON "public"."orders"`}, DependentTriggers: []string{`"audit" ON "public"."orders"`}},
+			want: `statement for table "orders" is refused: it drops a column that row security policy "owner_only" ON "public"."orders" and trigger "audit" ON "public"."orders" read; change them so they no longer read the column first, the policies in the schema file and the triggers outside SchemaBot, then plan again`,
 		},
 		{
 			name: "a policy with a manual path this build has no sentence for",
