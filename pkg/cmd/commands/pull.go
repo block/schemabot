@@ -24,7 +24,7 @@ type PullCmd struct {
 	CatalogDetail string   `help:"Structured catalog detail to include" default:"basic" enum:"basic,detailed"`
 	Lint          bool     `help:"Run the schema linters over every pulled table and include the violations per namespace"`
 	Output        string   `short:"o" help:"Output format: pretty renders the schema as readable SQL, json emits the API response after any --table filter" default:"pretty" enum:"pretty,json"`
-	JSON          bool     `help:"Print the API response as JSON, after any --table filter; the same as -o json"`
+	JSON          bool     `help:"Print the API response as JSON, after any --table filter. Overrides -o, so --json -o pretty prints JSON"`
 }
 
 // outputJSON reports whether the pull prints JSON. --json matches every other
