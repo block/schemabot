@@ -72,14 +72,14 @@ The CLI also has commands with no PR comment form, which change SchemaBot for ev
 
 ## When SchemaBot blocks or refuses a change
 
-Stop. Do not apply again, look for a flag, or try another environment, deployment, or credential to get past it.
+Stop. Never get past a refusal by repeating the command, adding a flag, or trying another environment, deployment, or credential. Do take the recovery the refusal itself names, such as posting the command again after reviewing a newer plan, under the rest of this policy. A temporary failure, such as a `503` while SchemaBot checks for freezes, is not a refusal: retry it with backoff. [Refusals, blocks, and failures](refusals-and-failures.md) tells them apart.
 
 - Tell the user the reason SchemaBot gave, in its words. For a freeze, say which freeze holds the change, why, and when it ends.
 - When the reason names a safe form of the change, rewrite the schema files into it, plan again, and show the user the new plan.
 - When no safe form exists, such as a PostgreSQL column type change that rewrites the table, say so. That change needs a separately reviewed process that a person runs.
-- A `401` or `403` means the account lacks access. Say which permission is missing. Never try other credentials or turn off authentication.
+- A `403` means the account lacks a permission. Say which one. A `401` means the token is missing, expired, or invalid, so the user needs to log in again or fix their token, not change their access. In either case, never try other credentials or turn off authentication.
 
-You may run `freeze list` and `freeze show` to check on a freeze. [Refusals, blocks, and failures](refusals-and-failures.md) lists each outcome's signal and next step.
+You may run `freeze list` and `freeze show` to check on a freeze.
 
 ## Never act outside SchemaBot
 
