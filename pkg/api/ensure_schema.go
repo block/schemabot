@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/sentinel"
+	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 
@@ -511,7 +512,7 @@ func ensureMySQLSchema(parent context.Context, dsn string, logger *slog.Logger, 
 		return fmt.Errorf("plan schema: %w", err)
 	}
 	if planResult.NoChanges {
-		staleTables, err := staleSpiritTableNames(ctx, dsn, workingTables)
+		staleTables, err := staleSpiritTableNames(ctx, dsn, workingTables, logger)
 		if err != nil {
 			return fmt.Errorf("check stale Spirit tables: %w", err)
 		}
@@ -1401,6 +1402,13 @@ func flatTableChanges(changes []engine.SchemaChange) []engine.TableChange {
 // that only looks like one of these, such as `_audit_old` created by an
 // operator, is not in the set. The storage tables declare no foreign keys, so
 // Spirit creates no foreign key probe tables for them.
+//
+// It reads each file with the same split and CREATE TABLE parse as the engine's
+// plan, so any file the plan accepts, including one declaring several tables,
+// yields every table in it. The names keep the declared spelling: on a server
+// with lower_case_table_names set, a table declared in mixed case would get
+// working tables this set does not name, and startup would leave them in place
+// rather than drop them. The embedded storage tables are all lowercase.
 func storageSpiritWorkingTables(schemaFiles schema.SchemaFiles) (map[string]bool, error) {
 	names := map[string]bool{
 		sentinel.TableName:          true,
@@ -1408,16 +1416,19 @@ func storageSpiritWorkingTables(schemaFiles schema.SchemaFiles) (map[string]bool
 	}
 	for namespace, ns := range schemaFiles {
 		for file, content := range ns.Files {
-			stmtType, tableName, err := ddl.ClassifyStatement(content)
+			stmts, err := ddl.SplitStatements(content)
 			if err != nil {
-				return nil, fmt.Errorf("read the table name in storage schema file %s/%s: %w", namespace, file, err)
+				return nil, fmt.Errorf("split statements in storage schema file %s/%s: %w", namespace, file, err)
 			}
-			if stmtType != ddl.StatementCreateTable {
-				return nil, fmt.Errorf("storage schema file %s/%s is not a CREATE TABLE statement", namespace, file)
+			for _, stmt := range stmts {
+				ct, err := statement.ParseCreateTable(stmt)
+				if err != nil {
+					return nil, fmt.Errorf("read the CREATE TABLE statements in storage schema file %s/%s: %w", namespace, file, err)
+				}
+				names[utils.NewTableName(ct.TableName)] = true
+				names[utils.OldTableName(ct.TableName)] = true
+				names[utils.CheckpointTableName(ct.TableName)] = true
 			}
-			names[utils.NewTableName(tableName)] = true
-			names[utils.OldTableName(tableName)] = true
-			names[utils.CheckpointTableName(tableName)] = true
 		}
 	}
 	return names, nil
@@ -1425,7 +1436,7 @@ func storageSpiritWorkingTables(schemaFiles schema.SchemaFiles) (map[string]bool
 
 // staleSpiritTableNames lists the working tables in the storage database that
 // a Spirit run on it left behind, sorted by name.
-func staleSpiritTableNames(ctx context.Context, dsn string, workingTables map[string]bool) ([]string, error) {
+func staleSpiritTableNames(ctx context.Context, dsn string, workingTables map[string]bool, logger *slog.Logger) ([]string, error) {
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
@@ -1447,10 +1458,19 @@ func staleSpiritTableNames(ctx context.Context, dsn string, workingTables map[st
 	for _, t := range tables {
 		if workingTables[t.Name] {
 			names = append(names, t.Name)
+		} else if strings.HasPrefix(t.Name, "_") {
+			logNotSpiritWorkingTable(logger, t.Name)
 		}
 	}
 	sort.Strings(names)
 	return names, nil
+}
+
+// logNotSpiritWorkingTable records why startup leaves an underscore-prefixed
+// table in the storage database: it is not a working table Spirit gives a
+// storage table, so it is not startup's to drop.
+func logNotSpiritWorkingTable(logger *slog.Logger, name string) {
+	logger.Debug("leaving table in place: not a Spirit working table of a storage table", "table", name)
 }
 
 // readEmbeddedSchemaFiles reads the embedded MySQL schema files into a SchemaFiles map.
@@ -1699,6 +1719,9 @@ func cleanStaleSpiritTables(ctx context.Context, dsn string, workingTables map[s
 
 	for _, t := range tables {
 		if !workingTables[t.Name] {
+			if strings.HasPrefix(t.Name, "_") {
+				logNotSpiritWorkingTable(logger, t.Name)
+			}
 			continue
 		}
 		staleCount++

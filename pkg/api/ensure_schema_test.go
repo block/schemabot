@@ -736,5 +736,32 @@ func TestStorageSpiritWorkingTablesRefusesAFileThatCreatesNoTable(t *testing.T) 
 
 	_, err := storageSpiritWorkingTables(files)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "tasks.sql is not a CREATE TABLE statement")
+	assert.Contains(t, err.Error(), "tasks.sql")
+	assert.Contains(t, err.Error(), "expected CREATE TABLE statement")
+}
+
+// A file may declare several tables, as the engine's plan accepts, and the set
+// then names the working tables of each one rather than refusing the file.
+func TestStorageSpiritWorkingTablesReadsEveryTableAFileDeclares(t *testing.T) {
+	files := schema.SchemaFiles{storageSchemaNamespace: &schema.Namespace{Files: map[string]string{
+		"ab.sql": "CREATE TABLE `a` (`id` bigint unsigned NOT NULL, PRIMARY KEY (`id`));\n" +
+			"CREATE TABLE `b` (`id` bigint unsigned NOT NULL, PRIMARY KEY (`id`));",
+	}}}
+
+	got, err := storageSpiritWorkingTables(files)
+	require.NoError(t, err, "the engine plan reads both tables from this file, so the working-table set must too")
+	for _, name := range []string{"_a_new", "_a_old", "_a_chkpnt", "_b_new", "_b_old", "_b_chkpnt"} {
+		assert.True(t, got[name], "%s is a working table of a declared table", name)
+	}
+}
+
+// Every embedded storage schema file is one this helper can read, so a new
+// file it cannot parse fails here rather than only in the container job.
+func TestStorageSpiritWorkingTablesReadsTheEmbeddedSchema(t *testing.T) {
+	embedded, err := readEmbeddedSchemaFiles()
+	require.NoError(t, err)
+
+	got, err := storageSpiritWorkingTables(embedded)
+	require.NoError(t, err)
+	assert.True(t, got["_tasks_new"], "tasks is a storage table, so its copy is a working table")
 }

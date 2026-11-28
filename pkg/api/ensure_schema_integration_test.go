@@ -139,6 +139,7 @@ func TestEnsureSchema_CleansStaleSpiritTables(t *testing.T) {
 	lookalikeTables := []string{
 		"_audit_old",
 		"_exports_new",
+		"_audit_chkpnt",
 	}
 	for _, tbl := range append(staleTables, lookalikeTables...) {
 		_, err := db.ExecContext(ctx, fmt.Sprintf("CREATE TABLE `%s` (id INT PRIMARY KEY)", tbl))
@@ -161,6 +162,19 @@ func TestEnsureSchema_CleansStaleSpiritTables(t *testing.T) {
 	// Verify real tables still exist.
 	assert.True(t, testutil.TableExists(t, db, sdb.Name, "tasks"),
 		"real tasks table should still exist")
+
+	// With only lookalikes left, startup takes the lock-free fast path: it
+	// reports the schema up to date, says why each lookalike stays, and leaves
+	// them in place.
+	var fastBuf syncBuffer
+	fastLogger := slog.New(slog.NewTextHandler(&fastBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	require.NoError(t, EnsureSchema(dsn, fastLogger))
+	assert.Contains(t, fastBuf.String(), "storage schema up-to-date",
+		"a lookalike is not a working table, so it must not send startup down the lock path")
+	for _, tbl := range lookalikeTables {
+		assert.True(t, testutil.TableExists(t, db, sdb.Name, tbl), "%s must survive the fast path", tbl)
+		assert.Contains(t, fastBuf.String(), "table="+tbl, "startup logs why it leaves %s in place", tbl)
+	}
 
 	assertEnsureSchemaDoesNotCleanSpiritTablesWhileWaitingForLock(t, ctx, sdb, db, logger)
 }
