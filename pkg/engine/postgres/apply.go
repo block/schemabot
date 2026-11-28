@@ -1107,6 +1107,7 @@ func dataFaultIndexWording(invalidErr *executor.InvalidIndexError, cleanup *data
 		causeAfter:  " was not built: " + dataFaultRows(invalidErr.Build),
 		lead:        "correct the rows",
 		remedyRest:  ", then re-run",
+		namesTable:  cleanup != nil && cleanup.onPartition,
 	}
 	const rerunRemoves = ", then re-run; the rerun removes the invalid index once it proves no build holds it"
 	const operatorDrops = "an operator must drop it"
@@ -1142,7 +1143,8 @@ func dataFaultIndexWording(invalidErr *executor.InvalidIndexError, cleanup *data
 	case cleanup != nil && cleanup.existing != nil:
 		// The drop failed after it found the leftover, possibly after it
 		// quarantined it under a new name, which the rerun's build does not
-		// meet; the operator is pointed at the name it holds now.
+		// meet, or no drop ran at all; the operator is pointed at the name
+		// it holds now.
 		w.causeAfter += ", and its invalid leftover " + leftoverStillChecks(invalidErr.Build)
 		w.lead = operatorDrops
 		w.remedyRest = fmt.Sprintf(", named %q.%q (see the PostgreSQL invalid-index recovery guidance), then correct the rows and re-run",
@@ -2620,6 +2622,7 @@ func buildPartitionedIndex(ctx context.Context, cfg dbconn.Config, pool *pgxpool
 		return fmt.Errorf("build PostgreSQL index on partitioned table %q: %w", change.table,
 			&partitionedIndexBoundError{bound: change.concurrentIndexMaxDuration, partitionsBuilt: built})
 	}
+	err = cleanupPartitionDataFaultIndex(ctx, pool, change, err, logger)
 	return fmt.Errorf("build PostgreSQL index on partitioned table %q: %w", change.table,
 		nameConcurrentIndexBound(err, change.concurrentIndexMaxDuration, time.Since(start)))
 }
@@ -2812,16 +2815,61 @@ func cleanupDataFaultIndex(ctx context.Context, pool *pgxpool.Pool, change nativ
 	if !errors.As(buildErr, &invalidErr) || !dataFaultLeftOwnIndex(change, invalidErr) {
 		return buildErr
 	}
+	return dropDataFaultIndex(ctx, pool, change, change.sql, invalidErr, buildErr, "", logger)
+}
+
+// cleanupPartitionDataFaultIndex removes the invalid index a partitioned
+// index build left on one leaf partition when that leaf's build failed on its
+// rows. The leftover sits on the partition as it would on a plain table, so
+// it is dropped the same proven way. The drop
+// names the leaf's own build statement, the parent's statement retargeted at
+// the partition and the index the build gave it, because pg-sprite's proof
+// re-verifies the entry under that partition's lock. The partitioned table's
+// own index stays: it carries no rows and the rerun resumes from it.
+func cleanupPartitionDataFaultIndex(ctx context.Context, pool *pgxpool.Pool, change nativeApply, buildErr error, logger *slog.Logger) error {
+	var invalidErr *executor.InvalidIndexError
+	if !errors.As(buildErr, &invalidErr) || !dataFaultLeftPartitionIndex(invalidErr) {
+		return buildErr
+	}
+	leafSQL, err := pgstatement.PartitionIndex(change.sql, invalidErr.Schema, invalidErr.Table, invalidErr.Index, pgstatement.PartitionIndexConcurrently)
+	if err != nil {
+		// No drop ran, so the leftover still holds the name the build gave
+		// it, and the refusal points the operator at that name.
+		logger.Error("PostgreSQL could not make the drop statement for the invalid index a partition's build left after failing on its rows; it stays on the partition under its own name for an operator to drop",
+			"namespace", change.namespace, "table", change.table,
+			"partition", invalidErr.Table, "index_schema", invalidErr.Schema, "index", invalidErr.Index, "error", err)
+		return &dataFaultIndexCleanupError{err: buildErr, verdict: invalidErr, existing: invalidErr, onPartition: true}
+	}
+	return dropDataFaultIndex(ctx, pool, change, leafSQL, invalidErr, buildErr, invalidErr.Table, logger)
+}
+
+// dataFaultLeftPartitionIndex reports whether a leaf partition's build failed
+// on its rows and pg-sprite proved the invalid index under the name it gave
+// that leaf is the one the build left there.
+func dataFaultLeftPartitionIndex(invalidErr *executor.InvalidIndexError) bool {
+	return invalidErr.Code() == executor.CodeDataFault &&
+		errors.Is(invalidErr.Cleanup, executor.ErrBuildLeftInvalidIndex) &&
+		invalidErr.Table != ""
+}
+
+// dropDataFaultIndex runs pg-sprite's proven drop of the invalid index
+// invalidErr names with dropSQL, the build statement that created it, and
+// records what the drop did beside buildErr. partition names the leaf
+// partition the leftover sits on, and is empty for a plain table's.
+func dropDataFaultIndex(ctx context.Context, pool *pgxpool.Pool, change nativeApply, dropSQL string, invalidErr *executor.InvalidIndexError, buildErr error, partition string, logger *slog.Logger) error {
+	if partition != "" {
+		logger = logger.With("partition", partition)
+	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dataFaultIndexCleanupBound)
 	defer cancel()
-	report, cleanupErr := concurrentIndex.drop(cleanupCtx, pool, change.sql,
+	report, cleanupErr := concurrentIndex.drop(cleanupCtx, pool, dropSQL,
 		executor.ConcurrentBudget{CallerOwned: true})
 	if cleanupErr != nil {
 		// A drop that fails after it quarantined the entry reports the
 		// entry under its quarantine name; that is where it still checks
 		// writes. A failure typed without an index leaves where it is
 		// uncertain.
-		outcome := &dataFaultIndexCleanupError{err: buildErr, verdict: invalidErr}
+		outcome := &dataFaultIndexCleanupError{err: buildErr, verdict: invalidErr, onPartition: partition != ""}
 		var cleanupVerdict *executor.InvalidIndexError
 		if errors.As(cleanupErr, &cleanupVerdict) {
 			outcome.existing = cleanupVerdict
@@ -2853,7 +2901,7 @@ func cleanupDataFaultIndex(ctx context.Context, pool *pgxpool.Pool, change nativ
 			"namespace", change.namespace, "table", change.table,
 			"index_schema", invalidErr.Schema, "index", invalidErr.Index, "duration", report.Duration)
 	}
-	return &dataFaultIndexCleanupError{err: buildErr, verdict: invalidErr, cleaned: true, dropped: report.Dropped, skipped: report.Skipped}
+	return &dataFaultIndexCleanupError{err: buildErr, verdict: invalidErr, cleaned: true, dropped: report.Dropped, skipped: report.Skipped, onPartition: partition != ""}
 }
 
 // dataFaultLeftOwnIndex reports whether a build failed on the table's rows
@@ -2873,12 +2921,16 @@ func dataFaultLeftOwnIndex(change nativeApply, invalidErr *executor.InvalidIndex
 // that failed leaves cleaned false and the leftover named as still in place,
 // under existing when the failure said where it is.
 type dataFaultIndexCleanupError struct {
-	err      error
-	verdict  *executor.InvalidIndexError
-	existing *executor.InvalidIndexError
-	cleaned  bool
-	dropped  []executor.DroppedIndex
-	skipped  []executor.QuarantinedIndex
+	// onPartition marks a leftover on one leaf partition of a partitioned
+	// table, which the detail names because that partition holds the rows
+	// to correct.
+	onPartition bool
+	err         error
+	verdict     *executor.InvalidIndexError
+	existing    *executor.InvalidIndexError
+	cleaned     bool
+	dropped     []executor.DroppedIndex
+	skipped     []executor.QuarantinedIndex
 }
 
 func (e *dataFaultIndexCleanupError) Error() string { return e.err.Error() }

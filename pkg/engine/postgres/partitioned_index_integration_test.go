@@ -152,3 +152,39 @@ func TestEngineApplyPartitionedIndexBuildRefusesAPlainTable(t *testing.T) {
 		`SELECT to_regclass('public.events_kind_idx') IS NOT NULL`).Scan(&exists))
 	assert.False(t, exists, "the refused statement must not have built an index")
 }
+
+// A unique index on a partitioned table whose rows in one partition duplicate
+// its key: that partition's build fails on its rows and leaves an invalid
+// index on the partition. The apply is refused naming the SQLSTATE, the
+// engine drops the partition's leftover the same proven way it drops a plain
+// table's, and the application can write the duplicate the live schema
+// allows into that partition.
+func TestEngineApplyPartitionedUniqueIndexOnDuplicateRowsDropsThePartitionsLeftover(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "partitioned_data_fault_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.ledger (ref text NOT NULL, day date NOT NULL) PARTITION BY RANGE (day);
+		CREATE TABLE public.ledger_2025 PARTITION OF public.ledger FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+		CREATE TABLE public.ledger_2026 PARTITION OF public.ledger FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+		INSERT INTO public.ledger (ref, day) VALUES
+			('a', '2025-03-01'), ('b', '2025-03-01'),
+			('c', '2026-03-01'), ('c', '2026-03-01')`)
+	require.NoError(t, err)
+
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "ledger",
+		"CREATE UNIQUE INDEX ledger_ref_key ON ONLY public.ledger USING btree (ref, day)"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "ledger")
+	require.Equal(t, engine.StateFailed, progress.State, "progress: %+v", progress)
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable, "a build the partition's rows violate fails the same way on every rerun")
+	// The partition's index carries a name derived from the partition's OID,
+	// so the detail is matched around it; the partition it names is where
+	// the rows to correct are.
+	assert.Regexp(t, `^index "public"\."ledger_ref_key_p\d+" \("ledger_2026"\) was not built: rows duplicate its key \(23505\), `+
+		`and its invalid leftover was dropped; correct the rows, then re-run$`, progress.ErrorMessage)
+	assertNoInvalidIndexOn(t, db, "ledger_2026")
+
+	_, err = db.ExecContext(t.Context(), "INSERT INTO public.ledger (ref, day) VALUES ('c', '2026-04-01'), ('c', '2026-04-01')")
+	require.NoError(t, err, "a write the live schema allows is not rejected by the failed build's index")
+}
