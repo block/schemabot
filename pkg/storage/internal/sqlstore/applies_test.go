@@ -5503,6 +5503,34 @@ func TestApplyStore_WithBranchReconcileElection_ReturnsTheReconcileError(t *test
 	require.ErrorIs(t, err, reconcileErr)
 }
 
+// Only one instance purges old storage rows per pass: a second instance that
+// asks while the first is inside its pass steps aside without running its own,
+// and once the first finishes the lock is free for the next pass.
+func TestApplyStore_WithStorageRetentionElection_ElectsOneInstancePerPass(t *testing.T) {
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+	other := NewMySQL(testDB)
+
+	ranOther := false
+	err := store.Applies().WithStorageRetentionElection(ctx, func(ctx context.Context) error {
+		otherErr := other.Applies().WithStorageRetentionElection(ctx, func(context.Context) error {
+			ranOther = true
+			return nil
+		})
+		require.ErrorIs(t, otherErr, storage.ErrStorageRetentionBusy, "a second instance steps aside while the first is purging")
+		return nil
+	})
+	require.NoError(t, err)
+	assert.False(t, ranOther)
+
+	ranNext := false
+	require.NoError(t, other.Applies().WithStorageRetentionElection(ctx, func(context.Context) error {
+		ranNext = true
+		return nil
+	}))
+	assert.True(t, ranNext, "the lock is released when the elected pass returns")
+}
+
 // A create taking over a stopped apply opens its transaction, and the attach
 // path, which stamps outside the apply target lock, then records an earlier
 // successor on the same stopped apply and commits. The create's stamp must
