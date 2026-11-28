@@ -43,9 +43,19 @@ func freezeUntil(f apitypes.Freeze) string {
 	return ui.FreezeUntil(f.EndsAt)
 }
 
+// cancelledBeforeStart reports a planned freeze lifted before its window
+// opened: it never held anything.
+func cancelledBeforeStart(f apitypes.Freeze) bool {
+	return f.LiftedAt != nil && f.LiftedAt.Before(f.StartsAt)
+}
+
 // freezeWindowEnd is where a freeze's window actually ended: when it was
-// lifted before its planned end, the lift; otherwise its planned end.
+// lifted before its planned end, the lift; otherwise its planned end. A
+// freeze cancelled before it started keeps its planned window and says so.
 func freezeWindowEnd(f apitypes.Freeze) string {
+	if cancelledBeforeStart(f) {
+		return freezeUntil(f) + ", cancelled at " + freezeTime(*f.LiftedAt) + " before it started"
+	}
 	if f.LiftedAt != nil && (f.EndsAt == nil || f.LiftedAt.Before(*f.EndsAt)) {
 		return "until lifted at " + freezeTime(*f.LiftedAt)
 	}
@@ -125,8 +135,26 @@ func WriteFreezeLifted(f apitypes.Freeze) {
 		fmt.Printf("✓ %s lifted.\n", ui.TerminalSafeLine(f.ID))
 		return
 	}
-	fmt.Printf("✓ %s lifted %s.\n", ui.TerminalSafeLine(f.ID), freezeLifted(f))
+	if cancelledBeforeStart(f) {
+		fmt.Printf("✓ %s cancelled before it started, %s.\n", ui.TerminalSafeLine(f.ID), freezeLifted(f))
+	} else {
+		fmt.Printf("✓ %s lifted %s.\n", ui.TerminalSafeLine(f.ID), freezeLifted(f))
+	}
 	fmt.Printf("   Scope:  %s in %s\n", freezeScope(f), ui.TerminalSafeLine(f.Environment))
+}
+
+// FrozenRetrySummary names the freezes in effect that a retry's --override
+// placeholder is for, on one line, for output that shows no plan: a reader
+// of JSON sees why the retry needs a reason and what it overrides.
+func FrozenRetrySummary(environment string, freezes []apitypes.Freeze) string {
+	var held []string
+	for _, f := range freezes {
+		if f.InEffect {
+			held = append(held, fmt.Sprintf("%s (%s)", ui.TerminalSafeLine(f.ID), ui.TerminalSafeLine(f.Reason)))
+		}
+	}
+	return fmt.Sprintf("%s is frozen by %s, so replace the --override placeholder with why this change can't wait",
+		ui.TerminalSafeLine(environment), strings.Join(held, ", "))
 }
 
 // WriteFreezeOverrideUsed says an apply ran through a freeze on an override,
@@ -146,6 +174,8 @@ func WriteFreezeOverrideUsed(overrideID, environment string) {
 func writeFreezeRows(f apitypes.Freeze, heading string, detail bool) {
 	status := ""
 	switch {
+	case cancelledBeforeStart(f):
+		status = ", cancelled"
 	case f.LiftedAt != nil:
 		status = ", lifted"
 	case f.InEffect:
@@ -176,26 +206,15 @@ func WriteFreezeShow(f apitypes.Freeze) {
 }
 
 // WriteFreezeList writes the freezes in effect, those scheduled, and those
-// that recently ended. The API's recent group also holds the freezes in the
-// first two, so each freeze is listed once, under its current state.
+// that recently ended. The API lists each freeze in one group only.
 func WriteFreezeList(list apitypes.FreezeListResponse) {
-	listed := make(map[string]bool, len(list.InEffect)+len(list.Scheduled))
-	for _, f := range append(append([]apitypes.Freeze(nil), list.InEffect...), list.Scheduled...) {
-		listed[f.ID] = true
-	}
-	var ended []apitypes.Freeze
-	for _, f := range list.Recent {
-		if !listed[f.ID] {
-			ended = append(ended, f)
-		}
-	}
 	groups := []struct {
 		title   string
 		freezes []apitypes.Freeze
 	}{
 		{"In effect", list.InEffect},
 		{"Scheduled", list.Scheduled},
-		{"Recently ended", ended},
+		{"Recently ended", list.Recent},
 	}
 	for i, group := range groups {
 		if i > 0 {

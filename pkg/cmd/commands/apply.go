@@ -668,7 +668,8 @@ func finishAfterCutover(result *apitypes.ProgressResponse, tables []*apitypes.Ta
 // placeholder the server refuses until it is replaced with a real reason.
 //
 // JSON output prints neither the plan nor the warning, so the error itself
-// names each unsafe change and the command that permits them.
+// names each unsafe change and the command that permits them, and, when the
+// retry carries the --override placeholder, the freezes it is for.
 func blockUnsafeApply(planResult *apitypes.PlanResponse, database, environment, schemaDir, target, override string, output OutputFormat) error {
 	unsafeChanges := planResult.RolloutUnsafeChanges()
 	retry := []string{"apply", "-s", initShellArg(schemaDir), "-e", initShellArg(environment)}
@@ -683,7 +684,11 @@ func blockUnsafeApply(planResult *apitypes.PlanResponse, database, environment, 
 		retry = append(retry, "--override", overrideReasonPlaceholder)
 	}
 	if output == OutputFormatJSON {
-		return errors.New(templates.UnsafeChangesBlockedSummary(unsafeChanges, retry))
+		summary := templates.UnsafeChangesBlockedSummary(unsafeChanges, retry)
+		if override == "" && anyFreezeInEffect(planResult.Freezes) {
+			summary += "; " + templates.FrozenRetrySummary(environment, planResult.Freezes)
+		}
+		return errors.New(summary)
 	}
 
 	// First show the plan so user can see what changes are proposed, and

@@ -675,7 +675,7 @@ comment say which freeze stopped an apply, and once that freeze has ended, that
 a plain start resumes it. A stopped apply resumes with
 `schemabot start` once the freeze ends, or with an approved
 override. Times are RFC3339 and print in UTC. `freeze list` shows the freezes in effect, the scheduled ones,
-and the recent ones.
+and the ones that recently ended, each once.
 
 On a server whose `freeze.override_policy` is `approval`, a second person
 approves a request to let one change through a freeze. Read it with

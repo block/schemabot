@@ -14,6 +14,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -311,6 +312,31 @@ func TestBlockUnsafeApplyShowsTheFreezesToo(t *testing.T) {
 	assert.Contains(t, out, "   freeze-abc  SEV-1234 payments latency  (until lifted)\n")
 	assert.Contains(t, out, `apply -s schema -e production --allow-unsafe --override "<why it can't wait>"`,
 		"the retry carries --override, so allowing the unsafe change is not refused by the freeze next")
+}
+
+// JSON output shows no plan, so the refusal itself names the freezes the
+// retry's --override placeholder is for. A reason the operator already gave
+// needs no explanation.
+func TestBlockUnsafeApplyJSONNamesTheFreezes(t *testing.T) {
+	plan := planWithTablesAndEngine("mysql", &apitypes.TableChangeResponse{
+		TableName: "legacy", DDL: "DROP TABLE `legacy`", ChangeType: "drop", IsUnsafe: true, UnsafeReason: "drops a table",
+	})
+	plan.Freezes = []apitypes.Freeze{
+		{ID: "freeze-abc", Environment: "production", Reason: "SEV-1234 payments latency", InEffect: true},
+		{ID: "freeze-next", Environment: "production", Reason: "holiday", InEffect: false},
+	}
+
+	err := blockUnsafeApply(plan, "orders", "production", "schema", "", "", OutputFormatJSON)
+	require.Error(t, err)
+	assert.Equal(t, "apply blocked: 1 unsafe change(s) detected (legacy: drops a table); to proceed with these destructive changes, re-run with: "+
+		cliname.Command("apply", "-s", "schema", "-e", "production", "--allow-unsafe", "--override", overrideReasonPlaceholder)+
+		"; production is frozen by freeze-abc (SEV-1234 payments latency), so replace the --override placeholder with why this change can't wait",
+		err.Error())
+
+	err = blockUnsafeApply(plan, "orders", "production", "schema", "", "Hotfix: checkout needs it", OutputFormatJSON)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "frozen by", "the operator's own reason needs no placeholder explanation")
+	assert.Contains(t, err.Error(), "--override 'Hotfix: checkout needs it'")
 }
 
 // The unsafe retry keeps the reason the operator already gave, and offers

@@ -64,7 +64,8 @@ own; their owners run them again.
 
 ```console
 $ schemabot unfreeze freeze-3f9a1c2e7b4d8a06 --reason "Holidays are over"
-✓ freeze-3f9a1c2e7b4d8a06 lifted.
+✓ freeze-3f9a1c2e7b4d8a06 lifted by alice at 2027-01-04T09:00:00Z: Holidays are over.
+   Scope:  whole environment in production
 ```
 
 To freeze less than the whole environment, add `--database` or `--deployment`.
@@ -125,6 +126,11 @@ $ schemabot unfreeze freeze-71d0e4a2c9b85f13 --reason "incident resolved"
 ✓ freeze-71d0e4a2c9b85f13 lifted by carol at 2026-12-02T11:30:00Z: incident resolved.
    Scope:  whole environment in production
 ```
+
+A planned freeze cancelled before it starts never held anything. `unfreeze`
+says `cancelled before it started` instead of `lifted`, and `freeze list`
+shows it as `(planned, cancelled)` with its planned window and when it was
+cancelled.
 
 See the [CLI reference](cli.md#freeze-an-environment) for every flag.
 
@@ -294,7 +300,7 @@ request body. A caller it could not verify is recorded as `unverified`.
 | Call | Does | Success |
 |---|---|---|
 | `POST /api/freezes` | Set or schedule a freeze | `201` with the freeze |
-| `GET /api/freezes?environment=&recent=` | List freezes `in_effect`, `scheduled` and `recent` (`recent` is 1 to 200, default 20) | `200` |
+| `GET /api/freezes?environment=&recent=` | List freezes `in_effect`, `scheduled` and `recent`, the ones that have ended (`recent` is 1 to 200, default 20) | `200` |
 | `GET /api/freezes/{id}` | Read one freeze | `200` with the freeze |
 | `POST /api/freezes/{id}/lift` | Lift a freeze early, or cancel a scheduled one | `200` with the lifted freeze |
 | `GET /api/freezes/overrides/{id}` | Read an override request | `200` with the request |
@@ -352,7 +358,8 @@ The response has `"in_effect": false` until the freeze starts.
 
 `GET /api/freezes?environment=production` returns three arrays of freeze
 objects: `in_effect`, oldest start first; `scheduled`, soonest first; and
-`recent`, newest first, which also includes the ones in the other two. To see
+`recent`, the freezes that have ended (lifted, cancelled, or past their end),
+newest first. Each freeze is in one array only. To see
 what holds production now:
 
 ```console
