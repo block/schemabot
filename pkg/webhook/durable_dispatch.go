@@ -434,6 +434,10 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 				"repo", event.Repository, "pr", event.PullRequest)
 			return
 		}
+		if errors.Is(processErr, errAutoPlanHeadMoved) {
+			h.supersedeHeadMovedDelivery(finishCtx, driverID, store, event, appName, recordOutcome)
+			return
+		}
 		var markErr error
 		var outcome string
 		var failureReason metrics.WebhookFailureReason
@@ -609,6 +613,35 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 	h.logger.Info("durable webhook driver completed delivery",
 		"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 		"action", event.Action, "repo", event.Repository, "pr", event.PullRequest)
+}
+
+// supersedeHeadMovedDelivery finishes an auto-plan delivery whose processing
+// found the PR's head had already moved past the delivery's head. The row ends
+// superseded rather than completed: a completed auto-plan row counts as
+// coverage for its head, and the retention purge reads a newer completed row
+// as proof that an older one is no longer needed. A delivery that arrived out
+// of order for an old head must not become that proof for the PR's real head.
+func (h *Handler) supersedeHeadMovedDelivery(ctx context.Context, driverID int, store storage.WebhookEventStore, event *storage.WebhookEvent, appName string, recordOutcome func(string)) {
+	if err := store.MarkSuperseded(ctx, event.ID, event.LeaseToken); err != nil {
+		if errors.Is(err, storage.ErrWebhookEventLeaseLost) || errors.Is(err, storage.ErrWebhookEventNotFound) {
+			recordOutcome("lease_lost")
+			h.logger.Warn("durable webhook driver lost the delivery lease before marking it superseded; another driver owns the delivery or the row is gone",
+				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+				"repo", event.Repository, "pr", event.PullRequest)
+			return
+		}
+		recordOutcome("finish_error")
+		h.logger.Error("durable webhook driver failed to mark delivery superseded; lease expiry will hand it to another driver",
+			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+			"repo", event.Repository, "pr", event.PullRequest, "head_sha", event.HeadSHA, "error", err)
+		return
+	}
+	recordOutcome("superseded")
+	metrics.RecordWebhookEvent(ctx, appName, event.Event, event.Action, event.Repository, "durable_dispatch_superseded")
+	h.logger.Info("durable webhook driver superseded auto-plan delivery because the pull request's head moved past it; the push that moved the head plans the new head",
+		"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+		"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
+		"head_sha", event.HeadSHA)
 }
 
 // supersedeCoveredAutoPlan coalesces a freshly claimed auto-plannable
@@ -994,7 +1027,7 @@ func (h *Handler) processDurablePullRequestAutoPlan(ctx context.Context, event *
 	}
 	defer cancel()
 
-	message, planErr := h.runAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, "pull_request", payload.Action, payload.Before, event.DeliveryID)
+	dispatch, planErr := h.dispatchAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, "pull_request", payload.Action, payload.Before, event.DeliveryID, autoPlanOptions{})
 	if planErr != nil {
 		return !autoPlanFailureIsPermanent(planErr), fmt.Errorf("auto-plan for durable delivery %s (%s#%d): %w", event.DeliveryID, repo, pr, planErr)
 	}
@@ -1005,11 +1038,21 @@ func (h *Handler) processDurablePullRequestAutoPlan(ctx context.Context, event *
 		// fully successful run as a failure and re-plan it on retry.
 		return true, fmt.Errorf("durable delivery %s run cancelled during auto-plan dispatch: %w", event.DeliveryID, ctxErr)
 	}
+	if dispatch.headMoved {
+		return false, fmt.Errorf("durable delivery %s (%s#%d) head %s: %w", event.DeliveryID, repo, pr, headSHA, errAutoPlanHeadMoved)
+	}
 	h.logger.Info("durable pull_request auto-plan dispatched",
 		"action", payload.Action, "repo", repo, "pr", pr, "head_sha", headSHA,
-		"delivery_id", event.DeliveryID, "outcome", message)
+		"delivery_id", event.DeliveryID, "outcome", dispatch.message)
 	return false, nil
 }
+
+// errAutoPlanHeadMoved is how processDurablePullRequestAutoPlan reports that
+// the PR's head had moved past the delivery's head, so nothing was planned. It
+// is an outcome, not a failure: the driver marks the delivery superseded
+// rather than completed, because a completed auto-plan row counts as coverage
+// for its head and this delivery's head was never evaluated as the PR's head.
+var errAutoPlanHeadMoved = errors.New("the pull request's head moved past the delivery's head")
 
 // autoPlanFailureIsPermanent reports whether a failed auto-plan run is
 // deterministic for the delivery's head, so retrying the same head cannot

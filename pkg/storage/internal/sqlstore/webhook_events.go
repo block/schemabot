@@ -592,6 +592,22 @@ func (s *webhookEventStore) MarkCompleted(ctx context.Context, id int64, leaseTo
 	return s.checkWebhookEventLeaseResult(ctx, result, id, leaseToken)
 }
 
+// MarkSuperseded marks a claimed auto-plannable pull_request event superseded
+// after the driver found the pull request's head had moved past it. Like
+// MarkCompleted it keeps the lease token and COALESCE-preserves completed_at,
+// so repeating the call with the same token is a no-op.
+func (s *webhookEventStore) MarkSuperseded(ctx context.Context, id int64, leaseToken string) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE webhook_events
+		SET state = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+		WHERE id = ? AND lease_token = ?
+	`, storage.WebhookEventSuperseded, id, leaseToken)
+	if err != nil {
+		return fmt.Errorf("mark webhook event %d superseded: %w", id, err)
+	}
+	return s.checkWebhookEventLeaseResult(ctx, result, id, leaseToken)
+}
+
 // MarkFailed marks a claimed event failed. A non-nil retryAfter keeps it
 // retryable after that time; nil makes the failure terminal.
 //
