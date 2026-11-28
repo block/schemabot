@@ -2440,7 +2440,9 @@ func TestEngineApplyRefusedByAnEventTriggerFailsAtOnce(t *testing.T) {
 // says to rebuild the table, rather than spending its retries.
 func TestEngineApplyColumnAddOnATableAtTheColumnLimitFailsAtOnce(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "column_limit_test")
-	_, err := db.ExecContext(t.Context(), `
+	setupCtx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	_, err := db.ExecContext(setupCtx, `
 		CREATE TABLE public.events (id bigint PRIMARY KEY);
 		DO $$
 		BEGIN
