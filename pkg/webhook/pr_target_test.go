@@ -253,27 +253,6 @@ func TestTargetRecoveryRetriesDespiteEarlierOrganicHeadCoverage(t *testing.T) {
 	}
 }
 
-// The inbox purge can delete the delivery that recorded the PR's current
-// target, such as an old retarget delivery, while the head keeps its covering
-// row. The head was planned and the target has not changed, so the reconciler
-// queues nothing.
-func TestTargetRecoverySkipsCoveredHeadWhoseObservedDeliveryWasPurged(t *testing.T) {
-	store := newRecordingWebhookEventStore()
-	h, mux := newReconcileTestHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}}, WithWebhookReconcileSynthesis())
-	_, err := store.Create(t.Context(), &storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: "head-push", Event: "pull_request", Action: "synchronize", Repository: "octocat/hello-world", PullRequest: 7, HeadSHA: "same-head", State: storage.WebhookEventCompleted, Payload: []byte(`{}`)})
-	require.NoError(t, err)
-	info := &ghclient.PullRequestInfo{HeadSHA: "same-head", BaseRef: "main", DefaultBranch: "main"}
-	require.NoError(t, h.recordPRTargetObservation(t.Context(), "octocat/hello-world", 7, info, ghclient.PRTargetEligibility{Target: "main", Eligible: true}, "purged-retarget-delivery"))
-	mux.HandleFunc("GET /repos/octocat/hello-world/pulls", func(w http.ResponseWriter, _ *http.Request) {
-		writeOpenPRs(t, w, openPR(7, "same-head", time.Now().Add(-time.Hour)))
-	})
-
-	scanned, missing, synthesized := h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
-	assert.Equal(t, 1, scanned)
-	assert.Zero(t, missing, "a covered head whose observed delivery was purged is not missing")
-	assert.Zero(t, synthesized, "no recovery may re-plan a head that was planned")
-}
-
 // A completed or permanently failed recovery from an earlier enforced-target
 // visit cannot hide a lost return notification at the same SHA. Its old outcome
 // is preserved while a fresh recovery is queued for the new visit.

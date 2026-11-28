@@ -313,8 +313,8 @@ func assertDeleteTerminalOlderThan(t *testing.T, store storage.Storage, db *sql.
 	assert.Equal(t, storage.WebhookEventPending, recreated.State)
 }
 
-// Retention keeps the newest covering row of each pull request, so purging
-// never makes the reconciler plan a head again: an old completed or
+// Retention keeps the newest covering row of each pull request, the row the
+// reconciler reads for its newest planned head: an old completed or
 // dead-lettered row survives unless a newer covering row exists for the same
 // pull request, and rows that cover nothing are deleted on age alone.
 func TestWebhookEventStore_PurgeKeepsNewestCoveringRow(t *testing.T) {
@@ -336,18 +336,23 @@ func assertPurgeKeepsNewestCoveringRow(t *testing.T, store storage.Storage, db *
 		return dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
 			LiteralIntervalAmount(uint64(d.Microseconds())), IntervalMicrosecond)
 	}
-	// seed inserts a delivery in order, so later seeds have higher ids. The row
-	// was received receivedAgo ago and reached its state finishedAgo ago.
-	seed := func(deliveryID string, pr int, head, action, state string, receivedAgo, finishedAgo time.Duration) {
+	// seedRow inserts a delivery in order, so later seeds have higher ids. The
+	// row was received receivedAgo ago and reached its state finishedAgo ago.
+	seedRow := func(deliveryID, repository, event string, pr int, head, action, state string, receivedAgo, finishedAgo time.Duration) {
 		t.Helper()
 		_, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
-			DeliveryID: deliveryID, Event: "pull_request", Action: action,
-			Repository: repo, PullRequest: pr, HeadSHA: head, Payload: []byte(`{}`),
+			DeliveryID: deliveryID, Event: event, Action: action,
+			Repository: repository, PullRequest: pr, HeadSHA: head, Payload: []byte(`{}`),
 		})
 		require.NoError(t, err, deliveryID)
 		_, err = db.ExecContext(ctx, rebind(`UPDATE webhook_events SET state = ?, received_at = `+ago(receivedAgo)+
 			`, completed_at = `+ago(finishedAgo)+`, updated_at = `+ago(finishedAgo)+` WHERE delivery_id = ?`), state, deliveryID)
 		require.NoError(t, err, deliveryID)
+	}
+	// seed inserts a pull_request delivery in the test's repository.
+	seed := func(deliveryID string, pr int, head, action, state string, receivedAgo, finishedAgo time.Duration) {
+		t.Helper()
+		seedRow(deliveryID, repo, "pull_request", pr, head, action, state, receivedAgo, finishedAgo)
 	}
 	exists := func(deliveryID string) bool {
 		t.Helper()
@@ -406,17 +411,36 @@ func assertPurgeKeepsNewestCoveringRow(t *testing.T, store storage.Storage, db *
 	seed("before-late-arrival", 16, "head-1", "synchronize", completed, old, old)
 	seed("current-before-late-arrival", 16, "head-2", "synchronize", completed, old, old)
 	seed("late-arrival-earlier-head", 16, "head-1", "synchronize", storage.WebhookEventSuperseded, old, old)
+	// 17: a newer row of another event type on the same pull request plans
+	// nothing, so it does not justify deleting the covering row, even when its
+	// action shares a name with an auto-plan action.
+	seed("beneath-check-run", 17, "head-1", "synchronize", completed, old, old)
+	seedRow("check-run-newest", repo, "check_run", 17, "head-1", "completed", completed, old, old)
+	seedRow("issue-reopened-newest", repo, "issues", 17, "head-1", "reopened", completed, old, old)
+	// 18: nor does a newer pull_request row whose action never plans a head.
+	seed("beneath-closed", 18, "head-1", "synchronize", completed, old, old)
+	seed("closed-newest", 18, "head-1", "closed", completed, old, old)
+	// 19: a newer covering row in another repository with the same pull request
+	// number belongs to another pull request.
+	seed("beneath-other-repo", 19, "head-1", "synchronize", completed, old, old)
+	seedRow("other-repo-newest", "block/other", "pull_request", 19, "head-2", "synchronize", completed, old, old)
+	// 20: a covering-shaped row with no pull request can never cover a head.
+	seed("no-pull-request", 20, "head-1", "synchronize", completed, old, old)
+	_, err = db.ExecContext(ctx, rebind(`UPDATE webhook_events SET pull_request = 0 WHERE delivery_id = ?`), "no-pull-request")
+	require.NoError(t, err)
 
 	wantDeleted := []string{
 		"completed-older", "permanent-older", "failed-newest", "superseded-newest",
 		"failed-alone", "superseded-alone", "closed-alone",
 		"before-late-arrival", "late-arrival-earlier-head",
+		"check-run-newest", "issue-reopened-newest", "closed-newest", "no-pull-request",
 	}
 	wantKept := []string{
 		"only-completed", "completed-newest", "permanent-newest", "older-than-pending",
 		storage.SynthesizedWebhookDeliveryIDPrefix + "permanent-only", "kept-beneath-failed",
 		"pending-newest", "failed-in-cool-off", "redelivered-older-head", "current-head",
-		"current-before-late-arrival",
+		"current-before-late-arrival", "beneath-check-run", "beneath-closed",
+		"beneath-other-repo", "other-repo-newest",
 	}
 
 	counted, err := store.WebhookEvents().CountTerminalOlderThan(ctx, retention)

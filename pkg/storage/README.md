@@ -73,8 +73,12 @@ each PR: a covering row is deleted only when a newer `completed` or
 `failed_permanent` row (a higher row id) exists for the same repository and PR.
 A newer row still in flight covers its head now but can fail later, so it does
 not justify a delete. The id orders them, not `received_at`, because a
-redelivery resets `received_at` and keeps the id. Purging never makes the
-reconciler plan a head again, and the table keeps about one row per PR. Rows
+redelivery resets `received_at` and keeps the id. The table keeps about one row
+per PR. Purging can still make the reconciler evaluate a PR once more, which is
+the safe direction: the keep is per PR, so a head the PR returns to later has
+lost its row, and the delivery that recorded the PR's current target (an old
+retarget, for example) can be deleted on age alone. Purging never makes an
+unplanned head read as planned. Rows
 that cover nothing (failed outside its cool-off, superseded, other event types)
 are deleted on age alone. GitHub lets an operator redeliver only deliveries from
 the past 3 days, and a redelivery reopens a terminal row anyway, so dedup needs

@@ -789,8 +789,11 @@ type WebhookEventStore interface {
 	// row that is still in flight, or failed inside its cool-off, covers now but
 	// can lose that coverage, so it never justifies a delete. The id, not
 	// received_at, orders them because a Redeliver reopen keeps a row's id and
-	// resets its received_at. So purging never makes the reconciler plan a head again, and
-	// the table keeps about one row per pull request however old it is. Rows
+	// resets its received_at. The table keeps about one row per pull request however
+	// old it is. The keep is per pull request, not per head, and the delivery that
+	// recorded the pull request's current target can be deleted on age alone, so a
+	// purge can make the reconciler evaluate a pull request once more. It never
+	// makes an unplanned head read as planned. Rows
 	// that cover nothing (failed outside its cool-off, failed synthesized,
 	// superseded, other event types or actions, rows with no pull request) are
 	// deleted on age alone.

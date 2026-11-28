@@ -3560,7 +3560,7 @@ var WebhookEventStatesAll = []string{
 // these are the only states retention may delete. A completed or permanently
 // failed row is also what HasEventForHead counts as coverage for its head, so
 // DeleteTerminalOlderThan keeps the newest covering row of each pull request.
-// Purging therefore never makes the reconciler plan a head again.
+// Purging never makes an unplanned head read as planned.
 var WebhookEventStatesTerminal = []string{
 	WebhookEventCompleted,
 	WebhookEventFailed,
