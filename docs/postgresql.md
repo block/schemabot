@@ -683,7 +683,9 @@ reason, even when the plan shows them as native:
 
 - A concurrent index build on the parent
 - Adopting an existing index on the parent
-- A `NOT VALID` foreign key, before PostgreSQL 18
+
+Before PostgreSQL 18, the plan itself blocks a `NOT VALID` foreign key on a
+parent.
 
 ### Enum types
 
@@ -965,7 +967,7 @@ ones it leaves out.
 | Adds a foreign key to an existing table | `ADD CONSTRAINT ... NOT VALID`, then `VALIDATE CONSTRAINT`. Both run |
 | Creates a table that has a foreign key | The `CREATE TABLE`, with the key. It runs |
 | Leaves out a live foreign key | `DROP CONSTRAINT`. It runs after you approve it with `--allow-unsafe` |
-| Changes a live foreign key, such as adding `ON DELETE CASCADE` | The `DROP CONSTRAINT`, then `ADD CONSTRAINT ... NOT VALID` and `VALIDATE CONSTRAINT`. All three run after you approve the drop |
+| Changes a live foreign key, such as adding `ON DELETE CASCADE` | One `DROP CONSTRAINT ..., ADD CONSTRAINT ... NOT VALID` statement, then `VALIDATE CONSTRAINT`. Both run after you approve the drop |
 | Leaves out a live foreign key into another namespace | Cannot be declared. The `DROP CONSTRAINT` is blocked, and so is the plan, until the key is removed from the database |
 
 A file can declare a foreign key only when the referenced table already exists
@@ -1007,10 +1009,11 @@ a key plans this drop.
 **When a dropped key is a surprise.** A planned drop is usually a key the file
 left out. To keep it, declare it in the file and plan again.
 
-**A changed key.** Between the drop and the add, writes are not checked
-against the key. A row written then that breaks the new key fails the
-validation, which leaves the key `NOT VALID` and still checking new writes.
-Fix the row, and the next plan is only the validation.
+**A changed key.** One statement drops the old key and adds the new one
+`NOT VALID`, so every write is checked against one or the other. When
+existing rows break the new key, the validation fails and leaves it
+`NOT VALID`, still checking new writes. Fix the rows, and the next plan is
+only the validation.
 
 **Declaring tables that have foreign keys.** `pull` writes them:
 
@@ -1562,8 +1565,8 @@ leaves. See [Index builds](#index-builds).
 - A namespace cannot be rolled back when one of its managed tables has RLS
   and a foreign key. A schema file cannot declare both on one table yet.
 - The originals carry foreign keys. Rolling back a plan that added a foreign
-  key shows the key's drop as a blocked step, since SchemaBot does not drop
-  foreign keys yet.
+  key plans its `DROP CONSTRAINT`, which runs after you approve it with
+  `--allow-unsafe`.
 - A namespace cannot be rolled back when one of its managed tables has a
   foreign key to or from another namespace, or is referenced by a table the
   plan does not manage.

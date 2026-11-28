@@ -343,7 +343,7 @@ func TestEnginePlanBlocksATableDropADeclaredForeignKeyReferences(t *testing.T) {
 			}
 			require.NotNil(t, usersDrop, "the undeclared table is planned as a drop")
 			assert.Equal(t, engine.ExecutionModeBlocked, usersDrop.ExecutionMode)
-			assert.Contains(t, usersDrop.ModeReason, `the schema file(s) of table(s) "orders" declare a foreign key that references it, so PostgreSQL refuses to drop it`)
+			assert.Contains(t, usersDrop.ModeReason, `the schema file of table "orders" declares a foreign key that references it, so PostgreSQL refuses to drop it`)
 		})
 	}
 }

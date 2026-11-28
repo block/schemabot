@@ -279,19 +279,28 @@ const hierarchyDropReason = "SchemaBot does not drop a partitioned table or a ta
 	" — declare the table in a schema file, or drop the table tree through a separately reviewed process"
 
 func keptReferenceDropReason(refs []string) string {
-	return fmt.Sprintf("foreign key constraint(s) %s of tables that stay reference it, so PostgreSQL refuses to drop it", strings.Join(quoteAll(refs), ", ")) +
+	n := len(refs)
+	return fmt.Sprintf("%s %s of %s that %s %s it, so PostgreSQL refuses to drop it",
+		plural(n, "foreign key", "foreign keys"), strings.Join(quoteAll(refs), ", "),
+		plural(n, "a table", "tables"), plural(n, "stays", "stay"), plural(n, "references", "reference")) +
 		" — remove those constraints or their tables' schema files too and plan again, or declare the table in a schema file"
 }
 
 func declaredReferenceDropReason(tables []string) string {
 	sorted := slices.Clone(tables)
 	slices.Sort(sorted)
-	return fmt.Sprintf("the schema file(s) of table(s) %s declare a foreign key that references it, so PostgreSQL refuses to drop it", strings.Join(quoteAll(slices.Compact(sorted)), ", ")) +
+	sorted = slices.Compact(sorted)
+	n := len(sorted)
+	return fmt.Sprintf("the %s of %s %s %s a foreign key that references it, so PostgreSQL refuses to drop it",
+		plural(n, "schema file", "schema files"), plural(n, "table", "tables"), strings.Join(quoteAll(sorted), ", "), plural(n, "declares", "declare")) +
 		" — remove those foreign keys from the files and plan again, or declare the table in a schema file"
 }
 
 func otherNamespaceReferenceDropReason(refs []string) string {
-	return fmt.Sprintf("foreign key constraint(s) %s in other namespaces reference it, and drops in different namespaces have no guaranteed order", strings.Join(quoteAll(refs), ", ")) +
+	n := len(refs)
+	return fmt.Sprintf("%s %s in %s %s it, and drops in different namespaces have no guaranteed order",
+		plural(n, "foreign key", "foreign keys"), strings.Join(quoteAll(refs), ", "),
+		plural(n, "another namespace", "other namespaces"), plural(n, "references", "reference")) +
 		" — drop those constraints or their tables first, then plan again, or declare the table in a schema file"
 }
 

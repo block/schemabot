@@ -1410,7 +1410,7 @@ func TestEnginePlanUndeclaredTableIsUnsafeDrop(t *testing.T) {
 		{"events", hierarchy},
 		{"ping", cycle},
 		{"pong", cycle},
-		{"tags", `foreign key constraint(s) "events.events_tag_id_fkey" of tables that stay reference it`},
+		{"tags", `foreign key "events.events_tag_id_fkey" of a table that stays references it`},
 		{"users_history", hierarchy},
 	}
 	changes := result.Changes[0].TableChanges

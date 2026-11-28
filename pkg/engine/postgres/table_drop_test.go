@@ -59,7 +59,7 @@ func TestPlanTableDropsKeepsATableReferencedFromAnotherSchema(t *testing.T) {
 	}, nil)
 	assert.Equal(t, []string{"orders"}, plan.order)
 	assert.Contains(t, plan.blocked["accounts"][0],
-		`foreign key constraint(s) "billing.orders.orders_user_fkey" in other namespaces reference it, and drops in different namespaces have no guaranteed order`)
+		`foreign key "billing.orders.orders_user_fkey" in another namespace references it, and drops in different namespaces have no guaranteed order`)
 }
 
 // A table that a kept table references is blocked, and blocking it keeps
@@ -71,7 +71,7 @@ func TestPlanTableDropsBlocksTablesThatStayReferenced(t *testing.T) {
 		"tags":   referencing("tags", "tags_color_fkey", fk("posts", "posts_tag_fkey")),
 	}, nil)
 	assert.Empty(t, plan.order)
-	assert.Contains(t, plan.blocked["tags"][0], `foreign key constraint(s) "posts.posts_tag_fkey" of tables that stay reference it`)
+	assert.Contains(t, plan.blocked["tags"][0], `foreign key "posts.posts_tag_fkey" of a table that stays references it`)
 	assert.Contains(t, plan.blocked["colors"][0], `"tags.tags_color_fkey"`)
 }
 
@@ -114,7 +114,7 @@ func TestPlanTableDropsBlocksHierarchiesAndCycles(t *testing.T) {
 	for _, table := range []string{"ping", "pong"} {
 		assert.Contains(t, plan.blocked[table][0], "its foreign keys form a cycle", table)
 	}
-	assert.Contains(t, plan.blocked["colors"][0], `foreign key constraint(s) "ping.ping_color_fkey" of tables that stay reference it`)
+	assert.Contains(t, plan.blocked["colors"][0], `foreign key "ping.ping_color_fkey" of a table that stays references it`)
 }
 
 // The apply admits a DROP TABLE only when it is exactly the plan's drop of
