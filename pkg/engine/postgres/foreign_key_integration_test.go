@@ -550,6 +550,51 @@ func TestEngineRollbackOfAnAddedForeignKeyDropsIt(t *testing.T) {
 	assert.True(t, converged.NoChanges, "the rollback converged, got %+v", converged.Changes)
 }
 
+// An owner removes a foreign key from the schema file and reviews the plan
+// that drops it. Before the apply runs, another session replaces the key with
+// a different one under the same name. The apply reads the key again under
+// the table lock, finds it is not the key the plan reviewed, and drops
+// nothing; the failure is not retried, because a retry would meet the same
+// replacement.
+func TestEngineApplyRefusesToDropAReplacedForeignKey(t *testing.T) {
+	const database = "apply_foreign_key_drop_replaced_test"
+	dsn, db := testutil.StartPostgres(t, database)
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE TABLE public.accounts (id bigint PRIMARY KEY);
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint NOT NULL CONSTRAINT orders_user_id_fkey REFERENCES public.users (id));
+		INSERT INTO public.users VALUES (1);
+		INSERT INTO public.accounts VALUES (1);
+		INSERT INTO public.orders VALUES (10, 1)`)
+	require.NoError(t, err)
+	eng := New()
+	planned := planForeignKeyFiles(t, eng, database, dsn, map[string]string{
+		"users.sql":    "CREATE TABLE users (id bigint PRIMARY KEY)",
+		"accounts.sql": "CREATE TABLE accounts (id bigint PRIMARY KEY)",
+		"orders.sql":   "CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint NOT NULL)",
+	})
+	require.Len(t, planned.Changes, 1)
+	require.Len(t, planned.Changes[0].TableChanges, 1)
+	drop := planned.Changes[0].TableChanges[0]
+	require.Equal(t, "ALTER TABLE public.orders DROP CONSTRAINT orders_user_id_fkey", drop.DDL)
+	require.True(t, drop.IsUnsafe)
+
+	_, err = db.ExecContext(t.Context(), `
+		ALTER TABLE public.orders DROP CONSTRAINT orders_user_id_fkey;
+		ALTER TABLE public.orders ADD CONSTRAINT orders_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.accounts (id)`)
+	require.NoError(t, err)
+
+	outcomes := applyPlannedSteps(t, eng, dsn, planned)
+	require.Len(t, outcomes, 1)
+	assert.Equal(t, engine.StateFailed, outcomes[0].State)
+	assert.False(t, outcomes[0].Retryable, "a retry would meet the same replacement key")
+	assert.Contains(t, outcomes[0].ErrorMessage, `the object the planned drop on "orders" removes changed after planning; re-plan against the current schema`)
+	var referenced string
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		`SELECT confrelid::regclass::text FROM pg_constraint WHERE conname = 'orders_user_id_fkey'`).Scan(&referenced))
+	assert.Equal(t, "accounts", referenced, "the replacement key is left in place")
+}
+
 // An owner renames a foreign key in the schema file. The plan adds the key
 // under its new name, validates it, and only then drops the old key, so the
 // table's rows stay checked throughout. Every step runs, and a fresh plan is
@@ -575,6 +620,16 @@ func TestEngineApplyForeignKeyMovedToANewName(t *testing.T) {
 		`ALTER TABLE "public"."orders" VALIDATE CONSTRAINT "orders_user_fk"`,
 		"ALTER TABLE public.orders DROP CONSTRAINT orders_user_id_fkey",
 	}, executableDDL(t, plan, "orders"), "the old key is dropped only after the new one is validated")
+	var drop *engine.TableChange
+	for _, sc := range plan.Changes {
+		for i := range sc.TableChanges {
+			if sc.TableChanges[i].DDL == "ALTER TABLE public.orders DROP CONSTRAINT orders_user_id_fkey" {
+				drop = &sc.TableChanges[i]
+			}
+		}
+	}
+	require.NotNil(t, drop, "the old key's drop is in the plan, got %+v", plan.Changes)
+	assert.True(t, drop.IsUnsafe, "dropping the old key needs the operator's consent")
 	outcomes := applyPlannedSteps(t, eng, dsn, plan)
 	require.Len(t, outcomes, 3)
 	for _, progress := range outcomes {

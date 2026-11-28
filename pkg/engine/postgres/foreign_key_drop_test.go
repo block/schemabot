@@ -98,6 +98,7 @@ func TestTableChangesNamesWhyAForeignKeyDropIsRefused(t *testing.T) {
 	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
 	require.NoError(t, err)
 	const removeOutside = "the plan stays blocked until the key is removed outside SchemaBot through a separately reviewed process"
+	const columnFirst = `statement for table "orders" drops foreign key "orders_user_id_fkey" in a plan that also drops or changes the type of a column on the table, and such a plan runs its drops first, so writes would be checked against no foreign key until the plan's new one is in place; SchemaBot does not apply it, so make the column change and the foreign key change in separate pull requests`
 	for _, tt := range []struct {
 		name           string
 		report         pgplan.Report
@@ -127,7 +128,49 @@ func TestTableChangesNamesWhyAForeignKeyDropIsRefused(t *testing.T) {
 				refusedForeignKeyDropStatement(),
 				executedStatement(schemadiff.ChangeAddForeignKey, "ALTER TABLE public.orders ADD CONSTRAINT orders_customer_id_fkey FOREIGN KEY (user_id) REFERENCES public.users (id) NOT VALID"),
 			),
-			want: `statement for table "orders" drops foreign key "orders_user_id_fkey" in a plan that also drops or changes the type of a column on the table, and such a plan runs its drops first, so writes would be checked against no foreign key until the plan's new one is in place; SchemaBot does not apply it, so make the column change and the foreign key change in separate pull requests`,
+			want: columnFirst,
+		},
+		{
+			// When several causes apply, the reason names the one whose
+			// remedy gets the plan past every cause: removal outside
+			// SchemaBot first, then splitting the column change out.
+			name: "key into another namespace in a plan that also drops a column and re-adds the key",
+			report: ordersReport(
+				executedStatement(schemadiff.ChangeDropColumn, "ALTER TABLE public.orders DROP COLUMN legacy"),
+				refusedForeignKeyDropStatement(),
+				executedStatement(schemadiff.ChangeAddForeignKey, "ALTER TABLE public.orders ADD CONSTRAINT orders_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users (id) ON DELETE CASCADE"),
+			),
+			crossNamespace: []string{"orders_user_id_fkey"},
+			want:           `statement for table "orders" drops foreign key "orders_user_id_fkey", which references another namespace, so a schema file cannot declare it and SchemaBot does not drop it; ` + removeOutside,
+		},
+		{
+			name: "key changed under the same name in a plan that also drops a column",
+			report: ordersReport(
+				executedStatement(schemadiff.ChangeDropColumn, "ALTER TABLE public.orders DROP COLUMN legacy"),
+				refusedForeignKeyDropStatement(),
+				executedStatement(schemadiff.ChangeAddForeignKey, "ALTER TABLE public.orders ADD CONSTRAINT orders_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users (id) ON DELETE CASCADE"),
+			),
+			want: columnFirst,
+		},
+		{
+			name: "plan that retypes a column and validates a key",
+			report: ordersReport(
+				executedStatement(schemadiff.ChangeAlterType, "ALTER TABLE public.orders ALTER COLUMN legacy TYPE bigint"),
+				refusedForeignKeyDropStatement(),
+				executedStatement(schemadiff.ChangeValidateForeignKey, `ALTER TABLE "public"."orders" VALIDATE CONSTRAINT "orders_customer_id_fkey"`),
+			),
+			want: columnFirst,
+		},
+		{
+			// Without the planner's record of the key there is no name to
+			// give, so the drop stays blocked with the generic refusal.
+			name: "refused drop the planner left without a record",
+			report: ordersReport(func() pgplan.Statement {
+				statement := refusedForeignKeyDropStatement()
+				statement.Drops = nil
+				return statement
+			}()),
+			want: `statement for table "orders" is refused: it cannot be executed safely as written`,
 		},
 		{
 			// The table's other key into another namespace is not this one,

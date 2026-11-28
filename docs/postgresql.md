@@ -964,6 +964,7 @@ ones it leaves out.
 | Adds a foreign key to an existing table | `ADD CONSTRAINT ... NOT VALID`, then `VALIDATE CONSTRAINT`. Both run |
 | Creates a table that has a foreign key | The `CREATE TABLE`, with the key. It runs |
 | Leaves out a live foreign key | `DROP CONSTRAINT`. It runs after you approve it with `--allow-unsafe` |
+| Leaves out a live foreign key to a table the same plan drops | The table's drop is blocked, because the plan still counts the key as a reference from a table that stays, and that blocks the whole plan. Leave out the key in one pull request and delete the table's file in the next |
 | Moves a foreign key to a new name | The new key's `ADD CONSTRAINT ... NOT VALID` and `VALIDATE CONSTRAINT`, then the old key's `DROP CONSTRAINT`, so the rows stay checked throughout. All run, and the drop needs `--allow-unsafe` |
 | Changes a foreign key under the same name on a partitioned table, or in a plan that also drops or retypes a column | The old key would be dropped before the new one is in place, so the drop is blocked. Declare the changed key under a new name, or make the column change in its own pull request |
 | Has a foreign key into another namespace | Cannot be declared. The plan stays blocked until the foreign key is removed from the database |
