@@ -733,6 +733,18 @@ of a table with no schema file. Enum labels are checked separately; see
 The pinned pg-sprite version defines which shapes run, so upgrading pg-sprite
 can admit more without a SchemaBot change.
 
+pg-sprite refuses some changes outright, because PostgreSQL would fail them or
+they would break the table. The plan comment names the fix:
+
+| Change | Fix |
+|---|---|
+| Adds a `NOT NULL` column with no default to a table that holds rows | Give the column a default. Or add it nullable, fill every row, and declare `NOT NULL` in a later change, which SchemaBot runs online. |
+| Drops the index, key, or column the table's replica identity uses | Point `REPLICA IDENTITY` at another index outside SchemaBot. |
+| Drops with `CASCADE` | Drop each dependent object as its own change, and remove `CASCADE`. |
+| Retypes or drops a column that a view, policy, trigger, or generated column reads | Change or drop the objects the comment names first. |
+| Retypes or drops a column in a partition key | PostgreSQL never allows it. Create a new partitioned table with the new key and move the rows into it. |
+| Uses an operation with no safe path, such as an `EXCLUDE` constraint | Make the change outside SchemaBot. |
+
 When a plan is blocked:
 
 - The plan comment names each blocked table and the reason. A refused shape
@@ -1296,6 +1308,20 @@ indexes still works on a table with live RLS. It manages columns and indexes
 and leaves policies alone. Leaving the RLS clauses out does **not** disable
 RLS or drop policies, so a no-change plan for that file says nothing about its
 policies.
+
+**Removing RLS clauses SchemaBot applied.** If a file no longer has RLS
+clauses that it had when SchemaBot last applied it, the plan is refused while
+the table still has RLS. A revert of the change that added them hits this. The
+refusal names the table, its live settings and policies, and the two fixes:
+
+- To remove the RLS, write `ALTER TABLE <table> DISABLE ROW LEVEL SECURITY;`
+  in the file. The plan then drops the policies and disables RLS.
+- To keep it, put the clauses back.
+
+"Last applied" means the newest apply that completed in that environment and
+covered the file's namespace, however many applies to other namespaces came
+after it. An environment where SchemaBot never applied the clauses keeps the
+rule above.
 
 **Not supported yet:**
 

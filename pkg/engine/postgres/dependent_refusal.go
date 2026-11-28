@@ -5,23 +5,17 @@ import (
 	"strings"
 
 	"github.com/block/pg-sprite/pkg/planner"
-
-	"github.com/block/schemabot/pkg/engine"
 )
 
-// dependentObjectRefusalReason names the objects that keep PostgreSQL from
+// dependentObjectCauses names the objects that keep PostgreSQL from
 // running a refused column change: the views, row security policies,
 // triggers, and generated columns that read a column the statement retypes
 // or drops, and the partitioned tables whose key includes it. PostgreSQL
 // refuses the change while any of them stands, even a type change that
 // rewrites nothing, so the operator's next step is to change those objects,
-// and naming them saves a search of the catalog. It reports false when no
-// decision names a dependent object.
-//
-// The names come from the catalog, so the composed reason is collapsed to
-// one line and its blocked-cause separator neutralized, as for every other
-// reason built from a database identifier.
-func dependentObjectRefusalReason(decisions []planner.Decision, table string) (string, bool) {
+// and naming them saves a search of the catalog. Each cause is a clause of
+// the sentence operationRefusalReason composes.
+func dependentObjectCauses(decisions []planner.Decision) []string {
 	var causes []string
 	for _, d := range decisions {
 		if n := len(d.DependentViews); n > 0 {
@@ -45,11 +39,7 @@ func dependentObjectRefusalReason(decisions []planner.Decision, table string) (s
 				strings.Join(d.PartitionKeyTables, ", ")))
 		}
 	}
-	if len(causes) == 0 {
-		return "", false
-	}
-	reason := fmt.Sprintf("statement for table %q is refused: %s, then plan again", table, strings.Join(causes, "; and "))
-	return engine.SanitizeBlockedCause(singleLine(reason)), true
+	return causes
 }
 
 // plural picks the singular or plural form for n.

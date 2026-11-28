@@ -308,7 +308,7 @@ func (tidbStatementParser) Split(content string) ([]string, error) {
 		AllowMixedStatementTypes: true,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse SQL statements %q: %w", statementPreview(content), err)
+		return nil, fmt.Errorf("failed to parse SQL statements %q: %w", StatementPreview(content), err)
 	}
 	stmts := make([]string, 0, len(parsed))
 	for i, s := range parsed {
@@ -317,7 +317,7 @@ func (tidbStatementParser) Split(content string) ([]string, error) {
 		// and lint from this list, so that is an error rather than a skip.
 		stmt := strings.TrimSpace((*s.StmtNode).Text())
 		if stmt == "" {
-			return nil, fmt.Errorf("statement %d of %q parsed with no text", i+1, statementPreview(content))
+			return nil, fmt.Errorf("statement %d of %q parsed with no text", i+1, StatementPreview(content))
 		}
 		stmts = append(stmts, stmt)
 	}
@@ -328,15 +328,15 @@ func (tidbStatementParser) Split(content string) ([]string, error) {
 func (tidbStatementParser) Classify(stmt string) (StatementType, string, error) {
 	results, err := statement.Classify(stmt)
 	if err != nil {
-		return StatementUnknown, "", fmt.Errorf("classify statement %q: %w", statementPreview(stmt), err)
+		return StatementUnknown, "", fmt.Errorf("classify statement %q: %w", StatementPreview(stmt), err)
 	}
 	if len(results) == 0 {
-		return StatementUnknown, "", fmt.Errorf("no classification result for statement %q", statementPreview(stmt))
+		return StatementUnknown, "", fmt.Errorf("no classification result for statement %q", StatementPreview(stmt))
 	}
 	if len(results) > 1 {
 		return StatementUnknown, "", fmt.Errorf(
 			"expected a single statement but %q parsed as %d statements; split with SplitStatements before classifying",
-			statementPreview(stmt), len(results),
+			StatementPreview(stmt), len(results),
 		)
 	}
 	return statementTypeFromSpirit(results[0].Type), results[0].Table, nil
@@ -345,7 +345,7 @@ func (tidbStatementParser) Classify(stmt string) (StatementType, string, error) 
 func (tidbStatementParser) DropTargets(stmt string) (DropTargets, error) {
 	parsed, err := statement.New(stmt)
 	if err != nil {
-		return DropTargets{}, fmt.Errorf("parse drop targets from statement %q: %w", statementPreview(stmt), err)
+		return DropTargets{}, fmt.Errorf("parse drop targets from statement %q: %w", StatementPreview(stmt), err)
 	}
 	if len(parsed) != 1 {
 		return DropTargets{}, fmt.Errorf("expected one statement for drop targets, got %d", len(parsed))
@@ -376,7 +376,7 @@ func (tidbStatementParser) DropTargets(stmt string) (DropTargets, error) {
 func (tidbStatementParser) CreateTableColumns(stmt string) ([]string, error) {
 	createTable, err := statement.ParseCreateTable(stmt)
 	if err != nil {
-		return nil, fmt.Errorf("parse CREATE TABLE %q: %w", statementPreview(stmt), err)
+		return nil, fmt.Errorf("parse CREATE TABLE %q: %w", StatementPreview(stmt), err)
 	}
 	columns := make([]string, 0, len(createTable.Columns))
 	for _, column := range createTable.Columns {
@@ -410,12 +410,12 @@ func (tidbStatementParser) CostScalesWithTableSize(stmt string) (bool, error) {
 	p := parser.New()
 	stmtNodes, _, err := p.Parse(stmt, "", "")
 	if err != nil {
-		return false, fmt.Errorf("parse statement %q: %w", statementPreview(stmt), err)
+		return false, fmt.Errorf("parse statement %q: %w", StatementPreview(stmt), err)
 	}
 	if len(stmtNodes) != 1 {
 		return false, fmt.Errorf(
 			"expected a single statement but %q parsed as %d statements; split with SplitStatements first",
-			statementPreview(stmt), len(stmtNodes),
+			StatementPreview(stmt), len(stmtNodes),
 		)
 	}
 	switch node := stmtNodes[0].(type) {

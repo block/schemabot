@@ -19,7 +19,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/schema"
@@ -135,9 +134,16 @@ func TestEnsureSchema_CleansStaleSpiritTables(t *testing.T) {
 		"_spirit_sentinel",
 		"_spirit_checkpoint",
 	}
-	for _, tbl := range staleTables {
+	// Tables that only look like Spirit's: no storage table is named audit or
+	// exports, so Spirit never gave these names to a working table.
+	lookalikeTables := []string{
+		"_audit_old",
+		"_exports_new",
+		"_audit_chkpnt",
+	}
+	for _, tbl := range append(staleTables, lookalikeTables...) {
 		_, err := db.ExecContext(ctx, fmt.Sprintf("CREATE TABLE `%s` (id INT PRIMARY KEY)", tbl))
-		require.NoError(t, err, "seed stale table %s", tbl)
+		require.NoError(t, err, "seed table %s", tbl)
 	}
 
 	// EnsureSchema should clean them up and succeed.
@@ -148,10 +154,27 @@ func TestEnsureSchema_CleansStaleSpiritTables(t *testing.T) {
 		assert.False(t, testutil.TableExists(t, db, sdb.Name, tbl),
 			"stale Spirit table %s should have been dropped", tbl)
 	}
+	for _, tbl := range lookalikeTables {
+		assert.True(t, testutil.TableExists(t, db, sdb.Name, tbl),
+			"%s is not a working table of a storage table, so startup must leave it in place", tbl)
+	}
 
 	// Verify real tables still exist.
 	assert.True(t, testutil.TableExists(t, db, sdb.Name, "tasks"),
 		"real tasks table should still exist")
+
+	// With only lookalikes left, startup takes the lock-free fast path: it
+	// reports the schema up to date, says why each lookalike stays, and leaves
+	// them in place.
+	var fastBuf syncBuffer
+	fastLogger := slog.New(slog.NewTextHandler(&fastBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	require.NoError(t, EnsureSchema(dsn, fastLogger))
+	assert.Contains(t, fastBuf.String(), "storage schema up-to-date",
+		"a lookalike is not a working table, so it must not send startup down the lock path")
+	for _, tbl := range lookalikeTables {
+		assert.True(t, testutil.TableExists(t, db, sdb.Name, tbl), "%s must survive the fast path", tbl)
+		assert.Contains(t, fastBuf.String(), "table="+tbl, "startup logs why it leaves %s in place", tbl)
+	}
 
 	assertEnsureSchemaDoesNotCleanSpiritTablesWhileWaitingForLock(t, ctx, sdb, db, logger)
 }
@@ -1005,6 +1028,11 @@ func seedStorageSettings(t *testing.T, db *sql.DB, count int) {
 func storageRowCensus(t *testing.T, db *sql.DB, database string) map[string]int64 {
 	t.Helper()
 
+	embedded, err := readEmbeddedSchemaFiles()
+	require.NoError(t, err, "read the embedded storage schema")
+	workingTables, err := storageSpiritWorkingTables(embedded)
+	require.NoError(t, err, "name Spirit's working tables for the storage schema")
+
 	rows, err := db.QueryContext(t.Context(),
 		"SELECT table_name FROM information_schema.tables WHERE table_schema = ?", database)
 	require.NoError(t, err, "list tables in %s", database)
@@ -1012,7 +1040,7 @@ func storageRowCensus(t *testing.T, db *sql.DB, database string) map[string]int6
 	for rows.Next() {
 		var name string
 		require.NoError(t, rows.Scan(&name), "scan table name")
-		if ddl.IsSpiritInternalTable(name) {
+		if workingTables[name] {
 			continue
 		}
 		tables = append(tables, name)

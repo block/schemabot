@@ -924,7 +924,7 @@ func canonicalCreateWithRowSecurity(p ddl.StatementParser, raw string) (canonica
 // the comparison has no name for and cannot verify.
 func canonicalDriftStatement(p ddl.StatementParser, statement string, stmtType ddl.StatementType) (string, error) {
 	if stmtType == ddl.StatementUnknown {
-		return "", fmt.Errorf("statement classified outside the shared DDL vocabulary; drift cannot verify it")
+		return "", fmt.Errorf("statement %q classified outside the shared DDL vocabulary; drift cannot verify it", ddl.StatementPreview(statement))
 	}
 	if !stmtType.IsDDL() {
 		return "", fmt.Errorf("expected a DDL statement, got %s", stmtType)

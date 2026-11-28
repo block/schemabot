@@ -31,13 +31,13 @@ import (
 func DeclaresForeignKey(stmt string) (bool, error) {
 	parsed, err := statement.New(stmt)
 	if err != nil {
-		return false, fmt.Errorf("parse statement %q: %w", statementPreview(stmt), err)
+		return false, fmt.Errorf("parse statement %q: %w", StatementPreview(stmt), err)
 	}
 	if len(parsed) != 1 {
-		return false, fmt.Errorf("expected exactly one statement, got %d in %q", len(parsed), statementPreview(stmt))
+		return false, fmt.Errorf("expected exactly one statement, got %d in %q", len(parsed), StatementPreview(stmt))
 	}
 	if parsed[0].StmtNode == nil {
-		return false, fmt.Errorf("statement %q parsed to no syntax tree", statementPreview(stmt))
+		return false, fmt.Errorf("statement %q parsed to no syntax tree", StatementPreview(stmt))
 	}
 
 	switch node := (*parsed[0].StmtNode).(type) {

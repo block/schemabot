@@ -369,6 +369,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		// so the rollback baseline declares their live row security too, even
 		// when the live table has none.
 		rowSecurityTables := make(map[string]bool)
+		removedRowSecurity := newRemovedRowSecurityGate(req.Database, namespace, pool, req.AppliedSchemaFiles)
 		// Enum label additions lead the namespace's changes, whichever file
 		// sorts first. The apply runs the changes one at a time in this
 		// order, each committed before the next starts, so every label the
@@ -415,6 +416,9 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 				desired, ok := file.Schema()
 				if !ok {
 					return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: the parse admitted no planner input", namespace, filename)
+				}
+				if err := removedRowSecurity.check(ctx, desired.Table()); err != nil {
+					return nil, plannerRefusal(fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err))
 				}
 				report, table, err = planPostgresDefinition(ctx, pool, namespace, desired)
 				if err != nil {
@@ -1507,8 +1511,8 @@ func singleLine(s string) string {
 
 // executionVerdict maps one planned statement to the verdict the operator
 // reviews. A planner value outside the vocabulary this mapping knows — a plan
-// contract, a disposition, a create shape cause, or a guidance code the planner
-// added after the mapping was written — still renders a blocked placeholder,
+// contract, a disposition, a create shape cause, a refusal reason, or a
+// guidance code the planner added after the mapping was written — still renders a blocked placeholder,
 // and is reported on the verdict so the caller can log it with the
 // identifiers this function does not have.
 func executionVerdict(formatVersion int, statement pgplan.Statement, table string, crossNamespaceForeignKeys []string) stepVerdict {
@@ -1567,15 +1571,20 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 		if statement.Kind == schemadiff.ChangeSetGeneratedExpression {
 			return blocked(generatedExpressionRefusalReason(table))
 		}
-		if reason, ok := dependentObjectRefusalReason(statement.Decisions, table); ok {
+		reason, unknownReason, ok := operationRefusalReason(statement.Decisions, table)
+		if ok {
 			return blocked(reason)
 		}
 		refused := blocked(fmt.Sprintf("statement for table %q is refused: it cannot be executed safely as written", table))
-		// An absent cause is a refusal from outside the create path and the
-		// generic sentence is the right one; only a cause the mapping has no
-		// sentence for is vocabulary that moved.
-		if statement.Cause != "" {
+		// An absent cause is a refusal from outside the create path and an
+		// absent refused decision leaves nothing to name, so the generic
+		// sentence is the right one; only a cause or a refusal reason the
+		// mapping has no sentence for is vocabulary that moved.
+		switch {
+		case statement.Cause != "":
 			refused.unrecognized = &unrecognizedPlannerVocabulary{kind: "create_shape_cause", value: string(statement.Cause)}
+		case unknownReason != "":
+			refused.unrecognized = &unrecognizedPlannerVocabulary{kind: "refusal_reason", value: string(unknownReason)}
 		}
 		return refused
 	case router.DispositionExecute:

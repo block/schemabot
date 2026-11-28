@@ -786,6 +786,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// A branch missing newer base-branch schema changes is shown first, since
 	// it says the plan below may not be the change the PR means to make.
 	writeBaseSchema(&sb, data.BaseSchema)
+	writeWhoCanApplyIfApplyOffered(&sb, data)
 	writePlanFreezesIfApplyOffered(&sb, data)
 	// Review-time deployment drift is shown before the change list — and before
 	// the no-changes short-circuit — because a non-primary deployment can drift
@@ -972,7 +973,6 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 			applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
 		}
 		writeApplyInstruction(&sb, appendFreezeOverride(applyCmd, data.Freezes), data)
-		writeWhoCanApply(&sb, data.Database, data.ApplyAuthorization)
 	}
 
 	return appendAgentHint(sb.String(), data.AgentHint)
@@ -990,7 +990,7 @@ func (d PlanCommentData) OffersApply() bool {
 
 // OffersApply reports whether the comment offers `schemabot apply` for any
 // environment: one has work to run and no refused environment ahead of it
-// withholds its apply. Only then does the footer show who can run it.
+// withholds its apply. Only then does the comment show who can run it.
 func (d MultiEnvPlanCommentData) OffersApply() bool {
 	return len(sortMultiEnvApplies(d).withChanges) > 0
 }
@@ -1043,35 +1043,53 @@ type ApplyAuthorizationData struct {
 	OperatorPrincipals []string
 	// OtherPrincipals are the deployment-wide and repository admins.
 	OtherPrincipals []string
+	// DeniedReader is the comment's reader when the apply gate's check ran
+	// and denied them, so the comment can say they cannot run the apply. It
+	// is empty when the check could not run or had no reader to check; the
+	// comment then says only who can, which stays true either way.
+	DeniedReader string
 }
 
-// writeWhoCanApply writes who may run the apply under the apply instruction.
-// Principals render as inline code rather than @-mentions: the plan comment is
-// posted on every push, and a mention would notify every listed team each time.
+// writeWhoCanApplyIfApplyOffered writes who may run the apply when the
+// comment's footer offers one.
+func writeWhoCanApplyIfApplyOffered(sb *strings.Builder, data PlanCommentData) {
+	if !data.OffersApply() {
+		return
+	}
+	writeWhoCanApply(sb, data.Database, data.ApplyAuthorization)
+}
+
+// writeWhoCanApply writes who may run the apply. It sits under the comment's
+// header, ahead of the DDL, so a PR author who cannot run the apply learns it
+// and whom to ask before reading the plan, not after reaching its last line.
+// Principals and the reader render as inline code rather than @-mentions: the
+// plan comment is posted on every push, and a mention would notify every
+// listed team each time.
 func writeWhoCanApply(sb *strings.Builder, database string, auth *ApplyAuthorizationData) {
 	if auth == nil {
 		return
 	}
-	sb.WriteString("\n")
 	operators, others := auth.OperatorPrincipals, auth.OtherPrincipals
 	if len(operators) == 0 && len(others) == 0 {
-		fmt.Fprintf(sb, "🔐 No team or user can run `schemabot apply` for %s yet. Ask a SchemaBot admin to configure its operators.\n", inlineCode(database))
+		fmt.Fprintf(sb, "🔐 No team or user can run `schemabot apply` for %s yet. Ask a SchemaBot admin to configure its operators.\n\n", inlineCode(database))
 		return
 	}
-	fmt.Fprintf(sb, "🔐 %s\n", whoCanApplySentence(database, append(append([]string{}, operators...), others...)))
+	fmt.Fprintf(sb, "🔐 %s\n", whoCanApplySentence(database, auth.DeniedReader, append(append([]string{}, operators...), others...)))
 	if len(operators) > 0 {
 		fmt.Fprintf(sb, "- Operators: %s\n", principalList(operators))
 	}
 	if len(others) > 0 {
 		fmt.Fprintf(sb, "- Admins: %s\n", principalList(others))
 	}
+	sb.WriteString("\n")
 }
 
 // whoCanApplySentence says who can run the apply and whom to ask, worded for
 // what principals holds: teams, users, or both, one or several. A principal in
 // org/team form is a team; GitHub logins cannot contain a slash, so anything
-// else is a user.
-func whoCanApplySentence(database string, principals []string) string {
+// else is a user. A non-empty deniedReader leads the sentence, naming them as
+// unable to run the apply.
+func whoCanApplySentence(database, deniedReader string, principals []string) string {
 	teams, users := 0, 0
 	for _, principal := range principals {
 		if strings.Contains(principal, "/") {
@@ -1098,11 +1116,14 @@ func whoCanApplySentence(database string, principals []string) string {
 		who = noun(users, "this user", "these users")
 		ask = noun(users, "Ask them to run it:", "Ask one of them to run it:")
 	}
+	if deniedReader != "" {
+		return fmt.Sprintf("**%s cannot run `schemabot apply` for %s.** Only %s can. %s", inlineCode(deniedReader), inlineCode(database), who, ask)
+	}
 	return fmt.Sprintf("Only %s can run `schemabot apply` for %s. %s", who, inlineCode(database), ask)
 }
 
 // maxListedPrincipals bounds each who-can-apply line, so a database with a
-// long allowlist cannot grow a footer the comment size budget never trims.
+// long allowlist cannot grow a list the comment size budget never trims.
 const maxListedPrincipals = 10
 
 // principalList renders principals as inline code, naming at most
@@ -4463,6 +4484,12 @@ func renderMultiEnvPlanComment(data MultiEnvPlanCommentData, budget *ddlBlockBud
 		return appendAgentHint(sb.String(), data.AgentHint)
 	}
 
+	// Who can run the applies the footer offers, ahead of every environment's
+	// DDL (see writeWhoCanApply).
+	if data.OffersApply() {
+		writeWhoCanApply(&sb, data.Database, data.ApplyAuthorization)
+	}
+
 	if multiEnvPlansRenderOnce(data) {
 		// Identical plans: render once with combined header
 		fmt.Fprintf(&sb, "### %s\n\n", capitalizeEnvNames(data.Environments))
@@ -4792,10 +4819,6 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 	case len(envsWithErrors) == 0 && len(envsRefused) == 0:
 		sb.WriteString("No changes to apply.\n")
 	}
-	if len(envsWithChanges) > 0 {
-		writeWhoCanApply(sb, data.Database, data.ApplyAuthorization)
-	}
-
 	for _, env := range envsFailOnRefusedChange {
 		sb.WriteString("\n")
 		writeRefusedChangeReplan(sb, fmt.Sprintf("the **%s** plan", env), command("schemabot plan", env))
