@@ -88,7 +88,7 @@ func unknownScopeApplies() []*storage.Apply {
 func newUnknownScopeServer(t *testing.T, applies *databaseApplyStore) *http.ServeMux {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	svc := New(&mockStorageWithApplyStores{applies: applies}, testServerConfig(), nil, logger)
+	svc := New(&mockStorageWithApplyStores{applies: applies, applyLogs: &windowedApplyLogStore{}}, testServerConfig(), nil, logger)
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)
 	return mux
@@ -237,4 +237,21 @@ func TestHandleLogsRefusesAnApplyOfAnotherDatabase(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &errResp))
 	assert.Equal(t, "apply apply-orders belongs to database orders, not billing. Ask for its logs without a database, or with database orders", errResp.Error)
 	assert.Equal(t, apitypes.ErrCodeInvalidRequest, errResp.ErrorCode)
+}
+
+// An apply recorded under a mixed-case spelling of its database belongs to the
+// same database as the path's lower-case name, so its logs are served.
+func TestHandleLogsServesAnApplyRecordedUnderAnotherSpelling(t *testing.T) {
+	applies := unknownScopeApplies()
+	applies[0].Database = "Orders"
+	mux := newUnknownScopeServer(t, &databaseApplyStore{applies: applies})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs/orders?apply_id=apply-orders", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var resp apitypes.LogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "apply-orders", resp.ApplyID)
 }

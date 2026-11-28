@@ -84,7 +84,7 @@ func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, datab
 			s.writeError(w, http.StatusNotFound, "apply not found")
 			return
 		}
-		if database != "" && apply.Database != database {
+		if database != "" && storage.CanonicalKey(apply.Database) != database {
 			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest,
 				fmt.Sprintf("apply %s belongs to database %s, not %s. Ask for its logs without a database, or with database %s",
 					apply.ApplyIdentifier, apply.Database, database, apply.Database))
