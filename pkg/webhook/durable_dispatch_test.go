@@ -210,6 +210,14 @@ func (s *recordingWebhookEventStore) InboxStats(context.Context) (*storage.Webho
 	return nil, errors.New("InboxStats not implemented by recordingWebhookEventStore")
 }
 
+func (s *recordingWebhookEventStore) DeleteTerminalOlderThan(context.Context, time.Duration, int) (int64, error) {
+	return 0, errors.New("DeleteTerminalOlderThan not implemented by recordingWebhookEventStore")
+}
+
+func (s *recordingWebhookEventStore) CountTerminalOlderThan(context.Context, time.Duration) (int64, error) {
+	return 0, errors.New("CountTerminalOlderThan not implemented by recordingWebhookEventStore")
+}
+
 func (s *recordingWebhookEventStore) TerminateStuckProcessing(_ context.Context, reason string) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
