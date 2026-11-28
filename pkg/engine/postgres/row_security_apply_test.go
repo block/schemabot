@@ -123,10 +123,10 @@ func TestUnsupportedRowSecurityShape(t *testing.T) {
 	require.ErrorAs(t, refusal, &refused)
 	assert.Equal(t, `SchemaBot does not manage row security on table "events" yet, because it is unlogged; remove the row security statements from its schema file, then plan again`, refusal.Error())
 
-	collation := fmt.Errorf("%w: %w", executor.ErrRowSecurityRefused, schemadiff.ErrUnrenderableCollation)
-	refusal, ok = unsupportedRowSecurityShape("public", live, collation)
+	inheritance := fmt.Errorf("%w: %w", executor.ErrRowSecurityRefused, schemadiff.ErrUnrenderableInheritance)
+	refusal, ok = unsupportedRowSecurityShape("public", live, inheritance)
 	require.True(t, ok)
-	assert.Contains(t, refusal.Error(), `on table "events" yet, because it has a column with an explicit collation; remove`)
+	assert.Contains(t, refusal.Error(), `on table "events" yet, because it uses table inheritance; remove`)
 
 	wrapped := fmt.Errorf("%w: %w", executor.ErrRowSecurityRefused, schemadiff.ErrUnrenderableUnlogged)
 	assert.Equal(t, "of a part of its definition SchemaBot cannot compare yet", rowSecurityShapePhrase(errors.New("a shape added later")))
@@ -193,6 +193,18 @@ func TestDeniedCommands(t *testing.T) {
 	}
 }
 
+// The warning names only what the change takes away: a table that already
+// grants only SELECT is not warned again on every policy edit, while
+// dropping its policy for ALL leaves writes denied, which it names.
+func TestNewlyDeniedCommands(t *testing.T) {
+	readOnly := schemadiff.RowSecurity{Enabled: true, Policies: []schemadiff.Policy{{Name: "readers", Command: schemadiff.PolicySelect, Permissive: true}}}
+	owners := schemadiff.RowSecurity{Enabled: true, Policies: []schemadiff.Policy{{Name: "owners", Command: schemadiff.PolicyAll, Permissive: true}}}
+	assert.Empty(t, newlyDeniedCommands(readOnly, readOnly), "a read-only table stays read-only")
+	assert.Len(t, newlyDeniedCommands(owners, readOnly), 3, "INSERT, UPDATE, and DELETE are newly denied")
+	assert.Len(t, newlyDeniedCommands(schemadiff.RowSecurity{}, readOnly), 3, "turning row security on denies the writes")
+	assert.Len(t, newlyDeniedCommands(owners, schemadiff.RowSecurity{Enabled: true}), 4)
+}
+
 // Each table shape the row security path cannot manage reads as what it is
 // about the table, and a foreign key refusal with no key to list, such as a
 // table the target lacks, names the shape alone rather than an empty list.
@@ -208,4 +220,18 @@ func TestRowSecurityShapePhrases(t *testing.T) {
 		fmt.Errorf("%w: %w", executor.ErrRowSecurityRefused, schemadiff.ErrUnrenderableForeignKey))
 	require.True(t, ok)
 	assert.Equal(t, `SchemaBot does not manage row security on table "cards" yet, because it is in a foreign key relationship; remove the row security statements from its schema file, then plan again`, refusal.Error())
+}
+
+// A file that turns on row security for a table it declares a foreign key
+// on is refused with the file named and both ways forward, rather than the
+// parser's own text, so the author knows which file to change and how.
+func TestDesiredFileRefusalNamesARowSecurityForeignKey(t *testing.T) {
+	_, err := parseDesiredFiles("public", map[string]string{
+		"notes.sql": "CREATE TABLE notes (id bigint PRIMARY KEY, owner_id bigint CONSTRAINT notes_owner_fk REFERENCES owners (id));\n" +
+			"ALTER TABLE notes ENABLE ROW LEVEL SECURITY;\n" +
+			"CREATE POLICY readers ON notes FOR SELECT USING (true);\n",
+	})
+	var refused *engine.PlanRefusedError
+	require.ErrorAs(t, err, &refused)
+	assert.Equal(t, `SchemaBot does not manage row security on the table in "public"/"notes.sql" yet, because the file declares a foreign key; remove either the foreign key or the row security statements from the file, then plan again`, refused.Error())
 }

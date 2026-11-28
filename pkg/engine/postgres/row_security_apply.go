@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 
 	"github.com/block/pg-sprite/pkg/executor"
@@ -59,7 +60,7 @@ func planRowSecurityOperation(ctx context.Context, pool *pgxpool.Pool, namespace
 		return nil, nil
 	}
 	reason := "Row security changes alter who can access rows, so review the complete policy and settings replacement"
-	if denied := deniedCommands(wanted.RowSecurity); len(denied) > 0 {
+	if denied := newlyDeniedCommands(live.RowSecurity, wanted.RowSecurity); len(denied) > 0 {
 		reason += "; " + denyReason(denied)
 	}
 	return []engine.TableChange{{
@@ -99,6 +100,21 @@ func deniedCommands(rs schemadiff.RowSecurity) []policyGrant {
 	var denied []policyGrant
 	for _, grant := range policyGrants {
 		if !grantsCommand(rs.Policies, grant.command) {
+			denied = append(denied, grant)
+		}
+	}
+	return denied
+}
+
+// newlyDeniedCommands returns the commands wanted denies that live did not,
+// so the warning names what this change takes away rather than repeating,
+// on every change to a table, a design such as read-only access that the
+// table already has.
+func newlyDeniedCommands(live, wanted schemadiff.RowSecurity) []policyGrant {
+	before := deniedCommands(live)
+	var denied []policyGrant
+	for _, grant := range deniedCommands(wanted) {
+		if !slices.Contains(before, grant) {
 			denied = append(denied, grant)
 		}
 	}
@@ -205,7 +221,6 @@ var rowSecurityShapePhrases = []struct {
 	{schemadiff.ErrUnrenderableInheritance, "it uses table inheritance"},
 	{schemadiff.ErrUnrenderableForeignKey, "it is in a foreign key relationship"},
 	{schemadiff.ErrUnrenderableUnlogged, "it is unlogged"},
-	{schemadiff.ErrUnrenderableCollation, "it has a column with an explicit collation"},
 	{schemadiff.ErrUnrenderableVirtual, "it has a virtual generated column"},
 	{schemadiff.ErrUnrenderableToastOptions, "it sets TOAST storage parameters"},
 	{schemadiff.ErrUnrenderableSequenceOptions, "it owns a sequence with options other than the defaults"},

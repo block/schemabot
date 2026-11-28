@@ -3074,11 +3074,11 @@ func TestEnginePlanRowSecurityOnAForeignKeyTable(t *testing.T) {
 }
 
 // Two files that turn on row security for tables the row security path
-// cannot manage, one in a foreign key relationship and one with a column of
-// an explicit collation, are refused together with a table the target lacks
-// that has one too: the refusal names every table, so the author fixes
-// every file before planning again, and the new table's refusal is a plan
-// refusal rather than an error the plan retries.
+// cannot manage, one in a foreign key relationship and one whose default
+// draws from a shared sequence, are refused together with a partitioned
+// table the target lacks: the refusal names every table, so the author
+// fixes every file before planning again, and the new table's refusal is a
+// plan refusal rather than an error the plan retries.
 func TestEnginePlanRowSecurityListsEveryRefusedTable(t *testing.T) {
 	const database = "rls_every_refusal"
 	dsn, db := testutil.StartPostgres(t, database)
@@ -3087,7 +3087,8 @@ func TestEnginePlanRowSecurityListsEveryRefusedTable(t *testing.T) {
 	_, err := db.ExecContext(ctx, `
   CREATE TABLE public.kinds (id bigint PRIMARY KEY);
   CREATE TABLE public.cards (id bigint PRIMARY KEY, kind_id bigint CONSTRAINT cards_kind_fk REFERENCES public.kinds (id));
-  CREATE TABLE public.words (id bigint PRIMARY KEY, tag text COLLATE "C");
+  CREATE SEQUENCE public.shared_ids;
+  CREATE TABLE public.words (id bigint PRIMARY KEY DEFAULT nextval('public.shared_ids'));
  `)
 	require.NoError(t, err)
 
@@ -3098,10 +3099,10 @@ func TestEnginePlanRowSecurityListsEveryRefusedTable(t *testing.T) {
 				"ALTER TABLE kinds ENABLE ROW LEVEL SECURITY;\n" +
 				"CREATE POLICY readers ON kinds FOR SELECT USING (true);\n",
 			"cards.sql": "CREATE TABLE cards (id bigint PRIMARY KEY, kind_id bigint CONSTRAINT cards_kind_fk REFERENCES kinds (id));\n",
-			"words.sql": "CREATE TABLE words (id bigint PRIMARY KEY, tag text COLLATE \"C\");\n" +
+			"words.sql": "CREATE TABLE words (id bigint PRIMARY KEY DEFAULT nextval('shared_ids'));\n" +
 				"ALTER TABLE words ENABLE ROW LEVEL SECURITY;\n" +
 				"CREATE POLICY readers ON words FOR SELECT USING (true);\n",
-			"labels.sql": "CREATE TABLE labels (id bigint PRIMARY KEY, tag text COLLATE \"C\");\n" +
+			"labels.sql": "CREATE TABLE labels (id bigint PRIMARY KEY) PARTITION BY RANGE (id);\n" +
 				"ALTER TABLE labels ENABLE ROW LEVEL SECURITY;\n" +
 				"CREATE POLICY readers ON labels FOR SELECT USING (true);\n",
 		}}},
@@ -3109,8 +3110,8 @@ func TestEnginePlanRowSecurityListsEveryRefusedTable(t *testing.T) {
 	var refused *engine.PlanRefusedError
 	require.ErrorAs(t, err, &refused)
 	assert.Equal(t, `SchemaBot does not manage row security on table "kinds" yet, because it is in a foreign key relationship ("cards.cards_kind_fk"); remove the row security statements from its schema file, then plan again
-SchemaBot does not manage row security on table "labels" yet, because it has a column with an explicit collation; remove the row security statements from its schema file, then plan again
-SchemaBot does not manage row security on table "words" yet, because it has a column with an explicit collation; remove the row security statements from its schema file, then plan again`, refused.Error())
+SchemaBot does not manage row security on table "labels" yet, because it is a partitioned table; remove the row security statements from its schema file, then plan again
+SchemaBot does not manage row security on table "words" yet, because it has a column whose default draws from a sequence other than the one a serial column declares; remove the row security statements from its schema file, then plan again`, refused.Error())
 }
 
 // A table that already has row security and gains a foreign key later
