@@ -1,6 +1,11 @@
 package ui
 
 import (
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -35,6 +40,57 @@ func TestDocLinksResolve(t *testing.T) {
 				"docs page %q has no heading anchored at %q", page, anchor)
 		})
 	}
+}
+
+// A documentation link written as a literal anywhere but docs.go is one
+// TestDocLinksResolve never sees, so a reworded heading would break it with no
+// failing test. Every link has to be built from DocsBaseURL here and listed in
+// DocLinks instead.
+func TestDocLinksAreOnlyBuiltInDocsGo(t *testing.T) {
+	const docsPathMarker = "blob/main/docs/"
+	root := filepath.Join("..", "..")
+	registry := filepath.Join("pkg", "ui", "docs.go")
+	fileSet := token.NewFileSet()
+	var scanned int
+	var strays []string
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if path != root && (strings.HasPrefix(entry.Name(), ".") || entry.Name() == "bin" || entry.Name() == "node_modules") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return fmt.Errorf("relative path of %s: %w", path, relErr)
+		}
+		file, parseErr := parser.ParseFile(fileSet, path, nil, parser.SkipObjectResolution)
+		if parseErr != nil {
+			return fmt.Errorf("parse %s: %w", path, parseErr)
+		}
+		scanned++
+		ast.Inspect(file, func(node ast.Node) bool {
+			literal, ok := node.(*ast.BasicLit)
+			if !ok || literal.Kind != token.STRING || !strings.Contains(literal.Value, docsPathMarker) {
+				return true
+			}
+			if rel != registry {
+				strays = append(strays, fmt.Sprintf("%s:%d", rel, fileSet.Position(literal.Pos()).Line))
+			}
+			return true
+		})
+		return nil
+	})
+	require.NoError(t, err)
+	require.NotZero(t, scanned, "no Go files found; the scan root is wrong")
+	assert.Empty(t, strays,
+		"documentation links must be built from DocsBaseURL in %s and listed in DocLinks", registry)
 }
 
 var (

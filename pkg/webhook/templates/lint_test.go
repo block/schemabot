@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/block/schemabot/pkg/ui"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -100,13 +101,13 @@ func TestRenderPlanComment_PrimaryKeyGuidance(t *testing.T) {
 			}
 			out := RenderPlanComment(data)
 			if !tc.want {
-				assert.NotContains(t, out, primaryKeyDocURL)
+				assert.NotContains(t, out, ui.PrimaryKeyDocURL)
 				return
 			}
-			assert.Equal(t, 1, strings.Count(out, primaryKeyDocURL))
-			assert.Contains(t, out, "📖 **Related guidance:**\n\n- [Choosing a primary key]("+primaryKeyDocURL+")")
+			assert.Equal(t, 1, strings.Count(out, ui.PrimaryKeyDocURL))
+			assert.Contains(t, out, "📖 **Related guidance:**\n\n- [Choosing a primary key]("+ui.PrimaryKeyDocURL+")")
 			if tc.count > lintWarningsFoldThreshold {
-				assert.Greater(t, strings.Index(out, primaryKeyDocURL), strings.Index(out, "</details>"))
+				assert.Greater(t, strings.Index(out, ui.PrimaryKeyDocURL), strings.Index(out, "</details>"))
 			}
 		})
 	}
