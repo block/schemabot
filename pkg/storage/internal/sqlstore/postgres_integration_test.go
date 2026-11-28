@@ -100,6 +100,17 @@ func TestPostgresStorageParity(t *testing.T) {
 			return NewPostgres(h.db)
 		}, postgresLockWaiter(h.db))
 	})
+	t.Run("ApplyCreateQueuedBehindReleaseSeesLockIntentChanged", func(t *testing.T) {
+		testApplyCreateQueuedBehindReleaseSeesLockIntentChanged(t, func(t *testing.T, classifier ErrorClassifier) *Storage {
+			t.Helper()
+			clearPostgresTables(t, h.db)
+			dialect := PostgresDialect{}
+			return NewWithDependencies(Dependencies{
+				DB: h.db, Binder: dialect, Dialect: dialect, Identity: dialect,
+				Locker: namedlock.Postgres{}, Classifier: classifier,
+			})
+		}, NewPostgresErrorClassifier(), postgresLockWaiter(h.db), 1)
+	})
 	t.Run("StoppedApplyStartRacingItsTakeover", func(t *testing.T) {
 		testStoppedApplyStartRacingItsTakeover(t, func(t *testing.T) *Storage {
 			t.Helper()
