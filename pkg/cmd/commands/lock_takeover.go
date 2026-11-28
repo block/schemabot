@@ -11,17 +11,7 @@ import (
 
 // stdinIsTerminal reports whether a person can answer a prompt. It is a
 // variable so tests can stand in for a terminal.
-var stdinIsTerminal = func() bool {
-	if !ui.IsTerminal(os.Stdin) {
-		return false
-	}
-	// The null device is a character device too, and it is what cron, CI, and
-	// a container started without a terminal give a command as its input.
-	// Nobody answers from it.
-	in, inErr := os.Stdin.Stat()
-	null, nullErr := os.Stat(os.DevNull)
-	return inErr != nil || nullErr != nil || !os.SameFile(in, null)
-}
+var stdinIsTerminal = func() bool { return ui.IsTerminal(os.Stdin) }
 
 // heldByAnotherOwner reports whether a lock exists and its owner is not the
 // given owner. A lock this command's owner already holds, and no lock at all,

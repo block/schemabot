@@ -53,6 +53,27 @@ func withoutTerminal(t *testing.T) {
 	})
 }
 
+// The lock takeover question in unlock --force and apply --force is asked only
+// when stdin is somewhere a person can answer: stdin on the null device, as in
+// a container started without a terminal, is refused, and another character
+// device is treated as a terminal.
+func TestStdinIsTerminalFollowsTheNullDevice(t *testing.T) {
+	original := os.Stdin
+	t.Cleanup(func() { os.Stdin = original })
+
+	null, err := os.Open(os.DevNull)
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, null.Close()) })
+	os.Stdin = null
+	assert.False(t, stdinIsTerminal(), "the null device is not somewhere a person can answer")
+
+	zero, err := os.Open("/dev/zero")
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, zero.Close()) })
+	os.Stdin = zero
+	assert.True(t, stdinIsTerminal(), "another character device is treated as a terminal")
+}
+
 // anotherOwnersLock is a lock on orders (mysql) that a pull request took two
 // hours ago.
 func anotherOwnersLock() *client.LockInfo {
