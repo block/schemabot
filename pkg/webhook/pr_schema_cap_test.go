@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -558,4 +559,45 @@ func TestPRSchemaCapRefreshesDiscoveryWhenComparisonTipMoves(t *testing.T) {
 	_, err = f.admitPRSchemaCommand(t.Context(), f.client, schemaCapTestRepo, 1, first.key)
 	require.NoError(t, err)
 	require.EqualValues(t, 2, f.fileReads.Load())
+}
+
+// A plan stopped before it dispatches tells the PR why. A refusal SchemaBot
+// wrote shows its own words, even when a caller wrapped it with more text, and
+// any other failure shows a fixed line and keeps its text out of the comment
+// and the response.
+func TestPlanRefusalCommentShowsOnlyAuthoredText(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "a refusal wrapped with more text shows only its own words",
+			err:  fmt.Errorf("admit plan: %w: %s", errPRSchemaMoved, rawInfrastructureError),
+			want: errPRSchemaMoved.Error(),
+		},
+		{
+			name: "any other failure shows the fixed line",
+			err:  errors.New(rawInfrastructureError),
+			want: "Could not verify the PR database limit. Retry the plan.",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, mux := setupGitHubServer(t)
+			comments := recordComments(t, mux)
+			st := &unlockTestStorage{locks: &unlockTestLockStore{}, applies: &noActiveAppliesStore{}}
+			h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+			w := httptest.NewRecorder()
+
+			h.answerPRSchemaPlanRefusal(w, schemaCapTestRepo, 1, 12345, "staging", "testuser", tt.err)
+
+			body := requireComment(t, comments, "plan refusal comment")
+			assert.Contains(t, body, tt.want)
+			requireNoInfrastructureDetail(t, body)
+			assert.NotContains(t, body, "admit plan")
+			assert.Contains(t, w.Body.String(), tt.want)
+			requireNoInfrastructureDetail(t, w.Body.String())
+		})
+	}
 }

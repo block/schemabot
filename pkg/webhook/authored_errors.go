@@ -32,3 +32,14 @@ func (e *databaseNotRegisteredError) AuthoredText() (string, bool) {
 func (e *closedPRRefreshError) AuthoredText() (string, bool) {
 	return e.Error(), false
 }
+
+// AuthoredText returns the whole message: it carries no cause.
+func (e *prSchemaRefusalError) AuthoredText() (string, bool) {
+	return e.Error(), false
+}
+
+// AuthoredText returns the refusal's own words, without the cause it was built
+// from.
+func (e *unlockRefusalError) AuthoredText() (string, bool) {
+	return e.message, false
+}
