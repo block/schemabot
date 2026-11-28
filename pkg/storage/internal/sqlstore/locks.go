@@ -416,12 +416,22 @@ func (s *lockStore) unmatchedPinnedReleaseCause(ctx context.Context, id int64, d
 	return storage.ErrLockIntentChanged
 }
 
-// isPinnedLockRow reports whether the lock row held for a database is the row
-// a pinned release read: the same row ID, still under the same owner and
-// pending plan. Owner and pending plan compare byte-exact, as ReleaseByID's
-// delete predicate does.
-func isPinnedLockRow(held *storage.Lock, id int64, owner, pendingPlanID string) bool {
-	return held.ID == id && held.Owner == owner && held.PendingPlanID == pendingPlanID
+// pinnedLockRowRefusal compares the lock row held for a database with the row
+// a pinned release read, and returns nil when it is the same row ID still under
+// the same owner and pending plan. Otherwise it returns why not:
+// ErrLockReplaced for a different row, ErrLockNotOwned for another owner, and
+// ErrLockIntentChanged for another pending plan. Owner and pending plan
+// compare byte-exact, as ReleaseByID's delete predicate does.
+func pinnedLockRowRefusal(held *storage.Lock, id int64, owner, pendingPlanID string) error {
+	switch {
+	case held.ID != id:
+		return storage.ErrLockReplaced
+	case held.Owner != owner:
+		return storage.ErrLockNotOwned
+	case held.PendingPlanID != pendingPlanID:
+		return storage.ErrLockIntentChanged
+	}
+	return nil
 }
 
 // ReleaseByIDIfUnused deletes the lock row ReleaseByID would, but decides
@@ -458,16 +468,17 @@ func (s *lockStore) ReleaseByIDIfUnused(ctx context.Context, id int64, database,
 		WHERE database_name = ? AND database_type = ?
 		FOR UPDATE
 	`, database, dbType).Scan(&locked.ID, &locked.Owner, &locked.PendingPlanID)
+	// The refusal is read from the row this transaction locked, while it still
+	// holds it, so the cause names the row that was refused rather than one a
+	// writer put in place after the rollback.
 	if errors.Is(err, sql.ErrNoRows) {
-		rollbackTx(ctx, tx, op)
-		return s.unmatchedPinnedReleaseCause(ctx, id, database, dbType, owner)
+		return storage.ErrLockNotFound
 	}
 	if err != nil {
 		return fmt.Errorf("lock row for %s: %w", op, err)
 	}
-	if !isPinnedLockRow(&locked, id, owner, pendingPlanID) {
-		rollbackTx(ctx, tx, op)
-		return s.unmatchedPinnedReleaseCause(ctx, id, database, dbType, owner)
+	if refusal := pinnedLockRowRefusal(&locked, id, owner, pendingPlanID); refusal != nil {
+		return refusal
 	}
 
 	// Unsettled, not merely non-terminal: a stopped apply is terminal but can
