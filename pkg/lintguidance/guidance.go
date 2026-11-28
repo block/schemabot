@@ -1,7 +1,11 @@
 // Package lintguidance connects disclosed lint findings to operator guides.
 package lintguidance
 
-import "slices"
+import (
+	"slices"
+
+	"github.com/block/schemabot/pkg/ui"
+)
 
 // Guide describes a document that explains a lint finding.
 type Guide struct {
@@ -22,8 +26,8 @@ func Guides(scopes ...Scope) []Guide {
 		guide     Guide
 		mysqlOnly bool
 	}{
-		{"primary_key", Guide{"Choosing a primary key", "https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key"}, true},
-		{"rename_column", Guide{"Renaming a column or table", "https://github.com/block/schemabot/blob/main/docs/pre-merge-workflow.md#renaming-a-column-or-table"}, false},
+		{"primary_key", Guide{"Choosing a primary key", ui.PrimaryKeyDocURL}, true},
+		{"rename_column", Guide{"Renaming a column or table", ui.RenameDocURL}, false},
 	}
 	var result []Guide
 	for _, entry := range registry {

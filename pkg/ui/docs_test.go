@@ -1,9 +1,16 @@
 package ui
 
 import (
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -35,6 +42,137 @@ func TestDocLinksResolve(t *testing.T) {
 				"docs page %q has no heading anchored at %q", page, anchor)
 		})
 	}
+}
+
+// Every documentation link constant in docs.go has to be listed in DocLinks,
+// or TestDocLinksResolve never checks it.
+func TestEveryDocURLConstantIsListedInDocLinks(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "docs.go", nil, parser.SkipObjectResolution)
+	require.NoError(t, err)
+
+	declared := map[string]bool{}
+	listed := map[string]bool{}
+	for _, decl := range file.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			value, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			for index, name := range value.Names {
+				switch {
+				case gen.Tok == token.CONST && name.Name != "DocsBaseURL":
+					declared[name.Name] = true
+				case gen.Tok == token.VAR && name.Name == "DocLinks":
+					composite, ok := value.Values[index].(*ast.CompositeLit)
+					require.True(t, ok, "DocLinks must be a slice literal")
+					for _, element := range composite.Elts {
+						ident, ok := element.(*ast.Ident)
+						require.True(t, ok, "DocLinks must list the constants by name")
+						listed[ident.Name] = true
+					}
+				}
+			}
+		}
+	}
+	require.NotEmpty(t, declared)
+	for name := range declared {
+		assert.True(t, listed[name], "%s is declared in docs.go but missing from DocLinks, so TestDocLinksResolve never checks it", name)
+	}
+}
+
+// docsLinkMarkers are fragments of a link into this repository's tree. A
+// shorter fragment than the docs path catches a link to another ref or a tree
+// view, and the scan joins concatenated literals before matching, so a link
+// split across a "+" is caught too.
+var docsLinkMarkers = []string{"schemabot/blob/", "schemabot/tree/"}
+
+// A documentation link written as a literal anywhere but the DocsBaseURL
+// declaration is one TestDocLinksResolve never sees, so a reworded heading
+// would break it with no failing test. Every link has to be built from
+// DocsBaseURL in docs.go and listed in DocLinks instead.
+func TestDocLinksAreOnlyBuiltInDocsGo(t *testing.T) {
+	root := filepath.Join("..", "..")
+	registry := filepath.Join("pkg", "ui", "docs.go")
+	fileSet := token.NewFileSet()
+	var scanned int
+	var strays []string
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if path != root && (strings.HasPrefix(entry.Name(), ".") || entry.Name() == "bin" || entry.Name() == "node_modules") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return fmt.Errorf("relative path of %s: %w", path, relErr)
+		}
+		file, parseErr := parser.ParseFile(fileSet, path, nil, parser.SkipObjectResolution)
+		if parseErr != nil {
+			return fmt.Errorf("parse %s: %w", path, parseErr)
+		}
+		scanned++
+		ast.Inspect(file, func(node ast.Node) bool {
+			if spec, ok := node.(*ast.ValueSpec); ok && rel == registry && len(spec.Names) == 1 && spec.Names[0].Name == "DocsBaseURL" {
+				return false
+			}
+			expr, ok := node.(ast.Expr)
+			if !ok {
+				return true
+			}
+			text, ok := stringConstant(expr)
+			if !ok {
+				return true
+			}
+			if slices.ContainsFunc(docsLinkMarkers, func(marker string) bool { return strings.Contains(text, marker) }) {
+				strays = append(strays, fmt.Sprintf("%s:%d", rel, fileSet.Position(expr.Pos()).Line))
+			}
+			// A whole literal or concatenation was read, so its parts are not
+			// read again.
+			return false
+		})
+		return nil
+	})
+	require.NoError(t, err)
+	require.NotZero(t, scanned, "no Go files found; the scan root is wrong")
+	assert.Empty(t, strays,
+		"documentation links must be built from DocsBaseURL in %s and listed in DocLinks", registry)
+}
+
+// stringConstant returns the text of a string literal, or of a "+" chain of
+// string literals joined, and whether expr is one.
+func stringConstant(expr ast.Expr) (string, bool) {
+	switch node := expr.(type) {
+	case *ast.BasicLit:
+		if node.Kind != token.STRING {
+			return "", false
+		}
+		text, err := strconv.Unquote(node.Value)
+		return text, err == nil
+	case *ast.ParenExpr:
+		return stringConstant(node.X)
+	case *ast.BinaryExpr:
+		if node.Op != token.ADD {
+			return "", false
+		}
+		left, ok := stringConstant(node.X)
+		if !ok {
+			return "", false
+		}
+		right, ok := stringConstant(node.Y)
+		return left + right, ok
+	}
+	return "", false
 }
 
 var (
