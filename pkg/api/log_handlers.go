@@ -84,6 +84,12 @@ func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, datab
 			s.writeError(w, http.StatusNotFound, "apply not found")
 			return
 		}
+		if database != "" && storage.CanonicalKey(apply.Database) != database {
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest,
+				fmt.Sprintf("apply %s belongs to database %s, not %s. Ask for its logs without a database, or with database %s",
+					apply.ApplyIdentifier, apply.Database, database, apply.Database))
+			return
+		}
 	} else {
 		// Get the most recent apply for this database/environment
 		if environment == "" {
@@ -100,6 +106,12 @@ func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, datab
 		}
 
 		if apply == nil {
+			if database != "" {
+				if unknown := s.unknownApplyScope(r.Context(), database, environment); unknown != "" {
+					s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeNotFound, unknown)
+					return
+				}
+			}
 			s.logger.Debug("no applies for database; returning no logs", "database", database, "environment", environment)
 			s.writeJSON(w, http.StatusOK, withLogScope(map[string]any{
 				"logs": []any{},
