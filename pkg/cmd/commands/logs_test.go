@@ -393,6 +393,43 @@ func TestRunFollowLoopInterruptDuringFailedPollIsNotAFailure(t *testing.T) {
 	assert.Equal(t, 2, polls)
 }
 
+// Ctrl-C can land just as a read answers successfully with no readable source.
+// That answer ends the tail like any other interrupt, on the initial read and
+// on a later poll, rather than as a failure the operator did not cause.
+func TestRunFollowLoopInterruptDuringUnreadableAnswerIsNotAFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		interruptPoll int
+	}{
+		{name: "initial read", interruptPoll: 1},
+		{name: "later poll", interruptPoll: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			polls := 0
+			fetch := func(int) ([]*client.LogEntry, error) {
+				polls++
+				if polls == tc.interruptPoll {
+					cancel()
+				}
+				return []*client.LogEntry{followLogEntry(int64(polls))}, nil
+			}
+			emit := func([]*client.LogEntry, bool) error {
+				if polls == tc.interruptPoll {
+					return &deploymentSourcesUnreadableError{permanent: true, failures: []string{"us-east: remote log not found"}}
+				}
+				return nil
+			}
+
+			err := runFollowLoop(ctx, fetch, emit, 3, fastFollowPacing())
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.interruptPoll, polls)
+		})
+	}
+}
+
 // heldLogServer answers its first answered requests with body and holds every
 // later one open without answering, as a server stuck on a slow read would.
 // Each held request is announced on the returned channel. A held request ends

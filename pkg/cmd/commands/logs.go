@@ -528,6 +528,11 @@ func runFollowLoop[T any](ctx context.Context, fetch func(limit int) (T, error),
 	wait := pacing.interval
 	failures := 0
 	if err := emit(result, true); err != nil {
+		if ctx.Err() != nil {
+			// A read the operator's Ctrl-C landed on is part of the interrupt,
+			// even when its answer had nothing readable in it.
+			return nil
+		}
 		failures++
 		var stopErr error
 		wait, stopErr = followFailureOutcome(err, failures, pacing)
@@ -542,13 +547,14 @@ func runFollowLoop[T any](ctx context.Context, fetch func(limit int) (T, error),
 			return nil
 		}
 		result, err := fetch(followFetchLimit)
-		if err != nil && ctx.Err() != nil {
-			// A poll the operator's Ctrl-C landed on is part of the interrupt,
-			// not a failure of the endpoint.
-			return nil
-		}
 		if err == nil {
 			err = emit(result, false)
+		}
+		if err != nil && ctx.Err() != nil {
+			// A poll the operator's Ctrl-C landed on is part of the interrupt,
+			// not a failure of the endpoint, whether the read failed or its
+			// answer had nothing readable in it.
+			return nil
 		}
 		if err != nil {
 			failures++
