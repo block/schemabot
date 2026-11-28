@@ -160,7 +160,7 @@ too.
 `schemabot plan` warns you the same way. Under the plan, it names the freezes
 in effect and those scheduled, and says to apply with `--override "<reason>"`
 if the change can't wait. A plan that apply refuses whatever its flags, such
-as one with a blocked change, names no freeze, as the plan comment does not. `schemabot apply` refused for an unsafe change names the freezes under its plan the same way, so `--allow-unsafe` is not followed by a freeze refusal you could not see coming. The response to `POST /api/plan` carries them in
+as one with a blocked change, names no freeze, as the plan comment does not. `schemabot apply` refused for an unsafe change names the freezes under its plan the same way. While one is in effect, the retry command it offers carries `--override` too: your reason if the command gave one, or the placeholder to replace. So `--allow-unsafe` is not followed by a freeze refusal you could not see coming. The response to `POST /api/plan` carries them in
 `freezes`, in effect first, each with `in_effect`.
 
 You have two choices:

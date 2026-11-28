@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -208,7 +209,7 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 
 	// Check for unsafe changes
 	if len(planResult.RolloutUnsafeChanges()) > 0 && !cmd.AllowUnsafe {
-		return blockUnsafeApply(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir, cmd.Target, cmd.Output)
+		return blockUnsafeApply(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir, cmd.Target, cmd.Override, cmd.Output)
 	}
 
 	// lockBefore is the lock this command saw held before it sent the
@@ -662,15 +663,25 @@ func finishAfterCutover(result *apitypes.ProgressResponse, tables []*apitypes.Ta
 // so following the advice re-runs the change on that member and not across the
 // whole rollout.
 //
+// A freeze in effect would refuse that retry next, so the retry also carries
+// --override: the operator's own reason when this command gave one, or a
+// placeholder the server refuses until it is replaced with a real reason.
+//
 // JSON output prints neither the plan nor the warning, so the error itself
 // names each unsafe change and the command that permits them.
-func blockUnsafeApply(planResult *apitypes.PlanResponse, database, environment, schemaDir, target string, output OutputFormat) error {
+func blockUnsafeApply(planResult *apitypes.PlanResponse, database, environment, schemaDir, target, override string, output OutputFormat) error {
 	unsafeChanges := planResult.RolloutUnsafeChanges()
 	retry := []string{"apply", "-s", initShellArg(schemaDir), "-e", initShellArg(environment)}
 	if target != "" {
 		retry = append(retry, "--target", initShellArg(target))
 	}
 	retry = append(retry, "--allow-unsafe")
+	switch {
+	case override != "":
+		retry = append(retry, "--override", initShellArg(override))
+	case anyFreezeInEffect(planResult.Freezes):
+		retry = append(retry, "--override", overrideReasonPlaceholder)
+	}
 	if output == OutputFormatJSON {
 		return errors.New(templates.UnsafeChangesBlockedSummary(unsafeChanges, retry))
 	}
@@ -685,6 +696,17 @@ func blockUnsafeApply(planResult *apitypes.PlanResponse, database, environment, 
 	// Then show the unsafe changes warning
 	templates.WriteUnsafeChangesBlocked(unsafeChanges, retry)
 	return ErrSilent
+}
+
+// overrideReasonPlaceholder is the reason a suggested command carries in its
+// --override, already quoted for the shell. The server refuses a reason
+// still in angle brackets, so a command pasted unedited never overrides a
+// freeze.
+const overrideReasonPlaceholder = `"<why it can't wait>"`
+
+// anyFreezeInEffect reports whether one of freezes blocks changes now.
+func anyFreezeInEffect(freezes []apitypes.Freeze) bool {
+	return slices.ContainsFunc(freezes, func(f apitypes.Freeze) bool { return f.InEffect })
 }
 
 // blockedPlanError returns the refusal for a plan carrying a blocked
