@@ -1,8 +1,11 @@
 package spirit
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"log/slog"
 	"net"
 	"sync"
 	"testing"
@@ -327,6 +330,7 @@ func TestControlWaitForAStuckRunnerEndsAtTheCallersContext(t *testing.T) {
 				assert.Contains(t, err.Error(), "the runner has not returned")
 				assert.Contains(t, err.Error(), "testdb")
 				assert.True(t, engine.IsRetryable(err), "an expired wait must leave the request pending, not failed")
+				assert.True(t, engine.IsNotSettled(err), "an expired wait reports the control as not settled yet")
 				assert.False(t, engine.IsAlreadyCompleted(err))
 				assert.False(t, engine.IsSettledOutcome(err))
 				assert.False(t, engine.IsUnsupportedOperation(err))
@@ -354,6 +358,148 @@ func TestControlWaitForAStuckRunnerEndsAtTheCallersContext(t *testing.T) {
 				assert.Same(t, rm, eng.runningSchemaChange, "a cancel that could not release the artifacts stays tracked")
 			}
 			assert.Equal(t, control.wantState, rm.state)
+		})
+	}
+}
+
+// settleCeilingControls are the two control operations that wait for the
+// runner they interrupt, each with the state it leaves the change in.
+var settleCeilingControls = map[string]struct {
+	run       func(eng *Engine, ctx context.Context) (*engine.ControlResult, error)
+	wantState engine.State
+}{
+	"stop": {run: func(eng *Engine, ctx context.Context) (*engine.ControlResult, error) {
+		return eng.Stop(ctx, &engine.ControlRequest{})
+	}, wantState: engine.StateStopped},
+	"cancel": {run: func(eng *Engine, ctx context.Context) (*engine.ControlResult, error) {
+		return eng.Cancel(ctx, &engine.ControlRequest{})
+	}, wantState: engine.StateCancelled},
+}
+
+// runControlWithin runs a control operation and fails the test if it has not
+// returned within controlDuringConnectDeadline.
+func runControlWithin(t *testing.T, name string, run func() (*engine.ControlResult, error)) (*engine.ControlResult, error) {
+	t.Helper()
+	type answer struct {
+		result *engine.ControlResult
+		err    error
+	}
+	returned := make(chan answer, 1)
+	go func() {
+		result, err := run()
+		returned <- answer{result: result, err: err}
+	}()
+	select {
+	case a := <-returned:
+		return a.result, a.err
+	case <-time.After(controlDuringConnectDeadline):
+		require.FailNow(t, "the "+name+" did not return")
+		return nil, nil
+	}
+}
+
+// The durable stop and cancel consumers call the engine with no deadline. A
+// runner that will not come down must still not hold their call forever: the
+// wait ends at the engine's settle ceiling with a not-settled error the
+// consumer retries, never a permanent or settled one. The change stays tracked
+// with the state the operator asked for and its runner alive, and the expiry is
+// logged at Warn with the change's identifiers and how long the wait ran.
+func TestControlWaitForAStuckRunnerEndsAtTheSettleCeiling(t *testing.T) {
+	for name, control := range settleCeilingControls {
+		t.Run(name, func(t *testing.T) {
+			var logs bytes.Buffer
+			eng := New(Config{})
+			eng.interruptedRunnerSettleTimeout = 50 * time.Millisecond
+			rm := registerRunningSchemaChange(eng)
+			rm.tables = []string{"users"}
+			rm.logger = slog.New(slog.NewJSONHandler(&logs, nil)).With("apply_id", "apply-settle-ceiling")
+			rm.cancelFunc = func() {}
+			stuck := make(chan struct{})
+			t.Cleanup(func() { close(stuck) })
+			startTestRun(eng, rm, func() { <-stuck })
+
+			// t.Context() has no deadline, as the durable consumers' context.
+			_, deadlineSet := t.Context().Deadline()
+			require.False(t, deadlineSet)
+			result, err := runControlWithin(t, name, func() (*engine.ControlResult, error) {
+				return control.run(eng, t.Context())
+			})
+
+			require.Error(t, err)
+			assert.Nil(t, result)
+			assert.True(t, engine.IsNotSettled(err), "the expired ceiling reports the control as not settled yet")
+			assert.True(t, engine.IsRetryable(err), "a not-settled control must leave the durable request pending")
+			assert.False(t, engine.IsAlreadyCompleted(err))
+			assert.False(t, engine.IsSettledOutcome(err))
+			assert.False(t, engine.IsUnsupportedOperation(err))
+			assert.ErrorIs(t, err, context.DeadlineExceeded)
+			assert.Contains(t, err.Error(), "the runner has not returned within the 50ms settle ceiling")
+			assert.Contains(t, err.Error(), "database testdb")
+			assert.Equal(t, control.wantState, rm.state)
+			assert.Same(t, rm, eng.runningSchemaChange, "the change stays tracked while its runner is alive")
+			assert.True(t, testRunAlive(eng, rm), "the runner is still alive")
+
+			var warned map[string]any
+			for line := range bytes.SplitSeq(bytes.TrimSpace(logs.Bytes()), []byte("\n")) {
+				var entry map[string]any
+				require.NoError(t, json.Unmarshal(line, &entry))
+				if entry["level"] == "WARN" {
+					warned = entry
+				}
+			}
+			require.NotNil(t, warned, "the expiry is logged at Warn")
+			assert.Equal(t, name+" wait reached its settle ceiling before the runner returned; the schema change stays tracked and the "+name+" can be sent again", warned["msg"])
+			assert.Equal(t, "apply-settle-ceiling", warned["apply_id"])
+			assert.Equal(t, name, warned["operation"])
+			assert.Equal(t, "testdb", warned["database"])
+			assert.Equal(t, float64(50*time.Millisecond), warned["settle_timeout"])
+			waited, ok := warned["waited"].(float64)
+			require.True(t, ok, "the warning carries how long the wait ran")
+			assert.GreaterOrEqual(t, time.Duration(waited), 50*time.Millisecond)
+		})
+	}
+}
+
+// A runner that takes a moment to tear down but comes down before the settle
+// ceiling settles the stop or cancel as usual: the stop answers stopped, and
+// the cancel goes on to release the artifacts rather than reporting the
+// control as not settled.
+func TestControlWaitForARunnerThatReturnsBeforeTheSettleCeiling(t *testing.T) {
+	// teardown is how long the fake runner takes to return once interrupted,
+	// standing in for the in-flight statements a real runner waits out.
+	const teardown = 50 * time.Millisecond
+	for name, control := range settleCeilingControls {
+		t.Run(name, func(t *testing.T) {
+			eng := New(Config{})
+			eng.interruptedRunnerSettleTimeout = controlDuringConnectDeadline
+			rm := registerRunningSchemaChange(eng)
+			interrupted := make(chan struct{})
+			var interruptOnce sync.Once
+			rm.cancelFunc = func() { interruptOnce.Do(func() { close(interrupted) }) }
+			startTestRun(eng, rm, func() {
+				<-interrupted
+				<-time.After(teardown)
+			})
+
+			result, err := runControlWithin(t, name, func() (*engine.ControlResult, error) {
+				return control.run(eng, t.Context())
+			})
+
+			assert.False(t, testRunAlive(eng, rm), "the runner returned once the control interrupted it")
+			assert.Equal(t, control.wantState, rm.state)
+			if name == "stop" {
+				require.NoError(t, err)
+				require.NotNil(t, result)
+				assert.True(t, result.Accepted)
+				assert.Equal(t, "Stopped - checkpoint saved for resume", result.Message)
+				return
+			}
+			// The cancel gets past the wait and goes on to release the
+			// artifacts, which fails at the connection because this fixture
+			// runs no target.
+			require.Error(t, err)
+			assert.False(t, engine.IsNotSettled(err), "a runner that returned settles the cancel's wait")
+			assert.Contains(t, err.Error(), "connect to database testdb to clean up cancelled schema change artifacts")
 		})
 	}
 }

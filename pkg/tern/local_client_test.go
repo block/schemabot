@@ -2384,6 +2384,113 @@ func TestLocalClient_ProcessPendingCancelControlRequest(t *testing.T) {
 	assert.True(t, hasLogMessageContaining(logs.logs, "Cancel requested: 1 tasks cancelled, 0 skipped (caller: cli:alice)"))
 }
 
+// A durable stop or cancel whose engine call ends at the engine's settle
+// ceiling, because the runner it interrupted will not come down, is not
+// settled. The request stays pending and the apply and its task keep their
+// state, so the drive exits and the operator's command is sent again on the
+// next claim; it is never resolved as done or failed. Once the runner has come
+// down, the retried request settles the apply. The engine reports the change
+// as still in motion while its runner is alive, as the Spirit engine does.
+func TestLocalClient_PendingControlStaysPendingWhileTheEngineHasNotSettled(t *testing.T) {
+	cases := map[string]struct {
+		operation    storage.ControlOperation
+		liveState    engine.State
+		notSettled   func(e *fakeControlEngine, err error)
+		process      func(c *LocalClient, ctx context.Context, apply *storage.Apply) (bool, error)
+		settledTask  string
+		settledApply string
+	}{
+		"stop": {
+			operation:  storage.ControlOperationStop,
+			liveState:  engine.StateRunning,
+			notSettled: func(e *fakeControlEngine, err error) { e.stopErr = err },
+			process: func(c *LocalClient, ctx context.Context, apply *storage.Apply) (bool, error) {
+				return c.processPendingStopControlRequest(ctx, apply)
+			},
+			settledTask:  state.Task.Stopped,
+			settledApply: state.Apply.Stopped,
+		},
+		"cancel": {
+			operation:  storage.ControlOperationCancel,
+			liveState:  engine.StateCancelled,
+			notSettled: func(e *fakeControlEngine, err error) { e.cancelErr = err },
+			process: func(c *LocalClient, ctx context.Context, apply *storage.Apply) (bool, error) {
+				return c.processPendingCancelControlRequest(ctx, apply)
+			},
+			settledTask:  state.Task.Cancelled,
+			settledApply: state.Apply.Cancelled,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			apply := &storage.Apply{
+				ID:              124,
+				ApplyIdentifier: "apply-not-settled-" + name,
+				Database:        "testdb",
+				DatabaseType:    storage.DatabaseTypeMySQL,
+				Environment:     "staging",
+				State:           state.Apply.Running,
+			}
+			task := &storage.Task{
+				ID:             457,
+				ApplyID:        apply.ID,
+				TaskIdentifier: "task-not-settled-" + name,
+				Database:       "testdb",
+				Namespace:      "testdb",
+				DatabaseType:   storage.DatabaseTypeMySQL,
+				TableName:      "users",
+				State:          state.Task.Running,
+			}
+			controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+				ApplyID:     apply.ID,
+				Operation:   tc.operation,
+				Status:      storage.ControlRequestPending,
+				RequestedBy: "cli:alice",
+			}}}
+			fakeEngine := &fakeControlEngine{progressResult: &engine.ProgressResult{State: tc.liveState}}
+			tc.notSettled(fakeEngine, &engine.NotSettledError{Err: fmt.Errorf("%s on database testdb tables [users]: the runner has not returned within the 2m0s settle ceiling: %w; send the %s again once it has", name, context.DeadlineExceeded, name)})
+			client := &LocalClient{
+				config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
+				storage: &exactProgressStorage{
+					applies:         &exactProgressApplyStore{apply: apply},
+					tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+					logs:            &mockApplyLogStore{},
+					controlRequests: controlRequests,
+				},
+				spiritEngine: fakeEngine,
+				logger:       slog.Default(),
+			}
+
+			_, err := tc.process(client, t.Context(), apply)
+			require.Error(t, err, "a control the engine has not settled must not be reported as done")
+			assert.True(t, engine.IsNotSettled(err), "the engine's not-settled error reaches the drive")
+			assert.Equal(t, state.Task.Running, task.State, "the task is not recorded settled while its runner is alive")
+			assert.Equal(t, state.Apply.Running, apply.State, "the apply is not recorded settled while its runner is alive")
+			pending, err := controlRequests.GetPending(t.Context(), apply.ID, tc.operation)
+			require.NoError(t, err)
+			require.NotNil(t, pending, "the durable request stays pending to be sent again")
+			assert.Equal(t, storage.ControlRequestPending, pending.Status)
+			assert.Empty(t, pending.ErrorMessage, "the request is not failed")
+
+			// The runner has come down: the retried request settles.
+			tc.notSettled(fakeEngine, nil)
+			fakeEngine.progressResult = nil
+			standDown, err := tc.process(client, t.Context(), apply)
+			require.NoError(t, err)
+			assert.True(t, standDown)
+			assert.Equal(t, tc.settledTask, task.State)
+			assert.Equal(t, tc.settledApply, apply.State)
+			pending, err = controlRequests.GetPending(t.Context(), apply.ID, tc.operation)
+			require.NoError(t, err)
+			assert.Nil(t, pending, "the retried request resolves once the engine settles")
+			resolved, err := controlRequests.GetByOperation(t.Context(), apply.ID, tc.operation)
+			require.NoError(t, err)
+			require.NotNil(t, resolved)
+			assert.Equal(t, storage.ControlRequestCompleted, resolved.Status)
+		})
+	}
+}
+
 // A pending cancel can be consumed after the engine's schema change has
 // already reached its completed terminal state — the change landed before the
 // cancel arrived. The engine rejects the cancel as already-completed, and the
