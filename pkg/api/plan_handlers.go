@@ -206,19 +206,19 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 	req.App = storage.CanonicalKey(strings.TrimSpace(req.App))
 
 	if req.App != "" && req.Database != "" {
-		s.writeError(w, http.StatusBadRequest, "database and app both select the database; set exactly one")
+		s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "database and app both select the database; set exactly one")
 		return
 	}
 	if req.Database == "" && req.App == "" {
-		s.writeError(w, http.StatusBadRequest, "database or app is required")
+		s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "database or app is required")
 		return
 	}
 	if req.Environment == "" {
-		s.writeError(w, http.StatusBadRequest, "environment is required")
+		s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "environment is required")
 		return
 	}
 	if _, err := pullCatalogDetail(req.CatalogDetail); err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
+		s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, err.Error())
 		return
 	}
 
@@ -243,7 +243,7 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 		database, err := s.config.withDatabaseSnapshot().DatabaseForApp(req.App)
 		if err != nil {
 			s.logger.Warn("pull schema rejected for unresolvable app", "app", req.App, "environment", req.Environment, "error", err)
-			s.writeError(w, http.StatusBadRequest, err.Error())
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, err.Error())
 			return
 		}
 		req.Database = database
@@ -260,17 +260,17 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if typeMismatchErr, ok := errors.AsType[*databaseTypeMismatchError](err); ok {
 			s.logger.Warn("pull schema rejected for mismatched database type", "database", req.Database, "environment", req.Environment, "request_type", typeMismatchErr.RequestType, "config_type", typeMismatchErr.ConfigType)
-			s.writeError(w, http.StatusBadRequest, err.Error())
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, err.Error())
 			return
 		}
 		if requestedRouteNotConfigured(err) {
 			s.logger.Warn("pull schema rejected for unconfigured database route", "database", req.Database, "environment", req.Environment, "error", err)
-			s.writeError(w, http.StatusBadRequest, err.Error())
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, err.Error())
 			return
 		}
 		if unselectedErr, ok := errors.AsType[*UnselectedPullNamespaceError](err); ok {
 			s.logger.Warn("pull schema rejected for namespaces no targets entry selects", "database", req.Database, "environment", req.Environment, "namespaces", unselectedErr.Namespaces, "selectable_namespaces", unselectedErr.Selectable)
-			s.writeError(w, http.StatusBadRequest, err.Error())
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, err.Error())
 			return
 		}
 		if unsupportedErr, ok := errors.AsType[*unsupportedPullSchemaError](err); ok {
@@ -280,12 +280,12 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 		}
 		if lintDialectErr, ok := errors.AsType[*unsupportedLintDialectError](err); ok {
 			s.logger.Warn("pull schema lint rejected for unsupported dialect", "database", req.Database, "environment", req.Environment, "type", lintDialectErr.DatabaseType)
-			s.writeError(w, http.StatusBadRequest, err.Error())
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, err.Error())
 			return
 		}
 		if unlintableErr, ok := errors.AsType[*unlintablePulledTableError](err); ok {
 			s.logger.Warn("pull schema lint rejected unlintable pulled table", "database", req.Database, "environment", req.Environment, "namespace", unlintableErr.Namespace, "table", unlintableErr.Table, "detail", unlintableErr.Detail)
-			s.writeError(w, http.StatusBadRequest, err.Error())
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, err.Error())
 			return
 		}
 		if unavailableErr, ok := errors.AsType[*RemoteDeploymentUnavailableError](err); ok {
