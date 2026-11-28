@@ -185,16 +185,19 @@ func TestResumeExistingDeployRequest_ApprovalRequiredIsPermanent(t *testing.T) {
 }
 
 // refusedStartClient refuses every deploy with deployErr and serves the deploy
-// request as current, which a close marks closed. closeErr fails the close.
-// Deploys, reads and closes are recorded.
+// request as current, which a close marks closed. closeErr fails the close;
+// getReturnsNil and closeReturnsNil make the read or the close answer with no
+// deploy request. Deploys, reads and closes are recorded.
 type refusedStartClient struct {
 	psclient.PSClient
-	deployErr   error
-	current     ps.DeployRequest
-	closeErr    error
-	deployCalls int
-	getCalls    int
-	closes      []uint64
+	deployErr       error
+	current         ps.DeployRequest
+	closeErr        error
+	getReturnsNil   bool
+	closeReturnsNil bool
+	deployCalls     int
+	getCalls        int
+	closes          []uint64
 }
 
 func (c *refusedStartClient) DeployDeployRequest(context.Context, *ps.PerformDeployRequest) (*ps.DeployRequest, error) {
@@ -204,6 +207,9 @@ func (c *refusedStartClient) DeployDeployRequest(context.Context, *ps.PerformDep
 
 func (c *refusedStartClient) GetDeployRequest(context.Context, *ps.GetDeployRequestRequest) (*ps.DeployRequest, error) {
 	c.getCalls++
+	if c.getReturnsNil {
+		return nil, nil
+	}
 	current := c.current
 	return &current, nil
 }
@@ -212,6 +218,9 @@ func (c *refusedStartClient) CloseDeployRequest(_ context.Context, req *ps.Close
 	c.closes = append(c.closes, req.Number)
 	if c.closeErr != nil {
 		return nil, c.closeErr
+	}
+	if c.closeReturnsNil {
+		return nil, nil
 	}
 	c.current.State = deployRequestClosed
 	closed := c.current
@@ -303,8 +312,8 @@ func TestStart_ApprovalRefusalWhoseCloseFailsNamesTheOpenDeployRequest(t *testin
 }
 
 // A deploy request the engine adopted from the branch was opened by someone
-// else, so a refused deploy leaves it open for them and answers with the
-// refusal unchanged.
+// else, so a refused deploy leaves it open for them. The failure still names
+// it, since it can be deployed from PlanetScale after the apply fails.
 func TestStart_ApprovalRefusalLeavesAnAdoptedDeployRequestOpen(t *testing.T) {
 	refusal := approvalRequiredFromAPI(t)
 	client := &refusedStartClient{deployErr: refusal, current: readyDeployRequest121()}
@@ -318,9 +327,72 @@ func TestStart_ApprovalRefusalLeavesAnAdoptedDeployRequestOpen(t *testing.T) {
 	require.ErrorAs(t, err, &permanent)
 	assert.ErrorIs(t, err, refusal)
 	assert.Contains(t, err.Error(), approvalRefusal121)
-	assert.NotContains(t, err.Error(), "still open")
+	assert.Contains(t, err.Error(), "SchemaBot did not open deploy request #121 on database mydb (https://example.test/deploys/121), so it left it open; close it in PlanetScale if it should not deploy")
 	assert.Empty(t, client.closes, "an adopted deploy request is never closed")
 	assert.Zero(t, client.getCalls)
+}
+
+// A deploy call that fails without a refusal, such as a dropped connection,
+// may have started the deploy, so the deploy request is never closed and the
+// caller gets an unknown outcome to recover from.
+func TestStart_AmbiguousDeployFailureNeverClosesTheDeployRequest(t *testing.T) {
+	client := &refusedStartClient{deployErr: errors.New("read tcp 10.0.0.1:443: connection reset by peer"), current: readyDeployRequest121()}
+	e := conformanceEngine(client)
+
+	result, err := e.Start(t.Context(), refusedStartRequest(t, false))
+
+	require.Error(t, err)
+	assert.Nil(t, result)
+	assert.True(t, engine.IsOutcomeUnknown(err))
+	assert.True(t, engine.IsRetryable(err))
+	assert.Empty(t, client.closes, "a deploy that may be running is never closed")
+}
+
+// When the re-read before the close shows PlanetScale may have begun the
+// deploy, the deploy request is not closed, and the failure tells the operator
+// to check whether the change landed rather than to close it.
+func TestStart_ApprovalRefusalOverARunningDeployRequestAdvisesCheckingIt(t *testing.T) {
+	running := readyDeployRequest121()
+	running.DeploymentState = deployState.InProgress
+	client := &refusedStartClient{deployErr: approvalRequiredFromAPI(t), current: running}
+	e := conformanceEngine(client)
+
+	_, err := e.Start(t.Context(), refusedStartRequest(t, false))
+
+	require.Error(t, err)
+	var permanent *engine.PermanentError
+	require.ErrorAs(t, err, &permanent)
+	assert.Empty(t, client.closes, "a deploy request that reads as deployed is never closed")
+	assert.Contains(t, err.Error(), "PlanetScale reports deploy request #121 on database mydb (https://example.test/deploys/121) may have started deploying; check in PlanetScale whether the change landed before applying again")
+	assert.NotContains(t, err.Error(), "close it in PlanetScale")
+}
+
+// A read or close that answers with no deploy request leaves the deploy
+// request unaccounted for, so the failure names it as still open.
+func TestStart_ApprovalRefusalWithAnEmptyResponseNamesTheOpenDeployRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		client     *refusedStartClient
+		wantCloses []uint64
+	}{
+		{name: "read returns nothing", client: &refusedStartClient{getReturnsNil: true}},
+		{name: "close returns nothing", client: &refusedStartClient{closeReturnsNil: true}, wantCloses: []uint64{121}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.client.deployErr = approvalRequiredFromAPI(t)
+			tc.client.current = readyDeployRequest121()
+			e := conformanceEngine(tc.client)
+
+			_, err := e.Start(t.Context(), refusedStartRequest(t, false))
+
+			require.Error(t, err)
+			var permanent *engine.PermanentError
+			require.ErrorAs(t, err, &permanent)
+			assert.Contains(t, err.Error(), approvalRefusal121)
+			assert.Contains(t, err.Error(), "SchemaBot could not close deploy request #121 on database mydb (https://example.test/deploys/121), so it is still open")
+			assert.Equal(t, tc.wantCloses, tc.client.closes)
+		})
+	}
 }
 
 // A fresh apply's deploy failure passes through unknownDeployOutcomeNeedsRecord

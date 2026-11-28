@@ -221,7 +221,9 @@ func (e *Engine) retireDeployRequestOfFailedApply(ctx context.Context, logger *s
 // It returns nil once the deploy request is closed and never deployed,
 // whether this call closed it or it was already closed. Otherwise the deploy
 // request was left in place: the reason is logged on logger with attrs, the
-// caller's triage identifiers, and returned. ctx is the drive's context; see
+// caller's triage identifiers, and returned. When it was left in place because
+// PlanetScale reports its deploy may have begun, the error is a
+// *deployMayHaveBegunError. ctx is the drive's context; see
 // retireDeployRequestOfFailedApply for why nothing further is issued once it
 // ends.
 func (e *Engine) closeUndeployedDeployRequestOfFailedApply(ctx context.Context, logger *slog.Logger, client psclient.PSClient, org, database string, number uint64, attrs []any) error {
@@ -247,7 +249,7 @@ func (e *Engine) closeUndeployedDeployRequestOfFailedApply(ctx context.Context, 
 	if !deployRequestNeverDeployed(dr) {
 		logger.Error("the deploy request of a failed apply reports a deploy may have begun; the apply is being failed over a deploy that may now be running, so the deploy request and its branch are left in place; "+reconcileDeployOfFailedApply,
 			append(slices.Clone(attrs), "deployment_state", dr.DeploymentState, "deployed_at", formatDeployedAt(dr.DeployedAt))...)
-		return fmt.Errorf("deploy request #%d reports a deploy may have begun (deployment state %q), so it was not closed", number, dr.DeploymentState)
+		return &deployMayHaveBegunError{msg: fmt.Sprintf("deploy request #%d reports a deploy may have begun (deployment state %q), so it was not closed", number, dr.DeploymentState)}
 	}
 	if dr.State == deployRequestClosed {
 		logger.Info("the deploy request of a failed apply was already closed before it deployed", attrs...)
@@ -280,11 +282,23 @@ func (e *Engine) closeUndeployedDeployRequestOfFailedApply(ctx context.Context, 
 	if !deployRequestNeverDeployed(closed) {
 		logger.Error("closing the deploy request of a failed apply reported a deploy began after the cleanup read it; the apply is being failed over a deploy that may now be running, so its branch is left in place; "+reconcileDeployOfFailedApply,
 			append(slices.Clone(attrs), "deployment_state", closed.DeploymentState, "deployed_at", formatDeployedAt(closed.DeployedAt))...)
-		return fmt.Errorf("closing deploy request #%d reported a deploy began (deployment state %q)", number, closed.DeploymentState)
+		return &deployMayHaveBegunError{msg: fmt.Sprintf("closing deploy request #%d reported a deploy began (deployment state %q)", number, closed.DeploymentState)}
 	}
 	logger.Info("closed the undeployed deploy request of a failed apply",
 		append(slices.Clone(attrs), "deployment_state", dr.DeploymentState)...)
 	return nil
+}
+
+// deployMayHaveBegunError reports that the deploy request of a failed apply
+// was left open because PlanetScale reports its deploy may have begun. Closing
+// it would be the wrong advice to an operator, so callers word this case on
+// its own.
+type deployMayHaveBegunError struct {
+	msg string
+}
+
+func (e *deployMayHaveBegunError) Error() string {
+	return e.msg
 }
 
 var _ engine.CancelledResumeStateReclaimer = (*Engine)(nil)

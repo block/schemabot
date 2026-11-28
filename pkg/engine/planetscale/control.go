@@ -340,13 +340,16 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 // still reads as never deployed.
 //
 // Only a deploy request this engine created is closed. One adopted from the
-// branch was opened by someone else, so it is left open for them.
+// branch was opened by someone else, so it is left open for them. The control
+// request carries no apply options, so Start cannot tell an operator-supplied
+// branch from one SchemaBot created, and leaving it open is the side that
+// never closes someone else's deploy request.
 //
-// It returns refusal unchanged when the deploy request is closed or was left
-// open on purpose. When the close fails, the returned error is still permanent
-// and keeps refusal on its chain, and its message adds which deploy request is
-// still open, so the operator knows what to close by hand. The close failure's
-// own text stays in the log and off the message.
+// It returns refusal unchanged when the deploy request is closed. Otherwise the
+// returned error is still permanent and keeps refusal on its chain, and its
+// message adds what the operator should do about the deploy request: close it
+// when it was left open, or check its deploy when PlanetScale reports one may
+// have begun. A close failure's own text stays in the log and off the message.
 func (e *Engine) closeRefusedDeployRequest(ctx context.Context, client psclient.PSClient, org, database string, meta *psMetadata, refusal error) error {
 	attrs := []any{
 		"organization", org,
@@ -356,46 +359,80 @@ func (e *Engine) closeRefusedDeployRequest(ctx context.Context, client psclient.
 		"branch", meta.BranchName,
 		"refusal", refusal,
 	}
+	refused := &refusedDeployRequestNotClosedError{
+		refusal:  refusal,
+		number:   meta.DeployRequestID,
+		url:      meta.DeployRequestURL,
+		database: database,
+	}
 	if meta.DeployRequestAdopted {
 		e.logger.Warn("PlanetScale refused the deploy permanently; leaving the deploy request open, since SchemaBot adopted it from the branch rather than creating it; close it in PlanetScale if it should not deploy",
 			attrs...)
-		return refusal
+		refused.reason = refusedDeployRequestAdopted
+		return &engine.PermanentError{Err: refused}
 	}
 	e.logger.Info("PlanetScale refused the deploy permanently; closing the deploy request SchemaBot created so it cannot be deployed after the apply fails",
 		attrs...)
-	if closeErr := e.closeUndeployedDeployRequestOfFailedApply(ctx, e.logger, client, org, database, meta.DeployRequestID, attrs); closeErr != nil {
-		return &engine.PermanentError{Err: &refusedDeployRequestLeftOpenError{
-			refusal:      refusal,
-			number:       meta.DeployRequestID,
-			url:          meta.DeployRequestURL,
-			database:     database,
-			closeFailure: closeErr,
-		}}
+	closeErr := e.closeUndeployedDeployRequestOfFailedApply(ctx, e.logger, client, org, database, meta.DeployRequestID, attrs)
+	if closeErr == nil {
+		return refusal
 	}
-	return refusal
+	refused.closeFailure = closeErr
+	refused.reason = refusedDeployRequestCloseFailed
+	var mayHaveBegun *deployMayHaveBegunError
+	if errors.As(closeErr, &mayHaveBegun) {
+		refused.reason = refusedDeployRequestMayHaveDeployed
+	}
+	return &engine.PermanentError{Err: refused}
 }
 
-// refusedDeployRequestLeftOpenError is a permanent deploy refusal whose deploy
-// request SchemaBot could not close. Its message is the refusal's, followed by
-// the deploy request that is still open; why the close failed stays on the
-// chain for errors.Is and the logs, but out of the text an operator reads.
-type refusedDeployRequestLeftOpenError struct {
+// refusedDeployRequestReason is why a refused deploy request was not closed.
+type refusedDeployRequestReason int
+
+const (
+	// refusedDeployRequestCloseFailed: the close failed, so it is still open.
+	refusedDeployRequestCloseFailed refusedDeployRequestReason = iota
+	// refusedDeployRequestMayHaveDeployed: PlanetScale reports its deploy may
+	// have begun, so it was not closed.
+	refusedDeployRequestMayHaveDeployed
+	// refusedDeployRequestAdopted: SchemaBot adopted it from the branch, so it
+	// was left open for whoever opened it.
+	refusedDeployRequestAdopted
+)
+
+// refusedDeployRequestNotClosedError is a permanent deploy refusal whose
+// deploy request SchemaBot did not close. Its message is the refusal's,
+// followed by what the operator should do about that deploy request; a close
+// failure stays on the chain for errors.Is and the logs, but out of the text
+// an operator reads.
+type refusedDeployRequestNotClosedError struct {
 	refusal      error
+	reason       refusedDeployRequestReason
 	number       uint64
 	url          string
 	database     string
 	closeFailure error
 }
 
-func (e *refusedDeployRequestLeftOpenError) Error() string {
+func (e *refusedDeployRequestNotClosedError) Error() string {
 	name := fmt.Sprintf("deploy request #%d on database %s", e.number, e.database)
 	if e.url != "" {
 		name = fmt.Sprintf("%s (%s)", name, e.url)
 	}
-	return fmt.Sprintf("%s. SchemaBot could not close %s, so it is still open; close it in PlanetScale so it cannot be deployed", e.refusal.Error(), name)
+	switch e.reason {
+	case refusedDeployRequestMayHaveDeployed:
+		return fmt.Sprintf("%s. PlanetScale reports %s may have started deploying; check in PlanetScale whether the change landed before applying again", e.refusal.Error(), name)
+	case refusedDeployRequestAdopted:
+		return fmt.Sprintf("%s. SchemaBot did not open %s, so it left it open; close it in PlanetScale if it should not deploy", e.refusal.Error(), name)
+	default:
+		return fmt.Sprintf("%s. SchemaBot could not close %s, so it is still open; close it in PlanetScale so it cannot be deployed", e.refusal.Error(), name)
+	}
 }
 
-func (e *refusedDeployRequestLeftOpenError) Unwrap() []error {
+func (e *refusedDeployRequestNotClosedError) Unwrap() []error {
+	if e.closeFailure == nil {
+		return []error{e.refusal}
+	}
 	return []error{e.refusal, e.closeFailure}
 }
 
