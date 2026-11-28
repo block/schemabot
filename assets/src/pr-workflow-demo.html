@@ -1,6 +1,6 @@
 <!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="pr-workflow-comments.css"><link rel="stylesheet" href="pr-workflow-demo.css"></head><body>
 <div class="repo"><svg width="17" height="18" viewBox="0 0 16 16" fill="#59636e"><path d="M2 1h11v14H2V1zm1 1v9h9V2H3zm0 10v2h9v-2H3z"/></svg><span>example / <b>shop</b></span><span class="pill">Public</span><span class="right">Code　 Issues　 <b>Pull requests</b>　 Actions</span></div>
-<div class="page" id="page"><div id="scroll-content"><div class="prhead"><h1>Add an index to users <span>#42</span></h1><div class="meta"><span class="state" id="state">Open</span><span id="prmeta"><b>octocat</b> wants to merge 1 commit into <code>main</code> from <code>add-user-index</code></span></div><div class="tabs"><span class="selected"><svg class="ui-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M2 2h10v8H7l-3 3v-3H2z"/><path d="M13 5h2v8h-2v2l-2-2H8"/></svg>Conversation <i class="counter">5</i></span><span><svg class="ui-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><circle cx="8" cy="8" r="3"/><path d="M1 8h4m6 0h4"/></svg>Commits <i class="counter">1</i></span><span><svg class="ui-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M7 13H2V1h9v5M5 4h3M5 7h2m2 4 2 2 4-4"/></svg>Checks <i class="counter">2</i></span><span><svg class="ui-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M3 1h7l3 3v11H3zM10 1v4h3M5 9h6M8 6v6"/></svg>Files changed <i class="counter">1</i></span></div></div>
+<div class="page" id="page"><div id="scroll-content"><div class="prhead"><h1 id="prtitle">Add an index to users <span>#42</span></h1><div class="meta"><span class="state" id="state">Open</span><span id="prmeta"><b>octocat</b> wants to merge 1 commit into <code>main</code> from <code>add-user-index</code></span></div><div class="tabs"><span class="selected"><svg class="ui-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M2 2h10v8H7l-3 3v-3H2z"/><path d="M13 5h2v8h-2v2l-2-2H8"/></svg>Conversation <i class="counter">5</i></span><span><svg class="ui-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><circle cx="8" cy="8" r="3"/><path d="M1 8h4m6 0h4"/></svg>Commits <i class="counter">1</i></span><span><svg class="ui-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M7 13H2V1h9v5M5 4h3M5 7h2m2 4 2 2 4-4"/></svg>Checks <i class="counter">2</i></span><span><svg class="ui-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M3 1h7l3 3v11H3zM10 1v4h3M5 9h6M8 6v6"/></svg>Files changed <i class="counter">1</i></span></div></div>
 <div id="diff-view" class="hidden">
 <div class="diff-toolbar"><button class="quiet">▣</button><button class="quiet">▣ All commits ⌄</button><span class="toolbar-spacer"></span><span class="tiny">◯ 0 / 1 viewed</span><span class="toolbar-divider"></span><button class="btn">Submit review ⌄</button><button class="quiet">⚙</button><span class="tiny">ⓘ　♧ 0</span></div>
 <div class="diff-layout"><aside class="file-tree"><div class="file-filter">⌕ <span>Filter files…</span></div><div class="tree-folder" id="tree-folder">⌄ <span class="folder-icon"></span>schema</div><div class="tree-file">▧ <span>users.sql</span></div></aside>
@@ -9,11 +9,27 @@
 </div>
 <div class="footer">Illustrative workflow using rendered comment templates · elapsed time compressed</div>
 <script>
-// ?engine=postgres records the PostgreSQL workflow; the default is MySQL.
-const ENGINE=new URLSearchParams(location.search).get('engine')==='postgres'?'postgres':'mysql';
-document.write(`<script src="${ENGINE==='postgres'?'pr-postgres-comments.js':'pr-workflow-comments.js'}"><\/script>`);
+// ?engine= records the PostgreSQL or Vitess workflow; the default is MySQL.
+const COMMENT_SOURCE={mysql:'pr-workflow-comments.js',postgres:'pr-postgres-comments.js',vitess:'pr-vitess-comments.js'};
+const requested=new URLSearchParams(location.search).get('engine');
+const ENGINE=COMMENT_SOURCE[requested]?requested:'mysql';
+document.write(`<script src="${COMMENT_SOURCE[ENGINE]}"><\/script>`);
 </script><script>
 const command='schemabot apply -e staging',clamp=x=>Math.max(0,Math.min(1,x)),ease=x=>{x=clamp(x);return x*x*(3-2*x)};
+// Scene beats, in scene seconds. Vitess runs 2.5s longer: its copy is followed
+// by a cutover and an open revert window before the apply completes, so the
+// check only passes — and the merge only unblocks — once it does.
+const BEATS={
+ mysql:   {complete:21.5,summary:23,  confirm:28,  merged:29,  cameraProgress:23,  cameraSummary:25},
+ postgres:{complete:21.5,summary:23,  confirm:28,  merged:29,  cameraProgress:23,  cameraSummary:25},
+ vitess:  {complete:24,  summary:25.5,confirm:30.5,merged:31.5,cameraProgress:25.5,cameraSummary:27.5},
+}[ENGINE];
+// The pull request each recording opens on.
+const SCENARIO={
+ mysql:   {title:'Add an index to users',    branch:'add-user-index'},
+ postgres:{title:'Add an index to users',    branch:'add-user-index'},
+ vitess:  {title:'Add a note column to orders',branch:'add-order-note'},
+}[ENGINE];
 function card(id,body,bot=true){return `<div class="c" id="${id}">${bot?'<img class="av" src="../schemabot-avatar-200.png">':'<img class="av h" src="../octocat-avatar-200.png">'}<div class="hd"><b>${bot?'schemabot':'octocat'}</b> commented <span>now</span><span class="lbl ${bot?'bot':''}">${bot?'bot':'Author'}</span><span class="more">···</span></div><div class="bd" id="${id}-body">${body}</div></div>`}
 document.getElementById('timeline').innerHTML=card('plan',COMMENTS.plan)+card('command','',false)+card('apply',COMMENTS.apply)+card('progress',COMMENTS.running)+card('summary',COMMENTS.summary);
 // Move the captured conversation explicitly so collapsing the comment editor
@@ -28,6 +44,14 @@ if(ENGINE==='postgres'){
  document.getElementById('diff-stat').innerHTML='<b class="ok">+2</b> <b class="deleted-text">−0</b> <span class="diffstat">▪▪▫▫▫</span>';
  document.getElementById('diff-rows').innerHTML='<tr class="hunk"><td colspan="6">　↥　　@@ −1,6 +1,8 @@ CREATE TABLE "users" (</td></tr>'+contextRows(6)+
   [6,7].map(i=>'<tr>'+diffSide('','','empty')+diffSide(i+1,diffLines[i],'added','+')+'</tr>').join('');
+} else if(ENGINE==='vitess'){
+ // The note column is one added line inside the sharded table's definition.
+ document.getElementById('tree-folder').innerHTML='⌄ <span class="folder-icon"></span>schema / shop';
+ document.getElementById('diff-path').textContent='schema/shop/orders.sql';
+ document.getElementById('diff-stat').innerHTML='<b class="ok">+1</b> <b class="deleted-text">−0</b> <span class="diffstat">▪▫▫▫▫</span>';
+ document.getElementById('diff-rows').innerHTML='<tr class="hunk"><td colspan="6">　↥　　@@ −1,5 +1,6 @@ CREATE TABLE `orders` (</td></tr>'+contextRows(3)+
+  '<tr>'+diffSide('','','empty')+diffSide(4,diffLines[3],'added','+')+'</tr>'+
+  [4,5].map(i=>'<tr>'+diffSide(i,diffLines[i])+diffSide(i+1,diffLines[i])+'</tr>').join('');
 } else {
  document.getElementById('diff-rows').innerHTML='<tr class="hunk"><td colspan="6">　↥　　@@ −1,6 +1,7 @@ CREATE TABLE `users` (</td></tr>'+contextRows(4)+
  '<tr>'+diffSide(5,diffLines[4].replace(/,$/,''),'deleted','−')+diffSide(5,diffLines[4],'added','+')+'</tr>'+
@@ -43,7 +67,8 @@ window.renderFrame=function(t,frameSeconds=1/12){
  document.getElementById('conversation').classList.toggle('hidden',showingDiff);
  document.querySelectorAll('.tabs>span').forEach((tab,i)=>tab.classList.toggle('selected',i===(showingDiff?3:0)));
  if(showingDiff){page.scrollTop=0;previousScroll=0;content.style.transform='';return;}
- for(const [id,start] of [['command',3],['apply',7.5],['progress',10],['summary',23]])document.getElementById(id).classList.toggle('hidden',t<start);
+ setHTML(document.getElementById('prtitle'),`${SCENARIO.title} <span>#42</span>`);
+ for(const [id,start] of [['command',3],['apply',7.5],['progress',10],['summary',BEATS.summary]])document.getElementById(id).classList.toggle('hidden',t<start);
  const commandBody=document.getElementById('command-body');
  if(t<7){let typed=command.slice(0,Math.floor(clamp((t-3.8)/2.4)*command.length));setHTML(commandBody,`<div class="editor-tabs"><b>Write</b><span class="tiny">Preview</span></div><div class="editor">${typed}<span class="caret" style="opacity:${Math.floor(t*2)%2}"> </span></div><div class="editor-foot"><span>Markdown is supported</span><button class="btn ${t>6.8?'pressed':''}" id="post">Comment</button></div>`);commandBody.style.padding='0'}
  else {commandBody.style.padding='16px';setHTML(commandBody,`<p>${command}</p>${t>=7.5?'<span class="rx"><span>👀 1</span></span>':''}`)}
@@ -51,19 +76,21 @@ window.renderFrame=function(t,frameSeconds=1/12){
  p=t>=20?100:Math.floor(p/4)*4;
  const bars='🟦'.repeat(Math.round(p/5))+'⬜'.repeat(20-Math.round(p/5));
  // PostgreSQL progress comments are rendered per polling update; MySQL fills one template.
- setHTML(document.getElementById('progress-body'),t>=21.5?COMMENTS.complete:ENGINE==='postgres'?COMMENTS.running[p]:COMMENTS.running.replace('DEMOVALUEBARTOKEN',bars).replace('DEMOVALUEPERCENTTOKEN',p.toFixed(2)).replace('DEMOVALUEROWSTOKEN',Math.round(7200000*p/100).toLocaleString('en-US')).replace('DEMOVALUEETATOKEN',p===100?'0s':`${Math.floor((100-p)*3.3/60)}m ${Math.round((100-p)*3.3%60)}s`));
+ // Vitess cuts over and then holds an open revert window before completing.
+ const vitessPhase=t>=BEATS.complete?COMMENTS.complete:t>=21.8?COMMENTS.revert:t>=20.5?COMMENTS.cutover:COMMENTS.running[p];
+ setHTML(document.getElementById('progress-body'),ENGINE==='vitess'?vitessPhase:t>=21.5?COMMENTS.complete:ENGINE==='postgres'?COMMENTS.running[p]:COMMENTS.running.replace('DEMOVALUEBARTOKEN',bars).replace('DEMOVALUEPERCENTTOKEN',p.toFixed(2)).replace('DEMOVALUEROWSTOKEN',Math.round(7200000*p/100).toLocaleString('en-US')).replace('DEMOVALUEETATOKEN',p===100?'0s':`${Math.floor((100-p)*3.3/60)}m ${Math.round((100-p)*3.3%60)}s`));
  const checks=document.getElementById('checks');checks.classList.remove('hidden');
- const applied=t>=21.5,active=t>=8&&!applied;
+ const applied=t>=BEATS.complete,active=t>=8&&!applied;
  const checkHeading=applied?'All checks have passed':active?'Some checks haven’t completed yet':'Some checks were not successful';
  const pendingLabel=active?'Apply in progress':'1 apply pending';
  const checksBody=applied?'<div class="check-group">2 successful checks ⌄</div>':'<div class="check-group">1 pending check ⌄<span class="check-settings">⚙</span></div>';
  const engineRow=`<div class="check-entry"><span class="${applied?'ok':'pending-icon'}">${applied?'✓':'<svg class="ui-icon" viewBox="0 0 16 16" fill="currentColor"><path d="M7.2 1.5a.9.9 0 0 1 1.6 0l6.9 12a1 1 0 0 1-.8 1.5H1.1a1 1 0 0 1-.8-1.5z"/><path d="M8 5v4" stroke="white" stroke-width="1.5" stroke-linecap="round"/><circle cx="8" cy="11.5" r=".8" fill="white"/></svg>'}</span><img src="../schemabot-avatar-200.png" width="20" height="20"><span>SchemaBot (staging)</span><span class="check-description">— ${applied?'All applies complete':pendingLabel}</span><span class="required-badge">Required</span><span class="check-menu">···</span></div>`;
- const mergeRow=!applied?'<div class="merge-controls"><button class="btn" disabled style="background:#f6f8fa;color:#8c959f">Merge pull request</button><span class="tiny">Merging is blocked</span></div>':t<29?`<div class="merge-controls"><span class="ok">✓</span><span>This branch has no conflicts with the base branch</span><button class="btn" id="merge">${t>=28?'Confirm merge':'Merge pull request'}</button></div>`:'<div class="merge-controls mergedrow"><span class="mergedicon"><svg viewBox="0 0 16 16" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="4" cy="3" r="2"/><circle cx="4" cy="13" r="2"/><circle cx="12" cy="9" r="2"/><path d="M4 5v6m0-6c0 4 4 4 6 4"/></svg></span><div><b>Pull request successfully merged and closed</b><br><span class="tiny">You’re all set — the <code>add-user-index</code> branch can be safely deleted.</span></div><button class="quiet">Delete branch</button></div>';
+ const mergeRow=!applied?'<div class="merge-controls"><button class="btn" disabled style="background:#f6f8fa;color:#8c959f">Merge pull request</button><span class="tiny">Merging is blocked</span></div>':t<BEATS.merged?`<div class="merge-controls"><span class="ok">✓</span><span>This branch has no conflicts with the base branch</span><button class="btn" id="merge">${t>=BEATS.confirm?'Confirm merge':'Merge pull request'}</button></div>`:`<div class="merge-controls mergedrow"><span class="mergedicon"><svg viewBox="0 0 16 16" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="4" cy="3" r="2"/><circle cx="4" cy="13" r="2"/><circle cx="12" cy="9" r="2"/><path d="M4 5v6m0-6c0 4 4 4 6 4"/></svg></span><div><b>Pull request successfully merged and closed</b><br><span class="tiny">You’re all set — the <code>${SCENARIO.branch}</code> branch can be safely deleted.</span></div><button class="quiet">Delete branch</button></div>`;
  setHTML(checks,`<div class="check-summary"><span class="check-ring ${applied?'passed':''}"></span><div><b>${checkHeading}</b><div class="check-description">${applied?'2 successful checks':'1 pending, 1 successful check'}</div></div><span class="check-chevron">⌄</span></div><div class="check-details">${checksBody}${engineRow}${applied?'<div class="check-entry"><span class="ok">✓</span><span>ci / test</span><span class="check-description">— Successful</span></div>':'<div class="check-group successful-group">1 successful check ⌄</div>'}</div>${mergeRow}`);
 
- const state=document.getElementById('state');state.textContent=t>=29?'Merged':'Open';state.style.background=t>=29?'#8250df':'#1f883d';
- setHTML(document.getElementById('prmeta'),t>=29?'<b>octocat</b> merged 1 commit into <code>main</code> from <code>add-user-index</code>':'<b>octocat</b> wants to merge 1 commit into <code>main</code> from <code>add-user-index</code>');
- let target=t<3?'checks':t<7.5?'command':t<10?'apply':t<23?'progress':t<25?'summary':'checks';
+ const state=document.getElementById('state');state.textContent=t>=BEATS.merged?'Merged':'Open';state.style.background=t>=BEATS.merged?'#8250df':'#1f883d';
+ setHTML(document.getElementById('prmeta'),`<b>octocat</b> ${t>=BEATS.merged?'merged':'wants to merge'} 1 commit into <code>main</code> from <code>${SCENARIO.branch}</code>`);
+ let target=t<3?'checks':t<7.5?'command':t<10?'apply':t<BEATS.cameraProgress?'progress':t<BEATS.cameraSummary?'summary':'checks';
  const el=document.getElementById(target),r=el.getBoundingClientRect(),vr=page.getBoundingClientRect();
  let desired=Math.min(Math.max(0,content.offsetHeight+64-page.clientHeight),Math.max(0,Math.round(previousScroll)+r.top-vr.top-20));
  if(t>=7)desired=Math.max(previousScroll,desired);

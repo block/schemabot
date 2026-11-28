@@ -3,6 +3,7 @@ package postgres
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -323,6 +324,22 @@ func TestClassifyRefusal(t *testing.T) {
 			wantNotDetail: []string{"statement budget", replanRemedy},
 		},
 		{
+			name: "validation that ran past its bound is a refusal naming the option and what stays live",
+			err: fmt.Errorf("validate reviewed constraint %q on PostgreSQL table %q: %w", "orders_user_id_fkey", "orders",
+				nameValidationBound(&executor.BudgetError{Cause: executor.CauseStatement, Budget: 36 * time.Hour}, "orders_user_id_fkey", 36*time.Hour)),
+			wantReason: "validation-bound-exceeded",
+			wantDetail: []string{
+				`constraint "orders_user_id_fkey" ran past postgres.validate_max_duration (36h0m0s); it stays NOT VALID and checks new writes only`,
+				"raise postgres.validate_max_duration and re-run",
+			},
+			wantNotDetail: []string{"statement budget", replanRemedy},
+		},
+		{
+			name: "validation that lost its lock budget stays operational",
+			err: fmt.Errorf("validate reviewed constraint %q on PostgreSQL table %q: %w", "orders_user_id_fkey", "orders",
+				nameValidationBound(&executor.BudgetError{Cause: executor.CauseLock, Budget: 3 * time.Second}, "orders_user_id_fkey", 36*time.Hour)),
+		},
+		{
 			name: "concurrent index drop that ran past its limit names the index and the drop to finish",
 			err: fmt.Errorf("drop reviewed index %q on PostgreSQL table %q.%q: %w", "orders_status_idx", "sales", "orders",
 				nameInterruptedIndexDrop(&executor.BudgetError{Cause: executor.CauseStatement, Budget: time.Hour}, "sales", "orders_status_idx", time.Hour)),
@@ -476,6 +493,9 @@ func TestApplyTablePreflightLimitFollowsStatementCost(t *testing.T) {
 
 	assert.Equal(t, preflight.NoSizeLimit, applyTablePreflightLimit(nativeApply{concurrentIndex: true}, configuredLimit))
 	assert.Equal(t, preflight.NoSizeLimit, applyTablePreflightLimit(nativeApply{partitionedIndex: true}, configuredLimit))
+	key := reviewedUserKey()
+	assert.Equal(t, preflight.NoSizeLimit, applyTablePreflightLimit(nativeApply{validates: &key}, configuredLimit),
+		"a validation scan rewrites nothing, so its cost is bounded by time, not table size")
 	assert.Equal(t, configuredLimit, applyTablePreflightLimit(nativeApply{}, configuredLimit))
 }
 
@@ -1365,6 +1385,29 @@ func TestCreateNamesUnverifiedRefusalLeadSurvivesStatusReasonClamp(t *testing.T)
 	}
 }
 
+// A validation refused for running past its bound ends in the remedy, and the
+// whole remedy stays inside the status listing's kept width for any legal
+// constraint name at the widest bound, including a name whose quoting doubles
+// its bytes, so the narrowest operator surface still says what to do.
+func TestValidationBoundRefusalKeepsItsRemedyInTheStatusWidth(t *testing.T) {
+	const remedy = "raise postgres.validate_max_duration and re-run"
+	for _, constraint := range []string{
+		strings.Repeat("a", maxIdentifierLength),
+		strings.Repeat(`"`, maxIdentifierLength),
+		strings.Repeat("\n", maxIdentifierLength/2),
+	} {
+		err := fmt.Errorf("validate reviewed constraint %q on PostgreSQL table %q: %w", constraint, "orders",
+			nameValidationBound(&executor.BudgetError{Cause: executor.CauseStatement, Budget: MaxConcurrentIndexMaxDuration}, constraint, MaxConcurrentIndexMaxDuration))
+
+		r := classifyRefusal(err, "orders")
+
+		require.NotNil(t, r)
+		assert.Equal(t, "validation-bound-exceeded", r.reason)
+		assert.True(t, strings.HasSuffix(r.detail, remedy), r.detail)
+		assert.LessOrEqual(t, len(r.detail), statusReasonKeptWidth, r.detail)
+	}
+}
+
 // widestCreateSet is a statement count wider than any create set a schema
 // file can carry: it is the largest count a 32-bit integer holds, and its
 // step clause is the widest the composition is asked to leave room for.
@@ -1703,8 +1746,9 @@ func TestClassifyApplyFailureCommittedCreatePrefix(t *testing.T) {
 	assert.Equal(t, 1, strings.Count(failure.detail, "re-plan"))
 }
 
-// A validation that existing rows fail names the key and the fix, and leaves
-// the row values the server quotes in its message out of the detail.
+// A validation that existing rows fail names the key and the fix, ends the
+// apply rather than retrying it, and leaves the row values the server quotes
+// in its message out of the detail.
 func TestClassifyApplyFailureBrokenForeignKey(t *testing.T) {
 	err := fmt.Errorf("validate: %w", &pgconn.PgError{
 		Code:           "23503",
@@ -1715,9 +1759,47 @@ func TestClassifyApplyFailureBrokenForeignKey(t *testing.T) {
 
 	failure := classifyApplyFailure(err, "orders", nil)
 
-	assert.True(t, failure.retryable)
-	assert.Equal(t, `existing rows in "orders" break foreign key "orders_user_id_fkey"; the key is in place and checks new writes; fix those rows, then retry`, failure.detail)
+	assert.False(t, failure.retryable, "rows that break the key keep breaking it until someone fixes them")
+	assert.Equal(t, `existing rows in "orders" break foreign key "orders_user_id_fkey"; fix those rows, then apply again`, failure.detail)
 	assert.NotContains(t, failure.detail, "99")
+}
+
+func TestClassifyApplyFailureDuplicateKey(t *testing.T) {
+	err := fmt.Errorf("add unique: %w", &pgconn.PgError{
+		Code:           "23505",
+		Message:        `could not create unique index "users_email_key"`,
+		Detail:         `Key (email)=(ada@example.com) is duplicated.`,
+		ConstraintName: "users_email_key",
+	})
+
+	failure := classifyApplyFailure(err, "users", nil)
+
+	assert.False(t, failure.retryable, "duplicates stay until someone removes or merges them")
+	assert.Equal(t, `existing rows in "users" hold duplicate values that unique key "users_email_key" does not allow; remove or merge the duplicates, then apply again`, failure.detail)
+	assert.NotContains(t, failure.detail, "ada@example.com")
+}
+
+// Only a failure that a retry cannot clear ends the apply at once. Rows that
+// break a validated constraint stay broken until someone changes them, so
+// the apply fails for good and says to apply again. A lost lock budget and a
+// dropped connection can clear on their own, so the drive keeps retrying them.
+func TestClassifyApplyFailureRetriesOnlyWhatARetryCanClear(t *testing.T) {
+	validates := &schemadiff.ConstraintValidation{Constraint: "users_name_not_null_check"}
+	brokenCheck := fmt.Errorf("validate: %w", &pgconn.PgError{Code: sqlstateCheckViolation, ConstraintName: "users_name_not_null_check"})
+	lockBudget := fmt.Errorf("validate: %w", &executor.BudgetError{Cause: executor.CauseLock, Budget: 3 * time.Second, Attempts: 3})
+	connection := fmt.Errorf("validate: %w", &pgconn.ConnectError{})
+
+	check := classifyApplyFailure(brokenCheck, "users", validates)
+	assert.False(t, check.retryable, "rows that break the check do not change between retries")
+	assert.Equal(t, `existing rows in "users" break check constraint "users_name_not_null_check"; fix those rows, then apply again`, check.detail)
+
+	budget := classifyApplyFailure(lockBudget, "users", validates)
+	assert.True(t, budget.retryable, "lock contention can subside before the next retry")
+	assert.True(t, budget.lockBudget)
+
+	dropped := classifyApplyFailure(connection, "users", validates)
+	assert.True(t, dropped.retryable, "a connection can come back before the next retry")
+	assert.Equal(t, "PostgreSQL schema change failed; see server logs", dropped.detail)
 }
 
 // A statement the server refuses for a missing grant, such as a foreign key
@@ -2189,6 +2271,110 @@ func TestHaltWorkOwnedByEndsOnlyThatOwnersBuild(t *testing.T) {
 	assert.Equal(t, engine.StateRunning, pollProgress(t, eng, "task-b").State, "drive-b's build is not drive-a's to halt")
 }
 
+// A drive that hands its apply back halts a constraint validation it started,
+// as it does an index build: the scan can run for hours, and left running it
+// would hold the table's lock under a lease nobody renews. The halt records
+// no cancel, so the drive publishes a retryable failure and the next driver
+// validates the constraint, which stayed NOT VALID.
+func TestHaltWorkOwnedByEndsAValidationWithoutRecordingACancel(t *testing.T) {
+	scripted := newScriptedExecutor(func(*progress.Tracker) error {
+		return errors.New("the executor must be ended by its context, not released")
+	})
+	eng := New()
+	eng.execute = scripted.execute
+	t.Cleanup(eng.Drain)
+	t.Cleanup(scripted.release)
+	record, err := json.Marshal(reviewedUserKey())
+	require.NoError(t, err)
+	const key = "task-validate"
+	accepted, err := eng.Apply(engine.WithWorkOwner(t.Context(), "drive-a"), &engine.ApplyRequest{
+		Database: "app",
+		Changes: []engine.SchemaChange{{Namespace: "public", TableChanges: []engine.TableChange{{
+			Table: "orders", DDL: reviewedValidationSQL,
+			Metadata: map[string]string{reviewedValidationMetadataKey: string(record)},
+		}}}},
+		Credentials: &engine.Credentials{DSN: "postgres://schemabot:secret@db.invalid/app?sslmode=disable"},
+		ResumeState: &engine.ResumeState{MigrationContext: key},
+		Logger:      slog.New(slog.DiscardHandler),
+	})
+	require.NoError(t, err)
+	require.True(t, accepted.Accepted)
+	scripted.envelope(t)
+	scripted.tracker(t)
+
+	ctx, cancel := context.WithTimeout(t.Context(), backgroundApplyDeadline)
+	defer cancel()
+	require.NoError(t, eng.HaltWorkOwnedBy(ctx, "drive-a"))
+
+	terminal := pollProgress(t, eng, key)
+	require.Equal(t, engine.StateFailed, terminal.State, "a halt is not an operator cancel")
+	assert.True(t, terminal.Retryable, "the next driver validates the constraint the halt left NOT VALID")
+}
+
+// An operator cancels an apply while it validates a constraint. PostgreSQL
+// cancels only index builds, so the cancel is refused, and the refusal says
+// when the validation ends on its own and what it leaves if the scan runs
+// out, instead of leaving the operator to wait without a bound.
+func TestCancelOfAValidationNamesItsBound(t *testing.T) {
+	scripted := newScriptedExecutor(func(*progress.Tracker) error {
+		return errors.New("the executor must be ended by its context, not released")
+	})
+	eng := New()
+	eng.execute = scripted.execute
+	t.Cleanup(eng.Drain)
+	t.Cleanup(scripted.release)
+	record, err := json.Marshal(reviewedUserKey())
+	require.NoError(t, err)
+	const key = "task-validate"
+	accepted, err := eng.Apply(engine.WithWorkOwner(t.Context(), "drive-a"), &engine.ApplyRequest{
+		Database: "app",
+		Changes: []engine.SchemaChange{{Namespace: "public", TableChanges: []engine.TableChange{{
+			Table: "orders", DDL: reviewedValidationSQL,
+			Metadata: map[string]string{reviewedValidationMetadataKey: string(record)},
+		}}}},
+		Credentials: &engine.Credentials{DSN: "postgres://schemabot:secret@db.invalid/app?sslmode=disable"},
+		ResumeState: &engine.ResumeState{MigrationContext: key},
+		Logger:      slog.New(slog.DiscardHandler),
+	})
+	require.NoError(t, err)
+	require.True(t, accepted.Accepted)
+	scripted.envelope(t)
+	scripted.tracker(t)
+
+	_, err = eng.Cancel(t.Context(), &engine.ControlRequest{ResumeState: &engine.ResumeState{MigrationContext: key}})
+	require.Error(t, err)
+	assert.True(t, engine.IsUnsupportedOperation(err))
+	assert.Equal(t, "cancel is supported for PostgreSQL index builds only: this constraint validation ends on its own within 1d (validate_max_duration), and leaves the constraint NOT VALID if the scan does not finish", err.Error())
+	assert.Equal(t, engine.StateRunning, pollProgress(t, eng, key).State, "a refused cancel leaves the validation running")
+
+	ctx, cancel := context.WithTimeout(t.Context(), backgroundApplyDeadline)
+	defer cancel()
+	require.NoError(t, eng.HaltWorkOwnedBy(ctx, "drive-a"))
+}
+
+// A validation apply's ceiling leaves room for the setup ahead of the scan and
+// for every lock retry before the attempt that scans, so the server's timer,
+// not the ceiling, ends an over-long scan and the refusal names the option.
+func TestValidationCeilingCoversSetupAndLockRetries(t *testing.T) {
+	policy := executor.DefaultRetryPolicy()
+	lockRetries := time.Duration(policy.MaxAttempts-1) * (optimisticLockTimeout + policy.MaxBackoff)
+	assert.Equal(t, 8*time.Second, lockRetries, "two lock waits of the short budget, each followed by the longest backoff")
+	assert.Equal(t, DefaultValidateMaxDuration+concurrentIndexHeadroom+lockRetries, validationCeiling(DefaultValidateMaxDuration))
+	assert.Equal(t, time.Second+concurrentIndexHeadroom+time.Duration(policy.MaxAttempts-1)*(500*time.Millisecond+policy.MaxBackoff), validationCeiling(time.Second),
+		"a short bound's lock retries wait half the bound each")
+}
+
+// A validation's lock wait keeps the short lock budget, and gets half the
+// bound when the bound is shorter, so the lock wait always ends before the
+// bound's statement timer and lock contention is never read as an over-long
+// scan.
+func TestValidationLockBudgetEndsBeforeTheBound(t *testing.T) {
+	assert.Equal(t, optimisticLockTimeout, validationLockBudget(DefaultValidateMaxDuration))
+	assert.Equal(t, optimisticLockTimeout, validationLockBudget(2*optimisticLockTimeout))
+	assert.Equal(t, 500*time.Millisecond, validationLockBudget(time.Second))
+	assert.Equal(t, time.Millisecond, validationLockBudget(MinValidateMaxDuration), "the shortest bound still leaves a whole-millisecond lock wait")
+}
+
 // A halt for shutdown leaves plain DDL to finish, so a statement that will not
 // return within the shutdown budget is reported as still holding the target
 // rather than interrupted.
@@ -2602,7 +2788,7 @@ func TestPartitionedBuildReportsEachPartitionsOwnPercent(t *testing.T) {
 	tracker.Start(3, progress.OperationBrief)
 	tracker.StartStep(2, progress.OperationConcurrentIndex, "CREATE INDEX CONCURRENTLY events_2025_kind_idx ON public.events_2025 (kind)")
 	tracker.SetConcurrentBuild(&publishedIndexProgressSession{row: &first}, 42)
-	eng.claimProgress("task-a", progressResult(engine.StateRunning, "running", time.Now(), change, ""), tracker, slog.Default(), change.buildShape(), nil, "")
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "running", time.Now(), change, ""), tracker, slog.Default(), change.buildShape(eng.validateMaxDuration), nil, "")
 	got := pollRunningIndexBuild(t, eng)
 	require.Equal(t, "2", got.Metadata["step"])
 	require.Equal(t, "21.88", got.Metadata["percent"])
@@ -2748,6 +2934,32 @@ func TestExecutorProgressMetadataBoundsTheServerPhase(t *testing.T) {
 	assert.Equal(t, "future phase / with layout", result.Metadata["server_phase"])
 	assert.Equal(t, 7, result.Tables[0].Progress)
 	assert.Equal(t, "1", result.Metadata["step"], "a nil metadata map is allocated rather than written through")
+}
+
+// TestExecutorProgressMetadataNamesTheLockHolder proves a step waiting
+// outside the lock queue publishes the session it waits on, the table, and
+// how long it has waited against its limit, and that the keys go away once
+// the wait ends.
+func TestExecutorProgressMetadataNamesTheLockHolder(t *testing.T) {
+	tracker := newTestTracker(t)
+	tracker.Start(1, progress.OperationAdmitting)
+	tracker.StartStep(1, progress.OperationBrief, "ALTER TABLE public.widgets ADD COLUMN note text")
+	tracker.SetLockHolderWait(&progress.LockHolderWait{PID: 4242, Table: "public.widgets", Waited: 3500 * time.Millisecond, Limit: 30 * time.Second})
+	result := &engine.ProgressResult{State: engine.StateRunning, Tables: []engine.TableProgress{{}}}
+
+	require.NoError(t, executorProgressMetadata(t.Context(), tracker, result))
+
+	assert.Equal(t, "4242", result.Metadata["lock_holder_pid"])
+	assert.Equal(t, "public.widgets", result.Metadata["lock_holder_table"])
+	assert.Equal(t, "3500", result.Metadata["lock_holder_waited_ms"])
+	assert.Equal(t, "30000", result.Metadata["lock_holder_limit_ms"])
+
+	tracker.SetLockHolderWait(nil)
+	require.NoError(t, executorProgressMetadata(t.Context(), tracker, result))
+
+	for _, key := range []string{"lock_holder_pid", "lock_holder_table", "lock_holder_waited_ms", "lock_holder_limit_ms"} {
+		assert.NotContains(t, result.Metadata, key, "the wait has ended")
+	}
 }
 
 // activeBuildTracker returns a tracker mid-way through a concurrent index
@@ -2949,6 +3161,56 @@ func TestConcurrentIndexApplyCeilingLeavesSetupHeadroom(t *testing.T) {
 	assert.Equal(t, bound, env.change.concurrentIndexMaxDuration)
 	assert.Greater(t, granted, bound, "the ceiling must outlast the build bound it wraps")
 	assert.LessOrEqual(t, granted, bound+concurrentIndexHeadroom)
+}
+
+// TestValidationApplyRunsUnderTheValidationBound proves the drive runs a
+// VALIDATE CONSTRAINT under a ceiling above the configured validation bound
+// and the lock retries ahead of it, so the scan's own statement_timeout ends an over-long validation and the
+// outcome names the option, and stamps that bound on the change the executor
+// receives instead of the per-statement limit.
+func TestValidationApplyRunsUnderTheValidationBound(t *testing.T) {
+	const bound = 5 * time.Hour
+	scripted := newScriptedExecutor(func(*progress.Tracker) error { return nil })
+	eng := NewWithOptions(0, 3*time.Hour).WithValidateMaxDuration(bound)
+	eng.execute = scripted.execute
+	t.Cleanup(eng.Drain)
+	t.Cleanup(scripted.release)
+	record, err := json.Marshal(reviewedUserKey())
+	require.NoError(t, err)
+	accepted, err := eng.Apply(t.Context(), &engine.ApplyRequest{
+		Database: "app",
+		Changes: []engine.SchemaChange{{Namespace: "public", TableChanges: []engine.TableChange{{
+			Table: "orders", DDL: reviewedValidationSQL,
+			Metadata: map[string]string{reviewedValidationMetadataKey: string(record)},
+		}}}},
+		Credentials: &engine.Credentials{DSN: "postgres://schemabot:secret@db.invalid/app?sslmode=disable"},
+		ResumeState: &engine.ResumeState{MigrationContext: "task-validate"},
+		Logger:      slog.New(slog.DiscardHandler),
+	})
+	require.NoError(t, err)
+	require.True(t, accepted.Accepted)
+
+	env := scripted.envelope(t)
+	granted := env.deadline.Sub(env.observed)
+	require.NotNil(t, env.change.validates)
+	assert.Equal(t, bound, env.change.validateMaxDuration)
+	assert.Zero(t, env.change.concurrentIndexMaxDuration, "the build bound is stamped only on a concurrent index apply")
+	assert.Greater(t, granted, bound+concurrentIndexHeadroom, "the ceiling outlasts the bound, the setup headroom, and the lock retries before the scan")
+	assert.LessOrEqual(t, granted, validationCeiling(bound))
+}
+
+// TestValidateMaxDurationIsNormalizedLikeTheBuildBound pins the validation
+// bound to the range statement_timeout can hold with a whole-millisecond lock
+// wait inside it: a bound that is not positive adopts the default, and one
+// outside the range is clamped into it.
+func TestValidateMaxDurationIsNormalizedLikeTheBuildBound(t *testing.T) {
+	assert.Equal(t, DefaultValidateMaxDuration, New().ValidateMaxDuration())
+	assert.Equal(t, 24*time.Hour, DefaultValidateMaxDuration)
+	assert.Equal(t, DefaultValidateMaxDuration, New().WithValidateMaxDuration(0).ValidateMaxDuration())
+	assert.Equal(t, DefaultValidateMaxDuration, New().WithValidateMaxDuration(-time.Second).ValidateMaxDuration())
+	assert.Equal(t, MinValidateMaxDuration, New().WithValidateMaxDuration(time.Millisecond).ValidateMaxDuration())
+	assert.Equal(t, MaxConcurrentIndexMaxDuration, New().WithValidateMaxDuration(MaxConcurrentIndexMaxDuration+1).ValidateMaxDuration())
+	assert.Equal(t, 36*time.Hour, New().WithValidateMaxDuration(36*time.Hour).ValidateMaxDuration())
 }
 
 // TestConcurrentIndexHeadroomCoversSessionSetup pins the headroom to what it
@@ -4165,7 +4427,7 @@ func TestBrokenCheckDetailNamesOnlyTheValidatedConstraint(t *testing.T) {
 
 	detail, ok := brokenCheckDetail(fmt.Errorf("validate: %w", violation), "accounts", validates)
 	require.True(t, ok)
-	assert.Equal(t, `existing rows in "accounts" break check constraint "accounts_display_name_not_null_check"; the constraint is in place and checks new writes; fix those rows, then retry`, detail)
+	assert.Equal(t, `existing rows in "accounts" break check constraint "accounts_display_name_not_null_check"; fix those rows, then apply again`, detail)
 	assert.NotContains(t, detail, "Failing row")
 
 	_, ok = brokenCheckDetail(violation, "accounts", nil)
@@ -4179,4 +4441,17 @@ func TestBrokenCheckDetailNamesOnlyTheValidatedConstraint(t *testing.T) {
 
 	_, ok = brokenCheckDetail(errors.New("connection reset"), "accounts", validates)
 	assert.False(t, ok, "an error that is not a server error is not a broken check")
+}
+
+// A size refusal reads in units a person compares at a glance and names the
+// option that sets the limit. Two sizes that round to the same figure fall
+// back to bytes, so the table never reads as no larger than its limit.
+func TestTableTooLargeRefusalReadsInBinaryUnits(t *testing.T) {
+	r := tableTooLargeRefusal(&preflight.SizeError{TotalBytes: 1556684800, LimitBytes: 1073741824})
+	assert.Equal(t, "table-too-large", r.reason)
+	assert.Equal(t, "the table is 1.4 GiB with its indexes, over the 1.0 GiB limit SchemaBot sets for a native-safe apply, not a PostgreSQL limit", r.cause)
+	assert.Equal(t, "raise postgres.native_safe_table_size_limit_bytes to change a table this size, then plan again", r.remedy)
+
+	r = tableTooLargeRefusal(&preflight.SizeError{TotalBytes: 1073741825, LimitBytes: 1073741824})
+	assert.Equal(t, "the table is 1073741825 bytes with its indexes, over the 1073741824 bytes limit SchemaBot sets for a native-safe apply, not a PostgreSQL limit", r.cause)
 }

@@ -147,7 +147,7 @@ func (s *Service) stopApplyForFreeze(ctx context.Context, freeze *storage.Enviro
 			return resp.ErrorMessage, freezeStopNotRecorded
 		}
 	}
-	if controlOperationErrorCode(err) == apitypes.ErrCodeAlreadyStopped {
+	if ControlOperationErrorCode(err) == apitypes.ErrCodeAlreadyStopped {
 		s.logger.Debug("apply is stopped with no start queued; the freeze has nothing to stop", attrs...)
 		return "", freezeStopNothingToStop
 	}

@@ -3346,3 +3346,55 @@ func TestRolloutLeftStop(t *testing.T) {
 		})
 	}
 }
+
+// finishedClaimStateStore fails the finished-lease clear and reports the
+// operation's row as the drive left it.
+type finishedClaimStateStore struct {
+	stubApplyOperationStore
+	row     *storage.ApplyOperation
+	readErr error
+}
+
+func (s *finishedClaimStateStore) ReleaseFinishedClaim(context.Context, storage.OperationLease) (bool, error) {
+	return false, errors.New("connection reset")
+}
+
+func (s *finishedClaimStateStore) Get(context.Context, int64) (*storage.ApplyOperation, error) {
+	return s.row, s.readErr
+}
+
+// A drive ends and its lease clear fails. The warning says what the leftover
+// lease holds up, read from the row's state rather than the state the drive
+// claimed it in: a failed_retryable operation's retry and its apply's expiry
+// wait for the lease to go stale, while a settled operation's leftover lease
+// holds up nothing.
+func TestReleaseFinishedOperationClaim_WarningNamesWhatTheLeftoverLeaseHoldsUp(t *testing.T) {
+	claimed := &storage.ApplyOperation{ID: 42, ApplyID: 7, Deployment: "west", State: state.ApplyOperation.FailedRetryable}
+	lease := storage.OperationLease{OperationID: 42, Token: "token-1"}
+	for name, tc := range map[string]struct {
+		store *finishedClaimStateStore
+		want  string
+	}{
+		"awaiting its retry": {
+			store: &finishedClaimStateStore{row: &storage.ApplyOperation{ID: 42, State: state.ApplyOperation.FailedRetryable}},
+			want:  "until the leftover lease goes stale, no driver claims this operation's retry and this apply's retryable expiry is deferred",
+		},
+		"settled": {
+			store: &finishedClaimStateStore{row: &storage.ApplyOperation{ID: 42, State: state.ApplyOperation.Completed}},
+			want:  "it is settled, so the leftover lease holds up nothing and goes stale on its own",
+		},
+		"state unreadable": {
+			store: &finishedClaimStateStore{readErr: errors.New("connection reset")},
+			want:  "if it ended failed_retryable, no driver claims its retry and this apply's retryable expiry is deferred until the leftover lease goes stale",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var logBuf bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			svc := New(&mockStorageWithApplyOperations{applyOps: tc.store}, testServerConfig(), nil, logger)
+			svc.releaseFinishedOperationClaim(t.Context(), 1, claimed, lease)
+			assert.Contains(t, logBuf.String(), tc.want)
+			assert.Contains(t, logBuf.String(), `"level":"WARN"`)
+		})
+	}
+}

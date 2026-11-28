@@ -29,6 +29,7 @@ import (
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 const (
@@ -112,6 +113,9 @@ const (
 type nativeApply struct {
 	rowSecurity      *pgstatement.DesiredWithRowSecurity
 	reviewedSecurity []string
+	// createsTable marks a row security apply that creates its table, in
+	// the same transaction as the row security.
+	createsTable     bool
 	namespace        string
 	table            string
 	sql              string
@@ -126,6 +130,13 @@ type nativeApply struct {
 	// indexDrop is set for a DROP INDEX CONCURRENTLY of the index dropped
 	// names, which runs through pg-sprite's concurrent index drop.
 	indexDrop bool
+	// adopts is the plan's record of the index the statement's constraint
+	// takes over, which the apply checks under the table's lock before the
+	// constraint attaches it.
+	adopts *schemadiff.IndexAdoption
+	// replacement is the plan's record of the index that replaces the one
+	// the statement drops, which the apply checks right before the drop.
+	replacement *schemadiff.IndexReplacement
 	// validates is the plan's record of the live NOT VALID constraint the
 	// statement validates, which the apply checks under the validation's
 	// lock before validating it.
@@ -136,7 +147,20 @@ type nativeApply struct {
 	// statement drops whole, which pg-sprite checks under the table's lock.
 	droppedTable               string
 	concurrentIndexMaxDuration time.Duration
-	cancelRequested            func() bool
+	// validateMaxDuration bounds the scan of a statement that validates a
+	// constraint; it is set only for such a statement.
+	validateMaxDuration time.Duration
+	cancelRequested     func() bool
+}
+
+// durationBoundedValidation reports whether the change validates a NOT VALID
+// constraint. The scan takes SHARE UPDATE EXCLUSIVE and rewrites nothing, so
+// reads and writes continue through it however long it runs: it is bounded by
+// the validation duration instead of the per-statement limit, the table size
+// ceiling, and the optimistic apply ceiling. Its lock wait keeps the short
+// lock budget.
+func (c nativeApply) durationBoundedValidation() bool {
+	return c.validates != nil
 }
 
 // durationBoundedIndexBuild reports whether the change is an index build run
@@ -158,10 +182,33 @@ type buildShape struct {
 	// concurrent build per partition, so a signal to the build in flight
 	// does not reach the partitions after it.
 	partitioned bool
+	// haltable is set for the work a shutdown or a drive handing the apply
+	// back ends instead of waiting out: the changes bounded by a long
+	// duration rather than the per-statement limit. An index build leaves an
+	// invalid index the next driver recovers, and a constraint validation
+	// leaves the constraint NOT VALID for the next driver to validate, so
+	// neither leaves work half-applied.
+	haltable bool
+	// validationBound is set for a constraint validation: how long its scan
+	// may run before it is cut off, which a refused cancel names as when the
+	// validation ends on its own.
+	validationBound time.Duration
 }
 
-func (c nativeApply) buildShape() buildShape {
-	return buildShape{cancellable: c.durationBoundedIndexBuild(), partitioned: c.partitionedIndex}
+// buildShape records the change's shape when the apply is admitted, before
+// the drive sets the change's own bounds, so the validation bound comes from
+// the engine's configuration.
+func (c nativeApply) buildShape(validateMaxDuration time.Duration) buildShape {
+	var validationBound time.Duration
+	if c.durationBoundedValidation() {
+		validationBound = validateMaxDuration
+	}
+	return buildShape{
+		cancellable:     c.durationBoundedIndexBuild(),
+		partitioned:     c.partitionedIndex,
+		haltable:        c.durationBoundedIndexBuild() || c.durationBoundedValidation(),
+		validationBound: validationBound,
+	}
 }
 
 // targetConn carries one background apply's connection inputs: the raw DSN
@@ -217,7 +264,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// engine itself can end the drive — a cancel of last resort, and the
 	// halt on shutdown.
 	applyCtx, cancelApply := context.WithCancel(context.WithoutCancel(ctx))
-	done := e.claimProgress(key, progressResult(engine.StateRunning, "preflight", started, change, ""), tracker, logger, change.buildShape(), cancelApply, engine.WorkOwnerFromContext(ctx))
+	done := e.claimProgress(key, progressResult(engine.StateRunning, "preflight", started, change, ""), tracker, logger, change.buildShape(e.validateMaxDuration), cancelApply, engine.WorkOwnerFromContext(ctx))
 	conn := targetConn{dsn: req.Credentials.DSN, caCertPath: caPath}
 	e.wg.Go(func() {
 		defer close(done)
@@ -257,7 +304,18 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned DDL is not one statement or a valid greenfield create set", tc.Table)
 	}
 	if hasRLS {
-		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: row security changes require one supported atomic operation for a single qualified table", tc.Table)
+		// A new table with row security is created with its policies in one
+		// reviewed transaction. Any other row security change on this path
+		// is refused: it needs one supported atomic operation.
+		creates, err := createsTableWithRowSecurity(tc.DDL)
+		if err != nil {
+			slog.Warn("PostgreSQL apply admission rejected planned DDL", "database", req.Database, "table", tc.Table, "error", err)
+			return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: classify the planned row security DDL: %w", tc.Table, err)
+		}
+		if !creates {
+			return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: row security changes require one supported atomic operation for a single qualified table", tc.Table)
+		}
+		return validateCreateWithRowSecurityApply(req)
 	}
 	if req.Options["defer_cutover"] == "true" {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: deferred cutover is unsupported", tc.Table)
@@ -316,6 +374,14 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 			return nativeApply{}, err
 		}
 		change.validates, err = reviewedValidationForApply(req.Database, tc, statements[0])
+		if err != nil {
+			return nativeApply{}, err
+		}
+		change.adopts, err = reviewedAdoptionForApply(req.Database, tc, statements[0])
+		if err != nil {
+			return nativeApply{}, err
+		}
+		change.replacement, err = indexReplacementForApply(req.Database, tc, change.dropped)
 		if err != nil {
 			return nativeApply{}, err
 		}
@@ -463,6 +529,13 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		ceiling = e.concurrentIndexMaxDuration + concurrentIndexHeadroom
 		change.concurrentIndexMaxDuration = e.concurrentIndexMaxDuration
 		change.cancelRequested = cancelRequested
+	}
+	if change.durationBoundedValidation() {
+		// The ceiling leaves room for the setup and the lock retries ahead of
+		// the scan, so the server's timer ends an over-long scan first and
+		// the outcome names the option.
+		ceiling = validationCeiling(e.validateMaxDuration)
+		change.validateMaxDuration = e.validateMaxDuration
 	}
 	ctx, cancel := context.WithTimeout(ctx, ceiling)
 	defer cancel()
@@ -612,11 +685,20 @@ func classifyApplyFailure(err error, table string, validates *schemadiff.Constra
 			lockBudget: true,
 		}
 	}
+	// Rows that break a constraint keep breaking it until someone changes
+	// them, which takes a person far longer than the drive's retries do, so
+	// the failure ends the apply at once rather than spending its retries on
+	// an answer that cannot change. A constraint the apply added is then
+	// dropped, so the re-apply after the data fix plans it again; one the
+	// table already had stays, and the re-apply resumes at its validation.
 	if detail, ok := brokenForeignKeyDetail(err, table); ok {
-		return applyFailure{detail: detail, retryable: true}
+		return applyFailure{detail: detail}
 	}
 	if detail, ok := brokenCheckDetail(err, table, validates); ok {
-		return applyFailure{detail: detail, retryable: true}
+		return applyFailure{detail: detail}
+	}
+	if detail, ok := duplicateKeyDetail(err, table); ok {
+		return applyFailure{detail: detail}
 	}
 	if detail, ok := missingGrantDetail(err, table); ok {
 		return applyFailure{detail: detail, retryable: true}
@@ -646,17 +728,19 @@ func missingGrantDetail(err error, table string) (string, bool) {
 const sqlstateForeignKeyViolation = "23503"
 
 // brokenForeignKeyDetail names the foreign key whose validation failed on
-// existing rows. The key was added NOT VALID in an earlier step, so it stays
-// in place and checks new writes; the apply can finish once the owner fixes
-// the rows. The detail is built from the server's typed fields, never its
-// message, because the message quotes the offending row's values.
+// existing rows. A new apply finishes it once the owner fixes the rows. The
+// drive removes the key when this apply added it NOT VALID, and leaves one
+// that was already on the table, so the detail does not say the key stays:
+// the apply log says what became of it. The detail is built from the server's
+// typed fields, never its message, because the message quotes the offending
+// row's values.
 func brokenForeignKeyDetail(err error, table string) (string, bool) {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateForeignKeyViolation {
 		return "", false
 	}
 	return sanitizeReasonText(fmt.Sprintf(
-		"existing rows in %q break foreign key %q; the key is in place and checks new writes; fix those rows, then retry",
+		"existing rows in %q break foreign key %q; fix those rows, then apply again",
 		table, pgErr.ConstraintName)), true
 }
 
@@ -667,13 +751,12 @@ const sqlstateCheckViolation = "23514"
 
 // brokenCheckDetail names the check constraint whose validation failed on
 // existing rows. It applies only when the failed step validates the
-// constraint the server names. That constraint is NOT VALID on the table,
-// whether the plan added it in an earlier step or found it live, so it stays
-// in place and checks new writes, and the apply can finish once the owner
-// fixes the rows. For the helper check a SET NOT NULL validates, those are
-// the rows that hold NULL in the column. The detail is built from the
-// server's typed fields, never its message, because the message can quote
-// row values.
+// constraint the server names. A new apply finishes it once the owner fixes
+// the rows. For the helper check a SET NOT NULL validates, those are the rows
+// that hold NULL in the column, and the drive removes the helper when this
+// apply added it, so the detail does not say the constraint stays: the apply
+// log says what became of it. The detail is built from the server's typed
+// fields, never its message, because the message can quote row values.
 func brokenCheckDetail(err error, table string, validates *schemadiff.ConstraintValidation) (string, bool) {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateCheckViolation {
@@ -683,7 +766,27 @@ func brokenCheckDetail(err error, table string, validates *schemadiff.Constraint
 		return "", false
 	}
 	return sanitizeReasonText(fmt.Sprintf(
-		"existing rows in %q break check constraint %q; the constraint is in place and checks new writes; fix those rows, then retry",
+		"existing rows in %q break check constraint %q; fix those rows, then apply again",
+		table, pgErr.ConstraintName)), true
+}
+
+// sqlstateUniqueViolation is the SQLSTATE the server raises when rows hold
+// duplicate values a unique key does not allow, which for a schema change
+// means adding a unique constraint that existing rows break.
+const sqlstateUniqueViolation = "23505"
+
+// duplicateKeyDetail names the unique key that existing rows break. The
+// statement that adds the key runs in one transaction, so it leaves nothing
+// behind, and a new apply adds the key once the owner removes or merges the
+// duplicates. The detail is built from the server's typed fields, never its
+// message or detail, because those quote the duplicated values.
+func duplicateKeyDetail(err error, table string) (string, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateUniqueViolation {
+		return "", false
+	}
+	return sanitizeReasonText(fmt.Sprintf(
+		"existing rows in %q hold duplicate values that unique key %q does not allow; remove or merge the duplicates, then apply again",
 		table, pgErr.ConstraintName)), true
 }
 
@@ -1043,6 +1146,15 @@ func refusalForCause(err error, table string) *refusal {
 		return &refusal{reason: "concurrent-index-bound-exceeded", cause: boundErr.Error(),
 			remedy: fmt.Sprintf("raise %s and re-run", concurrentIndexBoundOption)}
 	}
+	// A validation that ran past its bound is refused: retrying unchanged
+	// spends the same bound on the same scan. The constraint stays NOT VALID
+	// and checks new writes, and the remedy names the option that grants
+	// more time.
+	var validationErr *validationBoundError
+	if errors.As(err, &validationErr) {
+		return &refusal{reason: "validation-bound-exceeded", cause: validationErr.Error(),
+			remedy: fmt.Sprintf("raise %s and re-run", validationBoundOption)}
+	}
 	// A partitioned build that ran past its bound without finishing a
 	// partition made no progress a retry could keep, so retrying unchanged
 	// spends the same bound on the same partition again. It is refused like
@@ -1076,11 +1188,7 @@ func refusalForCause(err error, table string) *refusal {
 	}
 	var sizeErr *preflight.SizeError
 	if errors.As(err, &sizeErr) {
-		// Name whose limit this is: read cold, the size text sounds like a
-		// property of PostgreSQL or of the change, when it is SchemaBot's
-		// own conservatism for the native-safe path.
-		return &refusal{reason: "table-too-large",
-			cause: sizeErr.Error() + "; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit"}
+		return tableTooLargeRefusal(sizeErr)
 	}
 	// Decided before the bare table sentinels below: the unverified-create
 	// wrap carries the read-back's own cause inside it, and a table no longer
@@ -1192,7 +1300,7 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		executor.CodeUnsupportedPartitionedParent, executor.CodeNotConcurrentIndexBuild,
 		executor.CodeUnnamedIndex, executor.CodeUnqualifiedTable,
 		executor.CodeUnsupportedAcceptedBlocking, executor.CodeNotCreateIndex,
-		executor.CodeNotAddKeyConstraint:
+		executor.CodeNotAddKeyConstraint, executor.CodeNotAddForeignKey:
 		// Shape refusals: the executor refused the statement's form at
 		// admission, so retrying the identical plan refails the same way.
 		return &refusal{reason: "unsupported-statement-shape",
@@ -1317,6 +1425,40 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return &refusal{reason: "unsupported-statement-shape",
 			cause:  fmt.Sprintf("a partition of %s is itself partitioned, which the key build does not run", quotedTable(table)),
 			remedy: "add the key to that partition by hand, then " + replanRemedy}, true
+	case executor.CodePartitionedForeignKeyNameTaken:
+		// The build left the occupant alone, so only an operator freeing the
+		// name, or the schema file choosing another, changes the outcome.
+		return &refusal{reason: "partitioned-foreign-key-name-taken",
+			cause:  fmt.Sprintf("a name the foreign key on partitioned table %s needs on a partition is held by another constraint", quotedTable(table)),
+			remedy: "rename the foreign key in the schema file and re-plan, or drop or rename the constraint that holds the name"}, true
+	case executor.CodePartitionedForeignKeyConflict:
+		return &refusal{reason: "partitioned-foreign-key-conflict",
+			cause:  fmt.Sprintf("a partition of %s has duplicate foreign keys the parent's cannot adopt; nothing was added", quotedTable(table)),
+			remedy: "drop the partition's duplicate foreign keys, then " + replanRemedy}, true
+	case executor.CodePartitionedForeignKeyReferencedTable:
+		return &refusal{reason: "unsupported-statement-shape",
+			cause:  fmt.Sprintf("the foreign key on %s must reference a plain table outside its partitions", quotedTable(table)),
+			remedy: "reference a plain table outside the partition tree in the schema file, then " + replanRemedy}, true
+	case executor.CodePartitionedForeignKeyUnsupportedShape:
+		return &refusal{reason: "unsupported-statement-shape",
+			cause:  fmt.Sprintf("the foreign key on partitioned table %s has no name or a clause its partitions cannot carry", quotedTable(table)),
+			remedy: "name the foreign key and drop that clause in the schema file, then " + replanRemedy}, true
+	case executor.CodePartitionedForeignKeyParentConflict:
+		// Nothing was created, and the parent's own constraint stays until
+		// an operator or the schema file changes it.
+		return &refusal{reason: "partitioned-foreign-key-parent-conflict",
+			cause:  fmt.Sprintf("partitioned table %s already uses the foreign key's name, or has it under another name", quotedTable(table)),
+			remedy: "rename the foreign key in the schema file, or free the name, then " + replanRemedy}, true
+	case executor.CodePartitionedForeignKeySubPartitioned:
+		return &refusal{reason: "unsupported-statement-shape",
+			cause:  fmt.Sprintf("a partition of %s is itself partitioned, which the foreign key build does not run", quotedTable(table)),
+			remedy: "add the foreign key to that partition by hand, then " + replanRemedy}, true
+	case executor.CodePartitionedForeignKeyNotValidSupported:
+		// The server accepts NOT VALID on the partitioned table, so a new
+		// plan routes the foreign key to the NOT VALID then VALIDATE steps.
+		return &refusal{reason: "partitioned-foreign-key-not-valid-supported",
+			cause:  fmt.Sprintf("the server adds a foreign key on partitioned table %s online without the partition build; nothing was created", quotedTable(table)),
+			remedy: replanRemedy}, true
 	case executor.CodePartitionedIndexTablespace:
 		return &refusal{reason: "unsupported-statement-shape",
 			cause:  fmt.Sprintf("the index on %s names a TABLESPACE, which the partitions' indexes would not use", quotedTable(table)),
@@ -1372,6 +1514,14 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		// applied. The plan is stale, so only a re-plan changes the outcome.
 		return &refusal{reason: "planned-object-drift",
 			cause:  fmt.Sprintf("the index or constraint the planned statement for %s names changed after planning", quotedTable(table)),
+			remedy: replanRemedy}, true
+	case executor.CodeReplacementIndexDrift:
+		// The index the plan built to replace the one it drops is gone,
+		// invalid, or rebuilt with another definition, read again right
+		// before the drop; nothing was dropped, so the old index still
+		// enforces its definition. A re-plan builds the replacement again.
+		return &refusal{reason: "planned-object-drift",
+			cause:  fmt.Sprintf("the index the plan built on %s to replace the one it drops changed before the drop, so the old index was kept", quotedTable(table)),
 			remedy: replanRemedy}, true
 	case executor.CodeDroppedObjectDrift:
 		// The table, column, constraint, or NOT NULL the planned drop removes
@@ -1442,11 +1592,12 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		executor.CodeInvalidIndexAbandoned, executor.CodeInvalidIndexBuildInFlight,
 		executor.CodeInvalidIndexBuilderUnobservable, executor.CodeInvalidIndexUnproven,
 		executor.CodePartitionedIndexUnsettled, executor.CodePartitionedKeyUnsettled,
+		executor.CodePartitionedForeignKeyUnsettled, executor.CodePartitionedForeignKeyLeafChanged,
 		executor.CodeDetachInterrupted, executor.CodeExecutionFailed:
 		// Operational outcomes: a bounded lock race, the caller's own
 		// context ending or an external stop, an invalid-index state a retry
-		// recovers or an operator clears or waits out, a partitioned index
-		// or key build that a rerun resumes, a concurrent detach that running the
+		// recovers or an operator clears or waits out, a partitioned index,
+		// key, or foreign key build that a rerun resumes, a concurrent detach that running the
 		// same statement again finishes, or a failure outside the typed set. A retry can succeed once conditions change, so
 		// none is a permanent refusal.
 		return nil, true
@@ -1784,6 +1935,15 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	}
 	defer pool.Close()
 
+	if change.rowSecurity != nil && change.createsTable {
+		_, err := executor.ExecuteReviewedCreateWithRowSecurity(ctx, pool, change.namespace, tableOwner, *change.rowSecurity, change.reviewedSecurity, executor.Budget{
+			LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
+		})
+		if err != nil {
+			return fmt.Errorf("create table %q.%q with its row security: %w", change.namespace, change.table, err)
+		}
+		return nil
+	}
 	if change.rowSecurity != nil {
 		_, err := executor.ExecuteReviewedRowSecurity(ctx, pool, change.namespace, *change.rowSecurity, change.reviewedSecurity, executor.Budget{
 			LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
@@ -1823,8 +1983,8 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	if _, err := preflight.CheckPrivileges(ctx, pool, change.namespace, change.table, preflight.Requirement{Tier: tier}); err != nil {
 		return fmt.Errorf("check privileges for PostgreSQL table %q: %w", change.table, err)
 	}
-	// Concurrent and partitioned index builds are bounded by the duration
-	// envelope rather than the rewrite ceiling. NoSizeLimit still proves the
+	// Concurrent and partitioned index builds and constraint validations are
+	// bounded by their duration envelopes rather than the rewrite ceiling. NoSizeLimit still proves the
 	// target exists and is an ordinary or partitioned table.
 	preflightLimit := applyTablePreflightLimit(change, tableSizeLimit)
 	table, err := checkTableUnlessCatalogOnly(ctx, pool, change, statement, preflightLimit, logger)
@@ -1886,10 +2046,40 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 		// pg-sprite reads the constraint again under the validation's lock
 		// and refuses with ErrValidatedConstraintDrift, validating nothing,
 		// when it no longer has the definition the plan recorded.
+		// The scan runs under the validation bound; its lock wait keeps a
+		// short lock budget, so queueing behind other DDL never holds the
+		// apply for the whole bound.
+		if change.validateMaxDuration <= 0 {
+			return fmt.Errorf("validate reviewed constraint %q on PostgreSQL table %q: validation bound is not set", change.validates.Constraint, change.table)
+		}
 		if err := executor.ExecuteNativeValidatingWithProgress(ctx, pool, table, statement, executor.Budget{
-			LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
+			LockTimeout: validationLockBudget(change.validateMaxDuration), StatementTimeout: change.validateMaxDuration,
 		}, executor.DefaultRetryPolicy(), *change.validates, tracker); err != nil {
-			return fmt.Errorf("validate reviewed constraint %q on PostgreSQL table %q: %w", change.validates.Constraint, change.table, err)
+			return fmt.Errorf("validate reviewed constraint %q on PostgreSQL table %q: %w", change.validates.Constraint, change.table,
+				nameValidationBound(err, change.validates.Constraint, change.validateMaxDuration))
+		}
+		return nil
+	}
+	if change.adopts != nil {
+		// pg-sprite reads the index again under the table's lock and
+		// refuses with ErrAdoptedIndexDrift, attaching nothing, when it no
+		// longer has the definition the plan matched.
+		if err := executor.ExecuteNativeAdoptingWithProgress(ctx, pool, table, statement, executor.Budget{
+			LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
+		}, executor.DefaultRetryPolicy(), *change.adopts, tracker); err != nil {
+			return fmt.Errorf("attach reviewed index %q on PostgreSQL table %q: %w", change.adopts.Index, change.table, err)
+		}
+		return nil
+	}
+	if statement.Kind() == pgstatement.KindRenameIndex {
+		// ALTER INDEX ... RENAME TO names the index, not its table, so it
+		// takes pg-sprite's index rename: under the table's lock it checks
+		// that the name still resolves to a plain index of this table, and
+		// after the rename it confirms the renamed relation is that index.
+		if err := executor.ExecuteIndexRenameWithProgress(ctx, pool, table, statement, executor.Budget{
+			LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
+		}, executor.DefaultRetryPolicy(), tracker); err != nil {
+			return fmt.Errorf("rename index on PostgreSQL table %q: %w", change.table, err)
 		}
 		return nil
 	}
@@ -1921,7 +2111,7 @@ func executeReviewedDrop(ctx context.Context, pool *pgxpool.Pool, table prefligh
 		Concurrent: executor.ConcurrentBudget{Overall: optimisticStatementLimit},
 		Validate:   executor.ValidateBudget{LockTimeout: optimisticLockTimeout, Overall: optimisticStatementLimit},
 	}
-	if _, err := executor.RunSequenceAsStep(ctx, pool, table, []string{statement}, budget, executor.DefaultRetryPolicy(), nil, nil, change.dropped, at); err != nil {
+	if _, err := executor.RunSequenceAsStep(ctx, pool, table, []string{statement}, budget, executor.DefaultRetryPolicy(), change.adopts, nil, change.dropped, at); err != nil {
 		return fmt.Errorf("drop reviewed %s %q on PostgreSQL table %q: %w", change.dropped.Kind, change.dropped.Name, change.table, err)
 	}
 	return nil
@@ -1970,6 +2160,10 @@ func checkTableUnlessCatalogOnly(ctx context.Context, pool *pgxpool.Pool, change
 // sqlstateInsufficientPrivilege is the SQLSTATE the server returns when a
 // role lacks a privilege the statement needs.
 const sqlstateInsufficientPrivilege = "42501"
+
+// sqlstateUndefinedTable is undefined_table: a statement names a relation
+// the database does not have.
+const sqlstateUndefinedTable = "42P01"
 
 // catalogOnlyProofError reports a table over the size limit whose statement
 // went unproven because the proof itself failed, not because the statement
@@ -2027,7 +2221,7 @@ func provenCatalogOnly(ctx context.Context, pool *pgxpool.Pool, statement pgstat
 }
 
 func applyTablePreflightLimit(change nativeApply, tableSizeLimit int64) int64 {
-	if change.durationBoundedIndexBuild() {
+	if change.durationBoundedIndexBuild() || change.durationBoundedValidation() {
 		return preflight.NoSizeLimit
 	}
 	if change.indexDrop {
@@ -2451,6 +2645,26 @@ func (e *indexRecoveryError) Error() string {
 
 func (e *indexRecoveryError) Unwrap() error { return e.err }
 
+// tableSizeLimitOption is the server option that sets the largest table a
+// native-safe apply changes.
+const tableSizeLimitOption = "postgres.native_safe_table_size_limit_bytes"
+
+// tableTooLargeRefusal says how big the table is against the limit, in units
+// a person reads, and names the option that sets it. It says whose limit this
+// is because, read cold, a size refusal sounds like a property of PostgreSQL
+// or of the change, when it is SchemaBot's own conservatism for the
+// native-safe path. Two sizes that round to the same figure are given in
+// bytes, so the table never reads as no larger than its limit.
+func tableTooLargeRefusal(sizeErr *preflight.SizeError) *refusal {
+	size, limit := ui.FormatBytesBinary(sizeErr.TotalBytes), ui.FormatBytesBinary(sizeErr.LimitBytes)
+	if size == limit {
+		size, limit = fmt.Sprintf("%d bytes", sizeErr.TotalBytes), fmt.Sprintf("%d bytes", sizeErr.LimitBytes)
+	}
+	return &refusal{reason: "table-too-large",
+		cause:  fmt.Sprintf("the table is %s with its indexes, over the %s limit SchemaBot sets for a native-safe apply, not a PostgreSQL limit", size, limit),
+		remedy: fmt.Sprintf("raise %s to change a table this size, then plan again", tableSizeLimitOption)}
+}
+
 // concurrentIndexBoundOption is the configuration key an operator changes
 // when a concurrent index build needs more time than the bound allows.
 const concurrentIndexBoundOption = "postgres.concurrent_index_max_duration"
@@ -2472,6 +2686,63 @@ func (e *concurrentIndexBoundError) Error() string {
 }
 
 func (e *concurrentIndexBoundError) Unwrap() error { return e.err }
+
+// validationBoundOption is the configuration key an operator changes when a
+// constraint validation needs more time than the bound allows.
+const validationBoundOption = "postgres.validate_max_duration"
+
+// validationBoundError reports that a VALIDATE CONSTRAINT scan ran past the
+// configured bound. Like concurrentIndexBoundError, it names the option the
+// operator changes instead of the per-statement budget pg-sprite's verdict
+// describes, and it says what the cancelled validation left live: the
+// constraint, still NOT VALID, which checks new writes and not existing rows.
+type validationBoundError struct {
+	constraint string
+	bound      time.Duration
+	err        error
+}
+
+// Error is the refusal's cause. The constraint name is held to the width of
+// a maximal identifier, so with the widest bound the cause and the remedy
+// that follows it fit inside the status listing's kept width and the listing
+// still says what to do.
+func (e *validationBoundError) Error() string {
+	return fmt.Sprintf("constraint %s ran past %s (%s); it stays NOT VALID and checks new writes only",
+		boundedQuote(e.constraint, quotedTableWidth), validationBoundOption, e.bound)
+}
+
+func (e *validationBoundError) Unwrap() error { return e.err }
+
+// validationLockBudget is the lock wait a validation under bound gets: the
+// short lock budget, or half the bound when the bound is shorter. The lock is
+// the first thing the statement waits for, so a wait behind other DDL always
+// ends at its lock budget before the bound's statement timer fires, and lock
+// contention is retried as contention instead of refused as an over-long scan.
+func validationLockBudget(bound time.Duration) time.Duration {
+	return min(optimisticLockTimeout, bound/2)
+}
+
+// validationCeiling is how long a validation apply may run in all: the
+// scan's bound, the setup headroom a concurrent index build also gets, and
+// the lock retries that can come before the scan starts. Each attempt but the
+// last can wait out its lock budget and then back off for at most the
+// policy's longest backoff, and only the attempt that gets the lock scans.
+func validationCeiling(bound time.Duration) time.Duration {
+	policy := executor.DefaultRetryPolicy()
+	lockRetries := time.Duration(policy.MaxAttempts-1) * (validationLockBudget(bound) + policy.MaxBackoff)
+	return bound + concurrentIndexHeadroom + lockRetries
+}
+
+// nameValidationBound wraps a validation failure caused by the bound's
+// statement timeout firing so the operator detail names the option; every
+// other failure, the lock budget among them, passes through unchanged.
+func nameValidationBound(err error, constraint string, bound time.Duration) error {
+	var budgetErr *executor.BudgetError
+	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
+		return &validationBoundError{constraint: constraint, bound: bound, err: err}
+	}
+	return err
+}
 
 // sqlstateQueryCanceled is the SQLSTATE the server raises when a statement
 // is cancelled, whether by its statement_timeout or by a cancel request.
@@ -2763,6 +3034,21 @@ func executorProgressMetadata(ctx context.Context, tracker buildTracker, result 
 		metadata["lockers_done"] = strconv.FormatUint(work.LockersDone, 10)
 		metadata["lockers_total"] = strconv.FormatUint(work.LockersTotal, 10)
 	}
+	// A step waiting outside the lock queue for a conflicting session to end
+	// names that session, so an operator can see what the apply waits on.
+	// The keys are absent once the wait ends.
+	if wait := snapshot.Detail.LockHolderWait; wait != nil {
+		metadata[apitypes.LockHolderPIDMetadataKey] = strconv.FormatUint(uint64(wait.PID), 10)
+		if table := sanitizeReasonText(wait.Table); table != "" {
+			metadata[apitypes.LockHolderTableMetadataKey] = table
+		}
+		metadata[apitypes.LockHolderWaitedMetadataKey] = strconv.FormatInt(wait.Waited.Milliseconds(), 10)
+		metadata[apitypes.LockHolderLimitMetadataKey] = strconv.FormatInt(wait.Limit.Milliseconds(), 10)
+	} else {
+		for _, key := range apitypes.LockHolderMetadataKeys {
+			delete(metadata, key)
+		}
+	}
 	// pg-sprite's percent describes work in flight, so it only refines a
 	// running result's percent. A terminal result's percent is decided by its
 	// state; a stale build snapshot must not pull a completed apply below 100.
@@ -2902,7 +3188,7 @@ func (e *Engine) claimProgress(key string, result *engine.ProgressResult, tracke
 	done := make(chan struct{})
 	e.progress[key] = &trackedApply{
 		result: result, tracker: tracker, logger: logger,
-		cancellableBuild: shape.cancellable, partitionedBuild: shape.partitioned, cancelApply: cancelApply, done: done,
+		cancellableBuild: shape.cancellable, partitionedBuild: shape.partitioned, haltable: shape.haltable, validationBound: shape.validationBound, cancelApply: cancelApply, done: done,
 		owner: owner,
 	}
 	return done

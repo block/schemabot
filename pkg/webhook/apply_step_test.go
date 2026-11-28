@@ -105,15 +105,16 @@ func TestFormatApplyStatusComment_RendersBuildWorkPerDeployment(t *testing.T) {
 	assert.Equal(t, 1, strings.Count(out, "\n- Building index: 1 of 4 blocks\n"))
 }
 
-// A malformed build counter drops the build work line but keeps the readable
-// statement position, so one bad counter does not hide where the apply is.
+// A malformed build counter drops the counters but keeps the readable
+// statement position and operation, so one bad counter does not hide where
+// the apply is.
 func TestFormatApplyStatusComment_KeepsPositionWhenBuildWorkIsMalformed(t *testing.T) {
 	ops := []*storage.ApplyOperation{{ID: 1, Deployment: "eu", State: state.ApplyOperation.Running,
 		ProgressMetadata: `{"step":"2","steps_total":"3","statement":"CREATE INDEX CONCURRENTLY idx ON t (c)","executor_operation":"concurrent-index-build","blocks_done":"many"}`}}
 
 	displayByOp := resolveDisplayByOperation(t.Context(), nil, runningApply(), ops, nil)
 	require.Len(t, displayByOp, 1)
-	assert.Equal(t, apitypes.BuildWork{}, displayByOp[1].BuildWork)
+	assert.Equal(t, apitypes.BuildWork{Operation: "concurrent-index-build"}, displayByOp[1].BuildWork)
 
 	out := formatApplyStatusComment(runningApply(), ops, false, nil, displayByOp, nil, nil, "", "", nil, 0, 0)
 	assert.Contains(t, out, "step 2 of 3 · `CREATE INDEX CONCURRENTLY idx ON t (c)`\n")

@@ -6225,11 +6225,13 @@ func TestNewLocalClientConfiguresPostgresConcurrentIndexMaxDuration(t *testing.T
 		Database:                           "orders",
 		Type:                               storage.DatabaseTypePostgres,
 		PostgresConcurrentIndexMaxDuration: 36 * time.Hour,
+		PostgresValidateMaxDuration:        12 * time.Hour,
 	}, nil, slog.Default())
 	require.NoError(t, err)
 	eng, ok := c.getEngine().(*postgresengine.Engine)
 	require.True(t, ok)
 	assert.Equal(t, 36*time.Hour, eng.ConcurrentIndexMaxDuration())
+	assert.Equal(t, 12*time.Hour, eng.ValidateMaxDuration())
 }
 
 // A type with no built-in engine and no registered factory fails closed.

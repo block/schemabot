@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/block/pg-sprite/pkg/diffplan"
 	"github.com/block/pg-sprite/pkg/executor"
@@ -27,6 +28,32 @@ func planPostgresDefinition(ctx context.Context, pool *pgxpool.Pool, namespace s
 		return plan.Report{}, desired.Table(), fmt.Errorf("plan PostgreSQL table %q: %w%s", desired.Table(), err, referencedTableRemedy(err))
 	}
 	return report, desired.Table(), nil
+}
+
+// planRowSecurityTableDefinition plans a file that declares row security
+// when the live table's row security already matches it: the report changes
+// only the table definition, so its statements run as in-place DDL that
+// leaves the policies and settings as they are. matched is false when the
+// row security differs or the table does not exist yet; either one is
+// planned as a single row security operation instead. A table change the
+// planner refuses keeps its own error.
+func planRowSecurityTableDefinition(ctx context.Context, pool *pgxpool.Pool, namespace string, desired statement.DesiredWithRowSecurity) (report plan.Report, matched bool, err error) {
+	report, err = diffplan.PlanWithRowSecurity(ctx, pool, namespace, desired)
+	var review *diffplan.RowSecurityReviewRequired
+	switch {
+	case err == nil:
+		return report, true, nil
+	case errors.As(err, &review):
+		slog.Debug("PostgreSQL row security differs from the schema file; planning it as one row security operation",
+			"namespace", namespace, "table", desired.Table())
+		return plan.Report{}, false, nil
+	case errors.Is(err, schemadiff.ErrTableNotFound):
+		slog.Debug("PostgreSQL table declared with row security does not exist; planning its creation as one row security operation",
+			"namespace", namespace, "table", desired.Table())
+		return plan.Report{}, false, nil
+	default:
+		return plan.Report{}, false, fmt.Errorf("plan PostgreSQL table %q: %w%s", desired.Table(), err, referencedTableRemedy(err))
+	}
 }
 
 // parseDesiredFiles admits every schema file in a namespace once, through

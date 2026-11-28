@@ -20,6 +20,17 @@ import (
 // than returned.
 const unplannedMemberDetail = "could not be planned; see server logs for the cause, then plan again"
 
+// unplannedDetail is the attention detail for a member that could not be
+// planned. A member the engine refused for the declared schema gets the
+// refusal's own text, which the engine writes for the reader and which says
+// what to do next; any other failure gets unplannedMemberDetail.
+func unplannedDetail(err error) string {
+	if text, ok := schemaRefusalText(err); ok {
+		return "refused: " + text
+	}
+	return unplannedMemberDetail
+}
+
 // notPlannedBesideErroredPrimaryDetail is the detail a plan response gives
 // for a member that was not planned because the primary's plan reported
 // errors, which the response carries.
@@ -191,7 +202,7 @@ func planRolloutResponse(rollup PlanRollup, logAttrs ...any) *apitypes.PlanRollo
 		switch e.Class {
 		case DeploymentErrored:
 			resp.Attention = append(resp.Attention, &apitypes.PlanMemberAttentionResponse{
-				Member: names[i], Reason: apitypes.PlanMemberUnplanned, Detail: unplannedMemberDetail,
+				Member: names[i], Reason: apitypes.PlanMemberUnplanned, Detail: unplannedDetail(e.Err),
 			})
 			continue
 		case DeploymentDiverged:

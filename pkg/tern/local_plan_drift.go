@@ -51,16 +51,14 @@ type driftChangeMultiset map[driftChangeKey]int
 // verdict on how that statement would run here, whether its engine judged
 // the statement unsafe, and the engine's record of this target's objects the
 // statement acts on as the re-plan read them, which must equal the record the
-// change was reviewed with. metadataConflict marks a key the re-plan produced
-// more than once with records that disagree.
+// change was reviewed with.
 type replannedChange struct {
-	ddl              string
-	mode             string
-	reason           string
-	unsafe           bool
-	unsafeReason     string
-	metadata         map[string]string
-	metadataConflict bool
+	ddl          string
+	mode         string
+	reason       string
+	unsafe       bool
+	unsafeReason string
+	metadata     map[string]string
 }
 
 // replannedChangeOf reads the re-planned facts back off a plan row's change,
@@ -95,7 +93,7 @@ func (r replannedChange) stampOnto(tc *storage.TableChange) {
 }
 
 // replannedChanges records, per change, what this deployment's re-plan
-// produced, keyed exactly as the drift comparison keyed the changes (so
+// produced, in the re-plan's order, keyed exactly as the drift comparison keyed the changes (so
 // targetShard is the shard every key carries: "" for a whole-deployment
 // apply). All three parts are properties of a target, not of the reviewed
 // text. The verdict: the same statement can be executable on the primary's
@@ -115,35 +113,18 @@ func (r replannedChange) stampOnto(tc *storage.TableChange) {
 // engine against this target's live VSchema, just as the unsafe flag is.
 type replannedChanges struct {
 	targetShard     string
-	byChange        map[driftChangeKey]replannedChange
+	byChange        map[driftChangeKey][]replannedChange
 	vschemaMetadata map[string][]map[string]string
 }
 
-// record keeps the re-planned change for a key. A key can repeat when the
-// re-plan holds the same change twice; a blocked verdict then wins because
-// admitting a plan one copy would refuse is the failure this exists to
-// prevent, and an unsafe flag wins for the same reason: the kept copy takes
-// the unsafe flag and reason of the other copy when only that one is unsafe.
-// Otherwise the first seen stands — the copies canonicalize equal by
-// construction of the key, so either statement is this target's own. Copies
-// whose engine metadata disagree mark the key conflicting, since either record
-// could be the one the change runs against.
+// record keeps the re-planned change for a key, after any copy of it the
+// re-plan already produced. A key repeats when the re-plan holds the same
+// change twice, as a PostgreSQL SET NOT NULL re-planned after a failed attempt
+// does: it drops the helper the failure left and drops the new helper at the
+// end. Each copy keeps its own verdict and engine record, and
+// stampReplannedTables pairs them one to one with the reviewed copies.
 func (r replannedChanges) record(key driftChangeKey, change replannedChange) {
-	existing, seen := r.byChange[key]
-	if !seen {
-		r.byChange[key] = change
-		return
-	}
-	conflict := existing.metadataConflict || change.metadataConflict || !maps.Equal(existing.metadata, change.metadata)
-	kept, other := existing, change
-	if change.mode == engine.ExecutionModeBlocked && existing.mode != engine.ExecutionModeBlocked {
-		kept, other = change, existing
-	}
-	if other.unsafe && !kept.unsafe {
-		kept.unsafe, kept.unsafeReason = true, other.unsafeReason
-	}
-	kept.metadataConflict = conflict
-	r.byChange[key] = kept
+	r.byChange[key] = append(r.byChange[key], change)
 }
 
 // driftRecoveryHint gives a blocked operator the defined next step when the
@@ -424,7 +405,7 @@ func (c *LocalClient) driftMultisetFromPlanResult(result *engine.PlanResult, sha
 		return nil, replannedChanges{}, err
 	}
 	ms := driftChangeMultiset{}
-	replanned := replannedChanges{targetShard: targetShard, byChange: map[driftChangeKey]replannedChange{}}
+	replanned := replannedChanges{targetShard: targetShard, byChange: map[driftChangeKey][]replannedChange{}}
 	for _, sc := range result.Changes {
 		shard := sc.ShardName()
 		if shardScoped {
@@ -625,24 +606,32 @@ func decodeVSchemaUnsafeRecords(raw string) ([]vschemaUnsafeRecord, error) {
 }
 
 // stampReplannedTables stamps each change with its re-planned counterpart,
-// matched under the drift key the comparison admitted it on.
+// matched under the drift key the comparison admitted it on. When a key
+// repeats, the k-th reviewed copy pairs with the k-th re-planned copy, so each
+// copy is checked against its own engine record. Both plans list a table's
+// changes in the engine's plan order, and a pairing that came out crossed
+// fails the record check below rather than running against the wrong object.
+// A blocked change is not stamped but still takes its place in the pairing,
+// since the drift comparison counted it.
 func (c *LocalClient) stampReplannedTables(parser ddl.StatementParser, tables []storage.TableChange, replanned replannedChanges) error {
+	occurrences := map[driftChangeKey]int{}
 	for i := range tables {
 		tc := &tables[i]
-		if tc.EngineBlocked() {
-			continue
-		}
 		canon, err := canonicalDDLForDrift(parser, tc.DDL)
 		if err != nil {
 			return fmt.Errorf("table %q: %w", tc.Table, err)
 		}
-		change, ok := replanned.byChange[driftChangeKey{c.planNamespace(tc.Namespace), replanned.targetShard, tc.Table, tc.Operation, canon}]
-		if !ok {
+		key := driftChangeKey{c.planNamespace(tc.Namespace), replanned.targetShard, tc.Table, tc.Operation, canon}
+		occurrence := occurrences[key]
+		occurrences[key] = occurrence + 1
+		if tc.EngineBlocked() {
+			continue
+		}
+		copies := replanned.byChange[key]
+		if occurrence >= len(copies) {
 			return fmt.Errorf("table %q: no re-planned change for one the drift comparison matched", tc.Table)
 		}
-		if change.metadataConflict {
-			return engine.NewPermanentError("table %q: this deployment's re-plan holds more than one copy of a change with different engine records, so it cannot say which objects the change acts on; %s", tc.Table, driftRecoveryHint)
-		}
+		change := copies[occurrence]
 		if !maps.Equal(tc.Metadata, change.metadata) {
 			return engine.NewPermanentError("table %q: the objects this change acts on are not the ones the plan reviewed on this deployment (the engine's record of them differs), so it was refused rather than run against unreviewed objects; %s. If the new plan is refused here too, this deployment's objects differ from the primary deployment's and the change cannot run here", tc.Table, driftRecoveryHint)
 		}
@@ -858,6 +847,11 @@ func canonicalDDLForDrift(p ddl.StatementParser, raw string) (string, error) {
 	// a trailing statement cannot hide behind the classification of the first.
 	createSet, err := ddl.ParseCreateSet(p, raw)
 	if err != nil {
+		if canonical, ok, rlsErr := canonicalCreateWithRowSecurity(p, raw); rlsErr != nil {
+			return "", fmt.Errorf("DDL rejected by the statement parser: %w", rlsErr)
+		} else if ok {
+			return canonical, nil
+		}
 		return "", fmt.Errorf("DDL rejected by the statement parser: %w", err)
 	}
 	canonical := make([]string, 0, len(createSet.Statements))
@@ -869,6 +863,58 @@ func canonicalDDLForDrift(p ddl.StatementParser, raw string) (string, error) {
 		canonical = append(canonical, c)
 	}
 	return strings.Join(canonical, ";\n"), nil
+}
+
+// canonicalCreateWithRowSecurity canonicalizes the planned create of a new
+// table with its row security: a CREATE TABLE followed by statements that are
+// each either DDL the parser classifies or one atomic row security operation,
+// with at least one of the latter. Every statement is canonicalized and kept
+// in order, so no statement hides behind another's classification. ok is
+// false, with no error, when raw is not that shape at all; an error means it
+// is that shape and a statement in it is one drift cannot verify.
+func canonicalCreateWithRowSecurity(p ddl.StatementParser, raw string) (canonical string, ok bool, err error) {
+	rls, hasGrammar := p.(interface{ CanonicalRowSecurity(string) (string, error) })
+	if !hasGrammar {
+		return "", false, nil
+	}
+	statements, err := p.Split(raw)
+	if err != nil {
+		return "", false, nil
+	}
+	if len(statements) < 2 {
+		return "", false, nil
+	}
+	firstType, _, err := p.Classify(statements[0])
+	if err != nil {
+		return "", false, nil
+	}
+	if firstType != ddl.StatementCreateTable {
+		return "", false, nil
+	}
+	parts := make([]string, 0, len(statements))
+	declaresRowSecurity := false
+	for i, statement := range statements {
+		if i > 0 {
+			if c, rlsErr := rls.CanonicalRowSecurity(statement); rlsErr == nil {
+				parts = append(parts, c)
+				declaresRowSecurity = true
+				continue
+			}
+		}
+		stmtType, _, classifyErr := p.Classify(statement)
+		if classifyErr != nil {
+			return "", false, nil
+		}
+		c, canonErr := canonicalDriftStatement(p, statement, stmtType)
+		if canonErr != nil {
+			return "", true, fmt.Errorf("statement %d of create with row security: %w", i+1, canonErr)
+		}
+		parts = append(parts, c)
+	}
+	if !declaresRowSecurity {
+		return "", false, nil
+	}
+	return strings.Join(parts, ";\n"), true, nil
 }
 
 // canonicalDriftStatement canonicalizes one statement that must be DDL. Two

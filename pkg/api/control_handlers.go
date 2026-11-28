@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"slices"
 	"strings"
@@ -13,7 +14,6 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/caller"
-	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/presentation"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -111,9 +111,10 @@ func authoredTerminalControlf(format string, args ...any) error {
 	return &terminalControlError{err: err, shown: err.Error()}
 }
 
-// controlOperationErrorCode is the error code a rejection carries, empty for
-// one that carries none.
-func controlOperationErrorCode(err error) string {
+// ControlOperationErrorCode is the error code a rejection carries, empty for
+// one that carries none. The PR comment reads it to name a remedy in its own
+// command form, where the server's message names the CLI's.
+func ControlOperationErrorCode(err error) string {
 	if _, code, ok := changeGateErrorStatus(err); ok {
 		return code
 	}
@@ -122,6 +123,30 @@ func controlOperationErrorCode(err error) string {
 		return httpErr.code
 	}
 	return ""
+}
+
+// rollbackNotCapturedConflict refuses a rollback of an apply whose plan could
+// not save the current schema of a namespace. When the plan recorded which
+// tables kept it from saving, the refusal names them with why, as the plan
+// did before anyone applied it, and names the way to undo the change instead.
+func rollbackNotCapturedConflict(apply *storage.Apply, plan *storage.Plan) error {
+	for _, namespace := range slices.Sorted(maps.Keys(plan.Namespaces)) {
+		data := plan.Namespaces[namespace]
+		if data == nil || data.OriginalFilesCaptured || len(data.RollbackBlockers) == 0 {
+			continue
+		}
+		shown, more := presentation.RollbackBlockersShown(len(data.RollbackBlockers))
+		tables := make([]string, 0, shown+1)
+		for _, blocker := range data.RollbackBlockers[:shown] {
+			tables = append(tables, fmt.Sprintf("%s (%s)", blocker.Table, blocker.Reason))
+		}
+		if more > 0 {
+			tables = append(tables, presentation.RollbackBlockersMore(more))
+		}
+		return controlConflictf("apply %s can't be rolled back: when it was planned, SchemaBot couldn't save the current schema of these tables in namespace %s: %s. To undo the change, revert the schema files in a new pull request.",
+			apply.ApplyIdentifier, namespace, strings.Join(tables, ", "))
+	}
+	return controlConflictf("apply %s cannot be rolled back safely because its source plan has no stored original schema files", apply.ApplyIdentifier)
 }
 
 func controlOperationHTTPStatus(err error) int {
@@ -237,7 +262,7 @@ func (s *Service) ValidateRollbackSourceApply(ctx context.Context, req RollbackS
 		return apply, nil, terminalControlf("source plan %d not found for rollback apply %s", apply.PlanID, apply.ApplyIdentifier)
 	}
 	if !plan.HasOriginalFilesCapture() {
-		return apply, plan, controlConflictf("apply %s cannot be rolled back safely because its source plan has no stored original schema files", apply.ApplyIdentifier)
+		return apply, plan, rollbackNotCapturedConflict(apply, plan)
 	}
 
 	latestTask, err := latestCompletedTaskForRollback(ctx, taskStore, apply.Database, apply.DatabaseType, apply.Environment)
@@ -490,7 +515,7 @@ func (s *Service) writeControlError(w http.ResponseWriter, opName string, apply 
 		s.logger.Error(opName+" failed", attrs...)
 		// The code is what tells a client that an engine-unavailable 503 is
 		// worth retrying.
-		code := controlOperationErrorCode(err)
+		code := ControlOperationErrorCode(err)
 		if authored, ok := AuthoredControlFailureMessage(err); ok {
 			s.writeErrorCode(w, status, code, opName+" failed: "+authored)
 			return
@@ -498,7 +523,7 @@ func (s *Service) writeControlError(w http.ResponseWriter, opName string, apply 
 		s.writeErrorCode(w, status, code, controlInternalFailureMessage(opName, apply))
 	} else {
 		s.logger.Warn(opName+" rejected", attrs...)
-		s.writeErrorCode(w, status, controlOperationErrorCode(err), opName+" rejected: "+err.Error())
+		s.writeErrorCode(w, status, ControlOperationErrorCode(err), opName+" rejected: "+err.Error())
 	}
 }
 
@@ -597,7 +622,7 @@ func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, o
 			append(apply.LogAttrs(),
 				"operation", operation, "error", err)...)
 		failure := controlTernClientFailure(apply, deployment, err)
-		s.writeErrorCode(w, controlOperationHTTPStatus(failure), controlOperationErrorCode(failure), failure.Error())
+		s.writeErrorCode(w, controlOperationHTTPStatus(failure), ControlOperationErrorCode(failure), failure.Error())
 		return nil, nil, "", false
 	}
 
@@ -1387,8 +1412,10 @@ func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, a
 	return s.stopApply(ctx, client, apply, ternApplyID, caller)
 }
 
-// stopRefusal returns the operator-facing reason a stop of apply is refused.
-type stopRefusal func(s *Service, ctx context.Context, apply *storage.Apply) string
+// stopRefusal returns the operator-facing reason a stop of apply is refused,
+// and the error code that names its remedy for a client that renders the
+// command itself, or "" when the reason alone says what to do.
+type stopRefusal func(s *Service, ctx context.Context, apply *storage.Apply) (code, reason string)
 
 // stopRefusals maps every engine to how a stop of its schema change is
 // refused, or to nil when the engine can stop. An engine with no stopped
@@ -1399,38 +1426,47 @@ type stopRefusal func(s *Service, ctx context.Context, apply *storage.Apply) str
 var stopRefusals = map[string]stopRefusal{
 	storage.EngineSpirit: nil,
 	storage.EngineStrata: nil,
-	storage.EnginePlanetScale: func(*Service, context.Context, *storage.Apply) string {
-		return "stop is not supported for this schema change; use cancel to permanently cancel it"
+	storage.EnginePlanetScale: func(*Service, context.Context, *storage.Apply) (string, string) {
+		return "", "stop is not supported for this schema change; use cancel to permanently cancel it"
 	},
 	storage.EnginePostgres: (*Service).postgresStopRefusal,
 }
 
-// stopRefusalForEngine reports whether a stop of apply is refused, and the
-// operator-facing reason. An engine outside stopRefusals is left to decline
-// the stop itself.
-func (s *Service) stopRefusalForEngine(ctx context.Context, apply *storage.Apply) (string, bool) {
+// stopRefusalForEngine reports whether a stop of apply is refused, with the
+// operator-facing reason and the error code that names its remedy. An engine
+// outside stopRefusals is left to decline the stop itself.
+func (s *Service) stopRefusalForEngine(ctx context.Context, apply *storage.Apply) (code, reason string, refused bool) {
 	refusal := stopRefusals[apply.Engine]
 	if refusal == nil {
-		return "", false
+		return "", "", false
 	}
-	return refusal(s, ctx, apply), true
+	code, reason = refusal(s, ctx, apply)
+	return code, reason, true
 }
 
-// postgresStopRefusal gives the engine's own reason a stop is declined, so the
-// refusal and a stored stop's ErrorMessage say the same thing, followed by the
-// remedy the PR comment offers for this apply: cancel for a concurrent index
-// build that is its only statement, and waiting for anything else.
-func (s *Service) postgresStopRefusal(ctx context.Context, apply *storage.Apply) string {
+// postgresStopRefusal says why PostgreSQL refuses a stop and names what the
+// operator can do instead, with this apply's ID and environment filled in:
+// cancel for a concurrent index build that is its only statement, which is
+// what the PR comment offers, and following its progress for anything else,
+// which finishes on its own. The error code names the same remedy, so the CLI
+// can render the command with the route the operator invoked it with and the
+// PR comment can render it as a comment command or point at its progress
+// comment. progress is named with --no-watch because a watching progress can
+// stop or cancel the apply from its keys.
+func (s *Service) postgresStopRefusal(ctx context.Context, apply *storage.Apply) (string, string) {
+	cancel := fmt.Sprintf("`schemabot cancel %s -e %s`", apply.ApplyIdentifier, apply.Environment)
+	progress := fmt.Sprintf("`schemabot progress %s -e %s --no-watch`", apply.ApplyIdentifier, apply.Environment)
 	command, err := s.storedStopCommand(ctx, apply)
 	if err != nil {
 		s.logger.Warn("operator: could not read the apply's stored progress for a refused PostgreSQL stop; the refusal names the remedy for each kind of statement",
 			append(apply.LogAttrs(), "error", err)...)
-		return postgresengine.StopUnsupportedReason + ". Use cancel if this schema change is a single concurrent index build; otherwise wait for it to finish"
+		return apitypes.ErrCodeStopUnsupported, "PostgreSQL can't pause a schema change. If it is a single index build, end it with " + cancel +
+			"; anything else finishes on its own. To follow it: " + progress
 	}
 	if command == presentation.StopCommandCancel {
-		return postgresengine.StopUnsupportedReason + ". Use cancel to end this concurrent index build"
+		return apitypes.ErrCodeStopUnsupportedCancel, "PostgreSQL can't pause an index build. To end it: " + cancel
 	}
-	return postgresengine.StopUnsupportedReason + ". This schema change commits or fails on its own; wait for it to finish"
+	return apitypes.ErrCodeStopUnsupportedFinishes, "PostgreSQL can't pause this schema change, and it finishes on its own. To follow it: " + progress
 }
 
 // storedStopCommand names the command presentation.StopCommand offers for
@@ -1449,7 +1485,10 @@ func (s *Service) storedStopCommand(ctx context.Context, apply *storage.Apply) (
 		}
 		work, err := apitypes.ParseBuildWork(metadata)
 		if err != nil {
-			return "", fmt.Errorf("read stored build work of apply %s operation %d: %w", apply.ApplyIdentifier, op.ID, err)
+			// The operation's name survives a malformed counter or lock wait,
+			// and it is all the command depends on.
+			s.logger.Warn("operator: part of the apply's stored build work is malformed; the stop command is read from the rest",
+				append(op.LogAttrs(), "error", err)...)
 		}
 		step, err := apitypes.ParseProgressStep(metadata)
 		if err != nil {
@@ -1466,11 +1505,11 @@ func (s *Service) storedStopCommand(ctx context.Context, apply *storage.Apply) (
 // resolved and checked, and attempts an immediate local stop. Its returns are
 // those of executeStopForApply.
 func (s *Service) stopApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string) (*apitypes.StopResponse, int, error) {
-	if refusal, refused := s.stopRefusalForEngine(ctx, apply); refused {
+	if code, refusal, refused := s.stopRefusalForEngine(ctx, apply); refused {
 		s.logger.Info("operator: refused a stop because the apply's engine has no stopped phase",
 			append(apply.LogAttrs(), "requested_by", caller)...)
 		metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, "rejected")
-		return nil, 0, controlHTTPErrorf(http.StatusBadRequest, "%s", refusal)
+		return nil, 0, controlHTTPCodeErrorf(http.StatusBadRequest, code, "%s", refusal)
 	}
 	resp, responseStatus, err := s.queueStopForApplyOwner(ctx, apply, caller)
 	if err != nil {
@@ -1708,7 +1747,7 @@ func (s *Service) executeCancelForApply(ctx context.Context, client tern.Client,
 		metrics.RecordControlOperation(ctx, "cancel", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, 0, controlConflictf("schema change is already terminal (current state: %s)", apply.State)
 	}
-	resp, responseStatus, err := s.queueCancelForApplyOwner(ctx, apply, caller)
+	resp, responseStatus, revision, err := s.queueCancelForApplyOwner(ctx, apply, caller)
 	if err != nil {
 		metrics.RecordControlOperation(ctx, "cancel", apply.Database, apply.Deployment, apply.Environment, controlMetricStatus(err))
 		return nil, 0, err
@@ -1727,6 +1766,9 @@ func (s *Service) executeCancelForApply(ctx context.Context, client tern.Client,
 		SkippedCount:   resp.SkippedCount,
 		Status:         responseStatus,
 	}
+	if resp.Accepted {
+		httpResp.ControlRequestRevision = &revision
+	}
 	httpStatus := http.StatusOK
 	if responseStatus == cancelResponseStatusAlreadyRequested {
 		httpStatus = http.StatusAccepted
@@ -1734,13 +1776,26 @@ func (s *Service) executeCancelForApply(ctx context.Context, client tern.Client,
 	return httpResp, httpStatus, nil
 }
 
-func (s *Service) queueCancelForApplyOwner(ctx context.Context, apply *storage.Apply, caller string) (*ternv1.CancelResponse, string, error) {
-	if resp, responseStatus, found, err := s.pendingCancelResponseIfPresent(ctx, apply); err != nil || found {
-		return resp, responseStatus, err
+// queueCancelForApplyOwner records the cancel, or joins the one already
+// pending, and returns the revision of that request alongside the response, so
+// a caller waiting on the outcome reads this request's settlement and not a
+// later one recorded on the same row.
+func (s *Service) queueCancelForApplyOwner(ctx context.Context, apply *storage.Apply, caller string) (*ternv1.CancelResponse, string, int64, error) {
+	var pendingRevision int64
+	resp, responseStatus, found, err := pendingControlResponseIfPresent(ctx, s, apply, storage.ControlOperationCancel, cancelResponseStatusAlreadyRequested,
+		func(controlReq *storage.ApplyControlRequest) (*ternv1.CancelResponse, error) {
+			pendingRevision = controlReq.Revision
+			return cancelResponseFromControlRequest(controlReq)
+		})
+	if err != nil {
+		return nil, "", 0, err
+	}
+	if found {
+		return resp, responseStatus, pendingRevision, nil
 	}
 	tasks, err := s.storage.Tasks().GetByApplyID(ctx, apply.ID)
 	if err != nil {
-		return nil, "", fmt.Errorf("get tasks for apply %s: %w", apply.ApplyIdentifier, err)
+		return nil, "", 0, fmt.Errorf("get tasks for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	cancelledCount, skippedCount := stopRequestCounts(tasks)
 	if cancelledCount == 0 && skippedCount == 0 {
@@ -1755,16 +1810,16 @@ func (s *Service) queueCancelForApplyOwner(ctx context.Context, apply *storage.A
 	}
 	controlReq, alreadyPending, err := s.createCancelControlRequest(ctx, apply, caller, cancelledCount, skippedCount)
 	if err != nil {
-		return nil, "", err
+		return nil, "", 0, err
 	}
 	if alreadyPending {
 		resp, err := cancelResponseFromControlRequest(controlReq)
 		if err != nil {
-			return nil, "", err
+			return nil, "", 0, err
 		}
-		return resp, cancelResponseStatusAlreadyRequested, nil
+		return resp, cancelResponseStatusAlreadyRequested, controlReq.Revision, nil
 	}
-	return &ternv1.CancelResponse{Accepted: true, CancelledCount: cancelledCount, SkippedCount: skippedCount}, "", nil
+	return &ternv1.CancelResponse{Accepted: true, CancelledCount: cancelledCount, SkippedCount: skippedCount}, "", controlReq.Revision, nil
 }
 
 func (s *Service) createCancelControlRequest(ctx context.Context, apply *storage.Apply, caller string, cancelledCount, skippedCount int64) (*storage.ApplyControlRequest, bool, error) {
@@ -1772,10 +1827,6 @@ func (s *Service) createCancelControlRequest(ctx context.Context, apply *storage
 		CancelledCount: cancelledCount,
 		SkippedCount:   skippedCount,
 	})
-}
-
-func (s *Service) pendingCancelResponseIfPresent(ctx context.Context, apply *storage.Apply) (*ternv1.CancelResponse, string, bool, error) {
-	return pendingControlResponseIfPresent(ctx, s, apply, storage.ControlOperationCancel, cancelResponseStatusAlreadyRequested, cancelResponseFromControlRequest)
 }
 
 func cancelResponseFromControlRequest(controlReq *storage.ApplyControlRequest) (*ternv1.CancelResponse, error) {
@@ -2005,15 +2056,34 @@ func (s *Service) stopQueuedStart(ctx context.Context, apply *storage.Apply, cal
 	}
 }
 
+// stopRequestCounts counts the tables a stop or cancel acts on and the tables
+// it leaves alone because they already finished. It counts tables, not tasks:
+// one table can carry several tasks, such as the steps of a staged change or
+// one task per shard, and the operator reads the count as tables. A table is
+// acted on while any of its tasks is still active. A task that names no table
+// covers several tables at once and counts as one.
 func stopRequestCounts(tasks []*storage.Task) (int64, int64) {
+	type tableKey struct {
+		namespace string
+		table     string
+		taskID    int64
+	}
+	active := make(map[tableKey]bool)
+	for _, task := range tasks {
+		key := tableKey{namespace: task.Namespace, table: task.TableName}
+		if task.TableName == "" {
+			key.taskID = task.ID
+		}
+		active[key] = active[key] || !state.IsTerminalTaskState(task.State)
+	}
 	var stoppedCount int64
 	var skippedCount int64
-	for _, task := range tasks {
-		if state.IsTerminalTaskState(task.State) {
-			skippedCount++
+	for _, isActive := range active {
+		if isActive {
+			stoppedCount++
 			continue
 		}
-		stoppedCount++
+		skippedCount++
 	}
 	return stoppedCount, skippedCount
 }

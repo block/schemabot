@@ -3,6 +3,8 @@ package templates
 import (
 	"fmt"
 	"strings"
+
+	"github.com/block/schemabot/pkg/presentation"
 )
 
 // ANSI styling codes
@@ -178,7 +180,7 @@ func FormatApplyCompleteWithSummary(summary, applyID string) string {
 
 // FormatApplyFailed returns the styled "Apply failed" message with recovery guidance.
 func FormatApplyFailed() string {
-	return FormatApplyFailedHeadline() + "\n\nFix the issue above, then run a new apply.\nThe new apply will only process tables that haven't completed."
+	return FormatApplyFailedHeadline() + "\n\nFix the issue above, then run a new apply.\nThe new apply " + presentation.NewApplyRunsWhatRemains + "."
 }
 
 // FormatApplyFailedHeadline returns the styled "Apply failed" line alone, for

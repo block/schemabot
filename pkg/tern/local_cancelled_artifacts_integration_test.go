@@ -517,6 +517,6 @@ func TestLocalClient_CancelReportsAReleaseThatStoppedPartWay(t *testing.T) {
 		"the schema change's log must name where the copy was kept")
 	assert.Equal(t, 1, countLogMessagesContaining(logs, "stopped in testdb because the release failed"),
 		"the schema change's log must say where the release stopped")
-	assert.Zero(t, countLogMessagesContaining(logs, "copy was left on the target"),
+	assert.Zero(t, countLogMessagesContaining(logs, "was not reclaimed because"),
 		"the copy moved, so the log must not say it was left in place")
 }

@@ -1214,7 +1214,7 @@ func TestRenderApplyStatusComment_Failed(t *testing.T) {
 	assert.Contains(t, result, "📊 1/3 complete")
 	assert.Contains(t, result, "1 failed")
 	assert.Contains(t, result, "1 cancelled")
-	assert.Contains(t, result, "To retry:")
+	assert.Contains(t, result, presentation.RetryLabel+":")
 	assert.Contains(t, result, "schemabot apply -e staging")
 }
 
@@ -2175,7 +2175,7 @@ func TestPreviewCommentSummaryFailed(t *testing.T) {
 	assert.NotContains(t, result, "### ")
 	assert.Contains(t, result, "**`users`** — Failed at 30.00%")
 	assert.Contains(t, result, "**`orders`** — Completed", "on a failed apply, the reader must be able to tell which tables made it")
-	assert.Contains(t, result, "**`products`** — Cancelled")
+	assert.Contains(t, result, "**`products`** — Not run")
 }
 
 // A table whose copy finished short of its estimate, then halted, reads in
@@ -2194,7 +2194,7 @@ func TestSummaryEntryReadsAFinishedCopyAsDone(t *testing.T) {
 			writeSummaryTableEntry(&sb, schema.DialectMySQL, TableProgressData{
 				TableName: "users", Status: tc.status,
 				RowsCopied: 3_261_100_506, RowsTotal: 3_291_032_158, PercentComplete: 100,
-			}, true, nil)
+			}, true, false, nil)
 			assert.Contains(t, sb.String(), tc.want)
 			assert.NotContains(t, sb.String(), "99.09%")
 		})
@@ -3032,7 +3032,7 @@ func TestRenderApplyComments_CancelledTableSaysHowFarItGot(t *testing.T) {
 	summary := RenderApplySummaryComment(data)
 	assert.Contains(t, summary, "**`orders`** — Cancelled at 40.00%\n", "%s", summary)
 	assert.Contains(t, summary, "**`users`** — Cancelled\n", "%s", summary)
-	assert.Contains(t, summary, "**`products`** — Cancelled\n", "%s", summary)
+	assert.Contains(t, summary, "**`products`** — Cancelled (not started)\n", "%s", summary)
 }
 
 // A sharded table in a single-deployment apply whose shards are in different

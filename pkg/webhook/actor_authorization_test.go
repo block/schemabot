@@ -1029,27 +1029,35 @@ func TestPlanForResolvedDatabaseAllowsDatabaseOperator(t *testing.T) {
 
 // The plan comment lists who can apply only to a reader the apply gate would
 // deny. A reader the gate admits sees nothing, since applying is their happy
-// path, and so does everyone when PR command authorization is off. When the
-// reader's authorization cannot be checked, the list still renders, since it
-// stays true and names whom to ask.
+// path, and so does everyone when PR command authorization is off. A reader the
+// gate denies for not being listed is named as unable to run the apply. Any
+// other denial, such as a database this deployment does not configure, which
+// the gate refuses to everyone on the list too, and a reader whose
+// authorization cannot be checked, see the list without being named: it stays
+// true and names whom to ask.
 func TestApplyAuthorizationForPlanComment(t *testing.T) {
 	listed := &templates.ApplyAuthorizationData{
 		OperatorPrincipals: []string{"octocat/orders-operators", "mona"},
 		OtherPrincipals:    []string{"octocat/schema-admins"},
 	}
+	denied := *listed
+	denied.DeniedReader = "hubot"
+	unconfigured := &templates.ApplyAuthorizationData{OtherPrincipals: []string{"octocat/schema-admins"}}
 	tests := []struct {
 		name       string
 		enabled    bool
 		reader     string
+		database   string
 		teamStatus int
 		want       *templates.ApplyAuthorizationData
 	}{
 		{name: "operator user sees nothing", enabled: true, reader: "mona", teamStatus: http.StatusOK},
 		{name: "admin team member sees nothing", enabled: true, reader: "octo-admin", teamStatus: http.StatusOK},
-		{name: "unlisted reader sees the list", enabled: true, reader: "hubot", teamStatus: http.StatusOK, want: listed},
+		{name: "unlisted reader is told they cannot apply", enabled: true, reader: "hubot", teamStatus: http.StatusOK, want: &denied},
 		{name: "reader that cannot be checked sees the list", enabled: true, reader: "hubot", teamStatus: http.StatusInternalServerError, want: listed},
 		{name: "missing reader sees the list", enabled: true, reader: "", teamStatus: http.StatusOK, want: listed},
 		{name: "authorization off shows nothing", enabled: false, reader: "hubot", teamStatus: http.StatusOK},
+		{name: "reader denied for a database this deployment does not configure is not named", enabled: true, reader: "hubot", database: "someone-elses-db", teamStatus: http.StatusOK, want: unconfigured},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1066,7 +1074,11 @@ func TestApplyAuthorizationForPlanComment(t *testing.T) {
 			})
 			h := actorAuthTestHandler(cfg, installClient)
 
-			assert.Equal(t, tt.want, h.applyAuthorizationForPlanComment(t.Context(), installClient, "octocat/hello-world", 1, "orders", tt.reader))
+			database := tt.database
+			if database == "" {
+				database = "orders"
+			}
+			assert.Equal(t, tt.want, h.applyAuthorizationForPlanComment(t.Context(), installClient, "octocat/hello-world", 1, database, tt.reader))
 		})
 	}
 }

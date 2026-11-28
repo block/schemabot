@@ -2990,6 +2990,13 @@ type Task struct {
 	// DDLAction is "alter", "create", or "drop".
 	DDLAction string
 
+	// PlanChangeOrdinal is the 1-based position, among the plan's changes to
+	// this task's namespace and table, of the change the task runs. It tells
+	// apart changes that carry the same statement, whose engine metadata can
+	// differ. 0 means unknown, as on a task written by an older binary; the
+	// drive then matches the task to its change by statement.
+	PlanChangeOrdinal int
+
 	// Progress tracking (for copy-based schema changes)
 	RowsCopied      int64 // Rows copied so far
 	RowsTotal       int64 // Total rows to copy
@@ -3113,13 +3120,31 @@ type ApplyComment struct {
 	// member's cutover, including an apply whose cutover request names none.
 	PostedCutoverOperationID *int64
 
-	// PendingFreezeCommentID records the GitHub comment ID of a progress
-	// comment this row's comment superseded whose frozen rendering has not yet
-	// landed on GitHub. It is written in the same upsert that tracks the
-	// successor, so a failed freeze edit (or a pod dying before it) leaves a
-	// durable marker any later observer can reconcile; it is cleared once the
-	// freeze lands. Nil means no freeze is owed.
+	// PendingFreezeCommentID is the owed-freeze marker an earlier release
+	// wrote: the GitHub comment ID of a superseded progress comment whose
+	// frozen rendering had not landed. That release did not store the frozen
+	// body, so finishing its marker reads the comment from GitHub to tell
+	// whether the freeze already landed. The current release never sets it;
+	// it records owed freezes in FreezeCommentID instead. The column is being
+	// retired; docs/storage-schema.md ("Retiring a column") has its plan.
 	PendingFreezeCommentID *int64
+
+	// FreezeCommentID records the GitHub comment ID of a progress comment
+	// this row's comment superseded whose frozen rendering has not yet landed
+	// on GitHub. It is written in the same upsert that tracks the successor,
+	// so a failed freeze edit (or a pod dying before it) leaves a durable
+	// marker any later observer can reconcile; it is cleared, together with
+	// FrozenBody, once the freeze lands. Nil means no freeze is owed. It is a
+	// separate column from PendingFreezeCommentID so a release that predates
+	// stored frozen bodies never acts on a freeze this release owes.
+	FreezeCommentID *int64
+
+	// FrozenBody is the frozen rendering owed to FreezeCommentID, stored
+	// before the GitHub edit is attempted. A retry sends this body again
+	// instead of reading the comment back, so retrying is idempotent whether
+	// or not an earlier edit landed. Nil means the body has not been rendered
+	// yet, which also means no edit for this freeze has been attempted.
+	FrozenBody *string
 
 	// EditCount tracks how many times this comment was edited.
 	EditCount int

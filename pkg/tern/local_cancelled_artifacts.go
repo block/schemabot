@@ -22,7 +22,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -41,6 +43,25 @@ const cancelledArtifactReleaseTimeout = 10 * time.Minute
 type namespaceArtifacts struct {
 	task   *storage.Task
 	tables []string
+	// addedConstraints names, per table, the constraints the apply's
+	// completed tasks added.
+	addedConstraints map[string][]string
+	// validatedConstraints names, per table, the constraints the apply's plan
+	// validates in a step of its own.
+	validatedConstraints map[string][]string
+	// droppedConstraints names, per table, the constraints the apply's plan
+	// drops that no earlier step of the plan added: rules the table had.
+	droppedConstraints map[string][]string
+	// plannedConstraints names, per table, the constraints the apply's plan
+	// adds, whether or not the step ran.
+	plannedConstraints map[string][]string
+	// unreadTables names the tables with a statement the release could not
+	// read, on which it removes no constraint.
+	unreadTables []string
+	// heldConstraints says, per table and constraint, why the release keeps a
+	// constraint the apply's completed tasks added: the table's plan drops a
+	// rule the table had, or has a statement the release could not read.
+	heldConstraints map[string]map[string]string
 }
 
 // releaseCancelledArtifacts reclaims the artifacts the cancelled apply left on
@@ -52,17 +73,127 @@ type namespaceArtifacts struct {
 // leftover artifacts are inert disk where an undeliverable cancel is a wedged
 // pull request.
 func (c *LocalClient) releaseCancelledArtifacts(ctx context.Context, eng engine.Engine, apply *storage.Apply, tasks []*storage.Task) error {
+	return c.releaseArtifacts(ctx, eng, apply, tasks, cancelledRelease)
+}
+
+// artifactRelease is one way a schema change can stop short with its
+// artifacts on the target: the engine capability that reclaims them, and the
+// word the logs use for how the change ended.
+type artifactRelease struct {
+	outcome string
+	release func(context.Context, engine.Engine, *engine.ReleaseArtifactsRequest) (bool, *engine.ReleaseArtifactsResult, error)
+}
+
+var (
+	cancelledRelease = artifactRelease{outcome: "cancelled", release: engine.ReleaseCancelledArtifacts}
+	failedRelease    = artifactRelease{outcome: "failed", release: engine.ReleaseFailedArtifacts}
+)
+
+// releaseFailedApplyArtifacts removes the constraints an apply that failed for
+// good added to failedTask's table and left there: the apply ends, so nothing
+// will reach the step that removes them, and they go on checking the
+// application's writes. Only the failed task's table is in scope, since a
+// sequential drive starts a table's statements only after the ones before
+// them finished. A release that does not complete is logged to the server log
+// and the apply log and does not change the apply's outcome.
+func (c *LocalClient) releaseFailedApplyArtifacts(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, failedTask *storage.Task) {
+	if failedTask == nil || !state.IsState(failedTask.State, state.Task.Failed) {
+		return
+	}
+	eng := c.getEngine()
+	if _, ok := eng.(engine.FailedArtifactReleaser); !ok {
+		// An engine without the capability adds no constraint a failure strands,
+		// and keeps a failed apply's row copy for its resume.
+		c.logger.Debug("failed schema change leaves nothing this engine releases",
+			append(apply.LogAttrs(), "engine_type", c.config.Type)...)
+		return
+	}
+	history, err := c.taskHistory(ctx, apply, tasks)
+	if err != nil {
+		// A constraint is dropped only on proof the apply added it, and the
+		// proof is a completed step a resumed drive may not carry. Without the
+		// stored steps the release cannot tell the apply's constraints from the
+		// table's own, so it keeps every one.
+		c.logSkippedArtifactRelease(ctx, apply, failedRelease, err)
+		return
+	}
+	var sameTable []*storage.Task
+	for _, task := range history {
+		if task != nil && sameTaskTable(task, failedTask) {
+			sameTable = append(sameTable, task)
+		}
+	}
+	if err := c.releaseArtifacts(ctx, eng, apply, sameTable, failedRelease); err != nil {
+		c.logSkippedArtifactRelease(ctx, apply, failedRelease, err)
+	}
+}
+
+// taskHistory returns every task the apply stored, with the drive's own
+// copies in place of the stored ones they update. A resumed drive carries only
+// the tasks it still has to weigh, and the completed steps it leaves out are
+// what prove the apply added a constraint, so a history storage cannot read
+// is an error rather than the drive's copies alone.
+func (c *LocalClient) taskHistory(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) ([]*storage.Task, error) {
+	stored, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("read the stored tasks of apply %s: %w", apply.ApplyIdentifier, errors.Join(errTaskHistoryUnread, err))
+	}
+	current := make(map[string]*storage.Task, len(tasks))
+	for _, task := range tasks {
+		if task != nil && task.TaskIdentifier != "" {
+			current[task.TaskIdentifier] = task
+		}
+	}
+	history := make([]*storage.Task, 0, len(stored)+len(tasks))
+	seen := make(map[*storage.Task]bool, len(tasks))
+	for _, task := range stored {
+		if task == nil {
+			continue
+		}
+		if mine, ok := current[task.TaskIdentifier]; ok {
+			task = mine
+			seen[mine] = true
+		}
+		history = append(history, task)
+	}
+	for _, task := range tasks {
+		if task != nil && !seen[task] {
+			history = append(history, task)
+		}
+	}
+	return history, nil
+}
+
+// errTaskHistoryUnread marks a release that could not read the apply's stored
+// tasks, and so could not prove which constraints the apply added.
+var errTaskHistoryUnread = errors.New("the apply's task history could not be read")
+
+// sameTaskTable reports whether two tasks change the same table of the same
+// schema, within the same apply operation.
+func sameTaskTable(a, b *storage.Task) bool {
+	if a.Namespace != b.Namespace || a.TableName != b.TableName {
+		return false
+	}
+	if a.ApplyOperationID == nil || b.ApplyOperationID == nil {
+		return a.ApplyOperationID == nil && b.ApplyOperationID == nil
+	}
+	return *a.ApplyOperationID == *b.ApplyOperationID
+}
+
+// releaseArtifacts reclaims what a stopped apply left on the target through
+// kind's engine capability, under an exclusive hold on that target.
+func (c *LocalClient) releaseArtifacts(ctx context.Context, eng engine.Engine, apply *storage.Apply, tasks []*storage.Task, kind artifactRelease) error {
 	if eng == nil {
 		return fmt.Errorf("no engine configured for type: %s", c.config.Type)
 	}
 	if apply == nil {
-		return fmt.Errorf("apply is required to reclaim cancelled schema change artifacts")
+		return fmt.Errorf("apply is required to reclaim %s schema change artifacts", kind.outcome)
 	}
 
 	byNamespace := c.cancelledArtifactTables(apply, tasks)
 	if len(byNamespace) == 0 {
-		c.logger.Debug("cancelled schema change names no tables, so it left no artifacts to reclaim",
-			apply.LogAttrs()...)
+		c.logger.Debug("schema change names no tables, so it left no artifacts to reclaim",
+			append(apply.LogAttrs(), "outcome", kind.outcome)...)
 		return nil
 	}
 
@@ -72,10 +203,10 @@ func (c *LocalClient) releaseCancelledArtifacts(ctx context.Context, eng engine.
 	err := c.storage.Applies().WithExclusiveTarget(releaseCtx, apply, func(ctx context.Context) error {
 		reclaimedAny := false
 		for _, namespace := range slices.Sorted(maps.Keys(byNamespace)) {
-			reclaimed, err := c.releaseNamespaceArtifacts(ctx, eng, apply, namespace, byNamespace[namespace])
+			reclaimed, err := c.releaseNamespaceArtifacts(ctx, eng, apply, namespace, byNamespace[namespace], kind)
 			reclaimedAny = reclaimedAny || reclaimed
 			if err != nil {
-				return &artifactReleaseError{namespace: namespace, reclaimedAny: reclaimedAny, err: err}
+				return &artifactReleaseError{outcome: kind.outcome, namespace: namespace, reclaimedAny: reclaimedAny, err: err}
 			}
 		}
 		return nil
@@ -100,13 +231,14 @@ func releaseOutranItsHold(releaseCtx context.Context, err error) bool {
 // different words for an operator: "your copy is still where it was" is only
 // true when nothing moved.
 type artifactReleaseError struct {
+	outcome      string
 	namespace    string
 	reclaimedAny bool
 	err          error
 }
 
 func (e *artifactReleaseError) Error() string {
-	return fmt.Sprintf("reclaim cancelled schema change artifacts in %s: %v", e.namespace, e.err)
+	return fmt.Sprintf("reclaim %s schema change artifacts in %s: %v", e.outcome, e.namespace, e.err)
 }
 
 func (e *artifactReleaseError) Unwrap() error { return e.err }
@@ -115,46 +247,101 @@ func (e *artifactReleaseError) Unwrap() error { return e.err }
 // its data went, so an operator can answer "where did my copy go" from the pull
 // request timeline rather than a server-log dig. It reports whether anything
 // was reclaimed, including by a release that then failed.
-func (c *LocalClient) releaseNamespaceArtifacts(ctx context.Context, eng engine.Engine, apply *storage.Apply, namespace string, artifacts *namespaceArtifacts) (bool, error) {
+func (c *LocalClient) releaseNamespaceArtifacts(ctx context.Context, eng engine.Engine, apply *storage.Apply, namespace string, artifacts *namespaceArtifacts, kind artifactRelease) (bool, error) {
 	creds, err := c.credentialsForTask(artifacts.task)
 	if err != nil {
 		return false, fmt.Errorf("resolve credentials to reclaim artifacts in %s: %w", namespace, err)
 	}
 
-	supported, result, err := engine.ReleaseCancelledArtifacts(ctx, eng, &engine.ReleaseArtifactsRequest{
-		Database:    namespace,
-		Tables:      artifacts.tables,
-		Credentials: creds,
+	// The engine reaches the tables in the target's own schema, which a schema
+	// override can name differently from the namespace the tasks record.
+	physical, err := c.physicalNamespace(namespace)
+	if err != nil {
+		return false, fmt.Errorf("resolve the schema to reclaim artifacts in %s: %w", namespace, err)
+	}
+	supported, result, err := kind.release(ctx, eng, &engine.ReleaseArtifactsRequest{
+		Database:             physical,
+		Tables:               artifacts.tables,
+		Credentials:          creds,
+		AddedConstraints:     artifacts.addedConstraints,
+		ValidatedConstraints: artifacts.validatedConstraints,
 	})
 	if !supported {
-		// The engine's unfinished work lives in the service it drives, which
-		// released it when the cancel reached it. There is nothing local.
-		c.logger.Debug("engine leaves no artifacts on the target, so a cancel reclaims nothing",
-			append(apply.LogAttrs(), "engine", eng.Name(), "namespace", namespace)...)
+		// The engine leaves nothing on the target that this way of stopping
+		// strands: its unfinished work lives in the service it drives, or a
+		// later apply resumes from it.
+		c.logger.Debug("engine leaves no artifacts on the target to reclaim for this outcome",
+			append(apply.LogAttrs(), "engine", eng.Name(), "namespace", namespace, "outcome", kind.outcome)...)
 		return false, nil
 	}
 	// What the release did is recorded before its error is returned: a release
 	// that fails part-way has still moved the copy, and the entry naming where
 	// it went is what an operator follows to recover it.
-	reclaimed := c.recordReleaseResult(ctx, apply, namespace, result)
+	reclaimed := c.recordReleaseResult(ctx, apply, namespace, kind.outcome, result, heldByQualifiedTable(physical, artifacts.heldConstraints))
 	if err != nil {
 		return reclaimed, err
 	}
 	if !reclaimed {
-		c.logger.Info("cancelled schema change left no artifacts on the target",
-			append(apply.LogAttrs(), "namespace", namespace, "tables", artifacts.tables)...)
+		c.logger.Info("schema change left no artifacts on the target",
+			append(apply.LogAttrs(), "namespace", namespace, "outcome", kind.outcome, "tables", artifacts.tables)...)
 	}
 	return reclaimed, nil
 }
 
+// heldByQualifiedTable keys held by the schema-qualified table name the
+// engine reports each constraint under, in the target's physical schema.
+func heldByQualifiedTable(physical string, held map[string]map[string]string) map[string]map[string]string {
+	if len(held) == 0 {
+		return nil
+	}
+	qualified := make(map[string]map[string]string, len(held))
+	for table, constraints := range held {
+		qualified[physical+"."+table] = constraints
+	}
+	return qualified
+}
+
 // recordReleaseResult writes what one schema's release reclaimed and retained to
 // the server log and the apply log, and reports whether it reclaimed anything.
-func (c *LocalClient) recordReleaseResult(ctx context.Context, apply *storage.Apply, namespace string, result *engine.ReleaseArtifactsResult) bool {
+// held says why the release kept a constraint the apply added, per
+// schema-qualified table and constraint.
+func (c *LocalClient) recordReleaseResult(ctx context.Context, apply *storage.Apply, namespace, outcome string, result *engine.ReleaseArtifactsResult, held map[string]map[string]string) bool {
 	if result == nil {
 		return false
 	}
-	reclaimed := len(result.Preserved) > 0 || len(result.Discarded) > 0
-	if reclaimed {
+	for _, constraint := range result.RemovedConstraints {
+		c.logger.Info("removed a constraint the schema change added to a live table",
+			append(apply.LogAttrs(), "namespace", namespace, "outcome", outcome, "table", constraint.Table, "constraint", constraint.Name)...)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
+			removedConstraintMessage(constraint, outcome), "", "")
+	}
+	for _, constraint := range result.RemainingConstraints {
+		// The constraint goes on checking the application's writes, which the
+		// operator cannot know unless something says so.
+		c.logger.Warn("a constraint the schema change added is still on a live table",
+			append(apply.LogAttrs(), "namespace", namespace, "outcome", outcome, "table", constraint.Table, "constraint", constraint.Name)...)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
+			remainingConstraintMessage(constraint, outcome), "", "")
+	}
+	for _, constraint := range result.PreexistingConstraints {
+		if heldBecause, ok := held[constraint.Table][constraint.Name]; ok {
+			// The schema change added it, but the release kept it on purpose,
+			// so the log must not say the change did not add it.
+			c.logger.Warn("a constraint the schema change added is still on a live table, kept because its table's rules could not be released safely",
+				append(apply.LogAttrs(), "namespace", namespace, "outcome", outcome, "table", constraint.Table, "constraint", constraint.Name, "held_because", heldBecause)...)
+			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
+				heldConstraintMessage(constraint, outcome, heldBecause), "", "")
+			continue
+		}
+		// The schema change did not add it and the release does not remove
+		// it, but the operator may expect the table back as it was.
+		c.logger.Warn("a constraint the schema change worked with, but did not add, is still on a live table",
+			append(apply.LogAttrs(), "namespace", namespace, "outcome", outcome, "table", constraint.Table, "constraint", constraint.Name)...)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
+			preexistingConstraintMessage(constraint, outcome), "", "")
+	}
+	reclaimed := len(result.Preserved) > 0 || len(result.Discarded) > 0 || len(result.RemovedConstraints) > 0
+	if len(result.Preserved) > 0 || len(result.Discarded) > 0 {
 		c.logger.Info("reclaimed cancelled schema change artifacts",
 			append(apply.LogAttrs(),
 				"namespace", namespace,
@@ -178,6 +365,38 @@ func (c *LocalClient) recordReleaseResult(ctx context.Context, apply *storage.Ap
 			retainedArtifactsMessage(result), "", "")
 	}
 	return reclaimed
+}
+
+// removedConstraintMessage describes, for the apply log, a constraint the
+// release dropped from a live table.
+func removedConstraintMessage(constraint engine.EngineConstraint, outcome string) string {
+	return fmt.Sprintf("Removed constraint %s from %s. The %s schema change added it, and it %s",
+		constraint.Name, constraint.Table, outcome, constraint.Effect)
+}
+
+// remainingConstraintMessage describes, for the apply log, a constraint the
+// release could not drop, what it does to writes, and the statement that
+// drops it.
+func remainingConstraintMessage(constraint engine.EngineConstraint, outcome string) string {
+	return fmt.Sprintf("Constraint %s is still on %s. The %s schema change added it, and it %s until it is dropped. Drop it with: %s",
+		constraint.Name, constraint.Table, outcome, constraint.Effect, constraint.Removal)
+}
+
+// preexistingConstraintMessage describes, for the apply log, a constraint the
+// release left because the schema change is not known to have added it, what
+// it does to writes, and the statement that drops it.
+func preexistingConstraintMessage(constraint engine.EngineConstraint, outcome string) string {
+	return fmt.Sprintf("Constraint %s is still on %s. No finished step of the %s schema change added it, so SchemaBot left it, and it %s until it is dropped. Drop it with: %s",
+		constraint.Name, constraint.Table, outcome, constraint.Effect, constraint.Removal)
+}
+
+// heldConstraintMessage describes, for the apply log, a constraint the
+// schema change added that the release kept because heldBecause: removing it
+// could leave the table with neither the rule its plan drops nor the one that
+// replaces it.
+func heldConstraintMessage(constraint engine.EngineConstraint, outcome, heldBecause string) string {
+	return fmt.Sprintf("Constraint %s is still on %s. The %s schema change added it, but %s, so SchemaBot kept every constraint on the table rather than risk leaving it with no rule. It %s until it is dropped. Drop it with: %s",
+		constraint.Name, constraint.Table, outcome, heldBecause, constraint.Effect, constraint.Removal)
 }
 
 // releasedArtifactsMessage describes a release for the apply log, naming where
@@ -243,31 +462,174 @@ func (c *LocalClient) cancelledArtifactTables(apply *storage.Apply, tasks []*sto
 		if !slices.Contains(entry.tables, task.TableName) {
 			entry.tables = append(entry.tables, task.TableName)
 		}
+		constraints := c.taskConstraintChanges(apply, task)
+		entry.addedConstraints = appendTableNames(entry.addedConstraints, task.TableName, constraints.added)
+		entry.validatedConstraints = appendTableNames(entry.validatedConstraints, task.TableName, constraints.validated)
+		entry.droppedConstraints = appendTableNames(entry.droppedConstraints, task.TableName,
+			withoutNames(constraints.dropped, entry.plannedConstraints[task.TableName]))
+		entry.plannedConstraints = appendTableNames(entry.plannedConstraints, task.TableName, constraints.planned)
+		if constraints.unread && !slices.Contains(entry.unreadTables, task.TableName) {
+			entry.unreadTables = append(entry.unreadTables, task.TableName)
+		}
+	}
+	for _, entry := range byNamespace {
+		c.withholdReplacedConstraints(apply, entry)
 	}
 	return byNamespace
+}
+
+// withholdReplacedConstraints takes every constraint on a table whose plan
+// drops a constraint the table had out of the ones the release may drop. A
+// constraint an earlier step of the plan adds and a later one drops, such as
+// a SET NOT NULL helper, is the plan's own and does not count. A replacement
+// drops the old rule and adds the new one NOT VALID, under the same name or
+// a new one, in one statement or in steps of their own. Once the old rule is
+// gone, the unvalidated rule a failed or cancelled validation leaves is the
+// only one checking the table's writes, and dropping it would leave the
+// table with neither. The release cannot tell which dropped constraint a new
+// one replaces, so it keeps them all. A table with a statement the release
+// cannot read is treated the same way, since that statement might drop one.
+func (c *LocalClient) withholdReplacedConstraints(apply *storage.Apply, entry *namespaceArtifacts) {
+	for table := range entry.droppedConstraints {
+		c.keepTableConstraints(apply, entry, table, "a release keeps the constraints on a table whose schema change drops one: an unvalidated one may be the only rule left on the table",
+			"its plan also drops a rule the table had")
+	}
+	for _, table := range entry.unreadTables {
+		c.keepTableConstraints(apply, entry, table, "a release keeps the constraints on a table it cannot read every statement of: an unread one may have dropped the rule an unvalidated one replaces",
+			"SchemaBot could not read every statement of its plan")
+	}
+}
+
+// keepTableConstraints takes table out of the constraints the release may
+// drop, logging each constraint it keeps. Each one the apply added is held
+// for heldBecause, which the apply log gives as the reason it is still on the
+// table. Only the added names authorize a drop, so the validated names stay:
+// the release still finds those constraints and reports each one it keeps.
+func (c *LocalClient) keepTableConstraints(apply *storage.Apply, entry *namespaceArtifacts, table, reason, heldBecause string) {
+	kept := slices.Concat(entry.addedConstraints[table], entry.validatedConstraints[table])
+	slices.Sort(kept)
+	for _, name := range slices.Compact(kept) {
+		c.logger.Info(reason, append(apply.LogAttrs(), "namespace", entry.task.Namespace, "table", table, "constraint", name)...)
+	}
+	for _, name := range entry.addedConstraints[table] {
+		if entry.heldConstraints == nil {
+			entry.heldConstraints = map[string]map[string]string{}
+		}
+		if entry.heldConstraints[table] == nil {
+			entry.heldConstraints[table] = map[string]string{}
+		}
+		if _, held := entry.heldConstraints[table][name]; !held {
+			entry.heldConstraints[table][name] = heldBecause
+		}
+	}
+	delete(entry.addedConstraints, table)
+}
+
+// appendTableNames adds names to table's entry in byTable, creating the map
+// when it is nil and names is not empty.
+func appendTableNames(byTable map[string][]string, table string, names []string) map[string][]string {
+	if len(names) == 0 {
+		return byTable
+	}
+	if byTable == nil {
+		byTable = map[string][]string{}
+	}
+	byTable[table] = append(byTable[table], names...)
+	return byTable
+}
+
+// withoutNames returns names with every entry of drop removed.
+func withoutNames(names, drop []string) []string {
+	return slices.DeleteFunc(slices.Clone(names), func(name string) bool {
+		return slices.Contains(drop, name)
+	})
+}
+
+// constraintChanges is what one task's statement does to its table's
+// constraints, as far as a release needs to know.
+type constraintChanges struct {
+	// added names the constraints the statement adds, when the task
+	// completed.
+	added []string
+	// planned names the constraints the statement adds, whether or not the
+	// task ran.
+	planned []string
+	// validated names the constraints the statement validates in a step of
+	// its own, whether or not the task ran: the plan's intent is what makes
+	// an unvalidated constraint of that name an unfinished step.
+	validated []string
+	// dropped names the constraints the statement drops, whether or not the
+	// task ran: a plan that drops a rule and adds one replaces it, whichever
+	// step a failure or cancel stops at.
+	dropped []string
+	// unread is set when the statement could not be read.
+	unread bool
+}
+
+// taskConstraintChanges reads which constraints a task's statement adds,
+// validates and drops. Only a completed task is known to have committed its
+// statement: one that failed, for example on a constraint someone else added
+// under the same name, added nothing, and neither did one that never left
+// pending. A constraint of that name is not the apply's to remove. A
+// statement that cannot be read marks its table unread, and the release then
+// removes no constraint there: it cannot tell whether the statement dropped
+// the rule an unvalidated one replaces.
+func (c *LocalClient) taskConstraintChanges(apply *storage.Apply, task *storage.Task) constraintChanges {
+	parser, err := c.statementParser()
+	if err != nil {
+		c.logger.Warn("a release cannot read which constraints the task added, so it removes none of them",
+			append(task.LogAttrs(), "database", apply.Database, "error", err)...)
+		return constraintChanges{unread: true}
+	}
+	changes, err := parser.ObjectChanges(task.DDL)
+	if err != nil {
+		c.logger.Warn("a release cannot read which constraints the task added, so it removes none of them",
+			append(task.LogAttrs(), "database", apply.Database, "error", err)...)
+		return constraintChanges{unread: true}
+	}
+	result := constraintChanges{
+		planned:   constraintNames(changes.Added),
+		validated: constraintNames(changes.Validated),
+		dropped:   constraintNames(changes.Dropped),
+	}
+	if state.IsState(task.State, state.Task.Completed) {
+		result.added = constraintNames(changes.Added)
+	}
+	return result
+}
+
+// constraintNames names the constraints among objects.
+func constraintNames(objects []ddl.SchemaObject) []string {
+	var names []string
+	for _, object := range objects {
+		if object.Kind == ddl.ObjectConstraint {
+			names = append(names, object.Name)
+		}
+	}
+	return names
 }
 
 // logSkippedArtifactRelease records that a cancel left artifacts on the target,
 // on both the server log and the apply log. An operator seeing a cancelled
 // schema change needs to know a copy survived it, and why.
-func (c *LocalClient) logSkippedArtifactRelease(ctx context.Context, apply *storage.Apply, err error) {
+func (c *LocalClient) logSkippedArtifactRelease(ctx context.Context, apply *storage.Apply, kind artifactRelease, err error) {
 	reason := skippedArtifactReleaseReason(err)
 
 	var stopped *artifactReleaseError
 	if errors.As(err, &stopped) && stopped.reclaimedAny {
 		// Part of the release landed, and the entries before this one say where
 		// it went. Saying the copy was left in place would contradict them.
-		c.logger.Warn("cancelled schema change artifact release stopped part-way; the rest was left on the target",
-			append(apply.LogAttrs(), "namespace", stopped.namespace, "reason", reason, "error", err)...)
+		c.logger.Warn("schema change artifact release stopped part-way; the rest was left on the target",
+			append(apply.LogAttrs(), "namespace", stopped.namespace, "outcome", kind.outcome, "reason", reason, "error", err)...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
-			fmt.Sprintf("Reclaiming the cancelled schema change's artifacts stopped in %s because %s. The entries before this one name what was reclaimed; everything else was left on the target", stopped.namespace, reason), "", "")
+			fmt.Sprintf("Reclaiming the %s schema change's artifacts stopped in %s because %s. The entries before this one name what was reclaimed; everything else was left on the target", kind.outcome, stopped.namespace, reason), "", "")
 		return
 	}
 
-	c.logger.Warn("cancelled schema change left its artifacts on the target",
-		append(apply.LogAttrs(), "reason", reason, "error", err)...)
+	c.logger.Warn("schema change left its artifacts on the target",
+		append(apply.LogAttrs(), "outcome", kind.outcome, "reason", reason, "error", err)...)
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
-		fmt.Sprintf("The cancelled schema change's copy was left on the target because %s", reason), "", "")
+		fmt.Sprintf("What the %s schema change left on the target was not reclaimed because %s", kind.outcome, reason), "", "")
 }
 
 // skippedArtifactReleaseReason states why a release left artifacts behind, in
@@ -276,6 +638,8 @@ func skippedArtifactReleaseReason(err error) string {
 	switch {
 	case errors.Is(err, storage.ErrActiveApplyExists):
 		return "another schema change is running against the same target and may own the copy"
+	case errors.Is(err, errTaskHistoryUnread):
+		return "SchemaBot could not read the apply's task history, so it could not prove which constraints the apply added"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "the release ran past the time it is allowed to hold the target, so it gave the target back"
 	default:
