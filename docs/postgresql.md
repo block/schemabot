@@ -1066,6 +1066,7 @@ applying the same plan again meets the same refusal.
 | A new table's name is taken, its schema is missing, or its shape is refused | Refused. See [Greenfield tables](#greenfield-tables) |
 | A later step of a new table's set failed | Refused. The earlier steps stay committed. Follow the failure's fix, or plan again |
 | An index build failed | See [When a build fails](#when-a-build-fails) |
+| A column add on a table that has used up PostgreSQL's 1,600 column numbers. Dropped columns keep theirs until the table is rebuilt | Refused (SQLSTATE `54011`). Copy the table into a new one to reclaim them, since `VACUUM FULL` does not, then apply again |
 | Any other failure, such as a dropped connection | Retryable. The message is sanitized; connection and server details stay in the server logs |
 
 **The 5-minute ceiling** applies to every apply except an index build or a

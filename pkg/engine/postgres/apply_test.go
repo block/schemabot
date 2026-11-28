@@ -1794,6 +1794,19 @@ func TestClassifyApplyFailureDuplicateKey(t *testing.T) {
 	assert.NotContains(t, failure.detail, "ada@example.com")
 }
 
+// A column add on a table at PostgreSQL's column limit meets the same limit
+// on every retry, so the apply ends at once and names how to reclaim the
+// column numbers that dropped columns still hold.
+func TestClassifyApplyFailureTooManyColumns(t *testing.T) {
+	err := fmt.Errorf("execute: %w", &pgconn.PgError{Code: "54011", Message: "tables can have at most 1600 columns"})
+
+	failure := classifyApplyFailure(err, "events", nil)
+
+	assert.False(t, failure.retryable, "the table stays at the limit until someone rebuilds it")
+	assert.Equal(t, `"events" has reached PostgreSQL's limit of 1,600 columns, which counts dropped columns until the table is rebuilt (SQLSTATE 54011); `+
+		`copy the table into a new one to reclaim them (VACUUM FULL does not), then apply again`, failure.detail)
+}
+
 // Only a failure that a retry cannot clear ends the apply at once. Rows that
 // break a validated constraint stay broken until someone changes them, so
 // the apply fails for good and says to apply again. A lost lock budget and a

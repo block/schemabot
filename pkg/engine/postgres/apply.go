@@ -711,6 +711,11 @@ func classifyApplyFailure(err error, table string, validates *schemadiff.Constra
 	if detail, ok := duplicateKeyDetail(err, table); ok {
 		return applyFailure{detail: detail}
 	}
+	// A table at the column limit stays there until someone rebuilds it, so
+	// every retry of a column add meets the same limit.
+	if detail, ok := tooManyColumnsDetail(err, table); ok {
+		return applyFailure{detail: detail}
+	}
 	// An object that depends on what the statement drops keeps depending on
 	// it until someone changes that object, so a retry meets the same
 	// refusal.
@@ -944,6 +949,27 @@ func duplicateKeyDetail(err error, table string) (string, bool) {
 	return sanitizeReasonText(fmt.Sprintf(
 		"existing rows in %q hold duplicate values that unique key %q does not allow; remove or merge the duplicates, then apply again",
 		table, pgErr.ConstraintName)), true
+}
+
+// sqlstateTooManyColumns is the SQLSTATE of a statement that would give a
+// table more columns than PostgreSQL allows.
+const sqlstateTooManyColumns = "54011"
+
+// tooManyColumnsDetail names a table that has reached PostgreSQL's column
+// limit. The limit counts every column number the table has ever used, and a
+// dropped column keeps its number until the table is rebuilt, so a table
+// whose live columns are far under the limit can still be at it. The plan
+// builds the desired schema from scratch, where no dropped columns exist, so
+// the plan does not meet the limit and only the live table does.
+func tooManyColumnsDetail(err error, table string) (string, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateTooManyColumns {
+		return "", false
+	}
+	return sanitizeReasonText(fmt.Sprintf(
+		"%q has reached PostgreSQL's limit of 1,600 columns, which counts dropped columns until the table is rebuilt (SQLSTATE %s); "+
+			"copy the table into a new one to reclaim them (VACUUM FULL does not), then apply again",
+		table, sqlstateTooManyColumns)), true
 }
 
 // invalidIndexAdvice renders the operator-facing cause and next step for an
