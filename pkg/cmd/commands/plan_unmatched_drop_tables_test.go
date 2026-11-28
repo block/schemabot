@@ -344,6 +344,23 @@ func TestWritePlanBody_RolloutReportsOnlyEntriesNoTargetMatched(t *testing.T) {
 	})
 }
 
+// Staging still has _jobs_old, so its plan reports only the typo _jobs_olds,
+// while no target of the production rollout has either table. The production
+// section reports _jobs_olds and not _jobs_old: telling the reader to remove
+// _jobs_old would drop the entry staging's drop depends on.
+func TestOutputMultiEnvPlanResult_RolloutListNarrowedToEntriesEveryEnvironmentReports(t *testing.T) {
+	staging := &apitypes.PlanResponse{Engine: "spirit", UnmatchedDropTables: []string{"_jobs_olds"}}
+	production := unmatchedDropTablesRollout()
+	production.Rollout.UnmatchedDropTables = []string{"_jobs_old", "_jobs_olds"}
+
+	out := stripAnsi(captureStdout(func() {
+		outputMultiEnvPlanResult(map[string]*apitypes.PlanResponse{"staging": staging, "production": production}, "orders", "orders")
+	}))
+
+	assert.NotContains(t, out, `entry "_jobs_old" names no table`, out)
+	assert.Contains(t, out, cliUnmatchedDropLine, out)
+}
+
 // Apply against a rollout with nothing to reconcile on any target returns
 // before the plan body, so it reports the entries no target matched itself:
 // _jobs_olds, which names no table on either target, and not _jobs_old,

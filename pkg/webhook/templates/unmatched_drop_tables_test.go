@@ -185,6 +185,24 @@ func TestRenderPlanComment_RolloutReportsOnlyEntriesNoTargetMatched(t *testing.T
 	assert.Equal(t, 2, strings.Count(out, unmatchedDropLine+"\n"), "each environment's section reports the entry no target matched:\n%s", out)
 }
 
+// Staging still has _jobs_old, so its plan reports only the typo _jobs_olds,
+// while no target of the production rollout has either table. The production
+// section reports _jobs_olds and not _jobs_old: telling the reader to remove
+// _jobs_old would drop the entry staging's drop depends on.
+func TestRenderMultiEnvPlanComment_RolloutListNarrowedToEntriesEveryEnvironmentReports(t *testing.T) {
+	staging := unmatchedDropPlanData()
+	production := PlanCommentData{Database: "testapp", Environment: "production", IsMySQL: true, DeploymentDrift: unmatchedDropRolloutDrift()}
+	production.DeploymentDrift.UnmatchedDropTables = []string{"_jobs_old", "_jobs_olds"}
+
+	out := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database: "testapp", Environments: []string{"staging", "production"},
+		Plans: map[string]*PlanCommentData{"staging": &staging, "production": &production},
+	})
+
+	assert.NotContains(t, out, "entry `_jobs_old` names no table", out)
+	assert.Contains(t, out, unmatchedDropLine, out)
+}
+
 // A rollout whose list is empty, because a target could not be planned or
 // the rollup was not computed, reports nothing, whatever the primary's own
 // list says: what the other target holds is unknown.
