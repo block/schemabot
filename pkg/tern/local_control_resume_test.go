@@ -2588,3 +2588,141 @@ func TestFinalizeSequentialApplyKeepsAnObserverRegisteredDuringTerminal(t *testi
 		"the observer registered for the resume stays registered after the stopped drive settles")
 	assert.Equal(t, int32(1), stopped.terminal.Load())
 }
+
+// A running apply whose recovery cannot re-plan it is paused for operator
+// retry, with the cause on the apply. Left running, it would be re-claimed on
+// every lease lapse outside the recovery budget, so a re-plan that fails the
+// same way each time would retry forever while the apply reads as running.
+// Paused, each attempt counts against the budget, which fails the apply once
+// it runs out.
+func TestResumeApplyReplanFailurePausesForRetry(t *testing.T) {
+	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{plan: &storage.Plan{ID: 5}})
+
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
+
+	require.NoError(t, err, "the pause is the drive's outcome")
+	assert.Equal(t, state.Apply.FailedRetryable, applyStore.apply.State)
+	assert.Equal(t, "re-plan failed during recovery: re-plan failed: no engine configured for type: vitess", applyStore.apply.ErrorMessage)
+	assert.Equal(t, state.Task.FailedRetryable, tasks[0].State)
+}
+
+// replanRefusingEngine answers every re-plan with plan, or fails it with
+// planErr, and reports the deferred cutover signal as signalExists.
+type replanRefusingEngine struct {
+	engine.Engine
+	plan         *engine.PlanResult
+	planErr      error
+	signalExists bool
+}
+
+func (e *replanRefusingEngine) Name() string { return "replan-refusing" }
+
+func (e *replanRefusingEngine) Plan(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) {
+	return e.plan, e.planErr
+}
+
+func (e *replanRefusingEngine) DeferredCutoverSignalExists(context.Context, *engine.DeferredCutoverSignalRequest) (bool, error) {
+	return e.signalExists, nil
+}
+
+// A running apply whose re-plan the engine refuses permanently fails at once,
+// with the refusal on the apply. Every retry would be refused the same way, so
+// pausing it would only spend the recovery budget before the same failure.
+func TestResumeApplyPermanentReplanRefusalFailsTheApply(t *testing.T) {
+	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{plan: &storage.Plan{ID: 5}})
+	client.planetscaleEngine = &replanRefusingEngine{planErr: engine.NewPermanentError("live schema drifted from the reviewed plan")}
+
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
+
+	require.ErrorContains(t, err, "live schema drifted from the reviewed plan")
+	assert.Equal(t, state.Apply.Failed, applyStore.apply.State)
+	assert.Equal(t, "re-plan failed during recovery: re-plan failed: live schema drifted from the reviewed plan", applyStore.apply.ErrorMessage)
+	assert.Equal(t, state.Task.Failed, tasks[0].State)
+}
+
+// A running apply whose table was changed by hand since the plan was reviewed
+// fails at once: the re-plan now lists a statement no task was reviewed with,
+// and resume refuses to run unreviewed DDL. Every retry would re-plan to the
+// same drift, so the refusal does not spend the recovery budget.
+func TestResumeApplyHandDriftFailsTheApply(t *testing.T) {
+	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{plan: &storage.Plan{ID: 5}})
+	client.planetscaleEngine = &replanRefusingEngine{plan: &engine.PlanResult{
+		Changes: []engine.SchemaChange{{
+			Namespace:    "commerce",
+			TableChanges: []engine.TableChange{{Table: "users", Operation: ddl.StatementAlterTable, DDL: "ALTER TABLE `users` MODIFY COLUMN `email` int"}},
+		}},
+	}}
+
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
+
+	require.ErrorContains(t, err, "local schema has drifted from the reviewed plan")
+	assert.False(t, engine.IsRetryable(err))
+	assert.Equal(t, state.Apply.Failed, applyStore.apply.State)
+	assert.Contains(t, applyStore.apply.ErrorMessage, "resume would apply unreviewed DDL")
+	assert.Equal(t, state.Task.Failed, tasks[0].State)
+}
+
+// A deferred cutover apply whose engine cutover signal is absent, and whose
+// re-plan then fails transiently, is left waiting for cutover and the error
+// returned. Paused instead, the next claim would see a failed_retryable apply,
+// skip the signal check, and resume the remaining tasks rather than stopping
+// for manual reconciliation.
+func TestResumeApplyReplanFailureWithAbsentCutoverSignalIsLeftAsFound(t *testing.T) {
+	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{plan: &storage.Plan{ID: 5}})
+	client.planetscaleEngine = &replanRefusingEngine{planErr: errors.New("target unavailable")}
+	apply.State = state.Apply.WaitingForCutover
+	apply.SetOptions(storage.ApplyOptions{DeferCutover: true})
+	tasks[0].State = state.Task.WaitingForCutover
+
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
+
+	require.ErrorContains(t, err, "target unavailable")
+	assert.ErrorContains(t, err, "apply-recover-plan")
+	assert.Equal(t, state.Apply.WaitingForCutover, applyStore.apply.State)
+	assert.Empty(t, applyStore.apply.ErrorMessage)
+	assert.Equal(t, state.Task.WaitingForCutover, tasks[0].State)
+}
+
+// A multi-operation drive whose recovery cannot re-plan it pauses its own
+// operation row for retry and records the cause there, for the operator's
+// projection to lift onto the parent. The parent row is the operator's to
+// write and is left as found.
+func TestResumeApplyReplanFailurePausesTheLeasedOperation(t *testing.T) {
+	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{plan: &storage.Plan{ID: 5}})
+	ops := leasedOperationStore(client, apply)
+	ctx := storage.WithOperationLease(t.Context(), storage.OperationLease{ApplyID: apply.ID, OperationID: 3, Owner: "driver", Token: "op-token"})
+
+	err := client.resumeApplyWithTasks(ctx, apply, nil, tasks, nil, false, false)
+
+	require.NoError(t, err, "the pause is the drive's outcome")
+	assert.Equal(t, state.ApplyOperation.FailedRetryable, ops.ops[3].State)
+	assert.Equal(t, "re-plan failed during recovery: re-plan failed: no engine configured for type: vitess", ops.ops[3].ErrorMessage)
+	assert.Equal(t, state.Task.FailedRetryable, tasks[0].State)
+	assert.Equal(t, state.Apply.Running, applyStore.apply.State, "the operator projects the parent")
+}
+
+// An operation drive that pauses for retry with no tasks to carry the pause,
+// such as VSchema-only work, records it on its operation row. Left running,
+// the row would be re-claimed on every lease lapse outside the parent's
+// recovery budget.
+func TestMarkApplyRetryablePausesATasklessLeasedOperation(t *testing.T) {
+	client, apply, _, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{plan: &storage.Plan{ID: 5}})
+	ops := leasedOperationStore(client, apply)
+	ctx := storage.WithOperationLease(t.Context(), storage.OperationLease{ApplyID: apply.ID, OperationID: 3, Owner: "driver", Token: "op-token"})
+
+	require.NoError(t, client.markApplyRetryableWithTasks(ctx, apply, nil, "engine unavailable"))
+
+	assert.Equal(t, state.ApplyOperation.FailedRetryable, ops.ops[3].State)
+	assert.Equal(t, "engine unavailable", ops.ops[3].ErrorMessage)
+	assert.Equal(t, state.Apply.Running, applyStore.apply.State, "the operator projects the parent")
+}
+
+// leasedOperationStore wires a running operation 3 of apply into client's
+// storage, the row an operation-lease drive of the recovery fixture owns.
+func leasedOperationStore(client *LocalClient, apply *storage.Apply) *mockApplyOperationStore {
+	ops := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		3: {ID: 3, ApplyID: apply.ID, Deployment: "main", State: state.ApplyOperation.Running},
+	}}
+	client.storage.(*exactProgressStorage).applyOperations = ops
+	return ops
+}

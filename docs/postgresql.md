@@ -1302,6 +1302,20 @@ and leaves policies alone. Leaving the RLS clauses out does **not** disable
 RLS or drop policies, so a no-change plan for that file says nothing about its
 policies.
 
+**Removing RLS clauses SchemaBot applied.** If a file no longer has RLS
+clauses that it had when SchemaBot last applied it, the plan is refused while
+the table still has RLS. A revert of the change that added them hits this. The
+refusal names the table, its live settings and policies, and the two fixes:
+
+- To remove the RLS, write `ALTER TABLE <table> DISABLE ROW LEVEL SECURITY;`
+  in the file. The plan then drops the policies and disables RLS.
+- To keep it, put the clauses back.
+
+"Last applied" means the newest apply that completed in that environment and
+covered the file's namespace, however many applies to other namespaces came
+after it. An environment where SchemaBot never applied the clauses keeps the
+rule above.
+
 **Not supported yet:**
 
 - RLS changes and structural changes to an existing table in the same plan

@@ -731,6 +731,7 @@ func (c *LocalClient) replanTargetSchema(ctx context.Context, apply *storage.App
 	// plan dropped by name, so a drop the apply has not yet run still reads as
 	// owed.
 	result, err := c.planWithEngine(ctx, &ternv1.PlanRequest{
+		Environment:  apply.Environment,
 		IgnoreTables: plan.IgnoreTables(),
 		DropTables:   plan.DropTables(),
 		// Judged under the policy this apply was admitted with, so a
@@ -930,6 +931,7 @@ type replanResult struct {
 // up an apply whose tables may have completed before a stop or crash.
 func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan) (*replanResult, error) {
 	replanOut, err := c.planWithEngine(ctx, &ternv1.PlanRequest{
+		Environment:     apply.Environment,
 		IgnoreTables:    plan.IgnoreTables(),
 		DropTables:      plan.DropTables(),
 		DirectExecution: DirectExecutionPolicyProto(apply.GetOptions().DirectExecution),
@@ -1301,14 +1303,14 @@ func (c *LocalClient) verifyReplannedTaskDDL(task *storage.Task, replanned []str
 		operation: task.DDLAction,
 	})
 	if len(unreviewed) == 0 {
-		return "", false, fmt.Errorf("local schema has not drifted from the reviewed plan, but resume cannot run task %s: its reviewed DDL %q is absent from the re-plan for %s while the re-plan still lists the reviewed DDL of %s, which will not run it; resume refuses to run another task's statement in this task's place",
+		return "", false, engine.NewPermanentError("local schema has not drifted from the reviewed plan, but resume cannot run task %s: its reviewed DDL %q is absent from the re-plan for %s while the re-plan still lists the reviewed DDL of %s, which will not run it; resume refuses to run another task's statement in this task's place",
 			task.TaskIdentifier, reviewedCanon, loc, describeSiblingsThatWillNotRun(orphaned))
 	}
 	if len(siblings.pending) == 0 && len(orphaned) == 0 && len(unreviewed) == 1 {
-		return "", false, fmt.Errorf("local schema has drifted from the reviewed plan; resume would apply unreviewed DDL for %s: reviewed %q, re-planned %q",
+		return "", false, engine.NewPermanentError("local schema has drifted from the reviewed plan; resume would apply unreviewed DDL for %s: reviewed %q, re-planned %q",
 			loc, reviewedCanon, unreviewed[0])
 	}
-	return "", false, fmt.Errorf("local schema has drifted from the reviewed plan; the re-plan lists %s for %s, including %s that neither task %s nor %s was reviewed with, so resume refuses to apply unreviewed DDL: reviewed %q, unreviewed %q",
+	return "", false, engine.NewPermanentError("local schema has drifted from the reviewed plan; the re-plan lists %s for %s, including %s that neither task %s nor %s was reviewed with, so resume refuses to apply unreviewed DDL: reviewed %q, unreviewed %q",
 		countOf(len(replannedCanon), "pending statement"), loc, countOf(len(unreviewed), "statement"), task.TaskIdentifier, describePendingSiblings(siblings.pending), reviewedCanon, unreviewed)
 }
 
@@ -3136,8 +3138,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 
 	rp, err := c.replanAndFilterTasks(ctx, apply, tasks, plan)
 	if err != nil {
-		logger.Error("re-plan failed during recovery", append(apply.MutableLogAttrs(), "error", err)...)
-		return fmt.Errorf("re-plan failed during recovery for apply %s (database %s): %w", apply.ApplyIdentifier, apply.Database, err)
+		return c.pauseForReplanFailure(ctx, apply, tasks, err, deferredCutoverSignalAbsent)
 	}
 
 	activeTasks := rp.ActiveTasks
@@ -3307,6 +3308,58 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	}
 
 	return ctx.Err()
+}
+
+// pauseForReplanFailure pauses an apply whose recovery could not re-plan it.
+// The re-plan reconciles the stored tasks against the live target before any
+// engine work resumes, so without it the drive cannot tell what is left to
+// run. Returning the error with the apply still running would leave it
+// claimable on every lease lapse outside the recovery budget, so a re-plan the
+// engine refuses on every attempt would retry forever while the apply reads as
+// running. Pausing it for retry counts each attempt against the budget, which
+// fails the apply once it runs out, and records the cause on the apply where
+// the operator reads it.
+//
+// A refusal the engine reports as permanent fails the apply at once through
+// handleGroupedResumeFailure, the same settlement a grouped recovery gives its
+// re-plan refusals: every retry would refuse it again, so spending the budget
+// on it only delays the failure the operator has to act on.
+//
+// Two applies are left as found and the error returned, so the next claim
+// runs the recovery again from the state that selected it:
+//   - An apply in its revert phase: the pause rewrites every non-terminal task
+//     as failed_retryable, which erases the revert-phase task states a later
+//     recovery reattaches to the engine by.
+//   - A deferred cutover apply whose engine cutover signal is absent: the
+//     pause would move it out of waiting_for_cutover, and the next claim would
+//     then skip the signal check and resume the remaining tasks instead of
+//     stopping for manual reconciliation.
+func (c *LocalClient) pauseForReplanFailure(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, err error, deferredCutoverSignalAbsent bool) error {
+	if c.driveCancelled(ctx, apply, "while re-planning the apply for recovery") {
+		return nil
+	}
+	if revertPhaseInFlight(apply, tasks) {
+		c.logger.Error("re-plan failed during recovery of an apply in its revert phase; leaving it as found so a later recovery reattaches to the revert, and the current apply owner will exit for operator retry",
+			append(apply.MutableLogAttrs(), "error", err)...)
+		return fmt.Errorf("re-plan failed during recovery for apply %s (database %s): %w", apply.ApplyIdentifier, apply.Database, err)
+	}
+	if !engine.IsRetryable(err) {
+		c.logger.Error("re-plan refused permanently during recovery; failing the apply",
+			append(apply.MutableLogAttrs(), "error", err)...)
+		return c.handleGroupedResumeFailure(ctx, apply, tasks, fmt.Errorf("re-plan failed during recovery: %w", err))
+	}
+	if deferredCutoverSignalAbsent {
+		c.logger.Error("re-plan failed during recovery of a deferred cutover apply whose engine cutover signal is absent; leaving it as found so the next claim checks the signal again, and the current apply owner will exit for operator retry",
+			append(apply.MutableLogAttrs(), "error", err)...)
+		return fmt.Errorf("re-plan failed during recovery for deferred cutover apply %s (database %s): %w", apply.ApplyIdentifier, apply.Database, err)
+	}
+	c.logger.Error("re-plan failed during recovery; pausing the apply for operator retry",
+		append(apply.MutableLogAttrs(), "error", err)...)
+	if pauseErr := c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("re-plan failed during recovery: %v", err)); pauseErr != nil {
+		return fmt.Errorf("pause apply %s (database %s) after re-plan failed during recovery (%w): %w",
+			apply.ApplyIdentifier, apply.Database, err, pauseErr)
+	}
+	return nil
 }
 
 // handleGroupedResumeFailure settles a grouped resume the engine refused. A

@@ -182,6 +182,21 @@ column the change makes `NOT NULL`). Any failure SchemaBot does not recognize as
 one of these keeps its retry budget. That includes a missing grant found by
 Spirit's own privilege check before a copy, which Spirit reports without a code.
 
+A recovery that cannot re-plan the apply against the live target pauses it as
+`failed_retryable` with the cause. If the re-plan fails the same way every time,
+the apply uses up its budget and fails, instead of reading as `running`
+indefinitely. A re-plan the engine refuses permanently, such as live schema that
+drifted from the reviewed plan, fails the apply at once.
+
+Two applies are left in their current state instead, and the next claim runs the
+recovery again:
+
+- An apply in its revert phase. A pause would erase the task states the next
+  recovery uses to reattach to the revert.
+- A deferred cutover apply whose engine cutover signal is gone. A pause would
+  skip the signal check on the next claim, so remaining work would resume
+  instead of stopping for manual reconciliation.
+
 A clean shutdown is not one of these failures. A process that stops on purpose
 hands its claims back and leaves the apply active, so a peer driver resumes it
 without the apply ever passing through `failed_retryable` or spending budget.

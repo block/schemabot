@@ -3228,7 +3228,7 @@ func (s *stubPlanByIDStore) GetByID(context.Context, int64) (*storage.Plan, erro
 
 // TestMarkOperationFromOwnResult_TasklessVSchemaOnlyKeepsDriveOutcome verifies
 // that a task-less VSchema-only work operation is reported as already written
-// whenever the drive left it terminal. Such an operation has no task rows to
+// whenever the drive left it terminal or paused for retry. Such an operation has no task rows to
 // derive a state from, so the drive owns its outcome; an operation-lease-only
 // drive also leaves the parent apply running, so re-deriving the operation from
 // the parent would take the "leave claimable" branch and return updated=false —
@@ -3249,6 +3249,7 @@ func TestMarkOperationFromOwnResult_TasklessVSchemaOnlyKeepsDriveOutcome(t *test
 		{name: "completed", driveState: state.ApplyOperation.Completed},
 		{name: "failed", driveState: state.ApplyOperation.Failed},
 		{name: "stopped", driveState: state.ApplyOperation.Stopped},
+		{name: "paused for retry", driveState: state.ApplyOperation.FailedRetryable},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			op := &storage.ApplyOperation{

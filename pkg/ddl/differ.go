@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/block/spirit/pkg/sentinel"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
 )
@@ -111,22 +110,4 @@ func (d *Differ) DiffTable(sourceStmt, targetStmt string) ([]string, error) {
 		statements = append(statements, alter.Statement)
 	}
 	return statements, nil
-}
-
-// IsSpiritInternalTable checks if a table name is a Spirit internal table.
-// Spirit uses tables like _spirit_sentinel, _spirit_checkpoint, _tablename_new,
-// _tablename_old, _tablename_chkpnt. These are engine artifacts that should not
-// be included in schema diffs. A planned change is never hidden by this test:
-// a repository can name such a table in drop_tables, and the plan and the
-// apply's progress show that drop like any other change.
-func IsSpiritInternalTable(table string) bool {
-	if table == sentinel.TableName || table == "_spirit_checkpoint" {
-		return true
-	}
-	// Spirit temporary tables: _tablename_new, _tablename_old, _tablename_chkpnt
-	if strings.HasPrefix(table, "_") &&
-		(strings.HasSuffix(table, "_new") || strings.HasSuffix(table, "_old") || strings.HasSuffix(table, "_chkpnt")) {
-		return true
-	}
-	return false
 }

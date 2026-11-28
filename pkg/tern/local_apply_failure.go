@@ -429,13 +429,25 @@ func (c *LocalClient) markApplyRetryableWithTasks(ctx context.Context, apply *st
 	}
 
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
-	// A multi-operation drive owns only its operation: the failed_retryable
-	// tasks above carry the outcome, the operator derives the operation row from
-	// them and projects the parent, so the parent retryable write, apply-level
-	// metric, retry log, and observer are the operator's to make.
-	if suppressParentApplyWrites(ctx) {
-		logger.Info("operation drive paused its tasks for retry; operator derives the operation row and projects the parent",
-			"error_message", errMsg)
+	// A multi-operation drive owns only its operation, so it pauses that row
+	// and leaves the parent retryable write, apply-level metric, retry log, and
+	// observer to the operator, which projects the parent from it. The row
+	// carries the cause, which the projection lifts onto the parent, and the
+	// pause is what puts the re-claim under the parent's recovery budget: an
+	// operation with no tasks to derive a state from would otherwise stay
+	// running and be re-claimed on every lease lapse.
+	if opLease, operationScoped := operationLeaseOnlyDrive(ctx); operationScoped && opLease.Valid() {
+		if err := c.storage.ApplyOperations().MarkFailedRetryable(ctx, opLease.OperationID, errMsg); err != nil {
+			if c.driveCancelled(ctx, apply, "while pausing the operation for retry") {
+				return nil
+			}
+			logger.Error("failed to pause the operation for retry; current operation owner will exit with the operation still active",
+				"apply_operation_id", opLease.OperationID, "failure", errMsg, "error", err)
+			return fmt.Errorf("pause apply_operation %d of apply %s (database %s) for retry: %w",
+				opLease.OperationID, apply.ApplyIdentifier, apply.Database, err)
+		}
+		logger.Info("operation drive paused its operation for retry; operator projects the parent",
+			"apply_operation_id", opLease.OperationID, "error_message", errMsg)
 		return nil
 	}
 	// Re-read the apply from storage; Stop() may have already moved it to a
