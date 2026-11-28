@@ -1,9 +1,14 @@
 package postgres
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 
+	"github.com/block/pg-sprite/pkg/executor"
+	"github.com/block/pg-sprite/pkg/schemadiff"
 	pgstatement "github.com/block/pg-sprite/pkg/statement"
+	"github.com/stretchr/testify/assert"
 
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
@@ -103,4 +108,33 @@ func TestValidateRowSecurityApply(t *testing.T) {
 			require.Len(t, change.reviewedSecurity, 2)
 		})
 	}
+}
+
+// A table shape the row security path refuses becomes a plan refusal that
+// names the table and the shape. A missing privilege, which a grant fixes,
+// and an error that names no shape stay errors.
+func TestUnsupportedRowSecurityShape(t *testing.T) {
+	live := schemadiff.Model{Table: "events"}
+	unlogged := fmt.Errorf("admit row security target: %w: render table %q: %w", executor.ErrRowSecurityRefused, "events", schemadiff.ErrUnrenderableUnlogged)
+	refusal, ok := unsupportedRowSecurityShape("public", live, unlogged)
+	require.True(t, ok)
+	var refused *engine.PlanRefusedError
+	require.ErrorAs(t, refusal, &refused)
+	assert.Equal(t, `SchemaBot does not manage row security on table "events" yet: unlogged tables cannot be rendered as a desired schema; remove the row security statements from its schema file, then plan again`, refusal.Error())
+
+	_, ok = unsupportedRowSecurityShape("public", live, fmt.Errorf("%w: %w: %w", executor.ErrRowSecurityRefused, executor.ErrRowSecurityPrivileges, schemadiff.ErrUnrenderableUnlogged))
+	assert.False(t, ok, "a missing privilege is fixed by a grant, not by the file")
+	_, ok = unsupportedRowSecurityShape("public", live, fmt.Errorf("%w: mixed", executor.ErrRowSecurityRefused))
+	assert.False(t, ok, "a refusal that names no table shape is not this one")
+	_, ok = unsupportedRowSecurityShape("public", live, errors.New("connection reset"))
+	assert.False(t, ok)
+}
+
+// Row security that is on denies every row unless a permissive policy
+// grants it; restrictive policies only narrow what a permissive one grants.
+func TestDeniesEveryRow(t *testing.T) {
+	assert.False(t, deniesEveryRow(schemadiff.RowSecurity{}), "row security off")
+	assert.True(t, deniesEveryRow(schemadiff.RowSecurity{Enabled: true}))
+	assert.True(t, deniesEveryRow(schemadiff.RowSecurity{Enabled: true, Policies: []schemadiff.Policy{{Name: "narrow"}}}))
+	assert.False(t, deniesEveryRow(schemadiff.RowSecurity{Enabled: true, Policies: []schemadiff.Policy{{Name: "narrow"}, {Name: "readers", Permissive: true}}}))
 }

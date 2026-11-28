@@ -49,17 +49,82 @@ func planRowSecurityOperation(ctx context.Context, pool *pgxpool.Pool, namespace
 	preview, err := executor.PreviewRowSecurity(ctx, pool, namespace, desired, executor.Budget{
 		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
 	})
+	if refusal, ok := unsupportedRowSecurityShape(namespace, live, err); ok {
+		return nil, refusal
+	}
 	if err != nil {
 		return nil, err
 	}
 	if len(preview.Statements) == 0 {
 		return nil, nil
 	}
+	reason := "Row security changes alter who can access rows; review the complete policy and settings replacement"
+	if deniesEveryRow(wanted.RowSecurity) {
+		reason += ". " + denyAllReason
+	}
 	return []engine.TableChange{{
 		Table: desired.Table(), Operation: ddl.StatementAlterTable,
 		DDL:      strings.Join(preview.Statements, ";\n"),
-		IsUnsafe: true, UnsafeReason: "Row security changes alter who can access rows; review the complete policy and settings replacement",
+		IsUnsafe: true, UnsafeReason: reason,
 	}}, nil
+}
+
+// denyAllReason names what a table with row security on and no permissive
+// policy does to the application, so the plan says it rather than leaving
+// the reviewer to work it out from the statements.
+const denyAllReason = "After this change row security is on with no policy that grants access, so every role subject to it reads no rows and every write fails; declare a permissive policy in the same file"
+
+// deniesEveryRow reports row security that is on with no permissive
+// policy. PostgreSQL grants a row only through a permissive policy, and
+// restrictive policies only narrow what those grant, so such a table hides
+// every row from every role subject to row security.
+func deniesEveryRow(rs schemadiff.RowSecurity) bool {
+	if !rs.Enabled {
+		return false
+	}
+	for _, policy := range rs.Policies {
+		if policy.Permissive {
+			return false
+		}
+	}
+	return true
+}
+
+// unsupportedRowSecurityShape turns the executor's refusal of a table shape
+// the row security path cannot manage, such as a table in a foreign key
+// relationship, into a plan refusal that names the table and the shape. The
+// refusal stays until the file or the table changes, so planning again
+// cannot clear it. Any other error, privileges included, is not one.
+func unsupportedRowSecurityShape(namespace string, live schemadiff.Model, err error) (error, bool) {
+	if !errors.Is(err, executor.ErrRowSecurityRefused) || errors.Is(err, executor.ErrRowSecurityPrivileges) {
+		return nil, false
+	}
+	shape, ok := schemadiff.RenderRefusal(err)
+	if !ok {
+		return nil, false
+	}
+	why := ": " + shape.Error()
+	if errors.Is(shape, schemadiff.ErrUnrenderableForeignKey) {
+		why = ", because it is in a foreign key relationship (" + strings.Join(quoteAll(foreignKeyRelationships(namespace, live)), ", ") + ")"
+	}
+	return &engine.PlanRefusedError{Err: fmt.Errorf(
+		"SchemaBot does not manage row security on table %q yet%s; remove the row security statements from its schema file, then plan again",
+		live.Table, why)}, true
+}
+
+// foreignKeyRelationships names a table's own foreign keys and the foreign
+// keys of other tables that reference it, as "table.constraint".
+func foreignKeyRelationships(namespace string, m schemadiff.Model) []string {
+	var keys []string
+	for _, con := range m.Constraints {
+		if con.ForeignKey {
+			keys = append(keys, m.Table+"."+con.Name)
+		}
+	}
+	for _, fk := range m.IncomingForeignKeys {
+		keys = append(keys, foreignKeyName(namespace, fk))
+	}
+	return keys
 }
 
 // planCreateWithRowSecurity plans a table the target lacks together with its

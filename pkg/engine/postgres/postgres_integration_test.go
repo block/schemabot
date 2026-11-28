@@ -3044,6 +3044,73 @@ func TestEnginePlanTableChangeBesideDeclaredRowSecurity(t *testing.T) {
 	assert.True(t, strings.HasSuffix(err.Error(), mixed), "a table change the planner refuses still reads as a mixed file: %s", err)
 }
 
+// Turning on row security for a table a foreign key references is a shape
+// the row security path cannot manage yet. The plan is refused with the
+// table and the foreign key named, so the author knows what to change and
+// planning again does not loop on an internal error.
+func TestEnginePlanRowSecurityOnAForeignKeyTable(t *testing.T) {
+	const database = "rls_foreign_key"
+	dsn, db := testutil.StartPostgres(t, database)
+	ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	_, err := db.ExecContext(ctx, `
+  CREATE TABLE public.kinds (id bigint PRIMARY KEY);
+  CREATE TABLE public.cards (id bigint PRIMARY KEY, kind_id bigint CONSTRAINT cards_kind_fk REFERENCES public.kinds (id));
+ `)
+	require.NoError(t, err)
+
+	_, err = New().Plan(ctx, &engine.PlanRequest{
+		Database: database, Credentials: &engine.Credentials{DSN: dsn},
+		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+			"kinds.sql": "CREATE TABLE kinds (id bigint PRIMARY KEY);\n" +
+				"ALTER TABLE kinds ENABLE ROW LEVEL SECURITY;\n" +
+				"CREATE POLICY readers ON kinds FOR SELECT USING (true);\n",
+			"cards.sql": "CREATE TABLE cards (id bigint PRIMARY KEY, kind_id bigint CONSTRAINT cards_kind_fk REFERENCES kinds (id));\n",
+		}}},
+	})
+	var refused *engine.PlanRefusedError
+	require.ErrorAs(t, err, &refused)
+	assert.Equal(t, `SchemaBot does not manage row security on table "kinds" yet, because it is in a foreign key relationship ("cards.cards_kind_fk"); remove the row security statements from its schema file, then plan again`, refused.Error())
+}
+
+// A file that turns on row security with no policy, or drops a table's only
+// permissive policy, hides every row from every role subject to row
+// security. The plan says so in its unsafe reason.
+func TestEnginePlanRowSecurityWithNoPolicyWarnsDenyAll(t *testing.T) {
+	const database = "rls_deny_all"
+	dsn, db := testutil.StartPostgres(t, database)
+	ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	_, err := db.ExecContext(ctx, `CREATE TABLE public.notes (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+	planFile := func(rowSecurity string) engine.TableChange {
+		t.Helper()
+		result, err := New().Plan(ctx, &engine.PlanRequest{
+			Database: database, Credentials: &engine.Credentials{DSN: dsn},
+			SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+				"notes.sql": "CREATE TABLE notes (id bigint PRIMARY KEY);\nALTER TABLE notes ENABLE ROW LEVEL SECURITY;\n" + rowSecurity,
+			}}},
+		})
+		require.NoError(t, err)
+		require.Len(t, result.Changes, 1)
+		require.Len(t, result.Changes[0].TableChanges, 1)
+		return result.Changes[0].TableChanges[0]
+	}
+
+	for name, rowSecurity := range map[string]string{
+		"no policy":              "",
+		"only a restrictive one": "CREATE POLICY narrow ON notes AS RESTRICTIVE FOR SELECT USING (id > 0);\n",
+	} {
+		change := planFile(rowSecurity)
+		assert.True(t, change.IsUnsafe, name)
+		assert.Contains(t, change.UnsafeReason, "row security is on with no policy that grants access, so every role subject to it reads no rows and every write fails", name)
+	}
+
+	change := planFile("CREATE POLICY readers ON notes FOR SELECT USING (true);\n")
+	assert.True(t, change.IsUnsafe)
+	assert.NotContains(t, change.UnsafeReason, "no policy that grants access", "a permissive policy grants access")
+}
+
 // Forward structural planning remains available for RLS tables and siblings.
 func TestEngineForwardPlanWithRowSecurity(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "forward_rls")
