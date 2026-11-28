@@ -249,14 +249,16 @@ func TestFreezeListCmdPrintsEachGroup(t *testing.T) {
 	assert.Equal(t, "environment=production", api.query)
 	assert.Contains(t, out, "In effect (1)\n  1. freeze-abc  production (on demand, in effect)\n")
 	assert.Contains(t, out, "Scheduled (1)\n  1. freeze-next  production (planned)\n")
-	assert.Contains(t, out, "Window:   2026-11-21T10:00:00Z until 2026-11-22T10:00:00Z\n")
+	assert.Contains(t, out, "Window:    2026-11-21T10:00:00Z until 2026-11-22T10:00:00Z\n")
 	assert.Contains(t, out, "Recently ended (2)\n  1. freeze-cancelled  production (planned, cancelled)\n")
-	assert.Contains(t, out, "Window:   2026-11-23T10:00:00Z until 2026-11-24T10:00:00Z, cancelled at 2026-11-21T12:00:00Z before it started\n")
+	assert.Contains(t, out, "Window:    2026-11-23T10:00:00Z until 2026-11-24T10:00:00Z, cancelled at 2026-11-21T12:00:00Z before it started\n")
 	assert.Contains(t, out, "  2. freeze-old  production (on demand, lifted)\n")
-	assert.Contains(t, out, "Window:   2026-11-21T10:00:00Z until lifted at 2026-11-21T11:00:00Z\n")
-	assert.Contains(t, out, "Lifted:   by erin at 2026-11-21T11:00:00Z: SEV resolved\n")
-	assert.Contains(t, out, "Reason:   SEV-1234 payments latency\n")
-	assert.Contains(t, out, "By:       dana\n")
+	assert.Contains(t, out, "Window:    2026-11-21T10:00:00Z until lifted at 2026-11-21T11:00:00Z\n")
+	assert.Contains(t, out, "Lifted:    by erin at 2026-11-21T11:00:00Z: SEV resolved\n")
+	assert.Contains(t, out, "Cancelled: by erin at 2026-11-21T12:00:00Z")
+	assert.Equal(t, 1, strings.Count(out, "Lifted:"), "only the lifted freeze has a Lifted row")
+	assert.Contains(t, out, "Reason:    SEV-1234 payments latency\n")
+	assert.Contains(t, out, "By:        dana\n")
 }
 
 func TestFreezeListCmdSaysWhenThereAreNone(t *testing.T) {
@@ -281,9 +283,9 @@ func TestFreezeShowCmdPrintsDetail(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "/api/freezes/freeze-abc", api.path)
 	assert.Contains(t, out, "Freeze freeze-abc  production (on demand, in effect)\n")
-	assert.Contains(t, out, "Running:  continue (applies already running in scope)\n")
-	assert.Contains(t, out, "Source:   manual\n")
-	assert.Contains(t, out, "External: INC-42\n")
+	assert.Contains(t, out, "Running:   continue (applies already running in scope)\n")
+	assert.Contains(t, out, "Source:    manual\n")
+	assert.Contains(t, out, "External:  INC-42\n")
 }
 
 func TestFreezeApproveCmdPrintsTheApproval(t *testing.T) {

@@ -182,12 +182,15 @@ func writeFreezeRows(f apitypes.Freeze, heading string, detail bool) {
 		status = ", in effect"
 	}
 	fmt.Printf("%s%s  %s (%s%s)\n", heading, ui.TerminalSafeLine(f.ID), ui.TerminalSafeLine(f.Environment), freezeKind(f.Kind), status)
-	row := func(label, value string) { fmt.Printf("     %-9s %s\n", label+":", value) }
+	row := func(label, value string) { fmt.Printf("     %-10s %s\n", label+":", value) }
 	row("Scope", freezeScope(f))
 	row("Window", freezeTime(f.StartsAt)+" "+freezeWindowEnd(f))
 	row("Reason", ui.TerminalSafeLine(f.Reason))
 	row("By", ui.TerminalSafeLine(f.CreatedBy))
-	if f.LiftedAt != nil {
+	switch {
+	case cancelledBeforeStart(f):
+		row("Cancelled", freezeLifted(f))
+	case f.LiftedAt != nil:
 		row("Lifted", freezeLifted(f))
 	}
 	if detail {

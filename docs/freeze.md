@@ -50,13 +50,13 @@ See what is frozen:
 ```console
 $ schemabot freeze show freeze-3f9a1c2e7b4d8a06
 Freeze freeze-3f9a1c2e7b4d8a06  production (on demand, in effect)
-     Scope:    whole environment
-     Window:   2026-12-18T17:00:00Z until lifted
-     Reason:   Holiday code freeze
-     By:       alice
-     Running:  continue (applies already running in scope)
-     Source:   manual
-     Created:  2026-12-18T17:00:00Z
+     Scope:     whole environment
+     Window:    2026-12-18T17:00:00Z until lifted
+     Reason:    Holiday code freeze
+     By:        alice
+     Running:   continue (applies already running in scope)
+     Source:    manual
+     Created:   2026-12-18T17:00:00Z
 ```
 
 Lift it when you are done. Changes that the freeze refused do not run on their
@@ -97,25 +97,25 @@ narrows it to one environment:
 $ schemabot freeze list -e production
 In effect (1)
   1. freeze-3f9a1c2e7b4d8a06  production (on demand, in effect)
-     Scope:    whole environment
-     Window:   2026-12-18T17:00:00Z until lifted
-     Reason:   Holiday code freeze
-     By:       alice
+     Scope:     whole environment
+     Window:    2026-12-18T17:00:00Z until lifted
+     Reason:    Holiday code freeze
+     By:        alice
 
 Scheduled (1)
   1. freeze-b62e0d9c41f7a385  production (planned)
-     Scope:    whole environment
-     Window:   2027-02-01T17:00:00Z until 2027-02-08T17:00:00Z
-     Reason:   Launch week code freeze
-     By:       alice
+     Scope:     whole environment
+     Window:    2027-02-01T17:00:00Z until 2027-02-08T17:00:00Z
+     Reason:    Launch week code freeze
+     By:        alice
 
 Recently ended (1)
   1. freeze-71d0e4a2c9b85f13  production (on demand, lifted)
-     Scope:    whole environment
-     Window:   2026-12-02T09:00:00Z until lifted at 2026-12-02T11:30:00Z
-     Reason:   Payments latency incident
-     By:       alice
-     Lifted:   by carol at 2026-12-02T11:30:00Z: incident resolved
+     Scope:     whole environment
+     Window:    2026-12-02T09:00:00Z until lifted at 2026-12-02T11:30:00Z
+     Reason:    Payments latency incident
+     By:        alice
+     Lifted:    by carol at 2026-12-02T11:30:00Z: incident resolved
 ```
 
 `unfreeze` ends a freeze early, or cancels a planned one before it starts. It
@@ -129,8 +129,8 @@ $ schemabot unfreeze freeze-71d0e4a2c9b85f13 --reason "incident resolved"
 
 A planned freeze cancelled before it starts never held anything. `unfreeze`
 says `cancelled before it started` instead of `lifted`, and `freeze list`
-shows it as `(planned, cancelled)` with its planned window and when it was
-cancelled.
+shows it as `(planned, cancelled)` with its planned window, and a
+`Cancelled:` row in place of `Lifted:` for who cancelled it, when, and why.
 
 See the [CLI reference](cli.md#freeze-an-environment) for every flag.
 
