@@ -70,7 +70,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.check_ownership_misses_total` | Counter | operation, repository, database, database_type, environment | Guarded check updates skipped because ownership changed |
 | `schemabot.promotion.config_error_blocks_total` | Counter | repository, database, environment | Applies blocked because the target environment is absent from the configured promotion order |
 | `schemabot.status_check_operations_total` | Counter | operation, status, repository, database, database_type, environment | Status-check storage and GitHub operations |
-| `schemabot.webhook.events_total` | Counter | environment, app_name, event_type, action, repository, status, failure_reason | GitHub webhook events (`failure_reason` only on permanent dispatch failures) (`action` is omitted for events that carry none; `repository` is omitted for the `repo_not_configured` status — see [Webhook Ownership Rejections](#webhook-ownership-rejections)) |
+| `schemabot.webhook.events_total` | Counter | environment, app_name, event_type, action, repository, status, failure_reason | GitHub webhook events (`failure_reason` only on permanent dispatch failures) (`action` is omitted for events that carry none; `repository` is omitted for any delivery from a repository this deployment does not manage: always for `repo_not_configured`, and for other statuses such as `processed`, `ignored` and the `durable_*` statuses when the repository is missing from `repos:` — see [Webhook Ownership Rejections](#webhook-ownership-rejections)) |
 | `schemabot.webhook.unregistered_repository_ignored_total` | Counter | environment, app_name, event_type, action | Webhook events ignored because the repository is not configured (`action` is omitted for events that carry none, such as `push`; no `repository` label: any repository that installs the App can deliver, so the log line for each ignored event names it instead, at warn level, or at debug level for a `push` handled on the request path) |
 | `schemabot.webhook.inbox_depth` | Gauge | environment, state | Durable webhook inbox rows by state |
 | `schemabot.webhook.inbox_claimable_depth` | Gauge | environment | Rows ready to claim now; excludes scheduled work, active leases and exhausted retries. Use max across replicas sharing an inbox. |
@@ -220,6 +220,21 @@ cardinality. Do not build a query that facets `repo_not_configured` by
 repository; the rejection's debug log line carries the repository name for
 one-off triage. `app_repo_mismatch` does carry `repository`, because a declared
 repository is a bounded set.
+
+The ownership check does not see every unmanaged delivery. It runs only when
+`apps:` is configured, and it is skipped for repository-level webhooks, so in a
+single-App deployment or for a repository-level webhook a delivery from a
+repository missing from `repos:` gets past it. Such a delivery keeps the status
+it would have had, such as `processed` once a handler answers "repository not
+registered" or `ignored` for an event type SchemaBot does not handle, and is
+counted without the `repository` attribute, for the same cardinality reason.
+The same applies to the `durable_enqueue_failed` and `durable_dispatch_*`
+statuses of a closed pull request, which is queued before the allowlist check.
+The delivery's log line names the repository.
+
+When `repos:` is empty, every repository counts as managed, so every
+repository that sends a delivery keeps its name on the series. List the
+repositories in `repos:` to bound the `repository` attribute.
 
 Both statuses are rejections: the request fails closed with 401 either way, and
 the severity split exists only so a warn-level triage scan stays actionable.

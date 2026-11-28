@@ -1942,7 +1942,8 @@ func RecordWebhookPermanentFailure(ctx context.Context, appName, eventType, acti
 // Repo is not allowlisted since it's bounded by the repos configured in SchemaBot;
 // callers recording a status for a repo outside the configured set (e.g.
 // repo_not_configured) must pass repo as "" so unbounded repo names never
-// become attribute values.
+// become attribute values. With no repos configured every repo counts as
+// configured, so the attribute is bounded only by the repos that deliver.
 // appName is the resolved GitHub App name (bounded by config), or "unknown" if
 // the request could not be attributed to a configured App (e.g. unknown App ID
 // header). Pass "" in legacy single-App mode and the metric will record

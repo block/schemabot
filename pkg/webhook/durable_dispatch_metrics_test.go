@@ -18,6 +18,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
@@ -130,6 +131,38 @@ func TestDurableWebhookDispatchMetricsFirstClaimCompleted(t *testing.T) {
 	assert.Equal(t, uint64(1), durationPoints[0].Count)
 	assertStringAttr(t, durationPoints[0].Attributes, "event_type", "issue_comment")
 	assertStringAttr(t, durationPoints[0].Attributes, "outcome", "completed")
+}
+
+// A queued delivery whose repository this deployment does not manage, such as
+// a closed pull request (queued before the allowlist check) or a row whose
+// repository left the config while it waited, still records its dispatch
+// statuses, but without a repository attribute: the repository's name is
+// unbounded and belongs in the driver's log lines.
+func TestDurableWebhookDispatchMetricsOmitUnmanagedRepository(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
+	store := newScriptedWebhookEventStore(&storage.WebhookEvent{
+		Provider:   storage.WebhookProviderGitHub,
+		DeliveryID: "delivery-metrics-unmanaged",
+		Event:      "issue_comment",
+		Repository: "octocat/hello-world",
+		Payload:    []byte(`{}`),
+		ReceivedAt: time.Now(),
+	})
+	config := &api.ServerConfig{Repos: map[string]api.RepoConfig{"org/allowed-repo": {}}}
+	h := newDurableDriverHandler(t, store, config, nil)
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	require.Len(t, store.completed, 1, "the no-op issue_comment delivery must be marked completed")
+	points := collectCounterPoints(t, reader, "schemabot.webhook.events_total")
+	statuses := make([]string, 0, len(points))
+	for _, point := range points {
+		status, _ := point.Attributes.Value("status")
+		statuses = append(statuses, status.AsString())
+		repository, hasRepository := point.Attributes.Value("repository")
+		assert.False(t, hasRepository, "status %s must not carry the unmanaged repository, got %q", status.AsString(), repository.AsString())
+	}
+	assert.ElementsMatch(t, []string{"durable_dispatch_started", "durable_dispatch_completed"}, statuses)
 }
 
 // A delivery that spent time deferred by a not-before time measures dispatch
