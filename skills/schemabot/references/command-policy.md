@@ -66,7 +66,7 @@ The rules above apply to lifecycle commands in the terminal too: a `stop` or `cu
 
 A terminal `unlock --force` is the same decision as the `unlock --force` comment in the never-post list: never run it. The CLI asks the person to confirm before it takes another owner's lock, in `apply --force` as well, and `-y` or `--auto-approve` skips that question. Never add either flag to answer for them.
 
-A watching `progress` is not read-only: its keys stop or cancel the apply, run its cutover, or close the revert window. To follow an apply, use `status` or `progress --no-watch`, which print once and exit.
+A watching `progress` is not read-only: its keys stop or cancel the apply, run its cutover, or close the revert window. To follow an apply, use `status`, `progress --no-watch`, or `progress --json`, which print once and exit.
 
 The CLI also has commands with no PR comment form, which change SchemaBot for every team on the server rather than one change: `freeze`, `unfreeze`, `settings` given a value, `checks backfill`, and the `storage` commands other than `storage plan`. They are for SchemaBot's operators. Hand them over, in every environment. Their read-only forms, such as `freeze list`, `settings` with no value, `checks show`, and `storage plan`, you can run.
 
