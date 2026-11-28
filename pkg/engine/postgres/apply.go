@@ -700,6 +700,12 @@ func classifyApplyFailure(err error, table string, validates *schemadiff.Constra
 	if detail, ok := duplicateKeyDetail(err, table); ok {
 		return applyFailure{detail: detail}
 	}
+	// An object that depends on what the statement drops or retypes keeps
+	// depending on it until someone changes that object, so a retry meets
+	// the same refusal.
+	if detail, ok := dependentObjectsDetail(err, table); ok {
+		return applyFailure{detail: detail}
+	}
 	if detail, ok := missingGrantDetail(err, table); ok {
 		return applyFailure{detail: detail, retryable: true}
 	}
@@ -719,6 +725,26 @@ func missingGrantDetail(err error, table string) (string, bool) {
 	}
 	return sanitizeReasonText(fmt.Sprintf(
 		"the engine role lacks a privilege the statement on %q needs, such as REFERENCES on the table a foreign key references; the server log names it; grant it, then retry",
+		table)), true
+}
+
+// sqlstateDependentObjectsStillExist is the SQLSTATE the server raises when
+// a statement would drop or retype something other objects depend on, such
+// as a column a publication's column list or row filter names.
+const sqlstateDependentObjectsStillExist = "2BP01"
+
+// dependentObjectsDetail names a statement the server refused because other
+// objects depend on what it drops or retypes. The plan refuses the
+// dependents it can read before the apply starts; this covers the ones only
+// the server sees. The detail leaves out the server's message, which names
+// objects the plan did not, and the server log keeps it.
+func dependentObjectsDetail(err error, table string) (string, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateDependentObjectsStillExist {
+		return "", false
+	}
+	return sanitizeReasonText(fmt.Sprintf(
+		"other objects depend on what the statement on %q drops or retypes, such as a publication that names the column; the server log names them; remove the dependency, then apply again",
 		table)), true
 }
 

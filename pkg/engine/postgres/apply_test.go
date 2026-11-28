@@ -1812,6 +1812,24 @@ func TestClassifyApplyFailureMissingGrant(t *testing.T) {
 	assert.Equal(t, `the engine role lacks a privilege the statement on "orders" needs, such as REFERENCES on the table a foreign key references; the server log names it; grant it, then retry`, failure.detail)
 }
 
+// A statement the server refuses because other objects depend on what it
+// drops or retypes, such as a column a publication names, ends the apply at
+// once: the dependency stays until someone removes it, so retrying cannot
+// clear it. The detail leaves out the objects the server's message names.
+func TestClassifyApplyFailureDependentObjects(t *testing.T) {
+	err := fmt.Errorf("drop column: %w", &pgconn.PgError{
+		Code:    "2BP01",
+		Message: `cannot drop column amt of table orders because other objects depend on it`,
+		Detail:  `publication of table orders in publication orders_pub depends on column amt of table orders`,
+	})
+
+	failure := classifyApplyFailure(err, "orders", nil)
+
+	assert.False(t, failure.retryable, "the dependency stays until someone removes it")
+	assert.Equal(t, `other objects depend on what the statement on "orders" drops or retypes, such as a publication that names the column; the server log names them; remove the dependency, then apply again`, failure.detail)
+	assert.NotContains(t, failure.detail, "orders_pub")
+}
+
 func TestProgressResultReportsCreateSequenceLength(t *testing.T) {
 	result := progressResult(engine.StateRunning, "running", time.Now(), nativeApply{
 		namespace: "public",
