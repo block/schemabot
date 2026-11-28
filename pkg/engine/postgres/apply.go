@@ -595,7 +595,8 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		// An invalid index a retry recovers or an operator clears — a build's
 		// own leftover, abandoned debris, another backend's build to wait
 		// out, or a builder this role cannot observe — is operational: once
-		// it is gone a retry can succeed. Checked before the refusal and
+		// it is gone a retry can succeed, unless code in the database refused
+		// the build (invalidIndexRetryable). Checked before the refusal and
 		// budget arms because the verdict wraps the build failure that
 		// produced it (a budget-cancelled build leaves its own invalid
 		// index), and that inner cause must not be read as the outcome — the
@@ -611,7 +612,7 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 			"index_schema", invalidErr.Schema, "index", invalidErr.Index, "error", err)
 		result := progressResult(engine.StateFailed, "failed", started, change,
 			invalidIndexDetail(invalidErr))
-		result.Retryable = true
+		result.Retryable = invalidIndexRetryable(invalidErr)
 		publish(result)
 		return
 	}
@@ -733,18 +734,39 @@ const (
 // whoever meets the refusal, but it is untrusted text, so the detail names
 // the SQLSTATE and points at the server log, where the message is.
 func raisedByDatabaseCodeDetail(err error, table string) (string, bool) {
+	code, ok := raisedByDatabaseCode(err)
+	if !ok {
+		return "", false
+	}
+	return sanitizeReasonText(fmt.Sprintf(
+		"a trigger or function in the database refused the statement on %q (SQLSTATE %s); its message is in the server log; change or disable it, then apply again",
+		table, code)), true
+}
+
+// raisedByDatabaseCode returns the SQLSTATE of a failure that a trigger or
+// function in the database raised, and whether err is one.
+func raisedByDatabaseCode(err error) (string, bool) {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) {
 		return "", false
 	}
 	switch pgErr.Code {
 	case sqlstateRaiseException, sqlstateAssertFailure:
-		return sanitizeReasonText(fmt.Sprintf(
-			"a trigger or function in the database refused the statement on %q (SQLSTATE %s); its message is in the server log; change or disable it, then apply again",
-			table, pgErr.Code)), true
+		return pgErr.Code, true
 	default:
 		return "", false
 	}
+}
+
+// invalidIndexRetryable reports whether a retry can clear an operational
+// invalid-index verdict. A build that code in the database refused, such as
+// a function an index expression calls raising on a row, leaves its own
+// invalid index like any failed build, and the retry would remove that
+// leftover only to meet the same refusal, so the apply ends at once and the
+// detail names the SQLSTATE.
+func invalidIndexRetryable(invalidErr *executor.InvalidIndexError) bool {
+	_, raised := raisedByDatabaseCode(invalidErr.Build)
+	return invalidErr.Code() != executor.CodeInvalidIndexOwnLeftover || !raised
 }
 
 // unclassifiedFailureDetail is the detail of a failure no classifier above
@@ -977,6 +999,17 @@ func invalidIndexWordingFor(invalidErr *executor.InvalidIndexError) invalidIndex
 		// A leftover the bound's statement timeout produced says so: the
 		// retry rebuilds under the same bound, so the operator's step is to
 		// raise it, and the budget the verdict carries is that bound.
+		// A build code in the database refused fails the same way on every
+		// retry, so the operator's step is that code, and the next apply
+		// removes the leftover once the code lets the build through.
+		if code, raised := raisedByDatabaseCode(invalidErr.Build); raised {
+			return invalidIndexWording{
+				causeBefore: "this build left its own invalid index ",
+				causeAfter:  fmt.Sprintf(" on the target after a trigger or function in the database refused it (SQLSTATE %s)", code),
+				lead:        "change the database code that refused it",
+				remedyRest:  ", or disable it, then apply again; its message is in the server log, and the next apply removes the leftover and rebuilds the index",
+			}
+		}
 		var budgetErr *executor.BudgetError
 		if errors.As(invalidErr.Build, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
 			return invalidIndexWording{

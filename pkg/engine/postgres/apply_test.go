@@ -839,14 +839,15 @@ func TestInvalidIndexNamesCutsTheIndexLast(t *testing.T) {
 func TestInvalidIndexDetailKeepsItsRemedyLeadInsideTheClamp(t *testing.T) {
 	widest := strings.Repeat(`"`, maxIdentifierLength)
 	verdicts := map[string]*executor.InvalidIndexError{
-		"own leftover":                     {Cleanup: executor.ErrBuildLeftInvalidIndex},
-		"own leftover the bound cancelled": {Build: &executor.BudgetError{Cause: executor.CauseStatement, Budget: 36 * time.Hour}, Cleanup: executor.ErrBuildLeftInvalidIndex},
-		"abandoned":                        {Cleanup: executor.ErrAbandonedInvalidIndex},
-		"build in flight":                  {BuilderPID: math.MaxUint32, Cleanup: executor.ErrInvalidIndexBuildInFlight},
-		"builder unobservable":             {Cleanup: executor.ErrInvalidIndexBuilderUnobservable},
-		"on another table":                 {Cleanup: executor.ErrInvalidIndexOnOtherTable},
-		"the server will not drop":         {Cleanup: executor.ErrInvalidIndexNotDroppable},
-		"unproven":                         {Cleanup: errors.New("catalog read failed")},
+		"own leftover":                       {Cleanup: executor.ErrBuildLeftInvalidIndex},
+		"own leftover the bound cancelled":   {Build: &executor.BudgetError{Cause: executor.CauseStatement, Budget: 36 * time.Hour}, Cleanup: executor.ErrBuildLeftInvalidIndex},
+		"own leftover database code refused": {Build: &pgconn.PgError{Code: sqlstateRaiseException}, Cleanup: executor.ErrBuildLeftInvalidIndex},
+		"abandoned":                          {Cleanup: executor.ErrAbandonedInvalidIndex},
+		"build in flight":                    {BuilderPID: math.MaxUint32, Cleanup: executor.ErrInvalidIndexBuildInFlight},
+		"builder unobservable":               {Cleanup: executor.ErrInvalidIndexBuilderUnobservable},
+		"on another table":                   {Cleanup: executor.ErrInvalidIndexOnOtherTable},
+		"the server will not drop":           {Cleanup: executor.ErrInvalidIndexNotDroppable},
+		"unproven":                           {Cleanup: errors.New("catalog read failed")},
 	}
 	for name, verdict := range verdicts {
 		t.Run(name, func(t *testing.T) {
@@ -887,6 +888,14 @@ func TestInvalidIndexRemedyLeadsWithTheInstruction(t *testing.T) {
 				Cleanup: executor.ErrBuildLeftInvalidIndex,
 			},
 			want: "the retry removes it",
+		},
+		{
+			name: "own leftover database code refused",
+			verdict: &executor.InvalidIndexError{
+				Build:   &pgconn.PgError{Code: sqlstateAssertFailure},
+				Cleanup: executor.ErrBuildLeftInvalidIndex,
+			},
+			want: "change the database code that refused it",
 		},
 		{
 			name:    "abandoned",
@@ -1815,6 +1824,36 @@ func TestClassifyApplyFailureRaisedByDatabaseCode(t *testing.T) {
 			`); its message is in the server log; change or disable it, then apply again`, failure.detail)
 		assert.NotContains(t, failure.detail, "DBA policy")
 	}
+}
+
+// A trigger or function in the database that raises inside a concurrent
+// index build, such as a function an index expression calls, leaves the
+// build's own invalid index. The retry would remove that leftover only to
+// meet the same refusal, so the apply ends at once, and the detail names the
+// SQLSTATE and the code to change rather than promising a retry.
+func TestInvalidIndexBuildRaisedByDatabaseCodeIsTerminal(t *testing.T) {
+	for _, code := range []string{sqlstateRaiseException, sqlstateAssertFailure} {
+		err := fmt.Errorf("execute: %w", &executor.InvalidIndexError{
+			Schema: "public", Index: "orders_total_idx", Table: "orders",
+			Build:   fmt.Errorf("create index: %w", &pgconn.PgError{Code: code, Message: "total must be positive"}),
+			Cleanup: executor.ErrBuildLeftInvalidIndex,
+		})
+		var invalidErr *executor.InvalidIndexError
+		require.ErrorAs(t, err, &invalidErr)
+		require.False(t, invalidErr.Code().Permanent(), "the verdict stays on the operational path")
+
+		assert.False(t, invalidIndexRetryable(invalidErr), code)
+		assert.Equal(t, `this build left its own invalid index "public"."orders_total_idx" on the target after a trigger or function in the database refused it (SQLSTATE `+code+
+			`); change the database code that refused it, or disable it, then apply again; its message is in the server log, and the next apply removes the leftover and rebuilds the index`,
+			invalidIndexDetail(invalidErr))
+	}
+
+	other := &executor.InvalidIndexError{Schema: "public", Index: "orders_total_idx", Table: "orders",
+		Build: &pgconn.PgError{Code: "57014"}, Cleanup: executor.ErrBuildLeftInvalidIndex}
+	assert.True(t, invalidIndexRetryable(other), "any other build cause keeps the retry")
+	abandoned := &executor.InvalidIndexError{Schema: "public", Index: "orders_total_idx", Table: "orders",
+		Build: &pgconn.PgError{Code: sqlstateRaiseException}, Cleanup: executor.ErrAbandonedInvalidIndex}
+	assert.True(t, invalidIndexRetryable(abandoned), "only the build's own leftover carries the refusal")
 }
 
 // A failure no classifier recognizes stays retryable and names the server's
