@@ -2459,8 +2459,8 @@ func TestEngineApplyColumnAddOnATableAtTheColumnLimitFailsAtOnce(t *testing.T) {
 	failed := awaitPostgresProgress(t, eng, "events")
 	require.Equal(t, engine.StateFailed, failed.State, "progress: %+v", failed)
 	assert.False(t, failed.Retryable, "the table stays at the limit until someone rebuilds it")
-	assert.Equal(t, `"events" has reached PostgreSQL's limit of 1,600 columns, which counts dropped columns until the table is rebuilt (SQLSTATE 54011); `+
-		`copy the table into a new one to reclaim them (VACUUM FULL does not), then apply again`, failed.ErrorMessage)
+	assert.Equal(t, `"events", or one of its partitions or child tables, has reached PostgreSQL's limit of 1,600 columns, which counts dropped columns until the table is rebuilt (SQLSTATE 54011); `+
+		`copy whichever table is full into a new one to reclaim them (VACUUM FULL does not), then apply again`, failed.ErrorMessage)
 }
 
 // A concurrent index build over a function that raises on one of the table's

@@ -960,15 +960,18 @@ const sqlstateTooManyColumns = "54011"
 // dropped column keeps its number until the table is rebuilt, so a table
 // whose live columns are far under the limit can still be at it. The plan
 // builds the desired schema from scratch, where no dropped columns exist, so
-// the plan does not meet the limit and only the live table does.
+// the plan does not meet the limit and only the live table does. A column
+// added to a partitioned or inherited table is added to every partition and
+// child as well, and each one counts its own dropped columns, so the table at
+// the limit can be a child rather than the one the statement names.
 func tooManyColumnsDetail(err error, table string) (string, bool) {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || pgErr.Code != sqlstateTooManyColumns {
 		return "", false
 	}
 	return sanitizeReasonText(fmt.Sprintf(
-		"%q has reached PostgreSQL's limit of 1,600 columns, which counts dropped columns until the table is rebuilt (SQLSTATE %s); "+
-			"copy the table into a new one to reclaim them (VACUUM FULL does not), then apply again",
+		"%q, or one of its partitions or child tables, has reached PostgreSQL's limit of 1,600 columns, which counts dropped columns until the table is rebuilt (SQLSTATE %s); "+
+			"copy whichever table is full into a new one to reclaim them (VACUUM FULL does not), then apply again",
 		table, sqlstateTooManyColumns)), true
 }
 

@@ -1803,8 +1803,8 @@ func TestClassifyApplyFailureTooManyColumns(t *testing.T) {
 	failure := classifyApplyFailure(err, "events", nil)
 
 	assert.False(t, failure.retryable, "the table stays at the limit until someone rebuilds it")
-	assert.Equal(t, `"events" has reached PostgreSQL's limit of 1,600 columns, which counts dropped columns until the table is rebuilt (SQLSTATE 54011); `+
-		`copy the table into a new one to reclaim them (VACUUM FULL does not), then apply again`, failure.detail)
+	assert.Equal(t, `"events", or one of its partitions or child tables, has reached PostgreSQL's limit of 1,600 columns, which counts dropped columns until the table is rebuilt (SQLSTATE 54011); `+
+		`copy whichever table is full into a new one to reclaim them (VACUUM FULL does not), then apply again`, failure.detail)
 }
 
 // Only a failure that a retry cannot clear ends the apply at once. Rows that
