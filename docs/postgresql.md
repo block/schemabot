@@ -1278,8 +1278,9 @@ and its updates and deletes succeed without changing any row.
 
 SchemaBot does not manage RLS yet on some tables: one that has a foreign key
 or that a foreign key references, one with a column of an explicit collation,
-and a few other shapes. The plan is refused with the table and the reason
-named, and the keys when a foreign key is the reason. To plan the table's
+and a few other shapes. The plan is refused with each such table and its
+reason named, every one at once, and the keys when a foreign key is the
+reason. To plan the table's
 other changes, remove the RLS statements from its file. If the table already
 has RLS, make the file's RLS statements match its current settings and
 policies instead, since a file that stops declaring RLS SchemaBot applied is

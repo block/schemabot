@@ -118,9 +118,18 @@ func unsupportedRowSecurityShape(namespace string, live schemadiff.Model, err er
 	if hasRowSecurity(live.RowSecurity) {
 		next = "make the row security statements in its schema file match the table's current settings and policies, then plan again"
 	}
-	return &engine.PlanRefusedError{Err: fmt.Errorf(
-		"SchemaBot does not manage row security on table %q yet, because %s; %s",
-		live.Table, why, next)}, true
+	return &engine.PlanRefusedError{Err: &rowSecurityShapeError{table: live.Table, why: why, next: next}}, true
+}
+
+// rowSecurityShapeError is a table shape the row security path cannot
+// manage. Each one is about its own table and file, so the plan reports
+// every table's refusal at once rather than stopping at the first.
+type rowSecurityShapeError struct {
+	table, why, next string
+}
+
+func (e *rowSecurityShapeError) Error() string {
+	return fmt.Sprintf("SchemaBot does not manage row security on table %q yet, because %s; %s", e.table, e.why, e.next)
 }
 
 // rowSecurityShapePhrases says, in the operator's terms, what about a table

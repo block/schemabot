@@ -3073,6 +3073,40 @@ func TestEnginePlanRowSecurityOnAForeignKeyTable(t *testing.T) {
 	assert.Equal(t, `SchemaBot does not manage row security on table "kinds" yet, because it is in a foreign key relationship ("cards.cards_kind_fk"); remove the row security statements from its schema file, then plan again`, refused.Error())
 }
 
+// Two files that turn on row security for tables the row security path
+// cannot manage, one in a foreign key relationship and one with a column of
+// an explicit collation, are refused together: the refusal names both
+// tables, so the author fixes both files before planning again.
+func TestEnginePlanRowSecurityListsEveryRefusedTable(t *testing.T) {
+	const database = "rls_every_refusal"
+	dsn, db := testutil.StartPostgres(t, database)
+	ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	_, err := db.ExecContext(ctx, `
+  CREATE TABLE public.kinds (id bigint PRIMARY KEY);
+  CREATE TABLE public.cards (id bigint PRIMARY KEY, kind_id bigint CONSTRAINT cards_kind_fk REFERENCES public.kinds (id));
+  CREATE TABLE public.words (id bigint PRIMARY KEY, tag text COLLATE "C");
+ `)
+	require.NoError(t, err)
+
+	_, err = New().Plan(ctx, &engine.PlanRequest{
+		Database: database, Credentials: &engine.Credentials{DSN: dsn},
+		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+			"kinds.sql": "CREATE TABLE kinds (id bigint PRIMARY KEY);\n" +
+				"ALTER TABLE kinds ENABLE ROW LEVEL SECURITY;\n" +
+				"CREATE POLICY readers ON kinds FOR SELECT USING (true);\n",
+			"cards.sql": "CREATE TABLE cards (id bigint PRIMARY KEY, kind_id bigint CONSTRAINT cards_kind_fk REFERENCES kinds (id));\n",
+			"words.sql": "CREATE TABLE words (id bigint PRIMARY KEY, tag text COLLATE \"C\");\n" +
+				"ALTER TABLE words ENABLE ROW LEVEL SECURITY;\n" +
+				"CREATE POLICY readers ON words FOR SELECT USING (true);\n",
+		}}},
+	})
+	var refused *engine.PlanRefusedError
+	require.ErrorAs(t, err, &refused)
+	assert.Equal(t, `SchemaBot does not manage row security on table "kinds" yet, because it is in a foreign key relationship ("cards.cards_kind_fk"); remove the row security statements from its schema file, then plan again
+SchemaBot does not manage row security on table "words" yet, because it has a column with an explicit collation; remove the row security statements from its schema file, then plan again`, refused.Error())
+}
+
 // A table that already has row security and gains a foreign key later
 // keeps that row security whatever its file says. A policy change on it is
 // refused with the foreign key named, and the refusal asks for statements
