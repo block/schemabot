@@ -590,7 +590,10 @@ reconciler finds no proof that a pull request's head was planned and plans it ag
 failure that was dead-lettered on purpose. *Enforced:* the storage retention pass
 (`pkg/api/storage_retention.go`); the purge predicate `webhookPurgeCandidate`, which deletes only
 terminal rows and keeps the newest row covering each pull request
-(`pkg/storage/internal/sqlstore/webhook_events.go`); `StorageRetentionWebhookEvents`
+(`pkg/storage/internal/sqlstore/webhook_events.go`); the apply log purge eligibility
+`settledApplyLogEligibility`, which takes only settled applies past the window, and
+`undrivenSettledApply`, which keeps an apply a driver still leases
+(`pkg/storage/internal/sqlstore/apply_logs.go`); `StorageRetentionWebhookEvents`
 (`pkg/api/config.go`), which refuses a webhook inbox window shorter than GitHub's redelivery limit;
 `validateStorageRetentionWindows` (`pkg/serve/serve.go`, called from `Build`), which refuses to
 start with a window shorter than `ReconcileInboxCoverageWindow` (`pkg/webhook/durable_reconcile.go`);

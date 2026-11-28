@@ -50,6 +50,9 @@ type retentionWebhookStore struct {
 	failAfter int
 	counted   int64
 	countErr  error
+	// blockCount makes a count wait until its context ends, as a count over a
+	// large backlog would.
+	blockCount bool
 	// onDelete runs inside each delete call, before it answers.
 	onDelete func(call int)
 
@@ -77,14 +80,56 @@ func (s *retentionWebhookStore) DeleteTerminalOlderThan(_ context.Context, age t
 	return 0, nil
 }
 
-func (s *retentionWebhookStore) CountTerminalOlderThan(_ context.Context, age time.Duration) (int64, error) {
+func (s *retentionWebhookStore) CountTerminalOlderThan(ctx context.Context, age time.Duration) (int64, error) {
+	s.countCalls = append(s.countCalls, age)
+	if s.blockCount {
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}
+	return s.counted, s.countErr
+}
+
+// retentionApplyLogStore answers apply log purge calls from a script of batch
+// sizes, the same way retentionWebhookStore does for the webhook inbox.
+type retentionApplyLogStore struct {
+	storage.ApplyLogStore
+
+	batches   []int64
+	deleteErr error
+	// failAfter makes the delete call with this zero-based index fail.
+	failAfter int
+	counted   int64
+	countErr  error
+
+	deleteCalls []deleteCall
+	countCalls  []time.Duration
+}
+
+func (s *retentionApplyLogStore) DeleteForSettledAppliesOlderThan(_ context.Context, age time.Duration, limit int) (int64, error) {
+	call := len(s.deleteCalls)
+	s.deleteCalls = append(s.deleteCalls, deleteCall{age: age, limit: limit})
+	if s.deleteErr != nil && call == s.failAfter {
+		return 0, s.deleteErr
+	}
+	if call < len(s.batches) {
+		return s.batches[call], nil
+	}
+	return 0, nil
+}
+
+func (s *retentionApplyLogStore) CountForSettledAppliesOlderThan(_ context.Context, age time.Duration) (int64, error) {
 	s.countCalls = append(s.countCalls, age)
 	return s.counted, s.countErr
 }
 
 func newRetentionService(t *testing.T, cfg StorageRetentionConfig, applies *retentionApplyStore, events *retentionWebhookStore) (*Service, *bytes.Buffer) {
 	t.Helper()
-	store := &mockStorageWithApplyStores{mockStorage: mockStorage{webhookEvents: events}, applies: applies}
+	return newRetentionServiceWithApplyLogs(t, cfg, applies, events, &retentionApplyLogStore{})
+}
+
+func newRetentionServiceWithApplyLogs(t *testing.T, cfg StorageRetentionConfig, applies *retentionApplyStore, events *retentionWebhookStore, applyLogs *retentionApplyLogStore) (*Service, *bytes.Buffer) {
+	t.Helper()
+	store := &mockStorageWithApplyStores{mockStorage: mockStorage{webhookEvents: events}, applies: applies, applyLogs: applyLogs}
 	svc := New(store, &ServerConfig{StorageRetention: cfg}, nil, slog.New(slog.DiscardHandler))
 	var logs bytes.Buffer
 	svc.logger = slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -113,7 +158,15 @@ func deletingSettings() storageRetentionSettings {
 		batchSize:     3,
 		webhookEvents: 168 * time.Hour,
 		maxBatches:    10,
+		countTimeout:  time.Minute,
 	}
+}
+
+func deletingSettingsWithApplyLogs() storageRetentionSettings {
+	settings := deletingSettings()
+	settings.applyLogs = 2160 * time.Hour
+	settings.purgeApplyLogs = true
+	return settings
 }
 
 // A pass keeps deleting full batches and stops at the first short one, since a
@@ -233,6 +286,30 @@ func TestStorageRetentionPassLogsAFailedDryRunCount(t *testing.T) {
 	assert.Equal(t, true, failed[0]["dry_run"])
 }
 
+// A dry-run count that runs past its deadline gives up on its own, so a slow
+// count over a large backlog cannot hold the election. The pass reports no
+// figure for that table, never zero, and still counts the other table.
+func TestStorageRetentionDryRunCountGivesUpAtItsDeadline(t *testing.T) {
+	events := &retentionWebhookStore{blockCount: true}
+	applyLogs := &retentionApplyLogStore{counted: 4}
+	svc, logs := newRetentionServiceWithApplyLogs(t, StorageRetentionConfig{}, &retentionApplyStore{}, events, applyLogs)
+	settings := deletingSettingsWithApplyLogs()
+	settings.dryRun = true
+	settings.countTimeout = 10 * time.Millisecond
+
+	svc.runStorageRetentionPass(t.Context(), settings)
+
+	timedOut := logEntries(t, logs, "storage retention dry run could not count")
+	require.Len(t, timedOut, 1, logs.String())
+	assert.Equal(t, "webhook_events", timedOut[0]["table"])
+	assert.Equal(t, "WARN", timedOut[0]["level"])
+	assert.Equal(t, "10ms", timedOut[0]["count_timeout"])
+	complete := logEntries(t, logs, "storage retention pass complete")
+	require.Len(t, complete, 1, logs.String())
+	assert.Equal(t, "apply_logs", complete[0]["table"])
+	assert.InDelta(t, 4, complete[0]["rows_would_delete"], 0)
+}
+
 // Losing the election is the expected outcome on every instance but one, so
 // the pass deletes nothing and logs no failure.
 func TestStorageRetentionPassDoesNothingWhenAnotherInstanceIsElected(t *testing.T) {
@@ -314,6 +391,7 @@ func TestStorageRetentionPassStartsOnlyWhenEnabled(t *testing.T) {
 		{name: "invalid batch size", cfg: StorageRetentionConfig{Enabled: true, BatchSize: -1}},
 		{name: "invalid window", cfg: StorageRetentionConfig{Enabled: true, WebhookEvents: "a week"}},
 		{name: "window below GitHub's redelivery limit", cfg: StorageRetentionConfig{Enabled: true, DryRun: boolPtr(false), WebhookEvents: "24h"}},
+		{name: "invalid apply logs window", cfg: StorageRetentionConfig{Enabled: true, ApplyLogs: "ninety days"}},
 		{
 			name: "enabled alone is a dry run", cfg: StorageRetentionConfig{Enabled: true},
 			starts: true, wantInterval: time.Hour, wantCount: 1,
@@ -387,4 +465,208 @@ func TestStorageRetentionPassDoesNothingWhenDisabled(t *testing.T) {
 
 	assert.False(t, ok)
 	assert.Zero(t, applies.elections)
+}
+
+// With no apply_logs window the pass never touches apply logs, in a dry run or a
+// real pass, and says at debug level why it skipped them.
+func TestStorageRetentionPassNeverPurgesApplyLogsWhenTheWindowIsUnset(t *testing.T) {
+	for _, dryRun := range []bool{false, true} {
+		t.Run(map[bool]string{false: "real pass", true: "dry run"}[dryRun], func(t *testing.T) {
+			events := &retentionWebhookStore{batches: []int64{1}, counted: 1}
+			applyLogs := &retentionApplyLogStore{batches: []int64{3}, counted: 9}
+			svc, logs := newRetentionServiceWithApplyLogs(t, StorageRetentionConfig{}, &retentionApplyStore{}, events, applyLogs)
+			settings := deletingSettings()
+			settings.dryRun = dryRun
+
+			svc.runStorageRetentionPass(t.Context(), settings)
+
+			assert.Empty(t, applyLogs.deleteCalls)
+			assert.Empty(t, applyLogs.countCalls)
+			skipped := logEntries(t, logs, "storage retention: apply logs are not purged")
+			require.Len(t, skipped, 1, logs.String())
+			assert.Equal(t, "DEBUG", skipped[0]["level"])
+			assert.Equal(t, "apply_logs", skipped[0]["table"])
+			for _, entry := range logEntries(t, logs, "storage retention pass complete") {
+				assert.Equal(t, "webhook_events", entry["table"])
+			}
+		})
+	}
+}
+
+// With an apply_logs window the pass purges the webhook inbox and then apply
+// logs, each with its own window, and logs one completion line per table.
+func TestStorageRetentionPassPurgesApplyLogsAfterWebhookEvents(t *testing.T) {
+	events := &retentionWebhookStore{batches: []int64{3, 1}}
+	applyLogs := &retentionApplyLogStore{batches: []int64{3, 3, 2}}
+	svc, logs := newRetentionServiceWithApplyLogs(t, StorageRetentionConfig{}, &retentionApplyStore{}, events, applyLogs)
+
+	svc.runStorageRetentionPass(t.Context(), deletingSettingsWithApplyLogs())
+
+	assert.Len(t, events.deleteCalls, 2)
+	assert.Equal(t, []deleteCall{
+		{age: 2160 * time.Hour, limit: 3},
+		{age: 2160 * time.Hour, limit: 3},
+		{age: 2160 * time.Hour, limit: 3},
+	}, applyLogs.deleteCalls)
+	assert.Empty(t, applyLogs.countCalls, "a real pass does not count")
+
+	complete := logEntries(t, logs, "storage retention pass complete")
+	require.Len(t, complete, 2, logs.String())
+	assert.Equal(t, "webhook_events", complete[0]["table"])
+	assert.Equal(t, (168 * time.Hour).String(), complete[0]["window"])
+	assert.InDelta(t, 4, complete[0]["rows_deleted"], 0)
+	assert.Equal(t, "apply_logs", complete[1]["table"])
+	assert.Equal(t, (2160 * time.Hour).String(), complete[1]["window"])
+	assert.InDelta(t, 8, complete[1]["rows_deleted"], 0)
+	assert.InDelta(t, 3, complete[1]["batches"], 0)
+	assert.Equal(t, false, complete[1]["dry_run"])
+	assert.Empty(t, logEntries(t, logs, "storage retention: apply logs are not purged"))
+}
+
+// A dry run counts apply logs and deletes none.
+func TestStorageRetentionPassDryRunCountsApplyLogs(t *testing.T) {
+	events := &retentionWebhookStore{counted: 5}
+	applyLogs := &retentionApplyLogStore{counted: 77, batches: []int64{3}}
+	svc, logs := newRetentionServiceWithApplyLogs(t, StorageRetentionConfig{}, &retentionApplyStore{}, events, applyLogs)
+	settings := deletingSettingsWithApplyLogs()
+	settings.dryRun = true
+
+	svc.runStorageRetentionPass(t.Context(), settings)
+
+	assert.Empty(t, applyLogs.deleteCalls, "a dry run never deletes")
+	assert.Equal(t, []time.Duration{2160 * time.Hour}, applyLogs.countCalls)
+	complete := logEntries(t, logs, "storage retention pass complete")
+	require.Len(t, complete, 2, logs.String())
+	assert.Equal(t, "apply_logs", complete[1]["table"])
+	assert.InDelta(t, 77, complete[1]["rows_would_delete"], 0)
+	assert.NotContains(t, complete[1], "rows_deleted")
+	assert.Equal(t, true, complete[1]["dry_run"])
+}
+
+// Apply logs honor the same batch cap as the webhook inbox.
+func TestStorageRetentionPassStopsApplyLogsAtTheBatchCap(t *testing.T) {
+	applyLogs := &retentionApplyLogStore{batches: []int64{3, 3, 3, 3, 3, 3}}
+	svc, logs := newRetentionServiceWithApplyLogs(t, StorageRetentionConfig{}, &retentionApplyStore{}, &retentionWebhookStore{}, applyLogs)
+	settings := deletingSettingsWithApplyLogs()
+	settings.maxBatches = 4
+
+	svc.runStorageRetentionPass(t.Context(), settings)
+
+	assert.Len(t, applyLogs.deleteCalls, 4)
+	capped := logEntries(t, logs, "storage retention pass stopped at its batch cap")
+	require.Len(t, capped, 1, logs.String())
+	assert.Equal(t, "apply_logs", capped[0]["table"])
+	assert.InDelta(t, 12, capped[0]["rows_deleted"], 0)
+	assert.Equal(t, true, capped[0]["stopped_at_batch_cap"])
+}
+
+// A failure purging the webhook inbox does not skip apply logs, and the pass
+// returns the failure after logging it once.
+func TestStorageRetentionPassPurgesApplyLogsAfterAWebhookEventsFailure(t *testing.T) {
+	boom := errors.New("webhook purge failed")
+	events := &retentionWebhookStore{deleteErr: boom}
+	applyLogs := &retentionApplyLogStore{batches: []int64{2}}
+	svc, logs := newRetentionServiceWithApplyLogs(t, StorageRetentionConfig{}, &retentionApplyStore{}, events, applyLogs)
+
+	err := svc.purgeTables(t.Context(), deletingSettingsWithApplyLogs())
+
+	require.ErrorIs(t, err, boom)
+	assert.Len(t, applyLogs.deleteCalls, 1, "apply logs are still purged")
+	failed := logEntries(t, logs, "storage retention pass failed")
+	require.Len(t, failed, 1, logs.String())
+	assert.Equal(t, "webhook_events", failed[0]["table"])
+	complete := logEntries(t, logs, "storage retention pass complete")
+	require.Len(t, complete, 1, logs.String())
+	assert.Equal(t, "apply_logs", complete[0]["table"])
+	assert.InDelta(t, 2, complete[0]["rows_deleted"], 0)
+}
+
+// A failure purging apply logs leaves the webhook inbox purge already done, and
+// the pass returns the failure after logging it once.
+func TestStorageRetentionPassReportsAnApplyLogsFailureAfterPurgingWebhookEvents(t *testing.T) {
+	boom := errors.New("apply log purge failed")
+	events := &retentionWebhookStore{batches: []int64{2}}
+	applyLogs := &retentionApplyLogStore{deleteErr: boom}
+	svc, logs := newRetentionServiceWithApplyLogs(t, StorageRetentionConfig{}, &retentionApplyStore{}, events, applyLogs)
+
+	err := svc.purgeTables(t.Context(), deletingSettingsWithApplyLogs())
+
+	require.ErrorIs(t, err, boom)
+	assert.Len(t, events.deleteCalls, 1)
+	failed := logEntries(t, logs, "storage retention pass failed")
+	require.Len(t, failed, 1, logs.String())
+	assert.Equal(t, "apply_logs", failed[0]["table"])
+	complete := logEntries(t, logs, "storage retention pass complete")
+	require.Len(t, complete, 1, logs.String())
+	assert.Equal(t, "webhook_events", complete[0]["table"])
+}
+
+// When both tables fail, each failure is logged and the pass returns both.
+func TestStorageRetentionPassReturnsBothTableFailures(t *testing.T) {
+	webhookErr := errors.New("webhook purge failed")
+	applyLogErr := errors.New("apply log purge failed")
+	events := &retentionWebhookStore{deleteErr: webhookErr}
+	applyLogs := &retentionApplyLogStore{deleteErr: applyLogErr}
+	svc, logs := newRetentionServiceWithApplyLogs(t, StorageRetentionConfig{}, &retentionApplyStore{}, events, applyLogs)
+
+	err := svc.purgeTables(t.Context(), deletingSettingsWithApplyLogs())
+
+	require.ErrorIs(t, err, webhookErr)
+	require.ErrorIs(t, err, applyLogErr)
+	failed := logEntries(t, logs, "storage retention pass failed")
+	require.Len(t, failed, 2, logs.String())
+	assert.Equal(t, "webhook_events", failed[0]["table"])
+	assert.Equal(t, "apply_logs", failed[1]["table"])
+}
+
+// Shutdown that arrives while the webhook inbox is purging ends the pass before
+// apply logs start, and is a routine stop rather than a logged failure.
+func TestStorageRetentionPassStopsBetweenTablesOnShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	events := &retentionWebhookStore{batches: []int64{1}}
+	events.onDelete = func(int) { cancel() }
+	applyLogs := &retentionApplyLogStore{batches: []int64{1}, counted: 1}
+	svc, logs := newRetentionServiceWithApplyLogs(t, StorageRetentionConfig{}, &retentionApplyStore{}, events, applyLogs)
+
+	svc.runStorageRetentionPass(ctx, deletingSettingsWithApplyLogs())
+
+	assert.Len(t, events.deleteCalls, 1)
+	assert.Empty(t, applyLogs.deleteCalls, "apply logs do not start after shutdown")
+	assert.Empty(t, applyLogs.countCalls)
+	assert.Empty(t, logEntries(t, logs, "storage retention pass failed"))
+	assert.Len(t, logEntries(t, logs, "storage retention: pass interrupted by shutdown"), 1, logs.String())
+}
+
+// The startup line reports the apply logs window, or that none is set, and the
+// pass built from the config carries the window to the store.
+func TestStorageRetentionPassCarriesTheApplyLogsWindow(t *testing.T) {
+	tests := []struct {
+		name       string
+		applyLogs  string
+		wantWindow string
+		wantCalls  []deleteCall
+	}{
+		{name: "unset", wantWindow: "unset"},
+		{
+			name: "set", applyLogs: "2160h", wantWindow: (2160 * time.Hour).String(),
+			wantCalls: []deleteCall{{age: 2160 * time.Hour, limit: 250}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := StorageRetentionConfig{Enabled: true, DryRun: new(false), BatchSize: 250, ApplyLogs: tt.applyLogs}
+			applyLogs := &retentionApplyLogStore{}
+			svc, logs := newRetentionServiceWithApplyLogs(t, cfg, &retentionApplyStore{}, &retentionWebhookStore{}, applyLogs)
+
+			pass, _, ok := svc.storageRetentionPass()
+			require.True(t, ok)
+			pass(t.Context())
+
+			enabled := logEntries(t, logs, "storage retention pass enabled")
+			require.Len(t, enabled, 1, logs.String())
+			assert.Equal(t, tt.wantWindow, enabled[0]["apply_logs_window"])
+			assert.Equal(t, tt.wantCalls, applyLogs.deleteCalls)
+		})
+	}
 }

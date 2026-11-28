@@ -14,7 +14,13 @@ import (
 // elected instance and only from the operator's maintenance loop, never from a
 // request handler. It deletes only rows whose work is finished, and the store
 // keeps any row the webhook reconciler still reads as proof that a pull
-// request's head was planned.
+// request's head was planned. The store likewise keeps the log entries of an
+// apply that is stopped, in flight, or still leased by a driver.
+//
+// The pass covers each table that has a retention window configured: the
+// webhook inbox always, and apply logs only when storage_retention.apply_logs is
+// set. The tables are independent, so a failure purging one does not skip the
+// other.
 //
 //	every storage_retention.interval
 //	     │
@@ -22,20 +28,23 @@ import (
 //	elect one instance (advisory lock) ─── held elsewhere ──▶ skip the pass
 //	     │ elected
 //	     ▼
+//	for each configured table: webhook_events, then apply_logs (if a window is set)
+//	     │
+//	     ▼
 //	dry run? ── yes ──▶ count what a purge would delete, delete nothing
 //	     │ no
 //	     ▼
-//	delete one batch of old finished rows ─── fewer than a full batch ──▶ done
+//	delete one batch of old finished rows ─── fewer than a full batch ──▶ next table
 //	     │ a full batch
 //	     ▼
-//	pause, then delete the next batch, up to the cap on batches per pass
+//	pause, then delete the next batch, up to the cap on batches per table
 //
 // The election is an efficiency gate, not a safety one. Each delete repeats its
 // own state and age predicate and is idempotent, so two instances running the
 // pass at once would be correct, just wasteful.
 //
 // There is deliberately no metric for the pass: it runs too rarely for a rate
-// to mean anything. Each pass logs one line
+// to mean anything. Each pass logs one line per table
 // naming the table, how many rows it deleted or would delete, how many batches
 // it took, the retention window, and whether it was a dry run.
 
@@ -52,6 +61,17 @@ const (
 	// backlog drains in small steps that leave the database room for the
 	// webhook inbox's own claims and writes.
 	storageRetentionBatchPause = 200 * time.Millisecond
+
+	// storageRetentionCountTimeout bounds one dry-run count. A count reads every
+	// eligible row, so on a large backlog it can run long; the bound keeps one
+	// slow count from holding the election, and the other table is still
+	// counted.
+	storageRetentionCountTimeout = time.Minute
+
+	// storageRetentionApplyLogsUnset is what the startup line reports for the
+	// apply logs window when none is configured, which means every apply log is
+	// kept.
+	storageRetentionApplyLogsUnset = "unset"
 )
 
 // storageRetentionSettings is what one pass reads from the config and the
@@ -62,10 +82,18 @@ type storageRetentionSettings struct {
 	batchSize     int
 	webhookEvents time.Duration
 
-	// maxBatches and batchPause pace a pass that deletes. They are fields so a
-	// test can shrink them; storageRetentionPass sets them to the constants.
-	maxBatches int
-	batchPause time.Duration
+	// applyLogs is how long the log entries of a settled apply are kept. It
+	// applies only when purgeApplyLogs is true; with no window set, apply logs are
+	// never purged.
+	applyLogs      time.Duration
+	purgeApplyLogs bool
+
+	// maxBatches and batchPause pace a pass that deletes, and countTimeout
+	// bounds each dry-run count. They are fields so a test can shrink them;
+	// storageRetentionPass sets them to the constants.
+	maxBatches   int
+	batchPause   time.Duration
+	countTimeout time.Duration
 }
 
 // storageRetentionPass returns the pass to run, how often to run it, and true,
@@ -93,16 +121,29 @@ func (s *Service) storageRetentionPass() (func(context.Context), time.Duration, 
 		s.logger.Error("storage retention pass not started because its webhook_events window is invalid; old rows are kept until the config is fixed", "error", err)
 		return nil, 0, false
 	}
+	applyLogs, purgeApplyLogs, err := s.config.StorageRetentionApplyLogs()
+	if err != nil {
+		s.logger.Error("storage retention pass not started because its apply_logs window is invalid; old rows are kept until the config is fixed", "error", err)
+		return nil, 0, false
+	}
 	settings := storageRetentionSettings{
-		dryRun:        s.config.StorageRetentionDryRun(),
-		batchSize:     batchSize,
-		webhookEvents: webhookEvents,
-		maxBatches:    storageRetentionMaxBatches,
-		batchPause:    storageRetentionBatchPause,
+		dryRun:         s.config.StorageRetentionDryRun(),
+		batchSize:      batchSize,
+		webhookEvents:  webhookEvents,
+		applyLogs:      applyLogs,
+		purgeApplyLogs: purgeApplyLogs,
+		maxBatches:     storageRetentionMaxBatches,
+		batchPause:     storageRetentionBatchPause,
+		countTimeout:   storageRetentionCountTimeout,
+	}
+	applyLogsWindow := storageRetentionApplyLogsUnset
+	if purgeApplyLogs {
+		applyLogsWindow = applyLogs.String()
 	}
 	s.logger.Info("storage retention pass enabled",
 		"dry_run", settings.dryRun, "interval", interval.String(), "batch_size", batchSize,
-		"max_batches_per_pass", settings.maxBatches, "webhook_events_window", webhookEvents.String())
+		"max_batches_per_pass", settings.maxBatches, "webhook_events_window", webhookEvents.String(),
+		"apply_logs_window", applyLogsWindow)
 	return func(ctx context.Context) {
 		s.runStorageRetentionPass(ctx, settings)
 	}, interval, true
@@ -118,7 +159,7 @@ func (s *Service) runStorageRetentionPass(ctx context.Context, settings storageR
 	purged := false
 	err := s.storage.Applies().WithStorageRetentionElection(ctx, func(ctx context.Context) error {
 		purged = true
-		return s.purgeWebhookEvents(ctx, settings)
+		return s.purgeTables(ctx, settings)
 	})
 	switch {
 	case err == nil:
@@ -131,19 +172,64 @@ func (s *Service) runStorageRetentionPass(ctx context.Context, settings storageR
 	}
 }
 
-// purgeWebhookEvents counts or deletes finished webhook inbox rows older than
-// the window. A dry run reads only the count. A real pass deletes batch after
-// batch until one comes back short, the cap is reached, or shutdown arrives. It
-// returns the error it logged so the election wrapper does not log it again.
-func (s *Service) purgeWebhookEvents(ctx context.Context, settings storageRetentionSettings) error {
-	const table = "webhook_events"
+// purgeTables purges the webhook inbox, then apply logs when a window is set.
+// The tables are independent, so a failure purging one is kept and the other is
+// still purged; each failure has already been logged by the purge that hit it.
+// Shutdown ends the pass without starting the next table.
+func (s *Service) purgeTables(ctx context.Context, settings storageRetentionSettings) error {
+	var errs []error
+	events := s.storage.WebhookEvents()
+	if err := s.purgeTable(ctx, settings, "webhook_events", settings.webhookEvents,
+		events.CountTerminalOlderThan, events.DeleteTerminalOlderThan); err != nil {
+		errs = append(errs, err)
+	}
+	if ctx.Err() != nil {
+		if len(errs) == 0 {
+			errs = append(errs, ctx.Err())
+		}
+		return errors.Join(errs...)
+	}
+
+	if !settings.purgeApplyLogs {
+		s.logger.Debug("storage retention: apply logs are not purged because storage_retention.apply_logs is not set; every apply log is kept",
+			"table", "apply_logs")
+		return errors.Join(errs...)
+	}
+	logs := s.storage.ApplyLogs()
+	if err := s.purgeTable(ctx, settings, "apply_logs", settings.applyLogs,
+		logs.CountForSettledAppliesOlderThan, logs.DeleteForSettledAppliesOlderThan); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+// purgeTable counts or deletes the old finished rows of one table. A dry run
+// reads only the count. A real pass deletes batch after batch until one comes
+// back short, the cap is reached, or shutdown arrives. It returns the error it
+// logged so the election wrapper does not log it again.
+func (s *Service) purgeTable(
+	ctx context.Context,
+	settings storageRetentionSettings,
+	table string,
+	window time.Duration,
+	count func(ctx context.Context, age time.Duration) (int64, error),
+	deleteBatch func(ctx context.Context, age time.Duration, limit int) (int64, error),
+) error {
 	// The window is logged as text because a JSON log handler would otherwise
 	// render a duration as a bare nanosecond count.
-	logger := s.logger.With("table", table, "window", settings.webhookEvents.String(), "dry_run", settings.dryRun)
-	events := s.storage.WebhookEvents()
+	logger := s.logger.With("table", table, "window", window.String(), "dry_run", settings.dryRun)
 
 	if settings.dryRun {
-		wouldDelete, err := events.CountTerminalOlderThan(ctx, settings.webhookEvents)
+		countCtx, cancel := context.WithTimeout(ctx, settings.countTimeout)
+		defer cancel()
+		wouldDelete, err := count(countCtx, window)
+		if err != nil && ctx.Err() == nil && errors.Is(countCtx.Err(), context.DeadlineExceeded) {
+			// The count ran out of time, not the server: there is no figure for
+			// this pass, which is not the same as nothing to delete.
+			logger.Warn("storage retention dry run could not count the rows a purge would delete before its deadline; this pass reports no figure for the table",
+				"count_timeout", settings.countTimeout.String(), "error", err)
+			return err
+		}
 		if err != nil {
 			return logStorageRetentionFailure(ctx, logger, 0, 0, err)
 		}
@@ -154,7 +240,7 @@ func (s *Service) purgeWebhookEvents(ctx context.Context, settings storageRetent
 	var deleted int64
 	batches := 0
 	for {
-		n, err := events.DeleteTerminalOlderThan(ctx, settings.webhookEvents, settings.batchSize)
+		n, err := deleteBatch(ctx, window, settings.batchSize)
 		if err != nil {
 			return logStorageRetentionFailure(ctx, logger, deleted, batches, err)
 		}

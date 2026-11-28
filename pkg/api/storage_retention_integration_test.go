@@ -16,9 +16,11 @@ import (
 
 	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/storage/postgresstore"
+	"github.com/block/schemabot/pkg/storage/storagetest"
 )
 
 // An operator turns storage retention on and runs a pass against a real inbox.
@@ -35,14 +37,114 @@ func TestStorageRetentionPassPurgesOnlyOldFinishedRowsOnMySQL(t *testing.T) {
 // The same scenario on PostgreSQL storage, which elects the pass with a
 // different advisory lock mechanism and deletes through different SQL.
 func TestStorageRetentionPassPurgesOnlyOldFinishedRowsOnPostgres(t *testing.T) {
+	db := openRetentionPostgres(t)
+	runStorageRetentionPassAgainstRealStorage(t, postgresstore.New(db), db, postgresPlaceholder)
+}
+
+// An operator sets an apply_logs window and runs a pass. The logs of applies that
+// settled before the window are deleted, in batches smaller than the backlog.
+// The logs of an apply that settled inside the window and of an old stopped
+// apply, which can still be resumed, are kept. A dry run deletes nothing, and a
+// pass with no apply_logs window deletes no apply logs at all.
+func TestStorageRetentionPassPurgesOnlyOldSettledApplyLogsOnMySQL(t *testing.T) {
+	db := openMatrixStorage(t)
+	runApplyLogRetentionPassAgainstRealStorage(t, mysqlstore.New(db), db, func(int) string { return "?" })
+}
+
+// The same scenario on PostgreSQL storage.
+func TestStorageRetentionPassPurgesOnlyOldSettledApplyLogsOnPostgres(t *testing.T) {
+	db := openRetentionPostgres(t)
+	runApplyLogRetentionPassAgainstRealStorage(t, postgresstore.New(db), db, postgresPlaceholder)
+}
+
+func postgresPlaceholder(n int) string { return fmt.Sprintf("$%d", n) }
+
+func openRetentionPostgres(t *testing.T) *sql.DB {
+	t.Helper()
 	dsn, _ := startPostgresStorage(t)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
 	db, err := postgresconn.Open(dsn)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
 
-	runStorageRetentionPassAgainstRealStorage(t, postgresstore.New(db), db, func(n int) string { return fmt.Sprintf("$%d", n) })
+func runApplyLogRetentionPassAgainstRealStorage(t *testing.T, stor storage.Storage, db *sql.DB, placeholder func(int) string) {
+	t.Helper()
+	ctx := t.Context()
+	window := 720 * time.Hour
+	old := window + 24*time.Hour
+	young := window - 24*time.Hour
+	const logsPerApply = 2
+
+	planID := int64(9700)
+	seed := func(name, applyState string, completedAgo time.Duration) *storage.Apply {
+		t.Helper()
+		planID++
+		lock := storagetest.CreateLock(t, stor, name+"_db", storage.DatabaseTypeMySQL)
+		apply := storagetest.CreateApplyWithStateAndEnv(t, stor, lock, name, planID, applyState, "staging")
+		for i := range logsPerApply {
+			require.NoError(t, stor.ApplyLogs().Append(ctx, &storage.ApplyLog{
+				ApplyID:   apply.ID,
+				Level:     storage.LogLevelInfo,
+				EventType: storage.LogEventInfo,
+				Source:    storage.LogSourceSchemaBot,
+				Message:   fmt.Sprintf("%s entry %d", name, i+1),
+			}), name)
+		}
+		_, err := db.ExecContext(ctx,
+			"UPDATE applies SET completed_at = "+placeholder(1)+" WHERE id = "+placeholder(2),
+			time.Now().UTC().Add(-completedAgo), apply.ID)
+		require.NoError(t, err, name)
+		return apply
+	}
+	logCount := func(apply *storage.Apply) int {
+		t.Helper()
+		logs, err := stor.ApplyLogs().GetByApply(ctx, apply.ID)
+		require.NoError(t, err, apply.ApplyIdentifier)
+		return len(logs)
+	}
+
+	oldCompleted := seed("retention_old_completed", state.Apply.Completed, old)
+	oldFailed := seed("retention_old_failed", state.Apply.Failed, old)
+	youngCompleted := seed("retention_young_completed", state.Apply.Completed, young)
+	oldStopped := seed("retention_old_stopped", state.Apply.Stopped, old)
+
+	retentionLogger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	run := func(cfg StorageRetentionConfig) {
+		t.Helper()
+		cfg.Enabled = true
+		svc := New(stor, &ServerConfig{StorageRetention: cfg}, nil, retentionLogger)
+		pass, _, ok := svc.storageRetentionPass()
+		require.True(t, ok)
+		pass(ctx)
+	}
+	requireLogCounts := func(oldCompletedWant, oldFailedWant int, message string) {
+		t.Helper()
+		assert.Equal(t, oldCompletedWant, logCount(oldCompleted), "old completed apply: "+message)
+		assert.Equal(t, oldFailedWant, logCount(oldFailed), "old failed apply: "+message)
+		assert.Equal(t, logsPerApply, logCount(youngCompleted), "an apply that settled inside the window keeps its logs: "+message)
+		assert.Equal(t, logsPerApply, logCount(oldStopped), "an old stopped apply can be resumed and keeps its logs: "+message)
+	}
+
+	// With no apply_logs window, even a pass that deletes leaves every apply log.
+	run(StorageRetentionConfig{DryRun: new(false)})
+	requireLogCounts(logsPerApply, logsPerApply, "no apply_logs window is set")
+
+	// The first pass an operator sees is a dry run, so setting a window alone
+	// changes nothing.
+	run(StorageRetentionConfig{ApplyLogs: window.String()})
+	requireLogCounts(logsPerApply, logsPerApply, "a dry run deletes nothing")
+
+	// A batch size of two takes three batches to clear four old entries: two full
+	// batches, then one that comes back empty.
+	run(StorageRetentionConfig{DryRun: new(false), BatchSize: 2, ApplyLogs: window.String()})
+	requireLogCounts(0, 0, "the logs of applies settled before the window are deleted")
+
+	// A pass with nothing left to delete is harmless and repeatable.
+	run(StorageRetentionConfig{DryRun: new(false), BatchSize: 2, ApplyLogs: window.String()})
+	requireLogCounts(0, 0, "a second pass finds nothing to delete")
 }
 
 func runStorageRetentionPassAgainstRealStorage(t *testing.T, stor storage.Storage, db *sql.DB, placeholder func(int) string) {

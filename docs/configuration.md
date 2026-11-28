@@ -1757,10 +1757,11 @@ SchemaBot keeps every row it writes unless told otherwise. The
 `storage_retention` block turns on a background pass that deletes old rows from
 SchemaBot's own storage tables. It is off by default, and when enabled it only
 counts and logs what it would delete until `dry_run: false` is set, because a
-deleted row cannot be recovered. The pass covers one table today, the webhook
-inbox (`webhook_events`), and only deletes deliveries that have finished. It
-never deletes a delivery that is still pending, being processed, or waiting to
-retry, however old.
+deleted row cannot be recovered. The pass covers two tables: the webhook inbox
+(`webhook_events`), which it always purges, and the apply logs (`apply_logs`),
+which it purges only when you set a window for them. It only deletes rows whose
+work has finished. It never deletes a delivery that is still pending, being
+processed, or waiting to retry, however old.
 
 ```yaml
 storage_retention:
@@ -1769,18 +1770,45 @@ storage_retention:
   interval: 1h          # default: 1h — how often the pass runs
   batch_size: 500       # default: 500, at most 5000 — rows deleted per statement
   webhook_events: 168h  # default: 168h (7 days) — how long a finished delivery is kept
+  apply_logs: 2160h     # default: unset — apply logs are kept forever; 2160h is 90 days
 ```
 
 Every instance runs the pass on its own interval, and an advisory lock lets one
 instance purge at a time. A pass deletes in batches with a short pause between
 them, and stops after a fixed number of batches so a large first backlog drains
 over several passes instead of holding the database in one long run. Each pass
-logs one line naming the table, the rows it deleted (or would delete, in a dry
-run), the batches it took, the window, and whether it was a dry run. A pass that
-fails logs at error level and the next interval tries again.
+logs one line per table naming the table, the rows it deleted (or would delete,
+in a dry run), the batches it took, the window, and whether it was a dry run. A
+pass that fails logs at error level and the next interval tries again. The two
+tables are purged independently, so a failure on one does not stop the other.
 
 Read a dry run's log line before turning deletion on: set `enabled: true`, let a
-pass run, and check `rows_would_delete` for the `webhook_events` table.
+pass run, and check `rows_would_delete` for each table, `webhook_events` and,
+when you set `apply_logs`, `apply_logs`. Each count has one minute to finish; a
+table whose count runs out of time logs a warning that the pass has no figure
+for it, rather than a count of zero, and the other table is still counted.
+
+### Apply log window
+
+`apply_logs` has no default. Leave it unset and every apply log is kept, even
+with the pass enabled. The startup line `storage retention pass enabled` shows
+`apply_logs_window` as `unset` in that case.
+
+When you set it, the pass deletes the log entries of an apply that settled
+(completed, failed, cancelled, or reverted) more than the window ago. The age is
+measured from the apply's `completed_at`, on the database clock, so every
+instance cuts at the same moment. The pass keeps the entries of:
+
+- an apply that is stopped, because it can still be resumed;
+- an apply that is still in flight;
+- an apply that settled within the window;
+- an apply a driver still leases, which happens during a rollout when one
+  deployment's failure settles the apply while another is still being driven.
+
+The apply and its tasks are not touched; only its log entries are deleted. The
+logs API is the only reader of old entries, so once the window has passed,
+`schemabot logs` shows nothing for those applies. Pick a window that covers how
+long your team looks back at an apply, such as `2160h` (90 days).
 
 ### Webhook inbox window
 
