@@ -6,6 +6,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/block/spirit/pkg/utils"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -19,8 +20,10 @@ import (
 // event a DDL guard can use. Planning an index builds it in pg-sprite's scratch
 // schema, so the trigger fires there and the plan is refused in SchemaBot's own
 // words: the SQLSTATE and the schema prefix to exempt, never the trigger's
-// raised text. Once the trigger skips that prefix the way the refusal and the
-// PostgreSQL guide say for its event, the same files plan.
+// raised text. Once the trigger skips that prefix for the role SchemaBot
+// connects as, the way the refusal and the PostgreSQL guide say for its event,
+// the same files plan, and another role that names a schema with the prefix is
+// still refused.
 func TestEnginePlanRefusesWhenAnEventTriggerRaisesOnTheScratchSchema(t *testing.T) {
 	const database = "plan_event_trigger_test"
 	triggers := map[string]string{
@@ -29,7 +32,7 @@ func TestEnginePlanRefusesWhenAnEventTriggerRaisesOnTheScratchSchema(t *testing.
 		"ddl_command_start": `
 			CREATE FUNCTION public.refuse_create_index() RETURNS event_trigger LANGUAGE plpgsql AS $$
 			BEGIN
-				IF current_setting('test.exempt_scratch', true) = 'on' AND current_schema() LIKE 'pgsprite\_scratch\_%' THEN
+				IF session_user = current_setting('test.schemabot_role', true) AND current_schema() LIKE 'pgsprite\_scratch\_%' THEN
 					RETURN;
 				END IF;
 				RAISE EXCEPTION 'CREATE INDEX must use CONCURRENTLY (dba policy on db-7.internal)';
@@ -42,7 +45,7 @@ func TestEnginePlanRefusesWhenAnEventTriggerRaisesOnTheScratchSchema(t *testing.
 		"ddl_command_start on CREATE SCHEMA too": `
 			CREATE FUNCTION public.refuse_create_index() RETURNS event_trigger LANGUAGE plpgsql AS $$
 			BEGIN
-				IF current_setting('test.exempt_scratch', true) = 'on' AND (tg_tag = 'CREATE SCHEMA' OR current_schema() LIKE 'pgsprite\_scratch\_%') THEN
+				IF session_user = current_setting('test.schemabot_role', true) AND (tg_tag = 'CREATE SCHEMA' OR current_schema() LIKE 'pgsprite\_scratch\_%') THEN
 					RETURN;
 				END IF;
 				RAISE EXCEPTION 'CREATE INDEX must use CONCURRENTLY (dba policy on db-7.internal)';
@@ -55,7 +58,7 @@ func TestEnginePlanRefusesWhenAnEventTriggerRaisesOnTheScratchSchema(t *testing.
 				cmd record;
 			BEGIN
 				FOR cmd IN SELECT * FROM pg_event_trigger_ddl_commands() WHERE command_tag = 'CREATE INDEX' LOOP
-					CONTINUE WHEN current_setting('test.exempt_scratch', true) = 'on' AND cmd.schema_name LIKE 'pgsprite\_scratch\_%';
+					CONTINUE WHEN session_user = current_setting('test.schemabot_role', true) AND cmd.schema_name LIKE 'pgsprite\_scratch\_%';
 					RAISE EXCEPTION 'CREATE INDEX must use CONCURRENTLY (dba policy on db-7.internal)';
 				END LOOP;
 			END $$;
@@ -69,7 +72,7 @@ func TestEnginePlanRefusesWhenAnEventTriggerRaisesOnTheScratchSchema(t *testing.
 				cmd record;
 			BEGIN
 				FOR cmd IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP
-					CONTINUE WHEN current_setting('test.exempt_scratch', true) = 'on' AND (cmd.schema_name LIKE 'pgsprite\_scratch\_%'
+					CONTINUE WHEN session_user = current_setting('test.schemabot_role', true) AND (cmd.schema_name LIKE 'pgsprite\_scratch\_%'
 						OR (cmd.command_tag = 'CREATE SCHEMA' AND cmd.object_identity LIKE 'pgsprite\_scratch\_%'));
 					RAISE EXCEPTION 'CREATE INDEX must use CONCURRENTLY (dba policy on db-7.internal)';
 				END LOOP;
@@ -101,7 +104,8 @@ CREATE INDEX accounts_email_idx ON accounts (email);`,
 			assert.Equal(t, `code on database "plan_event_trigger_test" raised SQLSTATE P0001 while SchemaBot planned. `+
 				`Planning builds the declared tables in a schema named pgsprite_scratch_<suffix>, in a transaction it always rolls back, `+
 				`so an event trigger on DDL fires there too, on its CREATE SCHEMA and on the DDL inside it. `+
-				`Have the trigger allow both for a schema whose name starts with pgsprite_scratch_ `+
+				`Have the trigger allow both for a schema whose name starts with pgsprite_scratch_, `+
+				`and only when session_user is the role SchemaBot connects as, since any role that can create a schema can pick that name `+
 				`(at ddl_command_start, check current_schema(), and let CREATE SCHEMA through, since its new name is not visible until ddl_command_end; `+
 				`at ddl_command_end, check each command's schema_name, `+
 				`and the object_identity of a CREATE SCHEMA), then plan again`, text)
@@ -111,7 +115,9 @@ CREATE INDEX accounts_email_idx ON accounts (email);`,
 			assert.Equal(t, "P0001", pgErr.Code)
 			assert.Contains(t, err.Error(), "CREATE INDEX must use CONCURRENTLY", "the server log records the raised text")
 
-			_, err = db.ExecContext(t.Context(), `ALTER DATABASE plan_event_trigger_test SET test.exempt_scratch = 'on'`)
+			_, err = db.ExecContext(t.Context(), `DO $$ BEGIN
+				EXECUTE pg_catalog.format('ALTER DATABASE plan_event_trigger_test SET test.schemabot_role = %L', session_user);
+			END $$`)
 			require.NoError(t, err)
 
 			result, err := New().Plan(t.Context(), req)
@@ -123,6 +129,17 @@ CREATE INDEX accounts_email_idx ON accounts (email);`,
 				}
 			}
 			assert.Equal(t, []string{"CREATE INDEX CONCURRENTLY accounts_email_idx ON public.accounts USING btree (email)"}, ddls)
+
+			conn, err := db.Conn(t.Context())
+			require.NoError(t, err)
+			defer utils.CloseAndLog(conn)
+			_, err = conn.ExecContext(t.Context(), `CREATE ROLE intruder; GRANT CREATE ON DATABASE plan_event_trigger_test TO intruder;
+				SET SESSION AUTHORIZATION intruder`)
+			require.NoError(t, err)
+			_, err = conn.ExecContext(t.Context(), `CREATE SCHEMA pgsprite_scratch_intruder;
+				CREATE TABLE pgsprite_scratch_intruder.notes (body text);
+				CREATE INDEX notes_body_idx ON pgsprite_scratch_intruder.notes (body)`)
+			require.ErrorContains(t, err, "CREATE INDEX must use CONCURRENTLY", "another role's schema with the prefix is still guarded")
 		})
 	}
 }

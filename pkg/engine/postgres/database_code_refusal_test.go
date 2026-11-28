@@ -20,7 +20,8 @@ func TestDatabaseCodeRefusal(t *testing.T) {
 	const want = `code on database "app" raised SQLSTATE P0001 while SchemaBot planned. ` +
 		`Planning builds the declared tables in a schema named pgsprite_scratch_<suffix>, in a transaction it always rolls back, ` +
 		`so an event trigger on DDL fires there too, on its CREATE SCHEMA and on the DDL inside it. ` +
-		`Have the trigger allow both for a schema whose name starts with pgsprite_scratch_ ` +
+		`Have the trigger allow both for a schema whose name starts with pgsprite_scratch_, ` +
+		`and only when session_user is the role SchemaBot connects as, since any role that can create a schema can pick that name ` +
 		`(at ddl_command_start, check current_schema(), and let CREATE SCHEMA through, since its new name is not visible until ddl_command_end; ` +
 		`at ddl_command_end, check each command's schema_name, ` +
 		`and the object_identity of a CREATE SCHEMA), then plan again`
