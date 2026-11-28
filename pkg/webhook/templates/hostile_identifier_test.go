@@ -156,6 +156,18 @@ func TestHostileReasonStaysPlainTextInPlanComment(t *testing.T) {
 				assert.Contains(t, rendered, "1. `orders`: "+tt.written+"\n", name)
 			}
 			assert.Contains(t, RenderPlanComment(plan), "💡 **Lint Warnings**: 1 advisory finding\n1. `orders`: "+tt.written+"\n", "the lint line")
+
+			// An engine's refusal of a rollout member is shown as that
+			// member's detail, and quotes the schema files the same way.
+			refusedMember := PlanCommentData{
+				Database: "testapp", Environment: "staging", IsMySQL: true,
+				Changes: plan.Changes,
+				DeploymentDrift: &DeploymentDriftData{Computed: true, Independent: true, Deployments: []DeploymentDriftEntry{
+					{Deployment: "us", Primary: true, Class: "planned"},
+					{Deployment: "eu", Class: "errored", Detail: tt.reason},
+				}},
+			}
+			assert.Contains(t, RenderPlanComment(refusedMember), "- `eu` ❌ could not plan — "+tt.written+"\n", "the refused member's line")
 		})
 	}
 }

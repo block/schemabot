@@ -9,6 +9,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/presentation"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/storage"
@@ -22,13 +23,32 @@ const unplannedMemberDetail = "could not be planned; see server logs for the cau
 
 // unplannedDetail is the attention detail for a member that could not be
 // planned. A member the engine refused for the declared schema gets the
-// refusal's own text, which the engine writes for the reader and which says
-// what to do next; any other failure gets unplannedMemberDetail.
+// refusal (MemberRefusalDetail); any other failure gets unplannedMemberDetail.
 func unplannedDetail(err error) string {
-	if text, ok := schemaRefusalText(err); ok {
-		return "refused: " + text
+	if detail, ok := MemberRefusalDetail(err); ok {
+		return detail
 	}
 	return unplannedMemberDetail
+}
+
+// MemberRefusalDetail is the detail every surface shows for a rollout member
+// the engine refused for the declared schema, and reports whether err is such
+// a refusal. The refusal's own text says what to change, in the schema files
+// or on the target, so it is shown in place of a fixed "see server logs" line,
+// which would send the reader to plan again unchanged. Only the refusal's text
+// is kept, never the wrap around it, which can name an address the member was
+// dialed at. The text still quotes names from the schema files, so it is
+// redacted and kept to one line here, and a markdown surface escapes it too.
+//
+// The plan response and the pull request's plan comment both read it from
+// here, so the CLI, which prints the response, and the comment show the same
+// words for the same member.
+func MemberRefusalDetail(err error) (string, bool) {
+	text, ok := schemaRefusalText(err)
+	if !ok {
+		return "", false
+	}
+	return "refused: " + presentation.InlineError(text), true
 }
 
 // notPlannedBesideErroredPrimaryDetail is the detail a plan response gives
