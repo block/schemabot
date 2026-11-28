@@ -1249,7 +1249,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 			return taskHandover
 		case <-time.After(max(0, nextPollWait-time.Since(tickStart))):
 			tickStart = time.Now()
-			if !parked.runFullPoll(ctx, c.storage, apply, time.Now(), logger) {
+			if !parked.runFullPollWithin(ctx, c.storage, apply, time.Now(), logger, &controlReadOutage, c.controlReadOutageWindow()) {
 				continue
 			}
 			pending, readStart, err := c.loadPendingControlOperationsWithin(ctx, apply, &controlReadOutage)
@@ -1261,7 +1261,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				}
 				now := time.Now()
 				if controlReadOutage.recordFailure(readStart, now, c.controlReadOutageWindow()) {
-					logger.Error("pending control requests have been unreadable for the lease staleness window; this driver halts the engine and hands the apply back for another driver to claim",
+					logger.Error("pending control requests have been unreadable for the lease staleness window; this driver hands the apply back for another driver to claim and halts the engine work this process runs",
 						"task_id", task.TaskIdentifier, "table", task.TableName,
 						"consecutive_read_failures", controlReadOutage.failures, "failing_for", controlReadOutage.failingFor(now), "error", err)
 					return taskHandover

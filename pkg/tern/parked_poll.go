@@ -65,8 +65,19 @@ func (p *parkedPoll) hold() {
 // runFullPoll reports whether this tick runs the drive's full poll. A tick
 // that runs it clears the hold, so the drive stays slowed only while each full
 // poll finds it still holding. A failed read runs the full poll, whose own
-// reads then surface whatever is wrong with storage.
+// reads then surface whatever is wrong with storage. Its read has no deadline
+// of its own; a drive that counts failed control reads uses runFullPollWithin.
 func (p *parkedPoll) runFullPoll(ctx context.Context, store storage.Storage, apply *storage.Apply, now time.Time, logger *slog.Logger) bool {
+	return p.runFullPollWithin(ctx, store, apply, now, logger, nil, 0)
+}
+
+// runFullPollWithin is runFullPoll for a drive that counts failed control
+// reads in outage. The read a held drive makes is cut off at what is left of
+// the outage window, and a failed read counts toward the run, so a read that
+// hangs while the heartbeat succeeds cannot hold the drive past the window:
+// the full poll that follows reads with what is left, and hands the apply
+// back once the window is spent. A nil outage leaves the read unbounded.
+func (p *parkedPoll) runFullPollWithin(ctx context.Context, store storage.Storage, apply *storage.Apply, now time.Time, logger *slog.Logger, outage *controlReadOutage, window time.Duration) bool {
 	if p.held && ctx.Err() != nil {
 		logger.DebugContext(ctx, "drive context ended while held at a deferred cutover; skipping the poll so the loop can exit",
 			apply.MutableLogAttrs()...)
@@ -76,7 +87,7 @@ func (p *parkedPoll) runFullPoll(ctx context.Context, store storage.Storage, app
 		p.beginFullPoll(now)
 		return true
 	}
-	pending, err := loadPendingControlOperations(ctx, store, apply)
+	pending, err := p.readHeld(ctx, store, apply, outage, window)
 	if err != nil {
 		logger.WarnContext(ctx, "could not check for a pending control request while held at a deferred cutover; running the full poll",
 			append(apply.MutableLogAttrs(), "error", err)...)
@@ -91,6 +102,23 @@ func (p *parkedPoll) runFullPoll(ctx context.Context, store storage.Storage, app
 		return true
 	}
 	return false
+}
+
+// readHeld reads the apply's pending control requests for a held drive. With
+// an outage it reads under what is left of the window and records a failure
+// that is not the drive's own cancellation.
+func (p *parkedPoll) readHeld(ctx context.Context, store storage.Storage, apply *storage.Apply, outage *controlReadOutage, window time.Duration) (pendingControlOperations, error) {
+	if outage == nil {
+		return loadPendingControlOperations(ctx, store, apply)
+	}
+	start := time.Now()
+	readCtx, cancel := context.WithTimeout(ctx, outage.remaining(start, window))
+	defer cancel()
+	pending, err := loadPendingControlOperations(readCtx, store, apply)
+	if err != nil && ctx.Err() == nil {
+		outage.recordFailure(start, time.Now(), window)
+	}
+	return pending, err
 }
 
 // observe records what a control read made during the full poll found. A

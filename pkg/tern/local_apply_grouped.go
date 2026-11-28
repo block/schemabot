@@ -749,7 +749,7 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 			return nil
 		case <-time.After(max(0, ps.nextPollWait-time.Since(tickStart))):
 			tickStart = time.Now()
-			if !ps.parked.runFullPoll(ctx, c.storage, apply, time.Now(), c.logger.With(apply.IdentityLogAttrs()...)) {
+			if !ps.parked.runFullPollWithin(ctx, c.storage, apply, time.Now(), c.logger.With(apply.IdentityLogAttrs()...), &ps.controlReadOutage, c.controlReadOutageWindow()) {
 				continue
 			}
 			if done := c.handleAtomicProgressTick(ctx, eng, apply, tasks, creds, resumeState, ps, options, releaseAtCutoverBarrier); done {
@@ -791,7 +791,7 @@ func (c *LocalClient) atomicControlReadFailed(ctx context.Context, logger *slog.
 	}
 	now := time.Now()
 	if ps.controlReadOutage.recordFailure(readStart, now, c.controlReadOutageWindow()) {
-		logger.Error("pending control requests have been unreadable for the lease staleness window; this driver halts the engine and hands the apply back for another driver to claim",
+		logger.Error("pending control requests have been unreadable for the lease staleness window; this driver hands the apply back for another driver to claim and halts the engine work this process runs",
 			append(apply.MutableLogAttrs(), "read_point", point, "consecutive_read_failures", ps.controlReadOutage.failures,
 				"failing_for", ps.controlReadOutage.failingFor(now), "error", err)...)
 		return true

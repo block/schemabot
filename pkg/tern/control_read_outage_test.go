@@ -257,3 +257,76 @@ func TestHandleAtomicProgressTickHandsBackWhenTheReadAfterTheProgressSyncKeepsFa
 	assert.True(t, f.tick(t), "the run reaches the window and the drive hands the apply back")
 	require.NoError(t, f.ps.terminalErr)
 }
+
+// cancellingControlRequestStore ends the drive's context during the pending
+// read, standing in for a drive cancelled by shutdown or a lost lease while
+// storage is failing.
+type cancellingControlRequestStore struct {
+	*testControlRequestStore
+	cancel context.CancelFunc
+	reads  int
+}
+
+func (s *cancellingControlRequestStore) ListPending(ctx context.Context, applyID int64) ([]*storage.ApplyControlRequest, error) {
+	s.reads++
+	s.cancel()
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// A sequential drive cancelled while it reads its pending control requests
+// hands the apply back at once rather than counting the failed read toward
+// an outage it would then ride out.
+func TestPollTaskToCompletionHandsBackWhenTheDriveIsCancelledDuringAControlRead(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	controlRequests := &cancellingControlRequestStore{testControlRequestStore: &testControlRequestStore{}, cancel: cancel}
+	eng := &phaseSequenceEngine{results: []*engine.ProgressResult{
+		{State: engine.StateRunning, Tables: []engine.TableProgress{{Namespace: "orders", Table: "line_items", State: state.Task.Running, Progress: 40}}},
+	}}
+	client, apply, task := controlReadOutageSequentialFixture(controlRequests, eng)
+	client.controlReadOutageWindowOverride = time.Hour
+
+	action := client.pollTaskToCompletion(ctx, apply, task, nil, nil)
+
+	assert.Equal(t, taskHandover, action)
+	assert.Equal(t, 1, controlRequests.reads, "the drive does not read again once it is cancelled")
+	assert.Zero(t, eng.calls)
+	assert.Equal(t, state.Task.Running, task.State, "the task is left for the next driver")
+}
+
+// A grouped drive cancelled while it reads its pending control requests stops
+// polling without counting the read as a failure of storage.
+func TestHandleAtomicProgressTickStopsWhenTheDriveIsCancelledDuringAControlRead(t *testing.T) {
+	f := newRevertWindowTickFixture(storage.ApplyOptions{})
+	f.ps.stateEnteredAt = time.Now()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	f.client.storage.(*exactProgressStorage).controlRequests = &cancellingControlRequestStore{testControlRequestStore: f.controlRequests, cancel: cancel}
+	f.client.controlReadOutageWindowOverride = time.Hour
+
+	assert.True(t, f.client.handleAtomicProgressTick(ctx, f.eng, f.apply, f.tasks, &engine.Credentials{}, nil, f.ps, f.apply.GetOptions().Map(), false))
+	assert.Zero(t, f.ps.controlReadOutage.failures, "a cancelled read is not an outage")
+	assert.Zero(t, f.eng.progressCalls)
+	require.NoError(t, f.ps.terminalErr)
+}
+
+// The read a drive held at a deferred cutover makes is cut off at what is
+// left of the outage window and counts toward the run, so a read that hangs
+// while the heartbeat succeeds cannot keep the drive held past the window.
+func TestParkedPollReadHeldIsBoundedByTheOutageWindow(t *testing.T) {
+	apply := &storage.Apply{ID: 9, ApplyIdentifier: "apply-held"}
+	store := &mockStorage{controlRequests: &hangingControlRequestStore{ControlRequestStore: &testControlRequestStore{}}}
+	p := newParkedPoll()
+	now := time.Now()
+	require.True(t, p.runFullPoll(t.Context(), store, apply, now, slog.Default()))
+	p.hold()
+
+	var outage controlReadOutage
+	start := time.Now()
+	assert.True(t, p.runFullPollWithin(t.Context(), store, apply, now.Add(time.Second), slog.Default(), &outage, 50*time.Millisecond),
+		"a read that timed out runs the full poll")
+	assert.Less(t, time.Since(start), 5*time.Second, "the hung read was cut off at the window")
+	assert.Equal(t, 1, outage.failures, "the timed-out read counts toward the run")
+	assert.True(t, outage.recordFailure(start, time.Now(), 50*time.Millisecond), "the full poll's own read finds the window spent")
+}
