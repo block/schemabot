@@ -2239,7 +2239,9 @@ type ReapedOperation struct {
 
 // ApplyLogStore manages apply log entries for debugging and audit.
 // Logs capture state transitions, errors, and events during schema changes.
-// Logs are kept forever for audit purposes.
+// Logs of a stopped or in-flight apply are kept for as long as the apply can
+// still change. Logs of a settled apply are kept for audit purposes until a
+// retention sweep removes them with DeleteForSettledAppliesOlderThan.
 //
 // Ordering contract: every read returns entries ordered by created_at
 // ascending, with ties on created_at broken by ascending id so entries keep
@@ -2265,6 +2267,21 @@ type ApplyLogStore interface {
 	// ordered by created_at ascending (ties broken by ascending id) so the
 	// result reads chronologically.
 	List(ctx context.Context, filter ApplyLogFilter) ([]*ApplyLog, error)
+
+	// DeleteForSettledAppliesOlderThan deletes at most limit log entries that
+	// belong to an apply settled more than age ago, and returns how many it
+	// deleted. It takes the applies that settled longest ago first, and makes no
+	// promise about the order of one apply's entries. Settled means one of
+	// state.SettledApplyStates
+	// (completed, failed, cancelled, reverted), and the age is measured from the
+	// apply's completed_at. It never deletes an entry of a stopped apply, which
+	// can be resumed, or of any in-flight apply, however old their entries are,
+	// and it never deletes an entry of an apply with no completed_at.
+	//
+	// The cutoff is evaluated on the database clock rather than the caller's, so
+	// the same age cuts at the same instant on every pod. A non-positive age or
+	// limit is an error and deletes nothing.
+	DeleteForSettledAppliesOlderThan(ctx context.Context, age time.Duration, limit int) (int64, error)
 }
 
 // ControlRequestStore manages durable user control requests.

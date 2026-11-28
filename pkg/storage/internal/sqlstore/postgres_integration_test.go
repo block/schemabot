@@ -1255,6 +1255,20 @@ func TestPostgresFailedOrganicRowCoversOnlyDuringCoolOff(t *testing.T) {
 	assertFailedRowCoverageCoolOff(t, NewPostgres(db), db, PostgresDialect{}, PostgresDialect{}.Rebind)
 }
 
+// Retention deletes only the logs of old settled applies on PostgreSQL too: the
+// cutoff, the page select, and the guarded delete are rendered per dialect.
+func TestPostgresDeleteApplyLogsForSettledAppliesOlderThan(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_apply_logs_purge")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+	clearPostgresTables(t, db)
+
+	assertDeleteForSettledAppliesOlderThan(t, NewPostgres(db), db, PostgresDialect{}, PostgresDialect{}.Rebind)
+}
+
 func applyPostgresTestSchema(t *testing.T, db *sql.DB) {
 	t.Helper()
 	entries, err := schema.PostgresFS.ReadDir("postgres")
